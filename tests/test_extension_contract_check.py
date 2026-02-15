@@ -65,6 +65,27 @@ class ExtensionContractCheckTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn('entrypoint path missing', result.stderr)
 
+    def test_fails_on_unsafe_entrypoint_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            outside = repo.parent / 'outside.py'
+            outside.write_text('print("bad")\n', encoding='utf-8')
+            self._write_manifest(
+                repo,
+                'invalid-path',
+                {
+                    'name': 'unsafe-extension',
+                    'version': '0.1.0',
+                    'capabilities': ['sync', 'sync'],
+                    'entrypoints': {'doctor': '../outside.py'},
+                },
+            )
+
+            result = self._run(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('Unsafe package entry path', result.stderr)
+            self.assertIn('capabilities` contains duplicates', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

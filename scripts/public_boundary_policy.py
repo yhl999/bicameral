@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from migration_sync_lib import resolve_repo_root as _resolve_repo_root
+
 ALLOW = 'ALLOW'
 BLOCK = 'BLOCK'
 AMBIGUOUS = 'AMBIGUOUS'
@@ -76,13 +78,7 @@ def run_git_lines(repo_root: Path, *args: str) -> set[str]:
 def resolve_repo_root(cwd: Path) -> Path:
     """Resolve git repository root for the given working directory."""
 
-    result = subprocess.run(
-        ['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return Path(result.stdout.strip())
+    return _resolve_repo_root(cwd)
 
 
 def resolve_input_path(path: Path, repo_root: Path) -> Path:

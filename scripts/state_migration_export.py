@@ -12,6 +12,7 @@ from pathlib import Path
 from migration_sync_lib import (
     collect_file_entries,
     collect_manifest_files,
+    copy_entry,
     dump_json,
     load_json,
     now_utc_iso,
@@ -98,10 +99,7 @@ def main() -> int:
     if not args.dry_run:
         for entry in entries:
             rel = entry['path']
-            src = (repo_root / rel).resolve()
-            dst = (payload_root / rel).resolve()
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            copy_entry(repo_root, payload_root, rel)
 
     print(f'Package manifest written: {package_root / "package_manifest.json"}')
     if args.dry_run:

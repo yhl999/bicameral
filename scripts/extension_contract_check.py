@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from migration_sync_lib import load_json
+from migration_sync_lib import ensure_safe_relative, load_json, resolve_safe_child
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,7 +24,8 @@ def _is_non_empty_string(value: object) -> bool:
 
 def main() -> int:
     args = parse_args()
-    extensions_dir = args.extensions_dir if args.extensions_dir.is_absolute() else (Path.cwd() / args.extensions_dir).resolve()
+    repo_root = Path.cwd().resolve()
+    extensions_dir = args.extensions_dir if args.extensions_dir.is_absolute() else (repo_root / args.extensions_dir).resolve()
 
     if not extensions_dir.exists():
         print(f'Extensions directory missing: {extensions_dir}')
@@ -60,6 +61,8 @@ def main() -> int:
 
         if not isinstance(capabilities, list) or not all(_is_non_empty_string(item) for item in capabilities):
             issues.append(f'{normalized_name}: `capabilities` must be a list of non-empty strings')
+        elif len({item.strip() for item in capabilities}) != len(capabilities):
+            issues.append(f'{normalized_name}: `capabilities` contains duplicates')
 
         if not isinstance(entrypoints, dict) or not entrypoints:
             issues.append(f'{normalized_name}: `entrypoints` must be a non-empty object')
@@ -68,9 +71,21 @@ def main() -> int:
                 if not _is_non_empty_string(key) or not _is_non_empty_string(rel):
                     issues.append(f'{normalized_name}: invalid entrypoint pair `{key}` -> `{rel}`')
                     continue
-                candidate = (Path.cwd() / str(rel)).resolve()
-                if not candidate.exists():
-                    issues.append(f'{normalized_name}: entrypoint path missing `{rel}`')
+
+                rel_path = str(rel).strip()
+                try:
+                    ensure_safe_relative(rel_path)
+                    candidate = resolve_safe_child(
+                        repo_root,
+                        rel_path,
+                        context=f'extension `{normalized_name}` entrypoint',
+                    )
+                except ValueError as exc:
+                    issues.append(f'{normalized_name}: {exc}')
+                    continue
+
+                if not candidate.exists() or not candidate.is_file():
+                    issues.append(f'{normalized_name}: entrypoint path missing `{rel_path}`')
 
         discovered.append(normalized_name)
 

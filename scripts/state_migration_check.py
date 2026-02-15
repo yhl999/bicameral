@@ -52,6 +52,9 @@ def _validate_manifest_shape(manifest: dict) -> list[str]:
                 errors.append(f'Entry #{index} missing key `{key}`')
 
         path = entry.get('path')
+        digest = entry.get('sha256')
+        size_bytes = entry.get('size_bytes')
+
         if isinstance(path, str):
             try:
                 ensure_safe_relative(path)
@@ -59,6 +62,12 @@ def _validate_manifest_shape(manifest: dict) -> list[str]:
                 errors.append(str(exc))
         else:
             errors.append(f'Entry #{index} path must be a string')
+
+        if not isinstance(digest, str) or len(digest) != 64 or any(ch not in '0123456789abcdef' for ch in digest.lower()):
+            errors.append(f'Entry #{index} sha256 must be a 64-char hex string')
+
+        if not isinstance(size_bytes, int) or size_bytes < 0:
+            errors.append(f'Entry #{index} size_bytes must be a non-negative integer')
 
     expected_count = manifest.get('entry_count')
     if isinstance(expected_count, int) and expected_count != len(entries):

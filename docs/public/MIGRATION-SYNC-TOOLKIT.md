@@ -14,6 +14,7 @@ This repository ships a **delta-layer migration/sync toolkit** designed for:
 - `config/migration_sync_policy.json`
   - upstream/origin remotes + branch defaults,
   - sync-button safety policy,
+  - history export metric coefficients,
   - history scorecard threshold + weights,
   - weekly cadence metadata.
 - `config/state_migration_manifest.json`
@@ -81,7 +82,8 @@ python3 scripts/state_migration_import.py \
 
 Notes:
 - dry-run export writes package manifest preview (no payload files copied),
-- non-dry-run export writes payload files and checksums for deterministic imports.
+- non-dry-run export writes payload files and checksums for deterministic imports,
+- import performs path-safety + checksum + file-size validation before writing payload files.
 
 ## 4) Extension contract check
 
@@ -91,5 +93,6 @@ python3 scripts/extension_contract_check.py --strict
 
 Checks `extensions/*/manifest.json` for:
 - required fields (`name`, `version`, `capabilities`, `entrypoints`),
-- duplicate extension names,
-- missing entrypoint paths.
+- duplicate extension names/capabilities,
+- traversal-safe relative entrypoint paths,
+- missing entrypoint files.

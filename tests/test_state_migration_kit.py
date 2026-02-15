@@ -129,6 +129,105 @@ class StateMigrationKitTests(unittest.TestCase):
             )
             self.assertEqual(check_full.returncode, 0, msg=check_full.stderr)
 
+    def test_import_blocks_tampered_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True, exist_ok=True)
+            self._init_repo(repo)
+            self._seed_files(repo)
+
+            package = repo / 'out' / 'package'
+            export_full = subprocess.run(
+                [
+                    sys.executable,
+                    str(EXPORT_SCRIPT),
+                    '--repo',
+                    str(repo),
+                    '--manifest',
+                    'config/state_migration_manifest.json',
+                    '--out',
+                    str(package),
+                    '--force',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(export_full.returncode, 0, msg=export_full.stderr)
+
+            manifest = json.loads((package / 'package_manifest.json').read_text(encoding='utf-8'))
+            first_entry = manifest['entries'][0]['path']
+            payload_file = package / 'payload' / first_entry
+            payload_file.write_text('tampered\n', encoding='utf-8')
+
+            target = repo / 'import-target'
+            target.mkdir(parents=True, exist_ok=True)
+            import_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(IMPORT_SCRIPT),
+                    '--in',
+                    str(package),
+                    '--target',
+                    str(target),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(import_result.returncode, 1)
+            self.assertIn('payload integrity check failed', import_result.stderr)
+
+    def test_import_rejects_traversal_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / 'pkg'
+            package.mkdir(parents=True, exist_ok=True)
+            payload = package / 'payload'
+            payload.mkdir(parents=True, exist_ok=True)
+
+            manifest = {
+                'package_version': 1,
+                'manifest_version': 1,
+                'package_name': 'unsafe',
+                'created_at': '2026-02-15T00:00:00Z',
+                'source_repo': '/tmp/source',
+                'source_commit': 'abc123',
+                'dry_run_preview': False,
+                'entry_count': 1,
+                'entries': [
+                    {
+                        'path': '../escape.txt',
+                        'sha256': '0' * 64,
+                        'size_bytes': 0,
+                    },
+                ],
+            }
+            (package / 'package_manifest.json').write_text(
+                f'{json.dumps(manifest, indent=2)}\n',
+                encoding='utf-8',
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(IMPORT_SCRIPT),
+                    '--in',
+                    str(package),
+                    '--target',
+                    str(root / 'target'),
+                    '--dry-run',
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('Unsafe package entry path', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

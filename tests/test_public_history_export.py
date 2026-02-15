@@ -100,6 +100,75 @@ class PublicHistoryExportTests(unittest.TestCase):
             self.assertIn('metrics', filtered_payload)
             self.assertIn('metrics', clean_payload)
 
+    def test_uses_policy_overrides_for_metric_coefficients(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir()
+            self._init_repo(repo)
+
+            (repo / 'config').mkdir(parents=True, exist_ok=True)
+            (repo / 'docs' / 'public').mkdir(parents=True, exist_ok=True)
+            (repo / 'docs' / 'public' / 'x.md').write_text('ok\n', encoding='utf-8')
+            (repo / 'config' / 'public_export_allowlist.yaml').write_text(
+                'version: 1\n\nallowlist:\n  - "docs/public/**"\n  - "config/public_export_*.yaml"\n',
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'public_export_denylist.yaml').write_text(
+                'version: 1\n\ndenylist:\n',
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'migration_sync_policy.json').write_text(
+                json.dumps(
+                    {
+                        'history_metrics': {
+                            'filtered_history': {
+                                'privacy_risk': {
+                                    'base': 40,
+                                    'block_penalty': 0,
+                                    'ambiguous_penalty': 0,
+                                },
+                            },
+                        },
+                    },
+                    indent=2,
+                )
+                + '\n',
+                encoding='utf-8',
+            )
+
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '-m', 'seed'], cwd=repo, check=True)
+
+            filtered_json = repo / 'filtered.json'
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    '--repo',
+                    str(repo),
+                    '--mode',
+                    'filtered-history',
+                    '--manifest',
+                    'config/public_export_allowlist.yaml',
+                    '--denylist',
+                    'config/public_export_denylist.yaml',
+                    '--policy',
+                    'config/migration_sync_policy.json',
+                    '--report',
+                    str(repo / 'filtered.md'),
+                    '--summary-json',
+                    str(filtered_json),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+            payload = json.loads(filtered_json.read_text(encoding='utf-8'))
+            self.assertEqual(payload['metrics']['privacy_risk'], 40)
+
 
 if __name__ == '__main__':
     unittest.main()

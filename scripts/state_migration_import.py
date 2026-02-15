@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from migration_sync_lib import ensure_safe_relative, load_json
+from migration_sync_lib import ensure_safe_relative, load_json, resolve_safe_child, sha256_file
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,6 +18,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dry-run', action='store_true', help='Show planned writes without mutating target')
     parser.add_argument('--allow-overwrite', action='store_true', help='Allow overwriting existing files')
     return parser.parse_args()
+
+
+def _as_entry(index: int, entry: object) -> dict:
+    if not isinstance(entry, dict):
+        raise ValueError(f'Invalid migration entry object at index {index}')
+
+    required = ('path', 'sha256', 'size_bytes')
+    missing = [key for key in required if key not in entry]
+    if missing:
+        raise ValueError(
+            f'Migration entry #{index} missing keys: {", ".join(missing)}',
+        )
+
+    path = entry.get('path')
+    digest = entry.get('sha256')
+    size_bytes = entry.get('size_bytes')
+
+    if not isinstance(path, str):
+        raise ValueError(f'Migration entry #{index} has invalid `path` type')
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ValueError(f'Migration entry #{index} has invalid `sha256` value')
+    if not isinstance(size_bytes, int) or size_bytes < 0:
+        raise ValueError(f'Migration entry #{index} has invalid `size_bytes` value')
+
+    ensure_safe_relative(path)
+    return entry
 
 
 def main() -> int:
@@ -36,24 +62,36 @@ def main() -> int:
     planned_writes: list[tuple[Path, Path]] = []
     conflicts: list[str] = []
     missing_payload: list[str] = []
+    integrity_errors: list[str] = []
 
-    for entry in entries:
-        if not isinstance(entry, dict) or 'path' not in entry:
-            raise ValueError('Invalid migration entry object in manifest')
+    for index, raw_entry in enumerate(entries):
+        entry = _as_entry(index, raw_entry)
 
-        rel = entry['path']
-        if not isinstance(rel, str):
-            raise ValueError('Invalid migration entry path type')
+        rel = str(entry['path'])
+        expected_hash = str(entry['sha256'])
+        expected_size = int(entry['size_bytes'])
 
-        safe_rel = ensure_safe_relative(rel)
-        src = (payload_root / safe_rel).resolve()
-        dst = (target_root / safe_rel).resolve()
+        src = resolve_safe_child(payload_root, rel, context='migration payload entry')
+        dst = resolve_safe_child(target_root, rel, context='migration import target entry')
 
         if dst.exists() and not args.allow_overwrite:
             conflicts.append(rel)
 
-        if not src.exists():
+        if not src.exists() or not src.is_file():
             missing_payload.append(rel)
+            planned_writes.append((src, dst))
+            continue
+
+        actual_size = src.stat().st_size
+        if actual_size != expected_size:
+            integrity_errors.append(
+                f'{rel}: size mismatch (expected {expected_size}, got {actual_size})',
+            )
+
+        actual_hash = sha256_file(src)
+        if actual_hash != expected_hash:
+            integrity_errors.append(f'{rel}: checksum mismatch')
+
         planned_writes.append((src, dst))
 
     if conflicts and not args.dry_run:
@@ -69,11 +107,22 @@ def main() -> int:
             print(f'- {rel}', file=sys.stderr)
         return 1
 
+    if integrity_errors and not args.dry_run:
+        print('Import blocked: payload integrity check failed.', file=sys.stderr)
+        for issue in integrity_errors:
+            print(f'- {issue}', file=sys.stderr)
+        return 1
+
     if args.dry_run:
         print(f'DRY RUN import plan ({len(planned_writes)} files):')
         for src, dst in planned_writes:
             note = ' (payload missing in dry-run preview)' if not src.exists() else ''
             print(f'- {src} -> {dst}{note}')
+
+        if integrity_errors:
+            print('Dry-run integrity warnings:')
+            for issue in integrity_errors:
+                print(f'- {issue}')
         return 0
 
     if dry_run_preview:
