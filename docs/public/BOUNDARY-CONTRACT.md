@@ -24,8 +24,11 @@ Denylist matches always win over allowlist matches.
 python3 scripts/public_repo_boundary_audit.py \
   --manifest config/public_export_allowlist.yaml \
   --denylist config/public_export_denylist.yaml \
-  --report /tmp/boundary-audit.md
+  --report /tmp/boundary-audit.md \
+  --summary-json /tmp/boundary-audit-summary.json
 ```
+
+`--summary-json` is optional and emits machine-readable counts + offending path lists for CI/report tooling.
 
 ### Fail closed for CI
 
@@ -43,3 +46,13 @@ python3 scripts/public_repo_boundary_audit.py \
 
 Use `--include-untracked` to include local untracked paths via:
 `git ls-files --others --exclude-standard`.
+
+## Lint policy files
+
+```bash
+python3 scripts/public_boundary_policy_lint.py \
+  --manifest config/public_export_allowlist.yaml \
+  --denylist config/public_export_denylist.yaml
+```
+
+This fails when policy rules are duplicated or contradictory (same pattern in both allowlist and denylist).
