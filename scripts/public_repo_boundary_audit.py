@@ -10,7 +10,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ALLOW = 'ALLOW'
 BLOCK = 'BLOCK'
 AMBIGUOUS = 'AMBIGUOUS'
@@ -275,4 +274,4 @@ if __name__ == '__main__':
         raise SystemExit(main())
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
