@@ -14,6 +14,7 @@ from pathlib import Path
 ALLOW = 'ALLOW'
 BLOCK = 'BLOCK'
 AMBIGUOUS = 'AMBIGUOUS'
+STATUS_ORDER = (ALLOW, BLOCK, AMBIGUOUS)
 
 
 @dataclass(frozen=True)
@@ -125,13 +126,23 @@ def _classify(path: str, allowlist: list[str], denylist: list[str]) -> RuleDecis
     return RuleDecision(path, AMBIGUOUS, 'NO_MATCH', None)
 
 
-def _count_statuses(decisions: list[RuleDecision]) -> dict[str, int]:
-    """Count decisions by status."""
+def _summarize_decisions(
+    decisions: list[RuleDecision],
+) -> tuple[dict[str, int], list[RuleDecision], list[RuleDecision]]:
+    """Return status counts plus blocked and ambiguous path decisions."""
 
-    counts = {ALLOW: 0, BLOCK: 0, AMBIGUOUS: 0}
+    counts = {status: 0 for status in STATUS_ORDER}
+    blocked: list[RuleDecision] = []
+    ambiguous: list[RuleDecision] = []
+
     for decision in decisions:
         counts[decision.status] += 1
-    return counts
+        if decision.status == BLOCK:
+            blocked.append(decision)
+        elif decision.status == AMBIGUOUS:
+            ambiguous.append(decision)
+
+    return counts, blocked, ambiguous
 
 
 def _build_report(
@@ -139,12 +150,11 @@ def _build_report(
     manifest_path: Path,
     denylist_path: Path,
     include_untracked: bool,
+    status_counts: dict[str, int],
+    block_list: list[RuleDecision],
+    ambiguous_list: list[RuleDecision],
 ) -> str:
     """Build a markdown report with summary counts and remediation hints."""
-
-    status_counts = _count_statuses(decisions)
-    block_list = [d for d in decisions if d.status == BLOCK]
-    ambiguous_list = [d for d in decisions if d.status == AMBIGUOUS]
 
     lines = [
         '# Public Foundation Boundary Audit',
@@ -158,9 +168,7 @@ def _build_report(
         '',
         '| Status | Count |',
         '| --- | --- |',
-        f'| {ALLOW} | {status_counts[ALLOW]} |',
-        f'| {BLOCK} | {status_counts[BLOCK]} |',
-        f'| {AMBIGUOUS} | {status_counts[AMBIGUOUS]} |',
+        *[f'| {status} | {status_counts[status]} |' for status in STATUS_ORDER],
         '',
         '## Offending paths',
         '',
@@ -214,7 +222,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--include-untracked',
         action='store_true',
-        help='Include untracked files from git status',
+        help='Include untracked files (git ls-files --others --exclude-standard)',
     )
     parser.add_argument(
         '--strict',
@@ -239,24 +247,25 @@ def main() -> int:
 
     files = _collect_git_files(repo_root, include_untracked=args.include_untracked)
     decisions = [_classify(path, allowlist=allowlist_rules, denylist=denylist_rules) for path in files]
-    status_counts = _count_statuses(decisions)
+    status_counts, block_list, ambiguous_list = _summarize_decisions(decisions)
 
     report_text = _build_report(
         decisions=decisions,
         manifest_path=manifest,
         denylist_path=denylist,
         include_untracked=args.include_untracked,
+        status_counts=status_counts,
+        block_list=block_list,
+        ambiguous_list=ambiguous_list,
     )
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(report_text, encoding='utf-8')
 
+    summary = ' | '.join(f'{status}: {status_counts[status]}' for status in STATUS_ORDER)
     print(f'Report written to: {report}')
-    print(
-        f'Total: {len(decisions)} | ALLOW: {status_counts[ALLOW]} | '
-        f'BLOCK: {status_counts[BLOCK]} | AMBIGUOUS: {status_counts[AMBIGUOUS]}',
-    )
+    print(f'Total: {len(decisions)} | {summary}')
 
-    if args.strict and (status_counts[BLOCK] or status_counts[AMBIGUOUS]):
+    if args.strict and (block_list or ambiguous_list):
         return 1
     return 0
 
