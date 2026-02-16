@@ -99,5 +99,61 @@ python3 scripts/run_tests.py --target policy
 - Depends on boundary contract to define allowed foundation scope.
 - Feeds history migration (avoid rewriting history multiple times).
 
+## Execution Amendment (2026-02-15) — Delta Control-Layer Tranches 1→7
+
+### Why this amendment exists
+The implementation stream for this PRD converged on the **delta/control layer** as the highest-leverage simplification surface.
+This amendment captures the shipped scope and the new steady-state contract model.
+
+### Effective owned-path focus (override for this execution)
+- `scripts/**` (delta tooling + shared contract/migration libraries)
+- `config/**` (policy + contract metadata)
+- `docs/public/**` (operator-facing runbooks/docs)
+- `.github/workflows/**` (canonical CI gates + legacy archive policy)
+- `extensions/**` (versioned extension command contract)
+- `tests/**` (delta contract, migration, and pipeline coverage)
+
+### Shipped tranche outcomes
+1. **Boundary modularization + CI centralization**
+   - Boundary policy library + lint CLI + shared CI shell entrypoints.
+2. **Migration/sync toolkit + extension contracts baseline**
+   - Upstream doctor, history export/scorecard, state export/check/import.
+3. **Hardening + policy-driven metrics**
+   - Safer path handling, payload integrity checks, policyized history metrics.
+4. **Contract-first layer + unified command surface**
+   - `delta_contract_check.py` + `delta_tool.py` canonical entrypoint.
+5. **Registry/integrity dedupe + pipeline e2e**
+   - Shared extension inspection + shared payload evaluation + e2e test.
+6. **Modular contracts + explicit migration policy + workflow retirement**
+   - `delta_contracts_lib/**`, `delta_contract_migrate.py`, workflow archive policy.
+7. **Cross-contract invariants + safer execution semantics**
+   - Invariant checks across policy/manifest/contract policy,
+   - target-aware migration handlers,
+   - fail-fast command execution on registry warnings,
+   - atomic import rollback default.
+
+### Current design contract (steady state)
+- Exactly one canonical command bus: `scripts/delta_tool.py`
+- Exactly one canonical contract validator entrypoint: `scripts/delta_contract_check.py`
+- Exactly one canonical contract migration entrypoint: `scripts/delta_contract_migrate.py`
+- Extension commands must be namespaced and versioned via `command_contract`
+- State import defaults to atomic rollback semantics (`--atomic` default)
+
+### Delta-specific validation commands (canonical)
+```bash
+set -euo pipefail
+bash scripts/ci/run_ruff_lint.sh
+bash scripts/ci/run_migration_sync_toolkit.sh
+python3 tests/test_delta_contract_check.py
+python3 tests/test_delta_contract_migrate.py
+python3 tests/test_delta_tool.py
+python3 tests/test_delta_pipeline_e2e.py
+python3 tests/test_state_migration_kit.py
+```
+
+### Outcome note
+This PRD execution now functions as the implementation record for the tranche-based delta refactor line.
+Any future refactor should preserve these invariants unless an explicit ADR supersedes them.
+
 ## Open Questions
 - Should we set an explicit complexity budget target per module (e.g., max function length / branch count)?
