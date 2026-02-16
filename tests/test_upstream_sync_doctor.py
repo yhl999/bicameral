@@ -65,6 +65,7 @@ class UpstreamSyncDoctorTests(unittest.TestCase):
             self._git(root, 'clone', str(upstream_bare), str(upstream_work))
             self._git(upstream_work, 'config', 'user.email', 'test@example.com')
             self._git(upstream_work, 'config', 'user.name', 'Test User')
+            self._git(upstream_work, 'checkout', '-B', 'main', 'origin/main')
             (upstream_work / 'UPSTREAM.md').write_text('new\n', encoding='utf-8')
             self._git(upstream_work, 'add', 'UPSTREAM.md')
             self._git(upstream_work, 'commit', '-m', 'upstream-only change')
