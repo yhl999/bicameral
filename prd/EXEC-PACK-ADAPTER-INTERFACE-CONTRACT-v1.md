@@ -8,11 +8,11 @@
 - Preferred Engine: Either
 - Owned Paths:
   - `prd/EXEC-PACK-ADAPTER-INTERFACE-CONTRACT-v1.md`
-  - `docs/public/EXTENSION-INTERFACE.md` (new)
-  - `extensions/__init__.py` (new)
-  - `extensions/contracts.py` (new)
-  - `extensions/loader.py` (new)
-  - `scripts/extension_contract_check.py` (new)
+  - `docs/public/EXTENSION-INTERFACE.md`
+  - `extensions/__init__.py`
+  - `extensions/contracts.py`
+  - `extensions/loader.py`
+  - `scripts/extension_contract_check.py`
 
 ## Overview
 Define a stable extension interface so private/custom workflow and content packs can plug into the public core without modifying core foundation code.
@@ -24,6 +24,29 @@ Before implementation, the agent must:
 3. Identify at least 3 candidate simplifications across the owned-path surface; implement selected items or explicitly defer each candidate with rationale.
 4. If the PR touches only one file or one narrow function, include explicit justification for why broader owned-path opportunities were not applicable.
 
+## Cross-Repo Baseline Inventory (completed)
+### Private/source baseline reviewed (`projects/graphiti`)
+- `config/runtime_pack_registry.yaml`
+- `scripts/runtime_pack_router.py`
+- `schemas/runtime_pack_router.schema.json`
+- `exports/manifest.json`
+
+### Public target reviewed (`projects/graphiti-openclaw`)
+- `extensions/migration_sync/manifest.json`
+- `docs/public/MIGRATION-SYNC-TOOLKIT.md`
+- `scripts/extension_contract_check.py`
+- `scripts/delta_contracts_lib/extension.py`
+- `scripts/delta_contracts_lib/inspect.py`
+- `prd/EXEC-PACK-ADAPTER-INTERFACE-CONTRACT-v1.md`
+
+## Simplification Loop (candidates + rationale)
+| Candidate | Decision | Rationale |
+|---|---|---|
+| Centralize contract parsing/validation in a dedicated `extensions/contracts.py` model (instead of ad-hoc checks inside checker script) | **Selected** | Reduces duplication, gives one stable versioned contract surface, and makes future API version expansion easier. |
+| Move extension discovery/loading into a fail-safe loader (`extensions/loader.py`) and keep checker as a thin CLI | **Selected** | Improves maintainability and isolates failures per extension while preserving clear diagnostics. |
+| Enforce `api_version` strictly for every existing manifest immediately | **Deferred** | Existing manifests in repo and migration tests are legacy; v1 keeps compatibility via warning fallback while documenting explicit versioning as the standard forward path. |
+| Add YAML manifest support in v1 | **Deferred** | JSON-only keeps parser complexity low and deterministic for CI; YAML can be added in a later contract version if needed. |
+
 ## Goals
 - Keep public core generic and clean.
 - Allow private/persona overlays to attach through explicit contracts.
@@ -31,11 +54,11 @@ Before implementation, the agent must:
 
 ## Definition of Done (DoD)
 **DoD checklist:**
-- [ ] Extension contract types/interfaces are defined and versioned.
-- [ ] Loader path supports registering external packs without editing core logic.
-- [ ] Contract checker validates extension compatibility and fails with clear diagnostics.
-- [ ] Public docs explain adapter model with examples and anti-patterns.
-- [ ] Refactor-pass simplification loop is applied to all touched code.
+- [x] Extension contract types/interfaces are defined and versioned.
+- [x] Loader path supports registering external packs without editing core logic.
+- [x] Contract checker validates extension compatibility and fails with clear diagnostics.
+- [x] Public docs explain adapter model with examples and anti-patterns.
+- [x] Refactor-pass simplification loop is applied to all touched code.
 
 **Validation commands (run from repo root):**
 ```bash
@@ -52,15 +75,15 @@ python3 -m compileall extensions scripts
 **Description:** As maintainer, I want custom packs to plug in externally so the core repo remains broadly useful.
 
 **Acceptance Criteria:**
-- [ ] Core can run with zero custom packs installed.
-- [ ] Installing/removing a pack does not require editing core files.
+- [x] Core can run with zero custom packs installed.
+- [x] Installing/removing a pack does not require editing core files.
 
 ### US-002: Overlay safety
 **Description:** As operator, I want clear compatibility checks before enabling a pack.
 
 **Acceptance Criteria:**
-- [ ] Incompatible pack versions fail fast with actionable error messages.
-- [ ] Contract checker output includes fix guidance.
+- [x] Incompatible pack versions fail fast with actionable error messages.
+- [x] Contract checker output includes fix guidance.
 
 ## Functional Requirements
 - FR-1: Contract versioning must be explicit (`api_version` or equivalent).
@@ -96,3 +119,4 @@ python3 -m compileall extensions scripts
 
 ## Open Questions
 - Should extension manifests live in YAML only, or support JSON as well?
+  - **Decision for v1:** JSON manifest only (simpler parser + deterministic CI). YAML support deferred.
