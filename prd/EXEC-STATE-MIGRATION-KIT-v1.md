@@ -9,12 +9,12 @@
 - Owned Paths:
   - `prd/EXEC-STATE-MIGRATION-KIT-v1.md`
   - `config/state_migration_manifest.json`
-  - `docs/runbooks/state-migration.md` (new)
+  - `docs/runbooks/state-migration.md`
   - `scripts/delta_contracts_lib/package_manifest.py`
   - `scripts/migration_sync_lib.py`
-  - `scripts/state_migration_export.py` (new)
-  - `scripts/state_migration_import.py` (new)
-  - `scripts/state_migration_check.py` (new)
+  - `scripts/state_migration_export.py`
+  - `scripts/state_migration_import.py`
+  - `scripts/state_migration_check.py`
   - `tests/test_state_migration_kit.py`
 
 ## Overview
