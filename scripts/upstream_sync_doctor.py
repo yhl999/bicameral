@@ -142,8 +142,16 @@ def main() -> int:
         if require_clean_worktree:
             sync_button_safe = sync_button_safe and clean_worktree
 
+    # When --allow-missing-upstream is set and upstream refs are absent,
+    # degrade sync-button-safety to a warning instead of hard-failing.
+    _upstream_refs_absent = upstream_remote not in remotes or not upstream_ref_exists
     if args.check_sync_button_safety and not sync_button_safe:
-        issues.append('Sync button safety check failed; use PR-based sync lane')
+        if args.allow_missing_upstream and _upstream_refs_absent:
+            warnings.append(
+                'Sync button safety check skipped (--allow-missing-upstream; upstream refs absent)'
+            )
+        else:
+            issues.append('Sync button safety check failed; use PR-based sync lane')
 
     report = {
         'repo_root': str(repo_root),

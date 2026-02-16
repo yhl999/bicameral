@@ -8,12 +8,16 @@ python3 scripts/delta_tool.py contracts-check -- \
   --extensions-dir extensions \
   --strict
 
+# PR-safe: --allow-missing-upstream + --dry-run ensures CI does not hard-fail
+# when the upstream remote/refs are absent (e.g. shallow clones, forks without
+# upstream configured).  Sync-button-safety degrades to a warning in this mode.
 python3 scripts/delta_tool.py sync-doctor -- \
   --repo . \
   --policy config/migration_sync_policy.json \
   --dry-run \
   --allow-missing-upstream \
   --allow-dirty \
+  --check-sync-button-safety \
   --output-json /tmp/upstream-sync-doctor.json
 
 python3 scripts/delta_tool.py history-export -- \

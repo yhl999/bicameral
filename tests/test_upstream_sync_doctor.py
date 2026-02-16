@@ -130,5 +130,76 @@ class UpstreamSyncDoctorTests(unittest.TestCase):
             self.assertIn('Missing `upstream` remote', result.stdout)
 
 
+    def test_sync_button_safety_degrades_to_warning_when_allow_missing_upstream(self) -> None:
+        """Must-fix: --allow-missing-upstream + --check-sync-button-safety should warn, not fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir()
+            self._init_repo(repo)
+
+            origin_bare = Path(tmp) / 'origin.git'
+            self._git(Path(tmp), 'init', '--bare', str(origin_bare))
+            self._git(repo, 'remote', 'add', 'origin', str(origin_bare))
+            self._git(repo, 'push', '-u', 'origin', 'main')
+
+            policy_path = self._write_policy(Path(tmp))
+            output_json = Path(tmp) / 'doctor.json'
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    '--repo',
+                    str(repo),
+                    '--policy',
+                    str(policy_path),
+                    '--allow-missing-upstream',
+                    '--check-sync-button-safety',
+                    '--output-json',
+                    str(output_json),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=f'stdout={result.stdout}\nstderr={result.stderr}')
+            report = json.loads(output_json.read_text(encoding='utf-8'))
+            self.assertFalse(report['sync_button_safe'])
+            self.assertTrue(
+                any('skipped' in w for w in report['warnings']),
+                msg=f'Expected degraded warning in: {report["warnings"]}',
+            )
+
+    def test_sync_button_safety_still_fails_without_allow_missing_upstream(self) -> None:
+        """Preserve: without --allow-missing-upstream, missing upstream is a hard failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir()
+            self._init_repo(repo)
+
+            origin_bare = Path(tmp) / 'origin.git'
+            self._git(Path(tmp), 'init', '--bare', str(origin_bare))
+            self._git(repo, 'remote', 'add', 'origin', str(origin_bare))
+            self._git(repo, 'push', '-u', 'origin', 'main')
+
+            policy_path = self._write_policy(Path(tmp))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    '--repo',
+                    str(repo),
+                    '--policy',
+                    str(policy_path),
+                    '--check-sync-button-safety',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, msg=f'Expected failure.\nstdout={result.stdout}')
+
+
 if __name__ == '__main__':
     unittest.main()
