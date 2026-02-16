@@ -12,8 +12,8 @@
   - `scripts/backup.sh`
   - `scripts/snapshot_create.py`
   - `scripts/snapshot_restore_test.py`
-  - `docs/runbooks/publicization-backup-cutover.md` (new)
-  - `reports/publicization/backup-readiness.md` (new)
+  - `docs/runbooks/publicization-backup-cutover.md`
+  - `reports/publicization/backup-readiness.md`
 
 ## Overview
 Wire the existing migration/export and snapshot backup paths into one reproducible pre-cutover data safety lane.
