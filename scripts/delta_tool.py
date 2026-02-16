@@ -73,6 +73,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Repository root used for extension command discovery (default: cwd)',
     )
     parser.add_argument(
+        '--allow-registry-warnings',
+        action='store_true',
+        help='Allow command execution even when extension registry inspection reports warnings.',
+    )
+    parser.add_argument(
         'command',
         help='Tool command (use `list-commands` to print available commands)',
     )
@@ -109,6 +114,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f'- {command}')
         _print_registry_warnings(warnings)
         return 0
+
+    if warnings and not args.allow_registry_warnings:
+        _print_registry_warnings(warnings)
+        print(
+            'delta_tool: refusing to execute commands while extension registry warnings exist. '
+            'Use --allow-registry-warnings to override.',
+            file=sys.stderr,
+        )
+        return 1
 
     script_path = command_registry.get(args.command)
     if script_path is None:

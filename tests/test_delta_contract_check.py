@@ -41,7 +41,11 @@ def _valid_state_manifest() -> dict:
     return {
         'version': 1,
         'package_name': 'delta-state',
-        'required_files': ['config/migration_sync_policy.json'],
+        'required_files': [
+            'config/migration_sync_policy.json',
+            'config/state_migration_manifest.json',
+            'config/delta_contract_policy.json',
+        ],
         'optional_globs': ['scripts/*.py'],
         'exclude_globs': ['**/__pycache__/**'],
     }
@@ -51,6 +55,16 @@ def _valid_contract_policy() -> dict:
     return {
         'version': 1,
         'targets': {
+            'migration_sync_policy': {
+                'current_version': 1,
+                'migration_script': 'scripts/delta_contract_migrate.py',
+                'notes': 'Migration sync policy remains on schema v1.',
+            },
+            'state_migration_manifest': {
+                'current_version': 1,
+                'migration_script': 'scripts/delta_contract_migrate.py',
+                'notes': 'State migration manifest remains on schema v1.',
+            },
             'extension_command_contract': {
                 'current_version': 1,
                 'migration_script': 'scripts/delta_contract_migrate.py',
@@ -72,6 +86,7 @@ class DeltaContractCheckTests(unittest.TestCase):
         (root / 'scripts').mkdir(parents=True, exist_ok=True)
 
         (root / 'scripts' / 'tool.py').write_text('print("ok")\n', encoding='utf-8')
+        (root / 'scripts' / 'delta_contract_migrate.py').write_text('print("migrate")\n', encoding='utf-8')
         (root / 'config' / 'migration_sync_policy.json').write_text(
             f'{json.dumps(_valid_policy(), indent=2)}\n',
             encoding='utf-8',
@@ -139,6 +154,35 @@ class DeltaContractCheckTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn('schedule is required in strict mode', result.stderr)
+
+    def test_contract_check_fails_for_missing_migration_script_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._seed(repo)
+
+            invalid_contract_policy = _valid_contract_policy()
+            invalid_contract_policy['targets']['state_migration_manifest']['migration_script'] = 'scripts/missing.py'
+            (repo / 'config' / 'delta_contract_policy.json').write_text(
+                f'{json.dumps(invalid_contract_policy, indent=2)}\n',
+                encoding='utf-8',
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    '--repo',
+                    str(repo),
+                    '--strict',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('migration_script for target `state_migration_manifest`', result.stderr)
 
 
 if __name__ == '__main__':

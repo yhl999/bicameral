@@ -28,6 +28,9 @@ To inspect all available commands (core + extension-provided):
 python3 scripts/delta_tool.py list-commands
 ```
 
+By default, `delta_tool` refuses non-list command execution when extension registry warnings exist.
+Use `--allow-registry-warnings` only for local debugging while fixing the registry.
+
 ## Policy config
 
 - `config/migration_sync_policy.json`
@@ -74,7 +77,10 @@ python3 scripts/delta_tool.py contracts-migrate -- \
   --write
 ```
 
-Current migration support: extension command-contract normalization to v1 namespace format.
+Current migration policy executes target-aware handlers declared in `delta_contract_policy.json`:
+- `migration_sync_policy` (schema validation + version gate),
+- `state_migration_manifest` (schema validation + version gate),
+- `extension_command_contract` (namespaced command normalization to v1).
 
 ## 1) Upstream sync doctor
 
@@ -132,12 +138,24 @@ python3 scripts/delta_tool.py state-check -- \
 python3 scripts/delta_tool.py state-import -- \
   --in /tmp/graphiti-state-export \
   --dry-run
+
+# non-dry-run import with atomic rollback (default)
+python3 scripts/delta_tool.py state-import -- \
+  --in /tmp/graphiti-state-export \
+  --target .
+
+# explicitly disable rollback semantics (debug-only)
+python3 scripts/delta_tool.py state-import -- \
+  --in /tmp/graphiti-state-export \
+  --target . \
+  --no-atomic
 ```
 
 Notes:
 - dry-run export writes package manifest preview (no payload files copied),
 - non-dry-run export writes payload files and checksums for deterministic imports,
-- import/check share the same payload integrity evaluation path.
+- import/check share the same payload integrity evaluation path,
+- import defaults to atomic apply with rollback on write failure.
 
 ## 4) Extension contract check
 

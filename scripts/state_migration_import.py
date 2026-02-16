@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from delta_contracts import validate_package_manifest
@@ -18,13 +20,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--target', type=Path, default=Path('.'), help='Target repository root')
     parser.add_argument('--dry-run', action='store_true', help='Show planned writes without mutating target')
     parser.add_argument('--allow-overwrite', action='store_true', help='Allow overwriting existing files')
+    parser.add_argument(
+        '--atomic',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Apply writes with rollback on failure (default: true)',
+    )
     return parser.parse_args()
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _apply_import_atomic(planned_writes: list[tuple[str, Path, Path]], target_root: Path) -> None:
+    rollback_root = Path(
+        tempfile.mkdtemp(
+            prefix='.delta-import-rollback-',
+            dir=str(target_root),
+        ),
+    )
+
+    backup_pairs: list[tuple[Path, Path]] = []
+    created_paths: list[Path] = []
+
+    try:
+        for rel, src, dst in planned_writes:
+            if dst.exists():
+                backup_path = rollback_root / rel
+                _copy_file(dst, backup_path)
+                backup_pairs.append((dst, backup_path))
+            else:
+                created_paths.append(dst)
+
+            _copy_file(src, dst)
+    except Exception:
+        for created in reversed(created_paths):
+            if created.exists():
+                created.unlink()
+
+        for dst, backup_path in backup_pairs:
+            _copy_file(backup_path, dst)
+
+        raise
+    finally:
+        shutil.rmtree(rollback_root, ignore_errors=True)
+
+
+def _apply_import_non_atomic(planned_writes: list[tuple[str, Path, Path]]) -> None:
+    for _, src, dst in planned_writes:
+        _copy_file(src, dst)
 
 
 def main() -> int:
     args = parse_args()
     package_root = args.package if args.package.is_absolute() else (Path.cwd() / args.package).resolve()
     target_root = args.target if args.target.is_absolute() else (Path.cwd() / args.target).resolve()
+
+    if target_root.exists() and not target_root.is_dir():
+        raise ValueError(f'Import target must be a directory: {target_root}')
+    target_root.mkdir(parents=True, exist_ok=True)
 
     manifest = validate_package_manifest(
         load_json(package_root / 'package_manifest.json'),
@@ -89,17 +145,21 @@ def main() -> int:
             'Re-export without --dry-run to include payload files.',
         )
 
-    for _, src, dst in planned_writes:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(src.read_bytes())
+    if args.atomic:
+        _apply_import_atomic(planned_writes, target_root)
+    else:
+        _apply_import_non_atomic(planned_writes)
 
-    print(f'Imported {len(planned_writes)} files into {target_root}')
+    print(
+        f'Imported {len(planned_writes)} files into {target_root} '
+        f'(atomic={args.atomic})',
+    )
     return 0
 
 
 if __name__ == '__main__':
     try:
         raise SystemExit(main())
-    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
+    except (FileNotFoundError, ValueError, OSError, subprocess.CalledProcessError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         raise SystemExit(2) from exc

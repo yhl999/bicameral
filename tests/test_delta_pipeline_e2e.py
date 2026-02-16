@@ -97,6 +97,16 @@ class DeltaPipelineE2ETests(unittest.TestCase):
         contract_policy = {
             'version': 1,
             'targets': {
+                'migration_sync_policy': {
+                    'current_version': 1,
+                    'migration_script': 'scripts/delta_contract_migrate.py',
+                    'notes': 'Migration sync policy remains on schema v1.',
+                },
+                'state_migration_manifest': {
+                    'current_version': 1,
+                    'migration_script': 'scripts/delta_contract_migrate.py',
+                    'notes': 'State migration manifest remains on schema v1.',
+                },
                 'extension_command_contract': {
                     'current_version': 1,
                     'migration_script': 'scripts/delta_contract_migrate.py',
@@ -129,6 +139,7 @@ class DeltaPipelineE2ETests(unittest.TestCase):
 
         (repo / 'docs' / 'public' / 'MIGRATION-SYNC-TOOLKIT.md').write_text('# toolkit\n', encoding='utf-8')
         (repo / 'scripts' / 'tool.py').write_text('print("extension-command-ok")\n', encoding='utf-8')
+        (repo / 'scripts' / 'delta_contract_migrate.py').write_text('print("migrate")\n', encoding='utf-8')
 
         extension_manifest = {
             'name': 'demo-extension',

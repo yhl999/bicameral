@@ -41,7 +41,11 @@ def _valid_state_manifest() -> dict:
     return {
         'version': 1,
         'package_name': 'delta-state',
-        'required_files': ['config/migration_sync_policy.json'],
+        'required_files': [
+            'config/migration_sync_policy.json',
+            'config/state_migration_manifest.json',
+            'config/delta_contract_policy.json',
+        ],
         'optional_globs': ['scripts/*.py'],
         'exclude_globs': ['**/__pycache__/**'],
     }
@@ -51,6 +55,16 @@ def _valid_contract_policy() -> dict:
     return {
         'version': 1,
         'targets': {
+            'migration_sync_policy': {
+                'current_version': 1,
+                'migration_script': 'scripts/delta_contract_migrate.py',
+                'notes': 'Migration sync policy remains on schema v1.',
+            },
+            'state_migration_manifest': {
+                'current_version': 1,
+                'migration_script': 'scripts/delta_contract_migrate.py',
+                'notes': 'State migration manifest remains on schema v1.',
+            },
             'extension_command_contract': {
                 'current_version': 1,
                 'migration_script': 'scripts/delta_contract_migrate.py',
@@ -72,6 +86,7 @@ class DeltaToolTests(unittest.TestCase):
         (repo / 'scripts').mkdir(parents=True, exist_ok=True)
 
         (repo / 'scripts' / 'tool.py').write_text('print("ok")\n', encoding='utf-8')
+        (repo / 'scripts' / 'delta_contract_migrate.py').write_text('print("migrate")\n', encoding='utf-8')
         (repo / 'config' / 'migration_sync_policy.json').write_text(
             f'{json.dumps(_valid_policy(), indent=2)}\n',
             encoding='utf-8',
@@ -141,6 +156,52 @@ class DeltaToolTests(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, msg=run_result.stderr)
             self.assertIn('ok', run_result.stdout)
+
+    def test_refuses_execution_when_registry_warnings_exist_without_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._seed_repo(repo)
+            (repo / 'extensions' / 'broken').mkdir(parents=True, exist_ok=True)
+
+            blocked = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    'contracts-migrate',
+                    '--',
+                    '--repo',
+                    str(repo),
+                    '--contract-policy',
+                    'config/delta_contract_policy.json',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(blocked.returncode, 1)
+            self.assertIn('refusing to execute commands while extension registry warnings exist', blocked.stderr)
+
+            allowed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    '--allow-registry-warnings',
+                    'contracts-migrate',
+                    '--',
+                    '--repo',
+                    str(repo),
+                    '--contract-policy',
+                    'config/delta_contract_policy.json',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(allowed.returncode, 0, msg=allowed.stderr)
+            self.assertIn('Delta contract migrate', allowed.stdout)
 
 
 if __name__ == '__main__':

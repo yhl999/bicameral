@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -49,6 +50,9 @@ class StateMigrationKitTests(unittest.TestCase):
 
         subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
         subprocess.run(['git', 'commit', '-m', 'seed'], cwd=repo, check=True)
+
+    def _sha256_text(self, content: str) -> str:
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
     def test_export_check_import_dry_run_and_full(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,6 +183,75 @@ class StateMigrationKitTests(unittest.TestCase):
             )
             self.assertEqual(import_result.returncode, 1)
             self.assertIn('payload integrity check failed', import_result.stderr)
+
+    def test_atomic_import_rolls_back_on_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / 'pkg'
+            payload = package / 'payload'
+            payload.mkdir(parents=True, exist_ok=True)
+
+            first_rel = 'a/ok.txt'
+            second_rel = 'b/fail.txt'
+            first_content = 'first-payload\n'
+            second_content = 'second-payload\n'
+
+            first_src = payload / first_rel
+            second_src = payload / second_rel
+            first_src.parent.mkdir(parents=True, exist_ok=True)
+            second_src.parent.mkdir(parents=True, exist_ok=True)
+            first_src.write_text(first_content, encoding='utf-8')
+            second_src.write_text(second_content, encoding='utf-8')
+
+            manifest = {
+                'package_version': 1,
+                'manifest_version': 1,
+                'package_name': 'rollback-test',
+                'created_at': '2026-02-15T00:00:00Z',
+                'source_repo': '/tmp/source',
+                'source_commit': 'abc123',
+                'dry_run_preview': False,
+                'entry_count': 2,
+                'entries': [
+                    {
+                        'path': first_rel,
+                        'sha256': self._sha256_text(first_content),
+                        'size_bytes': len(first_content.encode('utf-8')),
+                    },
+                    {
+                        'path': second_rel,
+                        'sha256': self._sha256_text(second_content),
+                        'size_bytes': len(second_content.encode('utf-8')),
+                    },
+                ],
+            }
+            (package / 'package_manifest.json').write_text(
+                f'{json.dumps(manifest, indent=2)}\n',
+                encoding='utf-8',
+            )
+
+            target = root / 'target'
+            target.mkdir(parents=True, exist_ok=True)
+            (target / 'b').write_text('not-a-directory\n', encoding='utf-8')
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(IMPORT_SCRIPT),
+                    '--in',
+                    str(package),
+                    '--target',
+                    str(target),
+                    '--allow-overwrite',
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse((target / first_rel).exists(), msg='atomic rollback should remove partial writes')
+            self.assertTrue((target / 'b').is_file(), msg='original conflicting path should remain intact')
 
     def test_import_rejects_traversal_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
