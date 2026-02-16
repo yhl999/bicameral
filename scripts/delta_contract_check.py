@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 
 from delta_contracts import (
-    validate_extension_manifest,
+    inspect_extensions,
     validate_migration_sync_policy,
     validate_state_migration_manifest,
 )
-from migration_sync_lib import load_json, resolve_repo_root, resolve_safe_child
+from migration_sync_lib import load_json, resolve_repo_root
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +49,6 @@ def main() -> int:
     extensions_dir = _resolve(repo_root, args.extensions_dir)
 
     issues: list[str] = []
-    extension_count = 0
 
     try:
         validate_migration_sync_policy(
@@ -65,50 +64,8 @@ def main() -> int:
     except (FileNotFoundError, ValueError) as exc:
         issues.append(str(exc))
 
-    if not extensions_dir.exists() or not extensions_dir.is_dir():
-        issues.append(f'Extensions directory missing: {extensions_dir}')
-    else:
-        for extension_dir in sorted(path for path in extensions_dir.iterdir() if path.is_dir()):
-            extension_count += 1
-            extension_manifest_path = extension_dir / 'manifest.json'
-            if not extension_manifest_path.exists():
-                issues.append(f'{extension_dir.name}: missing manifest.json')
-                continue
-
-            try:
-                extension_manifest = validate_extension_manifest(
-                    load_json(extension_manifest_path),
-                    context=str(extension_manifest_path),
-                )
-            except (FileNotFoundError, ValueError) as exc:
-                issues.append(str(exc))
-                continue
-
-            entrypoints = extension_manifest.get('entrypoints', {})
-            if not isinstance(entrypoints, dict):
-                issues.append(f'{extension_manifest_path}: entrypoints must be an object')
-                continue
-
-            for entry_name, rel_path in entrypoints.items():
-                if not isinstance(entry_name, str) or not isinstance(rel_path, str):
-                    continue
-                try:
-                    candidate = resolve_safe_child(
-                        repo_root,
-                        rel_path,
-                        context=(
-                            f'extension `{extension_manifest.get("name", extension_dir.name)}` '
-                            f'entrypoint `{entry_name}`'
-                        ),
-                    )
-                except ValueError as exc:
-                    issues.append(str(exc))
-                    continue
-
-                if not candidate.exists() or not candidate.is_file():
-                    issues.append(
-                        f'{extension_manifest_path}: entrypoint path missing `{rel_path}`',
-                    )
+    extension_report = inspect_extensions(repo_root=repo_root, extensions_dir=extensions_dir)
+    issues.extend(extension_report.issues)
 
     if issues:
         print('Delta contract check: issues found', file=sys.stderr)
@@ -118,7 +75,8 @@ def main() -> int:
 
     print(
         'Delta contract check OK '
-        f'(policy={policy_path.name}, state_manifest={manifest_path.name}, extensions={extension_count})',
+        f'(policy={policy_path.name}, state_manifest={manifest_path.name}, '
+        f'extensions={len(extension_report.names)}, extension_commands={len(extension_report.command_registry)})',
     )
     return 0
 

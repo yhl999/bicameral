@@ -53,27 +53,32 @@ class DeltaToolTests(unittest.TestCase):
         subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=root, check=True)
         subprocess.run(['git', 'config', 'user.name', 'Test User'], cwd=root, check=True)
 
+    def _seed_repo(self, repo: Path) -> None:
+        (repo / 'config').mkdir(parents=True, exist_ok=True)
+        (repo / 'extensions' / 'sample').mkdir(parents=True, exist_ok=True)
+        (repo / 'scripts').mkdir(parents=True, exist_ok=True)
+
+        (repo / 'scripts' / 'tool.py').write_text('print("ok")\n', encoding='utf-8')
+        (repo / 'config' / 'migration_sync_policy.json').write_text(
+            f'{json.dumps(_valid_policy(), indent=2)}\n',
+            encoding='utf-8',
+        )
+        (repo / 'config' / 'state_migration_manifest.json').write_text(
+            f'{json.dumps(_valid_state_manifest(), indent=2)}\n',
+            encoding='utf-8',
+        )
+        (repo / 'extensions' / 'sample' / 'manifest.json').write_text(
+            (
+                f'{json.dumps({"name": "sample", "version": "0.1.0", "capabilities": ["sync"], "entrypoints": {"doctor": "scripts/tool.py"}, "commands": {"sample-tool": "scripts/tool.py"}}, indent=2)}\n'
+            ),
+            encoding='utf-8',
+        )
+
     def test_dispatches_contract_check_subcommand(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             self._init_repo(repo)
-            (repo / 'config').mkdir(parents=True, exist_ok=True)
-            (repo / 'extensions' / 'sample').mkdir(parents=True, exist_ok=True)
-            (repo / 'scripts').mkdir(parents=True, exist_ok=True)
-
-            (repo / 'scripts' / 'tool.py').write_text('print("ok")\n', encoding='utf-8')
-            (repo / 'config' / 'migration_sync_policy.json').write_text(
-                f'{json.dumps(_valid_policy(), indent=2)}\n',
-                encoding='utf-8',
-            )
-            (repo / 'config' / 'state_migration_manifest.json').write_text(
-                f'{json.dumps(_valid_state_manifest(), indent=2)}\n',
-                encoding='utf-8',
-            )
-            (repo / 'extensions' / 'sample' / 'manifest.json').write_text(
-                f'{json.dumps({"name": "sample", "version": "0.1.0", "capabilities": ["sync"], "entrypoints": {"doctor": "scripts/tool.py"}}, indent=2)}\n',
-                encoding='utf-8',
-            )
+            self._seed_repo(repo)
 
             result = subprocess.run(
                 [
@@ -93,6 +98,32 @@ class DeltaToolTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertIn('Delta contract check OK', result.stdout)
+
+    def test_loads_extension_commands_and_lists_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._seed_repo(repo)
+
+            list_result = subprocess.run(
+                [sys.executable, str(SCRIPT), 'list-commands'],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(list_result.returncode, 0, msg=list_result.stderr)
+            self.assertIn('sample-tool', list_result.stdout)
+
+            run_result = subprocess.run(
+                [sys.executable, str(SCRIPT), 'sample-tool'],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(run_result.returncode, 0, msg=run_result.stderr)
+            self.assertIn('ok', run_result.stdout)
 
 
 if __name__ == '__main__':

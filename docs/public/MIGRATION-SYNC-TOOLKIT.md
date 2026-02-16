@@ -20,6 +20,12 @@ The toolkit is now organized as:
 
 Use `delta_tool.py` as the preferred entrypoint.
 
+To inspect all available commands (core + extension-provided):
+
+```bash
+python3 scripts/delta_tool.py list-commands
+```
+
 ## Policy config
 
 - `config/migration_sync_policy.json`
@@ -116,9 +122,10 @@ python3 scripts/delta_tool.py extension-check -- --strict
 
 Checks `extensions/*/manifest.json` for:
 - required fields (`name`, `version`, `capabilities`, `entrypoints`),
+- optional extension command registry (`commands`) with safe command names,
 - duplicate extension names/capabilities,
 - traversal-safe relative entrypoint paths,
-- missing entrypoint files.
+- missing entrypoint/command files.
 
 ## CI command
 

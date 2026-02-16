@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from delta_contracts import validate_package_manifest
-from migration_sync_lib import load_json, resolve_safe_child, sha256_file
+from migration_sync_lib import evaluate_payload_entries, load_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,31 +35,14 @@ def main() -> int:
 
     should_verify_payload = not args.dry_run and not dry_run_preview
     if should_verify_payload:
-        for entry in entries:
-            if not isinstance(entry, dict):
-                errors.append('Encountered non-object entry in manifest')
-                continue
+        _, missing_payload, integrity_errors = evaluate_payload_entries(
+            entries=entries,
+            payload_root=payload_root,
+            context='state migration payload entry',
+        )
 
-            rel = str(entry['path'])
-            expected_hash = str(entry['sha256'])
-            expected_size = int(entry['size_bytes'])
-            payload_file = resolve_safe_child(
-                payload_root,
-                rel,
-                context='state migration payload entry',
-            )
-
-            if not payload_file.exists() or not payload_file.is_file():
-                errors.append(f'Missing payload file: {rel}')
-                continue
-
-            actual_hash = sha256_file(payload_file)
-            if actual_hash != expected_hash:
-                errors.append(f'Checksum mismatch for {rel}')
-
-            actual_size = payload_file.stat().st_size
-            if actual_size != expected_size:
-                errors.append(f'Size mismatch for {rel}: expected {expected_size}, got {actual_size}')
+        errors.extend(f'Missing payload file: {rel}' for rel in missing_payload)
+        errors.extend(integrity_errors)
 
     if errors:
         print('Migration package check FAILED:', file=sys.stderr)

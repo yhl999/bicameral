@@ -1,13 +1,12 @@
-name: Tests
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+name: Tests (manual legacy)
 
 permissions:
   contents: read
+
+# Legacy workflow kept for manual parity/debugging.
+# Canonical PR CI unit-test path is .github/workflows/ci.yml.
+on:
+  workflow_dispatch:
 
 jobs:
   unit-tests:

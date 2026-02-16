@@ -1,10 +1,9 @@
-name: Lint with Ruff
+name: Lint with Ruff (manual legacy)
 
+# Legacy workflow kept for manual parity/debugging.
+# Canonical PR CI lint path is .github/workflows/ci.yml.
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  workflow_dispatch:
 
 jobs:
   ruff:

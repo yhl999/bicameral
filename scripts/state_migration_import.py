@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from delta_contracts import validate_package_manifest
-from migration_sync_lib import load_json, resolve_safe_child, sha256_file
+from migration_sync_lib import evaluate_payload_entries, load_json, resolve_safe_child
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,41 +38,19 @@ def main() -> int:
     payload_root = package_root / 'payload'
     dry_run_preview = bool(manifest.get('dry_run_preview'))
 
-    planned_writes: list[tuple[Path, Path]] = []
+    planned_entries, missing_payload, integrity_errors = evaluate_payload_entries(
+        entries=entries,
+        payload_root=payload_root,
+        context='migration payload entry',
+    )
+
+    planned_writes: list[tuple[str, Path, Path]] = []
     conflicts: list[str] = []
-    missing_payload: list[str] = []
-    integrity_errors: list[str] = []
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError('Invalid migration entry object in manifest')
-
-        rel = str(entry['path'])
-        expected_hash = str(entry['sha256'])
-        expected_size = int(entry['size_bytes'])
-
-        src = resolve_safe_child(payload_root, rel, context='migration payload entry')
+    for rel, src in planned_entries:
         dst = resolve_safe_child(target_root, rel, context='migration import target entry')
-
         if dst.exists() and not args.allow_overwrite:
             conflicts.append(rel)
-
-        if not src.exists() or not src.is_file():
-            missing_payload.append(rel)
-            planned_writes.append((src, dst))
-            continue
-
-        actual_size = src.stat().st_size
-        if actual_size != expected_size:
-            integrity_errors.append(
-                f'{rel}: size mismatch (expected {expected_size}, got {actual_size})',
-            )
-
-        actual_hash = sha256_file(src)
-        if actual_hash != expected_hash:
-            integrity_errors.append(f'{rel}: checksum mismatch')
-
-        planned_writes.append((src, dst))
+        planned_writes.append((rel, src, dst))
 
     if conflicts and not args.dry_run:
         print('Import blocked: existing files would be overwritten.', file=sys.stderr)
@@ -95,7 +73,7 @@ def main() -> int:
 
     if args.dry_run:
         print(f'DRY RUN import plan ({len(planned_writes)} files):')
-        for src, dst in planned_writes:
+        for _, src, dst in planned_writes:
             note = ' (payload missing in dry-run preview)' if not src.exists() else ''
             print(f'- {src} -> {dst}{note}')
 
@@ -111,7 +89,7 @@ def main() -> int:
             'Re-export without --dry-run to include payload files.',
         )
 
-    for src, dst in planned_writes:
+    for _, src, dst in planned_writes:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(src.read_bytes())
 

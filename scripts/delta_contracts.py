@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from migration_sync_lib import ensure_safe_relative
+from migration_sync_lib import ensure_safe_relative, load_json, resolve_safe_child
 
 METRIC_KEYS = ('privacy_risk', 'simplicity', 'merge_conflict_risk', 'auditability')
+_COMMAND_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9-]*$')
 
 _FILTERED_HISTORY_FIELDS = {
     'privacy_risk': {'base', 'block_penalty', 'ambiguous_penalty'},
@@ -23,6 +27,16 @@ _CLEAN_FOUNDATION_FIELDS = {
     'merge_conflict_risk': {'base'},
     'auditability': {'base'},
 }
+
+
+@dataclass(frozen=True)
+class ExtensionInspection:
+    """Result of inspecting extension contracts under an extension directory."""
+
+    names: list[str]
+    command_registry: dict[str, Path]
+    issues: list[str]
+
 
 
 def _expect_dict(value: object, *, context: str) -> dict[str, Any]:
@@ -100,6 +114,15 @@ def _validate_glob_patterns(patterns: Iterable[str], *, context: str) -> list[st
             raise ValueError(f'{context}[{index}] must not contain path traversal (`..`)')
         validated.append(stripped)
     return validated
+
+
+def _validate_command_name(command_name: str, *, context: str) -> str:
+    normalized = _expect_non_empty_str(command_name, context=context)
+    if not _COMMAND_NAME_RE.fullmatch(normalized):
+        raise ValueError(
+            f'{context} must match pattern `{_COMMAND_NAME_RE.pattern}`',
+        )
+    return normalized
 
 
 def validate_migration_sync_policy(
@@ -365,4 +388,102 @@ def validate_extension_manifest(payload: object, *, context: str = 'extension_ma
         except ValueError as exc:
             raise ValueError(f'{context}.entrypoints.{key} invalid: {exc}') from exc
 
+    commands = manifest.get('commands')
+    if commands is not None:
+        commands_dict = _expect_dict(commands, context=f'{context}.commands')
+        for command_name, rel_path in commands_dict.items():
+            normalized_command = _validate_command_name(
+                command_name,
+                context=f'{context}.commands key',
+            )
+            rel = _expect_non_empty_str(rel_path, context=f'{context}.commands.{normalized_command}')
+            try:
+                ensure_safe_relative(rel)
+            except ValueError as exc:
+                raise ValueError(f'{context}.commands.{normalized_command} invalid: {exc}') from exc
+
     return manifest
+
+
+def inspect_extensions(repo_root: Path, extensions_dir: Path) -> ExtensionInspection:
+    """Inspect extension manifests, return discovered names, commands, and issues."""
+
+    issues: list[str] = []
+    names: list[str] = []
+    command_registry: dict[str, Path] = {}
+    seen_names: set[str] = set()
+
+    if not extensions_dir.exists() or not extensions_dir.is_dir():
+        issues.append(f'Extensions directory missing: {extensions_dir}')
+        return ExtensionInspection(names=names, command_registry=command_registry, issues=issues)
+
+    for extension_dir in sorted(path for path in extensions_dir.iterdir() if path.is_dir()):
+        manifest_path = extension_dir / 'manifest.json'
+        if not manifest_path.exists():
+            issues.append(f'{extension_dir.name}: missing manifest.json')
+            continue
+
+        try:
+            manifest = validate_extension_manifest(load_json(manifest_path), context=str(manifest_path))
+        except (FileNotFoundError, ValueError) as exc:
+            issues.append(str(exc))
+            continue
+
+        extension_name = str(manifest['name']).strip()
+        names.append(extension_name)
+        if extension_name in seen_names:
+            issues.append(f'{extension_dir.name}: duplicate extension name `{extension_name}`')
+        seen_names.add(extension_name)
+
+        entrypoints = manifest.get('entrypoints', {})
+        if isinstance(entrypoints, dict):
+            for entry_name, rel_path in entrypoints.items():
+                if not isinstance(entry_name, str) or not isinstance(rel_path, str):
+                    continue
+                try:
+                    resolved = resolve_safe_child(
+                        repo_root,
+                        rel_path,
+                        context=f'extension `{extension_name}` entrypoint `{entry_name}`',
+                    )
+                except ValueError as exc:
+                    issues.append(str(exc))
+                    continue
+
+                if not resolved.exists() or not resolved.is_file():
+                    issues.append(
+                        f'{manifest_path}: entrypoint path missing `{rel_path}`',
+                    )
+
+        commands = manifest.get('commands')
+        if isinstance(commands, dict):
+            for command_name, rel_path in commands.items():
+                if not isinstance(command_name, str) or not isinstance(rel_path, str):
+                    continue
+
+                normalized_command = command_name.strip()
+                if normalized_command in command_registry:
+                    issues.append(
+                        f'{manifest_path}: duplicate command `{normalized_command}` across extensions',
+                    )
+                    continue
+
+                try:
+                    resolved_command = resolve_safe_child(
+                        repo_root,
+                        rel_path,
+                        context=f'extension `{extension_name}` command `{normalized_command}`',
+                    )
+                except ValueError as exc:
+                    issues.append(str(exc))
+                    continue
+
+                if not resolved_command.exists() or not resolved_command.is_file():
+                    issues.append(
+                        f'{manifest_path}: command path missing `{rel_path}`',
+                    )
+                    continue
+
+                command_registry[normalized_command] = resolved_command
+
+    return ExtensionInspection(names=names, command_registry=command_registry, issues=issues)

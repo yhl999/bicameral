@@ -167,6 +167,49 @@ def collect_file_entries(files: list[Path], repo_root: Path) -> list[dict[str, A
     return entries
 
 
+def evaluate_payload_entries(
+    entries: list[dict[str, Any]],
+    payload_root: Path,
+    *,
+    context: str,
+) -> tuple[list[tuple[str, Path]], list[str], list[str]]:
+    """Evaluate payload entries for presence and integrity.
+
+    Returns:
+      - planned entries as ``(relative_path, payload_source_path)``
+      - missing payload relative paths
+      - integrity issues (size/checksum mismatches)
+    """
+
+    planned_entries: list[tuple[str, Path]] = []
+    missing_payload: list[str] = []
+    integrity_errors: list[str] = []
+
+    for entry in entries:
+        rel = str(entry['path'])
+        expected_hash = str(entry['sha256'])
+        expected_size = int(entry['size_bytes'])
+
+        src = resolve_safe_child(payload_root, rel, context=context)
+        planned_entries.append((rel, src))
+
+        if not src.exists() or not src.is_file():
+            missing_payload.append(rel)
+            continue
+
+        actual_size = src.stat().st_size
+        if actual_size != expected_size:
+            integrity_errors.append(
+                f'{rel}: size mismatch (expected {expected_size}, got {actual_size})',
+            )
+
+        actual_hash = sha256_file(src)
+        if actual_hash != expected_hash:
+            integrity_errors.append(f'{rel}: checksum mismatch')
+
+    return planned_entries, missing_payload, integrity_errors
+
+
 def copy_entry(src_root: Path, dst_root: Path, rel_path: str) -> None:
     """Copy a relative file path from src_root to dst_root preserving structure."""
 
