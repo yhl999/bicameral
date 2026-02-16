@@ -47,26 +47,39 @@ def _apply_import_atomic(planned_writes: list[tuple[str, Path, Path]], target_ro
         ),
     )
 
-    backup_pairs: list[tuple[Path, Path]] = []
+    backup_pairs: list[tuple[str, Path]] = []
     created_paths: list[Path] = []
 
     try:
         for rel, src, dst in planned_writes:
             if dst.exists():
-                backup_path = rollback_root / rel
+                backup_path = resolve_safe_child(
+                    rollback_root,
+                    rel,
+                    context='atomic rollback backup path',
+                )
                 _copy_file(dst, backup_path)
-                backup_pairs.append((dst, backup_path))
+                backup_pairs.append((rel, dst))
             else:
                 created_paths.append(dst)
 
             _copy_file(src, dst)
-    except Exception:
+    except Exception as import_exc:
         for created in reversed(created_paths):
             if created.exists():
                 created.unlink()
 
-        for dst, backup_path in backup_pairs:
-            _copy_file(backup_path, dst)
+        for rel, dst in backup_pairs:
+            restore_src = resolve_safe_child(
+                rollback_root,
+                rel,
+                context='atomic rollback restore source',
+            )
+            if not restore_src.exists() or not restore_src.is_file():
+                raise ValueError(
+                    f'Atomic rollback backup missing or invalid for {rel}: {restore_src}',
+                ) from import_exc
+            _copy_file(restore_src, dst)
 
         raise
     finally:
@@ -175,6 +188,8 @@ def main() -> int:
         for rel, src, dst in planned_writes:
             note = ' (payload missing in dry-run preview)' if not src.exists() else ''
             print(f'- write: {rel} -> {dst}{note}')
+
+        has_blocking_conflicts = bool(destination_conflicts or destination_path_conflicts)
         if destination_conflicts:
             for rel in destination_conflicts:
                 print(f'- would overwrite: {rel}', file=sys.stderr)
@@ -186,6 +201,14 @@ def main() -> int:
             print('Dry-run integrity warnings:')
             for issue in integrity_errors:
                 print(f'- {issue}')
+
+        if has_blocking_conflicts:
+            print(
+                'Dry-run detected blocking destination conflicts. '
+                'Resolve conflicts or use --allow-overwrite before import.',
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     if dry_run_preview:

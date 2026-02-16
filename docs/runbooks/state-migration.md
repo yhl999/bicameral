@@ -89,10 +89,11 @@ python3 scripts/state_migration_check.py --package /tmp/graphiti-state-export-ta
 ```bash
 git checkout main
 git pull --ff-only origin main
-git revert -m 1 C
+git revert C
 git push origin main
 ```
 
+- If `C` is a merge commit, use `git revert -m 1 C`.
 - Open a corrective follow-up PR for the desired state transition.
 
 ## Artifact deletion

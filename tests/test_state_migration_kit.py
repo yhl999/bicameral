@@ -316,6 +316,126 @@ class StateMigrationKitTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, msg=result.stderr)
             self.assertIn('manifest version mismatch', result.stderr)
 
+    def test_check_fails_on_target_manifest_scope_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'source'
+            source.mkdir(parents=True, exist_ok=True)
+            self._init_repo(source)
+            self._seed_files(source)
+
+            package = source / 'out' / 'package'
+            export = subprocess.run(
+                [
+                    sys.executable,
+                    str(EXPORT_SCRIPT),
+                    '--repo',
+                    str(source),
+                    '--manifest',
+                    'config/state_migration_manifest.json',
+                    '--out',
+                    str(package),
+                    '--force',
+                ],
+                cwd=source,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(export.returncode, 0, msg=export.stderr)
+
+            target = Path(tmp) / 'target'
+            target.mkdir(parents=True, exist_ok=True)
+            self._init_repo(target)
+            target_manifest = {
+                'version': 1,
+                'package_name': 'test-state',
+                'required_files': [
+                    'config/public_export_allowlist.yaml',
+                    'config/public_export_denylist.yaml',
+                    'config/migration_sync_policy.json',
+                    'config/state_migration_manifest.json',
+                ],
+                'optional_globs': ['docs/public/*.md', 'scripts/*.py'],
+                'exclude_globs': ['**/*.pyc'],
+            }
+            (target / 'config').mkdir(parents=True, exist_ok=True)
+            (target / 'config' / 'state_migration_manifest.json').write_text(
+                f'{json.dumps(target_manifest, indent=2)}\n',
+                encoding='utf-8',
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CHECK_SCRIPT),
+                    '--package',
+                    str(package),
+                    '--target',
+                    str(target),
+                    '--dry-run',
+                ],
+                cwd=source,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, msg=result.stderr)
+            self.assertIn('optional_globs mismatch', result.stderr)
+            self.assertIn('exclude_globs mismatch', result.stderr)
+
+    def test_import_dry_run_fails_when_overwrite_conflicts_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True, exist_ok=True)
+            self._init_repo(repo)
+            self._seed_files(repo)
+
+            package = repo / 'out' / 'package'
+            export = subprocess.run(
+                [
+                    sys.executable,
+                    str(EXPORT_SCRIPT),
+                    '--repo',
+                    str(repo),
+                    '--manifest',
+                    'config/state_migration_manifest.json',
+                    '--out',
+                    str(package),
+                    '--force',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(export.returncode, 0, msg=export.stderr)
+
+            target = repo / 'import-target'
+            target.mkdir(parents=True, exist_ok=True)
+            (target / 'config').mkdir(parents=True, exist_ok=True)
+            (target / 'config' / 'public_export_allowlist.yaml').write_text(
+                'different\n',
+                encoding='utf-8',
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(IMPORT_SCRIPT),
+                    '--in',
+                    str(package),
+                    '--target',
+                    str(target),
+                    '--dry-run',
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, msg=result.stderr)
+            self.assertIn('Dry-run detected blocking destination conflicts', result.stderr)
+
     def test_atomic_import_rolls_back_on_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -82,6 +82,22 @@ def main() -> int:
                         + ', '.join(missing_required),
                     )
 
+                source_optional = sorted(set(source_manifest.get('optional_globs', [])))
+                target_optional = sorted(set(target_manifest.get('optional_globs', [])))
+                if source_optional != target_optional:
+                    errors.append(
+                        'Compatibility check failed: optional_globs mismatch '
+                        f'(source={source_optional} target={target_optional})',
+                    )
+
+                source_exclude = sorted(set(source_manifest.get('exclude_globs', [])))
+                target_exclude = sorted(set(target_manifest.get('exclude_globs', [])))
+                if source_exclude != target_exclude:
+                    errors.append(
+                        'Compatibility check failed: exclude_globs mismatch '
+                        f'(source={source_exclude} target={target_exclude})',
+                    )
+
             source_package_name = manifest.get('package_name')
             target_package_name = target_manifest.get('package_name')
             if source_package_name != target_package_name:
