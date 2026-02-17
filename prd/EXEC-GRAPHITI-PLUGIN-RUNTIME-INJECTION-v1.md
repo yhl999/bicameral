@@ -36,10 +36,10 @@
   - `config/example_pack_composition.json` (NEW — example composition rules)
   - `config/example_pack_registry.json` (NEW — example pack registry)
 - Owned Paths (PRIVATE repo — `graphiti-openclaw-private`):
-  - `config/runtime_pack_registry.yaml` (add new packs)
-  - `config/runtime_consumer_profiles.yaml` (add new profiles)
-  - `config/plugin_intent_rules.yaml` (NEW — real intent routing rules)
-  - `config/pack_composition_rules.yaml` (NEW — real cross-pack injection rules)
+  - `config/runtime_pack_registry.json` (add new packs)
+  - `config/runtime_consumer_profiles.json` (add new profiles)
+  - `config/plugin_intent_rules.json` (NEW — real intent routing rules)
+  - `config/pack_composition_rules.json` (NEW — real cross-pack injection rules)
   - `workflows/dining_recs.pack.yaml` (NEW)
   - `workflows/content_tweet.pack.yaml` (NEW)
   - `workflows/content_long_form.pack.yaml` (NEW)
@@ -51,6 +51,13 @@
 Build an OpenClaw plugin that **guarantees** Graphiti knowledge graph retrieval, context injection, and content/workflow pack selection on every agent turn — replacing the current optional `memory_search` tool-call pattern with infrastructure-level injection that the model cannot skip.
 
 **Core insight:** OpenClaw's Plugin SDK exposes `before_agent_start` and `agent_end` hooks that fire on every turn with full access to the user's prompt and conversation history. The `before_agent_start` handler can return `{ prependContext }` which OpenClaw mechanically prepends to the prompt before the LLM sees it. This is the same pattern used by the Supermemory plugin (`@supermemory/openclaw-supermemory`) — proven in production.
+
+## Execution Status Snapshot (2026-02-17)
+- ✅ Public plugin/runtime wiring milestones merged (PR #34 + PR #7 + follow-up hardening).
+- ✅ Private Milestone 3 merged (`graphiti-openclaw-private` PR #8): intent/composition configs + new dining/content packs + overlay wiring.
+- ✅ Private rails merged: PR #12 (#10/#11), PR #13 (#1), PR #14 (#2/#3).
+- ✅ Verify-only CLR passes achieved after hardening (review APPROVE, security CLEAN).
+- ⏳ Deferred: issue #9 (replace synthetic `content_voice_style` / `content_writing_samples` placeholders with real writing corpus).
 
 ---
 
@@ -83,10 +90,10 @@ The plugin architecture follows the same public/private overlay pattern as the r
 
 | Component | Path(s) | Purpose |
 |-----------|---------|---------|
-| Real intent rules | `config/plugin_intent_rules.yaml` | Our specific intent → consumer profile mappings (dining, VC, content) |
-| Real composition rules | `config/pack_composition_rules.yaml` | Cross-pack injection rules (voice/writing → VC memo, etc.) |
-| Real pack registry | `config/runtime_pack_registry.yaml` | Real pack registry (VC + dining + content packs) |
-| Real consumer profiles | `config/runtime_consumer_profiles.yaml` | Real consumer profiles |
+| Real intent rules | `config/plugin_intent_rules.json` | Our specific intent → consumer profile mappings (dining, VC, content) |
+| Real composition rules | `config/pack_composition_rules.json` | Cross-pack injection rules (voice/writing → VC memo, etc.) |
+| Real pack registry | `config/runtime_pack_registry.json` | Real pack registry (VC + dining + content packs) |
+| Real consumer profiles | `config/runtime_consumer_profiles.json` | Real consumer profiles |
 | Real workflow packs | `workflows/*.pack.yaml` | Real workflow packs (VC memo, deal brief, IC prep, dining, content) |
 | Content voice/writing context packs | `workflows/content_voice_style.pack.yaml`, `workflows/content_writing_samples.pack.yaml` | Yuan's voice model, writing samples, content strategy |
 | Compliance rules | Embedded in `domain_context` fields of VC/content packs | SEC/RIA hard gates for content workflows |
@@ -352,7 +359,7 @@ Similarly, the content tweet workflow might want `dining_preferences` context if
 
 ### Composition Rules (private config)
 
-`config/pack_composition_rules.yaml`:
+`config/pack_composition_rules.json`:
 
 ```yaml
 schema_version: 1
