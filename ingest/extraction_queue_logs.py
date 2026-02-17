@@ -98,14 +98,14 @@ def parse_queue_service_line(line: str) -> Optional[QueueServiceEvent]:
         # Sanitize failure_reason: truncate to prevent leaking internal
         # stack traces or other verbose state into structured events.
         raw_reason = (m_fail.group("reason") or "").strip()
-        # Strip anything that looks like a stack trace (lines starting with
-        # whitespace + "File " or "Traceback") and cap length.
+        # The reason comes from a single log line (no embedded newlines),
+        # so strip inline exception detail and cap length.
         if raw_reason:
+            # Remove class paths like "module.sub.ExcType: long msg"
             raw_reason = re.sub(
-                r"(?:Traceback \(most recent call last\)(?:\n\s+.+)*|(?:\s+File .+\n?)+)",
-                "[stack trace removed]",
+                r"[A-Za-z0-9_.]+Error:\s*",
+                "[err]: ",
                 raw_reason,
-                flags=re.MULTILINE,
             )
             raw_reason = raw_reason[:200]
         return QueueServiceEvent(

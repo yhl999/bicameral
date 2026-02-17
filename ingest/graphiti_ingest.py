@@ -35,7 +35,9 @@ except ImportError:
     print("Note: graphiti-core not installed. Running in dry-run mode.")
 
 
-def _sanitize_metadata_str(value: Any, field_name: str = "unknown_field", max_len: int = 256) -> str:
+def _sanitize_metadata_str(
+    value: Any, field_name: str = "unknown_field", max_len: int = 256,
+) -> str:
     """Validate and sanitize a metadata string field.
 
     Returns a safe string (stripped, truncated, control-chars removed).
