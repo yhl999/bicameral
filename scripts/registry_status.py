@@ -32,15 +32,19 @@ from registry import (
     get_registry,
 )
 
-# Import from shared module (ingest/queue.py) rather than duplicating the DDL.
-# Use spec_from_file_location to load by explicit path, avoiding stdlib ``queue``
-# name collision (importlib.import_module would return the cached stdlib module if
-# anything else has already imported it).
+# Import QUEUE_SCHEMA_DDL from shared module (ingest/queue.py).
+# sys.path already has ingest/ at index 0 (line 28), but ``import queue``
+# would return the cached stdlib module if anything imported it first.
+# Load by explicit file path to guarantee we get our local module.
 import importlib.util as _imputil
-_queue_spec = _imputil.spec_from_file_location(
-    "ingest_queue",
-    str(Path(__file__).resolve().parents[1] / "ingest" / "queue.py"),
-)
+
+_queue_path = str(Path(__file__).resolve().parents[1] / "ingest" / "queue.py")
+_queue_spec = _imputil.spec_from_file_location("ingest_queue", _queue_path)
+if _queue_spec is None or _queue_spec.loader is None:
+    raise ImportError(
+        f"Cannot load ingest/queue.py from {_queue_path} "
+        "(file not found or loader unavailable)"
+    )
 _queue_mod = _imputil.module_from_spec(_queue_spec)
 _queue_spec.loader.exec_module(_queue_mod)
 QUEUE_SCHEMA_DDL = _queue_mod.QUEUE_SCHEMA_DDL
