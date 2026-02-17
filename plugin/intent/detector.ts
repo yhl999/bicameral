@@ -43,10 +43,20 @@ const shouldStick = (
   return signals.some((signal) => promptLower.includes(signal));
 };
 
-const safeRegex = (pattern: string): RegExp | null => {
+const safeRegex = (
+  pattern: string,
+  logger?: (message: string) => void,
+  label?: string,
+): RegExp | null => {
   try {
     return new RegExp(pattern, 'i');
-  } catch {
+  } catch (error) {
+    if (logger) {
+      const context = label ? ` for ${label}` : '';
+      logger(
+        `Invalid regex pattern${context}: ${pattern}. ${(error as Error).message}`,
+      );
+    }
     return null;
   }
 };
@@ -54,13 +64,25 @@ const safeRegex = (pattern: string): RegExp | null => {
 const matchBoost = (
   boost: EntityBoost,
   graphitiResults?: GraphitiSearchResults | null,
+  logger?: (message: string) => void,
+  ruleId?: string,
 ): BoostMatch => {
   if (!graphitiResults) {
     return { matched: false, reason: 'no graphiti results' };
   }
 
-  const summaryRegex = safeRegex(boost.summaryPattern);
-  const factRegex = boost.factPattern ? safeRegex(boost.factPattern) : null;
+  const summaryRegex = safeRegex(
+    boost.summaryPattern,
+    logger,
+    ruleId ? `${ruleId} summaryPattern` : 'summaryPattern',
+  );
+  const factRegex = boost.factPattern
+    ? safeRegex(
+        boost.factPattern,
+        logger,
+        ruleId ? `${ruleId} factPattern` : 'factPattern',
+      )
+    : null;
 
   const entitySummaries = graphitiResults.entities?.map((entity) => entity.summary) ?? [];
   const factTexts = graphitiResults.facts?.map((fact) => fact.fact) ?? [];
@@ -159,7 +181,7 @@ export const detectIntent = (
     const explanation = [`keywords matched: ${keywordHits.join(', ')}`];
 
     for (const boost of rule.entityBoosts ?? []) {
-      const match = matchBoost(boost, input.graphitiResults ?? null);
+      const match = matchBoost(boost, input.graphitiResults ?? null, input.logger, rule.id);
       if (match.matched) {
         score += boost.weight;
         explanation.push(`entity boost +${boost.weight}`);

@@ -66,8 +66,41 @@ const resolveRegistryEntry = (registry: PackRegistry, packType: string) => {
   );
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === 'object' && value !== null;
+};
+
+const isNonEmptyString = (value: unknown): value is string => {
+  return typeof value === 'string' && value.trim().length > 0;
+};
+
+const escapeXmlAttr = (value: string): string => {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+};
+
+const isPathWithinRoot = (root: string, target: string): boolean => {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+};
+
+const resolvePackPath = (repoRoot: string, packPath: string): string => {
+  const resolvedRoot = path.resolve(repoRoot);
+  const resolvedPath = path.resolve(resolvedRoot, packPath);
+  if (!isPathWithinRoot(resolvedRoot, resolvedPath)) {
+    throw new Error(
+      `Pack path ${resolvedPath} is outside repo root ${resolvedRoot}`,
+    );
+  }
+  return resolvedPath;
+};
+
 const loadPackContent = (repoRoot: string, packPath: string): string => {
-  const resolved = path.resolve(repoRoot, packPath);
+  const resolved = resolvePackPath(repoRoot, packPath);
   return fs.readFileSync(resolved, 'utf8');
 };
 
@@ -78,8 +111,11 @@ const formatPackContext = (
   additional: PackMaterialized[],
 ): string => {
   const lines: string[] = [];
+  const safeIntentId = escapeXmlAttr(intentId);
+  const safePackId = escapeXmlAttr(primary.packId);
+  const safeScope = escapeXmlAttr(primary.scope);
   lines.push(
-    `<pack-context intent="${intentId}" primary-pack="${primary.packId}" scope="${primary.scope}">`,
+    `<pack-context intent="${safeIntentId}" primary-pack="${safePackId}" scope="${safeScope}">`,
   );
   if (plan) {
     lines.push(`## Active Workflow: ${plan.workflow_id}`);
@@ -107,20 +143,131 @@ const formatPackContext = (
 };
 
 const parseRouterOutput = (raw: string): PackPlan => {
-  const parsed = JSON.parse(raw) as PackPlan;
-  if (!parsed || !Array.isArray(parsed.packs)) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Pack router returned invalid JSON: ${(error as Error).message}`);
+  }
+
+  if (!isRecord(parsed)) {
     throw new Error('Pack router returned invalid plan');
   }
-  return parsed;
+
+  const packs = parsed.packs;
+  if (!Array.isArray(packs) || packs.length === 0) {
+    throw new Error('Pack router returned invalid plan');
+  }
+
+  const validatedPacks = packs.map((pack, index) => {
+    if (!isRecord(pack)) {
+      throw new Error(`Pack router returned invalid packs[${index}]`);
+    }
+    const packId = pack.pack_id;
+    const query = pack.query;
+    if (!isNonEmptyString(packId) || !isNonEmptyString(query)) {
+      throw new Error(`Pack router returned invalid packs[${index}]`);
+    }
+    return { pack_id: packId, query };
+  });
+
+  const consumer = parsed.consumer;
+  if (!isNonEmptyString(consumer)) {
+    throw new Error('Pack router returned invalid consumer');
+  }
+  const workflowId = parsed.workflow_id;
+  if (!isNonEmptyString(workflowId)) {
+    throw new Error('Pack router returned invalid workflow_id');
+  }
+  const stepId = parsed.step_id;
+  if (!isNonEmptyString(stepId)) {
+    throw new Error('Pack router returned invalid step_id');
+  }
+  const scope = parsed.scope;
+  if (!isNonEmptyString(scope)) {
+    throw new Error('Pack router returned invalid scope');
+  }
+
+  const task = typeof parsed.task === 'string' ? parsed.task : '';
+  const injectionText =
+    typeof parsed.injection_text === 'string' ? parsed.injection_text : '';
+
+  return {
+    consumer,
+    workflow_id: workflowId,
+    step_id: stepId,
+    scope,
+    task,
+    injection_text: injectionText,
+    packs: validatedPacks,
+  };
 };
 
 const runPackRouter = (
-  command: string,
+  command: string | string[],
   args: string[],
   timeoutMs: number,
 ): Promise<string> => {
   return new Promise((resolve, reject) => {
-    const [cmd, ...baseArgs] = command.split(' ').filter((part) => part.length > 0);
+    let commandParts: string[];
+    if (Array.isArray(command)) {
+      commandParts = command.filter((part) => part.trim().length > 0);
+    } else {
+      const trimmed = command.trim();
+      if (!trimmed) {
+        reject(new Error('Pack router command is empty'));
+        return;
+      }
+      if (trimmed.includes(' ') && !/["']/.test(trimmed) && fs.existsSync(trimmed)) {
+        commandParts = [trimmed];
+      } else {
+        commandParts = [];
+        let current = '';
+        let inSingle = false;
+        let inDouble = false;
+        for (let i = 0; i < trimmed.length; i += 1) {
+          const char = trimmed[i];
+          if (char === "'" && !inDouble) {
+            inSingle = !inSingle;
+            continue;
+          }
+          if (char === '"' && !inSingle) {
+            inDouble = !inDouble;
+            continue;
+          }
+          if (!inSingle && !inDouble && /\s/.test(char)) {
+            if (current) {
+              commandParts.push(current);
+              current = '';
+            }
+            continue;
+          }
+          if (char === '\\' && !inSingle) {
+            const next = trimmed[i + 1];
+            if (next && /[\s"'\\]/.test(next)) {
+              i += 1;
+              current += next;
+              continue;
+            }
+          }
+          current += char;
+        }
+        if (inSingle || inDouble) {
+          reject(new Error('Pack router command has unterminated quotes'));
+          return;
+        }
+        if (current) {
+          commandParts.push(current);
+        }
+      }
+    }
+
+    if (commandParts.length === 0) {
+      reject(new Error('Pack router command is empty'));
+      return;
+    }
+
+    const [cmd, ...baseArgs] = commandParts;
     const child = spawn(cmd, [...baseArgs, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
@@ -222,6 +369,7 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         stickyMaxWords: config.stickyMaxWords,
         stickySignals: config.stickySignals,
         defaultMinConfidence: config.defaultMinConfidence,
+        logger,
       });
 
       if (!decision.matched || !decision.rule) {

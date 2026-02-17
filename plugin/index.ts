@@ -44,12 +44,32 @@ export const createGraphitiPlugin = (options?: GraphitiPluginOptions): OpenClawP
     ...loadConfigFromEnv(),
     ...(options?.config ?? {}),
   });
+  const logger = config.debug ? (message: string) => console.log(message) : () => undefined;
+  const configRoots = config.configPathRoots;
+
+  const safeLoad = <T>(label: string, loader: () => T | null): T | null => {
+    try {
+      return loader();
+    } catch (error) {
+      logger(`Config load failed for ${label}: ${(error as Error).message}`);
+      return null;
+    }
+  };
 
   const intentRules =
-    options?.intentRules ?? loadIntentRules(config.intentRulesPath) ?? { schema_version: 1, rules: [] };
+    options?.intentRules ??
+    safeLoad('intent rules', () => loadIntentRules(config.intentRulesPath, configRoots)) ?? {
+      schema_version: 1,
+      rules: [],
+    };
   const compositionRules =
-    options?.compositionRules ?? loadCompositionRules(config.compositionRulesPath);
-  const packRegistry = options?.packRegistry ?? loadPackRegistry(config.packRegistryPath);
+    options?.compositionRules ??
+    safeLoad('composition rules', () =>
+      loadCompositionRules(config.compositionRulesPath, configRoots),
+    );
+  const packRegistry =
+    options?.packRegistry ??
+    safeLoad('pack registry', () => loadPackRegistry(config.packRegistryPath, configRoots));
 
   const client = new GraphitiClient({
     baseUrl: config.graphitiBaseUrl,

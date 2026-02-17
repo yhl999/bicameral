@@ -29,11 +29,12 @@ export interface PluginConfig {
   intentRulesPath?: string;
   compositionRulesPath?: string;
   packRegistryPath?: string;
-  packRouterCommand?: string;
+  packRouterCommand?: string | string[];
   packRouterRepoRoot?: string;
   packRouterTimeoutMs: number;
   defaultMinConfidence: number;
   debug: boolean;
+  configPathRoots?: string[];
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -58,8 +59,32 @@ export const normalizeConfig = (config?: Partial<PluginConfig>): PluginConfig =>
   };
 };
 
-const readConfigFile = <T>(filePath: string): T => {
+const resolveAllowedRoots = (allowedRoots?: string[]): string[] => {
+  if (!allowedRoots || allowedRoots.length === 0) {
+    return [process.cwd()];
+  }
+  return allowedRoots.map((root) => path.resolve(root));
+};
+
+const isPathWithinRoot = (root: string, target: string): boolean => {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+};
+
+const resolveSafePath = (filePath: string, allowedRoots?: string[]): string => {
   const absolute = path.resolve(filePath);
+  const roots = resolveAllowedRoots(allowedRoots);
+  const allowed = roots.some((root) => isPathWithinRoot(root, absolute));
+  if (!allowed) {
+    throw new Error(
+      `Config path ${absolute} is outside allowed roots: ${roots.join(', ')}`,
+    );
+  }
+  return absolute;
+};
+
+const readConfigFile = <T>(filePath: string, allowedRoots?: string[]): T => {
+  const absolute = resolveSafePath(filePath, allowedRoots);
   const raw = fs.readFileSync(absolute, 'utf8');
   try {
     return JSON.parse(raw) as T;
@@ -70,23 +95,32 @@ const readConfigFile = <T>(filePath: string): T => {
   }
 };
 
-export const loadIntentRules = (filePath?: string): IntentRuleSet | null => {
+export const loadIntentRules = (
+  filePath?: string,
+  allowedRoots?: string[],
+): IntentRuleSet | null => {
   if (!filePath) {
     return null;
   }
-  return readConfigFile<IntentRuleSet>(filePath);
+  return readConfigFile<IntentRuleSet>(filePath, allowedRoots);
 };
 
-export const loadCompositionRules = (filePath?: string): CompositionRuleSet | null => {
+export const loadCompositionRules = (
+  filePath?: string,
+  allowedRoots?: string[],
+): CompositionRuleSet | null => {
   if (!filePath) {
     return null;
   }
-  return readConfigFile<CompositionRuleSet>(filePath);
+  return readConfigFile<CompositionRuleSet>(filePath, allowedRoots);
 };
 
-export const loadPackRegistry = (filePath?: string): PackRegistry | null => {
+export const loadPackRegistry = (
+  filePath?: string,
+  allowedRoots?: string[],
+): PackRegistry | null => {
   if (!filePath) {
     return null;
   }
-  return readConfigFile<PackRegistry>(filePath);
+  return readConfigFile<PackRegistry>(filePath, allowedRoots);
 };

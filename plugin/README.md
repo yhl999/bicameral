@@ -31,13 +31,19 @@ Configuration is passed as JSON through `GRAPHITI_PLUGIN_CONFIG` or OpenClaw's p
   "packRegistryPath": "config/example_pack_registry.yaml",
   "packRouterCommand": "python3 scripts/runtime_pack_router.py",
   "packRouterRepoRoot": ".",
+  "configPathRoots": ["."],
   "debug": true
 }
 ```
 
 Notes:
-- The scaffold loader expects JSON content (files may use `.yaml` extension but must contain JSON).
+- The scaffold loader expects JSON content. You can keep `.yaml` extensions, but the file must still be JSON.
+- Consider renaming config files to `.json` to avoid confusion.
 - `packRouterCommand` is optional. If omitted, the pack registry is used directly.
+- For command paths with spaces, wrap paths in quotes or use an array form:
+  - `"packRouterCommand": "python3 \"scripts/pack router.py\""`
+  - `"packRouterCommand": ["python3", "scripts/pack router.py"]`
+- `configPathRoots` is an allowlist. Config files outside these roots are rejected. Defaults to the current working directory.
 
 ## Intent Rules
 

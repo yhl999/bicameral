@@ -47,6 +47,7 @@ export interface IntentDetectionInput {
   stickyMaxWords?: number;
   stickySignals?: string[];
   defaultMinConfidence?: number;
+  logger?: (message: string) => void;
 }
 
 export interface IntentDetectionOutput {
