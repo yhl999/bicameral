@@ -68,7 +68,13 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     Sub-chunk keys use :p0, :p1, ... suffixes for deterministic idempotent keys.
     Splits on paragraph boundaries (double newline) when possible to keep context
     coherent. Falls back to hard split at max_chars if no good boundary exists.
+
+    Raises:
+        ValueError: If max_chars <= 0 (would cause infinite loop).
     """
+    if max_chars <= 0:
+        raise ValueError(f"max_chars must be positive, got {max_chars}")
+
     if len(content) <= max_chars:
         return [(chunk_key, content)]
 
@@ -284,6 +290,9 @@ def main():
         "Only applies to group IDs in _SUBCHUNK_GROUP_IDS (e.g. s1_sessions_main).",
     )
     args = ap.parse_args()
+
+    if args.subchunk_size <= 0:
+        ap.error("--subchunk-size must be a positive integer")
 
     evidence_path = Path(args.evidence)
     if not evidence_path.exists():
