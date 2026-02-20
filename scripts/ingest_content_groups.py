@@ -25,6 +25,9 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from graph_driver import get_sync_client, add_backend_args
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -32,8 +35,12 @@ from pathlib import Path
 MCP_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 REDIS_CLI = os.environ.get("REDIS_CLI", "/opt/homebrew/opt/redis/bin/redis-cli")
 REDIS_PORT = "6379"
-MCP_LOG = Path(os.environ.get("MCP_LOG", "/Users/archibald/clawd/tools/falkordb/logs/graphiti-mcp-stderr.log"))
+MCP_LOG = Path(os.environ.get("MCP_LOG", "/Users/archibald/clawd/logs/graphiti/mcp-8000-openrouter.log"))
 SUBPROCESS_TIMEOUT = 30  # seconds for redis-cli calls
+
+# Module-level graph client, set in main()
+_graph_client = None
+_backend = "neo4j"
 
 # Allowlist pattern for graph/group names (prevents Cypher injection)
 SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
@@ -86,55 +93,65 @@ def _validate_evidence_dir(p: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# FalkorDB helpers
+# Graph helpers (dual-backend: Neo4j or FalkorDB)
 # ---------------------------------------------------------------------------
 
-def _cypher(graph: str, query: str) -> str:
-    """Run a Cypher query against a FalkorDB graph via redis-cli."""
-    _validate_name(graph)
-    return subprocess.check_output(
-        [REDIS_CLI, "-p", REDIS_PORT, "GRAPH.QUERY", graph, query],
-        text=True, timeout=SUBPROCESS_TIMEOUT,
-    )
+def _query_rows(group_id: str, cypher: str, params: dict | None = None) -> list[list]:
+    """Run a Cypher query via the module-level sync client and return rows."""
+    _validate_name(group_id)
+    if _graph_client is None:
+        raise RuntimeError("Graph client not initialised — call _init_graph_client() first")
+    _header, rows, _stats = _graph_client.query(group_id, cypher, params)
+    return rows
 
 
-def _count(output: str) -> int:
-    """Parse a single-row integer result from GRAPH.QUERY output.
-
-    Redis-cli output for `RETURN count(e)` looks like:
-        count(e)
-        42
-        ...stats lines...
-    We grab the first purely-numeric non-header line.
-    """
-    lines = output.splitlines()
-    for line in lines[1:]:  # skip header row
-        s = line.strip()
-        if s.isdigit():
-            return int(s)
+def _query_count(group_id: str, cypher: str, params: dict | None = None) -> int:
+    """Run a count query and return the integer result."""
+    rows = _query_rows(group_id, cypher, params)
+    if rows and rows[0]:
+        val = rows[0][0]
+        return int(val) if val is not None else 0
     return 0
 
 
 def correct_chunk_keys(group_id: str) -> set[str]:
     """Chunk keys present in the right graph with matching group_id."""
     gid = _validate_name(group_id)
-    out = _cypher(gid, f"MATCH (e:Episodic) WHERE e.group_id = '{gid}' RETURN e.source_description")
+    rows = _query_rows(
+        gid,
+        "MATCH (e:Episodic) WHERE e.group_id = $gid RETURN e.source_description",
+        {"gid": gid},
+    )
     keys: set[str] = set()
-    for line in out.splitlines():
-        m = re.search(r"session chunk: (.+?) \(scope=", line)
-        if m:
-            keys.add(m.group(1).strip())
+    for row in rows:
+        if row and row[0]:
+            m = re.search(r"session chunk: (.+?) \(scope=", str(row[0]))
+            if m:
+                keys.add(m.group(1).strip())
     return keys
 
 
 def misplaced_total(groups: list[str]) -> int:
-    """Count episodes sitting in the wrong graph across given groups."""
+    """Count episodes sitting in the wrong graph across given groups.
+
+    For Neo4j (single database) we check all group_ids in one query.
+    For FalkorDB (per-group graphs) we iterate each graph.
+    """
+    if _backend == "neo4j":
+        # Single query: episodes whose group_id is one of our content groups
+        # but doesn't match what it *should* be. In Neo4j all groups share one DB,
+        # so "misplaced" means group_id is set to a value not matching its intended group.
+        # For content groups this is irrelevant (MCP routes by group_id at write time),
+        # so we just return 0 — cross-contamination is a FalkorDB-graph-level concern.
+        return 0
     total = 0
     for g in groups:
         gid = _validate_name(g)
-        total += _count(_cypher(
-            gid, f"MATCH (e:Episodic) WHERE e.group_id IS NOT NULL AND e.group_id <> '{gid}' RETURN count(e)",
-        ))
+        total += _query_count(
+            gid,
+            f"MATCH (e:Episodic) WHERE e.group_id IS NOT NULL AND e.group_id <> $gid RETURN count(e)",
+            {"gid": gid},
+        )
     return total
 
 
@@ -199,27 +216,25 @@ def sanitize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:8000]
 
 
-def last_openai_ts() -> float:
-    """Epoch of most recent OpenAI call in MCP logs (assumes UTC)."""
+def last_llm_ts() -> float:
+    """Epoch of most recent LLM API call in MCP logs.
+
+    Checks for both OpenAI (api.openai.com) and OpenRouter (openrouter.ai).
+    """
     try:
-        # Read tail of native MCP log file (or fall back to journalctl/docker)
         if MCP_LOG.exists():
             lines_raw = subprocess.check_output(
                 ["tail", "-200", str(MCP_LOG)], text=True, timeout=10).splitlines()
         else:
-            # Fallback: try launchd stdout
-            lines_raw = subprocess.check_output(
-                ["tail", "-200", str(MCP_LOG)], text=True, timeout=10).splitlines()
+            return 0.0
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return 0.0
-    lines = [line for line in lines_raw if "api.openai.com" in line]
+    lines = [line for line in lines_raw if "api.openai.com" in line or "openrouter.ai" in line]
     if not lines:
         return 0.0
     m = re.match(r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})", lines[-1])
     if not m:
         return 0.0
-    # MCP logs are written in local time (launchd), so interpret the timestamp
-    # in the local timezone to avoid false "OpenAI quiet" stall detection.
     local_tz = datetime.now().astimezone().tzinfo or timezone.utc
     return datetime.fromisoformat(f"{m.group(1)} {m.group(2)}").replace(
         tzinfo=local_tz).timestamp()
@@ -264,9 +279,9 @@ def wait_for_drain(
         prev = current
 
         if stable >= stable_checks:
-            quiet = time.time() - (last_openai_ts() or 0)
+            quiet = time.time() - (last_llm_ts() or 0)
             if quiet > 180:
-                log(f"  stalled: no progress + OpenAI quiet {int(quiet)}s")
+                log(f"  stalled: no progress + LLM quiet {int(quiet)}s")
                 return False
 
         time.sleep(poll_s)
@@ -341,7 +356,10 @@ def process_group(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _graph_client, _backend
+
     ap = argparse.ArgumentParser(description="Strict sequential content-group ingestion")
+    add_backend_args(ap)
     ap.add_argument("--groups", default=",".join(CONTENT_GROUPS))
     ap.add_argument("--evidence-dir", type=Path, default=DEFAULT_EVIDENCE_DIR)
     ap.add_argument("--sleep", type=float, default=2.0, help="seconds between enqueue calls")
@@ -353,6 +371,9 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--mcp-url", default=MCP_URL, help="MCP endpoint URL")
     args = ap.parse_args()
+
+    _backend = args.backend
+    _graph_client = get_sync_client(_backend)
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
 
