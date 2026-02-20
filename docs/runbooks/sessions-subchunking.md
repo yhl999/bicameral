@@ -35,7 +35,7 @@ When `mcp_ingest_sessions.py` processes evidence for a group ID in the sub-chunk
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--subchunk-size` | 10,000 | Max characters per sub-chunk |
-| `--group-id` | (required) | Only groups in `_SUBCHUNK_GROUP_IDS` get sub-chunked |
+| `--group-id` | (required) | All groups are sub-chunked by default (`_SUBCHUNK_GROUP_IDS = None`) |
 
 ## When to Adjust
 

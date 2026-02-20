@@ -210,6 +210,10 @@ These scripts are FalkorDB-specific and should **not** be used with Neo4j:
 - `scripts/cleanup_misplacements_all_graphs.py`
 - `scripts/scan_misplacements_all_graphs.py`
 - `scripts/extraction_monitor.py`
-- `scripts/ingest_content_groups.py`
 
-(Neo4j equivalents require different queries and group_id scoping.)
+**Updated for dual-backend (Neo4j + FalkorDB):**
+
+- `scripts/ingest_content_groups.py` — supports `--backend neo4j` (requires `graph_driver.py` from private overlay)
+- `scripts/dedupe_nodes.py` — supports `--backend neo4j` (private overlay)
+- `scripts/repair_timeline.py` — supports `--backend neo4j` (private overlay)
+- `scripts/import_graphiti_candidates.py` — supports `--backend neo4j` (private overlay)
