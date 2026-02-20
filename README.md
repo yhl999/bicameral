@@ -103,33 +103,44 @@ Packs are defined declaratively in YAML/JSON config. The **Runtime Pack Router**
 
 ## How Packs Work with Agents (OpenClaw Integration)
 
-Agents don't query the graph directly. They use the **Runtime Pack Router** as a high-level hook.
+Agents don't query the graph directly. Integration is via an **OpenClaw plugin** that hooks into the agent lifecycle.
 
-### The Routing Flow
+### The Plugin Hook
+
+The plugin registers `before_agent_start` and `agent_end` hooks. On each agent invocation, the **Pack Injector** automatically:
+
+1. **Detects intent** from the user's prompt (keyword matching + entity boost scoring via `config/plugin_intent_rules.json`).
+2. **Resolves the consumer profile** → which pack(s) to load, what mode, what ChatGPT policy.
+3. **Enforces scope** — private packs are suppressed in group chats automatically.
+4. **Resolves composition** — some intents trigger multiple packs (e.g., content drafting pulls voice + samples).
+5. **Materializes pack content** — loads pack files and formats as `<pack-context>` XML blocks.
+6. **Injects into the agent's context window** before the agent processes the user's message.
+
+### The Full Routing Flow
 
 ```
-Agent receives task (e.g., "draft a deal brief for Acme")
+User message arrives → OpenClaw triggers before_agent_start hook
     │
     ▼
-Intent Classification
-    │  "vc_deal_brief" matched via keyword/entity boost rules
+Intent Classification (config/plugin_intent_rules.json)
+    │  Keyword matching + entity boost scoring → matched intent
     ▼
 Consumer Profile Lookup (config/runtime_consumer_profiles.json)
     │  Maps agent + intent → pack_ids, modes, chatgpt_mode, scope
     ▼
+Composition Rules (config/pack_composition_rules.json)
+    │  Checks if intent injects additional packs
+    ▼
 Pack Resolution (config/runtime_pack_registry.json)
-    │  Resolves each pack_id → retrieval matrix, query template
+    │  Resolves each pack_id → file path, retrieval matrix
     ▼
-Graph Query (per graph lane in retrieval matrix)
-    │  Queries s1_sessions_main, s1_curated_refs, etc.
-    ▼
-Policy Enforcement
-    │  Applies scope (private vs group_safe), ChatGPT lane gating
+Scope + Safety Enforcement
+    │  Private packs suppressed in group chats; path traversal blocked
     ▼
 Context Assembly
-    │  Formats retrieved facts + provenance into injection text
+    │  Formats packs as <pack-context> XML blocks
     ▼
-Agent receives structured context in its context window
+Agent receives structured context prepended to its prompt
 ```
 
 ### Materialization
