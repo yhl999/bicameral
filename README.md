@@ -188,7 +188,39 @@ python3 mcp_server/main.py
 
 ### Ingesting Data
 
-Data flows through a 7-stage pipeline: Source Material → Evidence (deterministic chunking) → Ingest Registry (watermarks + dedup) → Graphiti MCP (LLM extraction) → Candidates DB (quarantine) → Promotion Policy (gates) → Fact Ledger (canonical truth).
+Data flows through a 7-stage pipeline:
+
+```
+1. Source Material (memory/*.md, sessions/*.jsonl, ChatGPT exports, writing samples,
+                    taste DBs, CRM, compound notes, self-audit JSONL)
+       ↓  deterministic chunking (H2 sections for markdown, 5-turn windows for sessions)
+2. Evidence Layer (evidence/*.json — immutable, stable chunk_key identifiers)
+       ↓  watermark tracking + content-hash dedup
+3. Ingest Registry (state/ingest_registry.db — tracks what's been ingested)
+       ↓  queue to MCP server
+4. Graphiti MCP + Graph DB (entity/relationship extraction via LLM)
+       ↓  per-group ontology resolution + entity dedup
+5. Candidates DB (state/candidates.db — quarantine queue)
+       ↓  PromotionPolicy gates
+6. Fact Ledger (state/fact_ledger.db — append-only canonical truth)
+       ↓  graph + markdown sync
+7. Graph DB sync + Markdown audit exports
+```
+
+#### Active Graph Groups
+
+| Group ID | Source | Custom Ontology | Ingest Script | Est. Episodes |
+|----------|--------|:-:|---------------|:---:|
+| `s1_sessions_main` | Session transcripts | ✅ | `mcp_ingest_sessions.py` | ~5,000+ |
+| `s1_chatgpt_history` | ChatGPT export (Constantine-filtered) | — | `mcp_ingest_sessions.py` | ~543 |
+| `s1_memory_day1` | `memory/*.md` files | — | `mcp_ingest_sessions.py` | ~604 |
+| `s1_inspiration_long_form` | Long-form writing samples | ✅ | `ingest_content_groups.py` | ~491 |
+| `s1_inspiration_short_form` | Short-form/tweet samples | ✅ | `ingest_content_groups.py` | ~190 |
+| `s1_writing_samples` | Writing style examples | ✅ | `ingest_content_groups.py` | ~48 |
+| `s1_content_strategy` | Strategy docs | ✅ | `ingest_content_groups.py` | ~6 |
+| `engineering_learnings` | CLR compound notes | ✅ | `ingest_compound_notes.py` | ~80+ |
+| `learning_self_audit` | Nightly self-audit | ✅ | `mcp_ingest_self_audit.py` | ~22+ |
+| `s1_curated_refs` | MEMORY.md, preferences.md, etc. | — | `curated_snapshot_ingest.py` | ~4 |
 
 ```bash
 # Parse session transcripts into evidence JSON
@@ -201,7 +233,31 @@ python3 scripts/mcp_ingest_sessions.py --group-id s1_sessions_main --incremental
 python3 scripts/registry_status.py
 ```
 
-Ingestion is idempotent (content-hash dedup), incremental (delta since last watermark), and supports sub-chunking for large evidence (>10k chars).
+#### Key Ingest Properties
+
+- **Idempotent:** Same input → same output. Registry DB tracks watermarks and content hashes.
+- **Incremental:** Delta since last watermark + overlap re-check window (20 messages for ChatGPT, 50 for sessions).
+- **Sub-chunked:** Large evidence (>10k chars) is deterministically split at enqueue time with `:p0/:p1/...` key suffixes. **Enabled for all groups** (not just sessions_main).
+- **Queue-based:** Durable queue in registry DB. At-least-once execution with bounded retry/backoff.
+- **Dual-lane ingest:** Some content (writing samples, ChatGPT) can be ingested as both **artifacts** (full text as few-shot examples) and **extracted facts** (voice patterns, preferences). Artifacts are retrieval-eligible but never auto-promoted as truth; claims remain policy-gated.
+- **Per-group ontology:** Custom entity types resolved per-call via `extraction_ontologies.yaml`. Groups without explicit ontology fall back to global defaults.
+
+#### Batch vs Steady-State
+
+The system has two operating modes with very different configurations:
+
+| Property | Batch (initial/re-extraction) | Steady-State (ongoing) |
+|----------|------|------|
+| MCP shards | 4 (ports 8000-8003) | 1 (port 8000) |
+| `SEMAPHORE_LIMIT` | 20 | 8 |
+| `GRAPHITI_QUEUE_CONCURRENCY` | 20 | **1 (serial per-group)** |
+| Throughput | ~1,500-2,300 episodes/hr | ~200-500 episodes/hr |
+| Entity dedup quality | Poor (post-process required) | Good (real-time resolution) |
+| Timeline integrity | None (repair required) | Maintained by serial ordering |
+
+**After batch ingestion, always run:** `dedupe_nodes.py` → `repair_timeline.py` → switch to steady-state config.
+
+**Full details:** [sessions-ingestion.md](docs/runbooks/sessions-ingestion.md) — comprehensive runbook covering both modes, adding new data sources, troubleshooting, and operational learnings.
 
 ---
 
@@ -225,6 +281,7 @@ For the full sync procedure, see [Upstream Sync Runbook](docs/runbooks/upstream-
 - [Runtime Pack Overlay](docs/runbooks/runtime-pack-overlay.md) — how private packs map to agents
 
 ### Operations
+- [Sessions Ingestion](docs/runbooks/sessions-ingestion.md) — **comprehensive:** batch & steady-state config, all 10 graph groups, throughput tuning, post-processing (dedup/timeline), adding new data sources, troubleshooting, operational learnings
 - [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md)
 - [State Migration Runbook](docs/runbooks/state-migration.md)
 - [High-Throughput Extraction](docs/runbooks/high-throughput-extraction.md)
