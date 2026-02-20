@@ -187,7 +187,8 @@ def main() -> None:
                 capture_output=True, text=True, timeout=1,
             )
             code = r.stdout.strip()
-            mcp_status.append(f"{port}:{'\u2705' if code == '200' else '\U0001f534'}")
+            icon = '\u2705' if code == '200' else '\U0001f534'
+            mcp_status.append(f"{port}:{icon}")
         except Exception:
             mcp_status.append(f"{port}:\U0001f534")
 

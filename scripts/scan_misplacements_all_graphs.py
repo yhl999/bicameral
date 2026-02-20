@@ -20,7 +20,7 @@ import argparse
 import json
 from pathlib import Path
 
-from graph_cli import SAFE_NAME_RE, list_graphs, parse_count, run_cypher
+from graph_cli import list_graphs, parse_count, run_cypher
 
 SAFE_OUTPUT_ROOTS = [Path.cwd(), Path("_tmp").resolve(), Path("/tmp")]
 DEFAULT_OUT = Path("_tmp/misplacements_all_graphs.json")
