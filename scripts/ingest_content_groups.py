@@ -26,17 +26,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from graph_driver import get_sync_client, add_backend_args
+try:
+    from graph_driver import get_sync_client, add_backend_args
+except ImportError:
+    raise ImportError(
+        "graph_driver.py not found in scripts/. "
+        "Apply the private overlay (graphiti-openclaw-private) or copy graph_driver.py "
+        "into scripts/ before running with --backend neo4j."
+    ) from None
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 MCP_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
-REDIS_CLI = os.environ.get("REDIS_CLI", "/opt/homebrew/opt/redis/bin/redis-cli")
-REDIS_PORT = "6379"
 MCP_LOG = Path(os.environ.get("MCP_LOG", "/Users/archibald/clawd/logs/graphiti/mcp-8000-openrouter.log"))
-SUBPROCESS_TIMEOUT = 30  # seconds for redis-cli calls
+SUBPROCESS_TIMEOUT = 30  # seconds for subprocess calls (tail, etc.)
 
 # Module-level graph client, set in main()
 _graph_client = None
@@ -100,7 +105,7 @@ def _query_rows(group_id: str, cypher: str, params: dict | None = None) -> list[
     """Run a Cypher query via the module-level sync client and return rows."""
     _validate_name(group_id)
     if _graph_client is None:
-        raise RuntimeError("Graph client not initialised — call _init_graph_client() first")
+        raise RuntimeError("Graph client not initialised — run via main() or set _graph_client first")
     _header, rows, _stats = _graph_client.query(group_id, cypher, params)
     return rows
 
@@ -143,14 +148,15 @@ def misplaced_total(groups: list[str]) -> int:
         # so "misplaced" means group_id is set to a value not matching its intended group.
         # For content groups this is irrelevant (MCP routes by group_id at write time),
         # so we just return 0 — cross-contamination is a FalkorDB-graph-level concern.
+        # TODO: optionally verify group_id correctness via Neo4j query for defense-in-depth
+        log("  ℹ misplacement check skipped (Neo4j: group_id property-scoped)")
         return 0
     total = 0
     for g in groups:
         gid = _validate_name(g)
         total += _query_count(
             gid,
-            f"MATCH (e:Episodic) WHERE e.group_id IS NOT NULL AND e.group_id <> $gid RETURN count(e)",
-            {"gid": gid},
+            f"MATCH (e:Episodic) WHERE e.group_id IS NOT NULL AND e.group_id <> '{gid}' RETURN count(e)",
         )
     return total
 
@@ -211,7 +217,7 @@ def log(msg: str) -> None:
 
 
 def sanitize(text: str) -> str:
-    """Strip chars that break FalkorDB Cypher parsing."""
+    """Strip special chars from episode body before MCP submission."""
     text = re.sub(r'[{}()\[\]|<>@#$%^&*~`"\'\\]', " ", text)
     return re.sub(r"\s+", " ", text).strip()[:8000]
 
@@ -375,54 +381,58 @@ def main() -> None:
     _backend = args.backend
     _graph_client = get_sync_client(_backend)
 
-    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    try:
+        groups = [g.strip() for g in args.groups.split(",") if g.strip()]
 
-    # Validate all group names upfront
-    for g in groups:
-        _validate_name(g)
+        # Validate all group names upfront
+        for g in groups:
+            _validate_name(g)
 
-    # Validate evidence dir resolves under allowed roots
-    args.evidence_dir = _validate_evidence_dir(args.evidence_dir)
+        # Validate evidence dir resolves under allowed roots
+        args.evidence_dir = _validate_evidence_dir(args.evidence_dir)
 
-    log(f"groups={groups} force={args.force} dry_run={args.dry_run}")
+        log(f"groups={groups} force={args.force} dry_run={args.dry_run}")
 
-    if args.dry_run:
+        if args.dry_run:
+            for gid in groups:
+                ev = load_evidence(gid, args.evidence_dir)
+                present = correct_chunk_keys(gid)
+                missing = sorted(ev.keys()) if args.force else sorted(set(ev.keys()) - present)
+                log(f"\n{gid}: expected={len(ev)} correct={len(present)} to_queue={len(missing)}")
+                for k in missing[:5]:
+                    log(f"  {k}")
+                if len(missing) > 5:
+                    log(f"  ... +{len(missing) - 5} more")
+            return
+
+        mcp = MCPClient(args.mcp_url)
+        mcp.init()
+        log(f"MCP session={mcp.sid}")
+
+        results: list[dict] = []
         for gid in groups:
-            ev = load_evidence(gid, args.evidence_dir)
-            present = correct_chunk_keys(gid)
-            missing = sorted(ev.keys()) if args.force else sorted(set(ev.keys()) - present)
-            log(f"\n{gid}: expected={len(ev)} correct={len(present)} to_queue={len(missing)}")
-            for k in missing[:5]:
-                log(f"  {k}")
-            if len(missing) > 5:
-                log(f"  ... +{len(missing) - 5} more")
-        return
+            r = process_group(
+                gid, mcp, args.evidence_dir,
+                force=args.force, sleep_s=args.sleep, poll_s=args.poll,
+                stable_checks=args.stable_checks, max_wait_s=args.max_wait,
+                max_misplace_growth=args.max_misplace_growth)
+            results.append(r)
+            if r["queued"] > 0 and not r["drained"]:
+                log("  stopping before next group")
+                break
 
-    mcp = MCPClient(args.mcp_url)
-    mcp.init()
-    log(f"MCP session={mcp.sid}")
+        log("\n== Summary ==")
+        for r in results:
+            icon = "✅" if r["drained"] else "⏳"
+            log(f"  {icon} {r['group']}: queued={r['queued']} errors={r['errors']}")
 
-    results: list[dict] = []
-    for gid in groups:
-        r = process_group(
-            gid, mcp, args.evidence_dir,
-            force=args.force, sleep_s=args.sleep, poll_s=args.poll,
-            stable_checks=args.stable_checks, max_wait_s=args.max_wait,
-            max_misplace_growth=args.max_misplace_growth)
-        results.append(r)
-        if r["queued"] > 0 and not r["drained"]:
-            log("  stopping before next group")
-            break
-
-    log("\n== Summary ==")
-    for r in results:
-        icon = "✅" if r["drained"] else "⏳"
-        log(f"  {icon} {r['group']}: queued={r['queued']} errors={r['errors']}")
-
-    if any(not r["drained"] for r in results if r["queued"] > 0):
-        log("⚠ re-run to continue remaining groups")
-        sys.exit(1)
-    log("✅ all groups complete")
+        if any(not r["drained"] for r in results if r["queued"] > 0):
+            log("⚠ re-run to continue remaining groups")
+            sys.exit(1)
+        log("✅ all groups complete")
+    finally:
+        if _graph_client is not None:
+            _graph_client.close()
 
 
 if __name__ == "__main__":
