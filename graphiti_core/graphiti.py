@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 from datetime import datetime
 from time import time
+from typing import Literal
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -440,6 +441,7 @@ class Graphiti:
         nodes: list[EntityNode],
         uuid_map: dict[str, str],
         custom_extraction_instructions: str | None = None,
+        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
     ) -> tuple[list[EntityEdge], list[EntityEdge]]:
         """Extract edges from episode and resolve against existing graph."""
         extracted_edges = await extract_edges(
@@ -462,6 +464,7 @@ class Graphiti:
             nodes,
             edge_types or {},
             edge_type_map,
+            dedupe_mode=dedupe_mode,
         )
 
         return resolved_edges, invalidated_edges
@@ -775,6 +778,7 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -822,6 +826,11 @@ class Graphiti:
             query to find the most recent episode. Useful for efficiently adding multiple episodes
             to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
             as this parameter for the next episode.
+        dedupe_mode : Literal['semantic', 'deterministic']
+            Edge deduplication strategy.
+            - 'semantic' (default): uses LLM duplicate + contradiction resolution.
+            - 'deterministic': migration-safe mode that skips semantic duplicate/contradiction
+              resolution (exact-match dedupe still runs). Intended for controlled backfills.
 
         Returns
         -------
@@ -927,6 +936,7 @@ class Graphiti:
                     nodes,
                     uuid_map,
                     custom_extraction_instructions,
+                    dedupe_mode=dedupe_mode,
                 )
 
                 entity_edges = resolved_edges + invalidated_edges
