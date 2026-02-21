@@ -412,6 +412,7 @@ class EntityEdge(Edge):
 
         match_query = """
             MATCH (n:Entity {uuid: $source_node_uuid})-[e:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
+            WHERE e.uuid IS NOT NULL AND e.group_id IS NOT NULL AND e.episodes IS NOT NULL
         """
         if driver.provider == GraphProvider.KUZU:
             match_query = """
