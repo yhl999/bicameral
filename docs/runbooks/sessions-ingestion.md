@@ -6,6 +6,8 @@ This runbook covers the full lifecycle of Graphiti extraction: batch ingestion f
 
 **Default backend: Neo4j.** FalkorDB is legacy-only. Neo4j is strongly recommended for high-throughput extraction — FalkorDB's single-threaded write model saturates at low concurrency.
 
+> **Operational caveat (2026-02-22):** treat `ingest_registry.db` queue rows as advisory until extraction reconciliation is verified. Current audits show queued `episode_uuid` rows that are not present in Neo4j (UUID/bookkeeping drift). For flip-readiness decisions, use Neo4j freshness (`max(Episodic.created_at)` by `group_id`) plus shadow-compare on fresh post-fix data.
+
 ---
 
 ## Table of Contents
