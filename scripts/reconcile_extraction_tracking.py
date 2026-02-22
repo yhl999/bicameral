@@ -222,6 +222,7 @@ def _apply_success(
                 updated_at = ?
             WHERE group_id = ?
               AND episode_uuid = ?
+              AND status IN ('queued', 'failed')
             """,
             (new_episode_uuid, succeeded_at, now_iso, group_id, old_episode_uuid),
         )
@@ -229,7 +230,10 @@ def _apply_success(
             return True
     except sqlite3.IntegrityError:
         # Target UUID already exists for this group; keep old key but mark succeeded.
-        pass
+        print(
+            f"  [WARN] UUID conflict: {new_episode_uuid!r} already exists in extraction_tracking "
+            f"for group={group_id!r}; marking old row succeeded without UUID rewrite."
+        )
 
     cur = conn.execute(
         """
@@ -241,6 +245,7 @@ def _apply_success(
             updated_at = ?
         WHERE group_id = ?
           AND episode_uuid = ?
+          AND status IN ('queued', 'failed')
         """,
         (succeeded_at, now_iso, group_id, old_episode_uuid),
     )
