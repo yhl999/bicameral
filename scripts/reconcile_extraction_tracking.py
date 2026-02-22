@@ -28,7 +28,6 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = REPO_ROOT / "state" / "ingest_registry.db"
 DEFAULT_GROUPS = ["s1_sessions_main", "s1_chatgpt_history", "s1_memory_day1"]
