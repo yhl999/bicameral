@@ -19,6 +19,7 @@ allowlist:
   - "examples/**"
   - "images/**"
   - "reports/publicization/**"
+  - "reports/upstream-sync/**"
 
   # Build/release/config metadata
   - "config/**"

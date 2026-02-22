@@ -48,6 +48,7 @@ from graphiti_core.helpers import (
     validate_group_id,
 )
 from graphiti_core.llm_client import LLMClient, OpenAIClient
+from graphiti_core.namespaces import EdgeNamespace, NodeNamespace
 from graphiti_core.nodes import (
     CommunityNode,
     EntityNode,
@@ -237,6 +238,10 @@ class Graphiti:
             tracer=self.tracer,
         )
 
+        # Initialize namespace API (graphiti.nodes.entity.save(), etc.)
+        self.nodes = NodeNamespace(self.driver, self.embedder)
+        self.edges = EdgeNamespace(self.driver, self.embedder)
+
         # Capture telemetry event
         self._capture_initialization_telemetry()
 
@@ -260,6 +265,18 @@ class Graphiti:
         except Exception:
             # Silently handle telemetry errors
             pass
+
+    @property
+    def token_tracker(self):
+        """Access the LLM client's token usage tracker.
+
+        Returns the TokenUsageTracker from the LLM client, which can be used to:
+        - Get token usage by prompt type: tracker.get_usage()
+        - Get total token usage: tracker.get_total_usage()
+        - Print a formatted summary: tracker.print_summary()
+        - Reset tracking: tracker.reset()
+        """
+        return self.llm_client.token_tracker
 
     def _get_provider_type(self, client) -> str:
         """Get provider type from client class name."""
@@ -442,8 +459,14 @@ class Graphiti:
         uuid_map: dict[str, str],
         custom_extraction_instructions: str | None = None,
         dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
-    ) -> tuple[list[EntityEdge], list[EntityEdge]]:
-        """Extract edges from episode and resolve against existing graph."""
+    ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
+        """Extract edges from episode and resolve against existing graph.
+
+        Returns
+        -------
+        tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]
+            A tuple of (resolved_edges, invalidated_edges, new_edges).
+        """
         extracted_edges = await extract_edges(
             self.clients,
             episode,
@@ -457,7 +480,7 @@ class Graphiti:
 
         edges = resolve_edge_pointers(extracted_edges, uuid_map)
 
-        resolved_edges, invalidated_edges = await resolve_extracted_edges(
+        resolved_edges, invalidated_edges, new_edges = await resolve_extracted_edges(
             self.clients,
             edges,
             episode,
@@ -467,7 +490,7 @@ class Graphiti:
             dedupe_mode=dedupe_mode,
         )
 
-        return resolved_edges, invalidated_edges
+        return resolved_edges, invalidated_edges, new_edges
 
     async def _process_episode_data(
         self,
@@ -703,6 +726,8 @@ class Graphiti:
         for result in edge_results:
             resolved_edges.extend(result[0])
             invalidated_edges.extend(result[1])
+            # result[2] is new_edges - not used in bulk flow since attributes
+            # are extracted before edge resolution
 
         return final_hydrated_nodes, resolved_edges, invalidated_edges, uuid_map
 
@@ -926,7 +951,11 @@ class Graphiti:
                 )
 
                 # Extract and resolve edges in parallel with attribute extraction
-                resolved_edges, invalidated_edges = await self._extract_and_resolve_edges(
+                (
+                    resolved_edges,
+                    invalidated_edges,
+                    new_edges,
+                ) = await self._extract_and_resolve_edges(
                     episode,
                     extracted_nodes,
                     previous_episodes,
@@ -941,14 +970,15 @@ class Graphiti:
 
                 entity_edges = resolved_edges + invalidated_edges
 
-                # Extract node attributes
+                # Extract node attributes - only pass new edges for summary generation
+                # to avoid duplicating facts that already exist in the graph
                 hydrated_nodes = await extract_attributes_from_nodes(
                     self.clients,
                     nodes,
                     episode,
                     previous_episodes,
                     entity_types,
-                    edges=entity_edges,
+                    edges=new_edges,
                 )
 
                 # Process and save episode data (including saga association if provided)

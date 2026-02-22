@@ -14,6 +14,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  graphiti_core_guard:
+    name: Graphiti core allowlist guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Enforce graphiti_core patch allowlist
+        run: bash scripts/ci/check_graphiti_core_allowlist.sh
+
   lint:
     name: Ruff lint
     runs-on: ubuntu-latest

@@ -103,6 +103,21 @@ Why strict:
 - PR lane preserves review, rollback, and conflict visibility,
 - Sync button bypasses branch-level review discipline.
 
+## Graphiti Core Patch-Stack Guardrail
+
+Policy file: `config/graphiti_core_allowlist.txt`
+
+CI check: `scripts/ci/check_graphiti_core_allowlist.sh` (wired into `.github/workflows/ci.yml`)
+
+Rule:
+- Any PR touching `graphiti_core/**` must be limited to the allowlisted files.
+- Non-allowlisted `graphiti_core/**` changes fail CI by default.
+
+Operational intent:
+- keep `graphiti_core` local drift explicit and small,
+- preserve fast upstream syncs,
+- move behavior to runtime layer when feasible.
+
 ## Rollback / Recovery
 
 ### A) Bad sync PR before merge
