@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   unit-tests:
+    if: github.repository == 'getzep/graphiti'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +46,7 @@ jobs:
             --ignore=tests/evals/
 
   database-integration-tests:
+    if: github.repository == 'getzep/graphiti'
     runs-on: ubuntu-latest
     services:
       falkordb:

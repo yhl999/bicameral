@@ -8,6 +8,7 @@ on:
 
 jobs:
   ruff:
+    if: github.repository == 'getzep/graphiti'
     environment: development
     runs-on: ubuntu-latest
     steps:

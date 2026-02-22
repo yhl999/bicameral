@@ -11,6 +11,7 @@ on:
 
 jobs:
   pyright:
+    if: github.repository == 'getzep/graphiti'
     runs-on: ubuntu-latest
     environment: development
     steps:
