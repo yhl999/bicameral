@@ -1,0 +1,4 @@
+64f81388cf08526784cc8977b44815aa915ad210|2026-02-17|fix: post-PR34 follow-up hardening (#45)
+f93924ff6b4a3be80800a999f8ac32aadf54f732|2026-02-20|feat: trust-aware retrieval — post-RRF additive boost (#63)
+ff34e16a1e37bc9d8f6e1a7027873dfb0a868ba5|2026-02-21|fix(edges): skip malformed RELATES_TO rows in get_between_nodes (#66)
+5f4e7c00d4b86b616d5874acc87c20b35deaeb8c|2026-02-21|feat(dedupe): migration-only deterministic edge dedupe mode (#67)
