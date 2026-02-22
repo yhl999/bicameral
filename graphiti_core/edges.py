@@ -412,14 +412,12 @@ class EntityEdge(Edge):
 
         match_query = """
             MATCH (n:Entity {uuid: $source_node_uuid})-[e:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
-            WHERE e.uuid IS NOT NULL AND e.group_id IS NOT NULL AND e.episodes IS NOT NULL
         """
         if driver.provider == GraphProvider.KUZU:
             match_query = """
                 MATCH (n:Entity {uuid: $source_node_uuid})
                       -[:RELATES_TO]->(e:RelatesToNode_)
                       -[:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
-                WHERE e.uuid IS NOT NULL AND e.group_id IS NOT NULL AND e.episodes IS NOT NULL
             """
 
         records, _, _ = await driver.execute_query(
@@ -460,9 +458,6 @@ class EntityEdge(Edge):
             match_query
             + """
             WHERE e.uuid IN $uuids
-              AND e.uuid IS NOT NULL
-              AND e.group_id IS NOT NULL
-              AND e.episodes IS NOT NULL
             RETURN
             """
             + get_entity_edge_return_query(driver.provider),
@@ -513,9 +508,6 @@ class EntityEdge(Edge):
             match_query
             + """
             WHERE e.group_id IN $group_ids
-              AND e.uuid IS NOT NULL
-              AND e.group_id IS NOT NULL
-              AND e.episodes IS NOT NULL
             """
             + cursor_query
             + """
@@ -560,7 +552,6 @@ class EntityEdge(Edge):
         records, _, _ = await driver.execute_query(
             match_query
             + """
-            WHERE e.uuid IS NOT NULL AND e.group_id IS NOT NULL AND e.episodes IS NOT NULL
             RETURN
             """
             + get_entity_edge_return_query(driver.provider),
