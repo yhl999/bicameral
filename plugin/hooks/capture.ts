@@ -1,6 +1,7 @@
 import type { GraphitiClient, GraphitiMessage } from '../client.ts';
 import { normalizeConfig } from '../config.ts';
 import type { PluginConfig } from '../config.ts';
+import { deriveGroupLane } from '../lane-utils.ts';
 import type { PackInjectorContext } from './pack-injector.ts';
 
 export interface AgentEndEvent {
@@ -32,9 +33,21 @@ const resolveGroupId = (ctx: PackInjectorContext, config: PluginConfig): string 
   // to one group lane. Only allow it when the operator has explicitly declared
   // singleTenant: true. In multi-tenant mode (the safe default), fall through
   // to per-session lanes so different users cannot read each other's memories.
-  return (config.singleTenant && config.memoryGroupId)
-    ? config.memoryGroupId
-    : (ctx.messageProvider?.groupId ?? ctx.sessionKey ?? null);
+  if (config.singleTenant && config.memoryGroupId) {
+    return config.memoryGroupId;
+  }
+  if (ctx.messageProvider?.groupId) {
+    return ctx.messageProvider.groupId;
+  }
+  // SECURITY: never forward the raw sessionKey to Graphiti — it may embed
+  // sensitive platform identifiers (e.g. Telegram chat IDs, routing tokens).
+  // Derive a deterministic, non-reversible lane id from it instead so that
+  // recall and capture are still scoped to the same lane without leaking the
+  // original value to an external service.
+  if (ctx.sessionKey) {
+    return deriveGroupLane(ctx.sessionKey);
+  }
+  return null;
 };
 
 const extractTurn = (messages: Array<{ role?: string; content: string }>): GraphitiMessage[] => {

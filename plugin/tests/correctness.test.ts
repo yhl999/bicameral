@@ -9,6 +9,7 @@ import { createCaptureHook, stripInjectedContext } from '../hooks/capture.ts';
 import { createLegacyBeforeAgentStartHook } from '../hooks/legacy-before-agent-start.ts';
 import { createModelResolveHook } from '../hooks/model-resolve.ts';
 import { createRecallHook } from '../hooks/recall.ts';
+import { deriveGroupLane } from '../lane-utils.ts';
 import { detectIntent } from '../intent/detector.ts';
 import type { IntentRuleSet } from '../intent/types.ts';
 import { loadIntentRules, normalizeConfig } from '../config.ts';
@@ -995,4 +996,176 @@ test('recall hook fallback block contains "Service unavailable" not raw error te
     !context.includes('127.0.0.1'),
     'internal host must not appear in model-visible output',
   );
+});
+
+// ── deriveGroupLane / session-key hashing tests ───────────────────────────
+
+test('deriveGroupLane returns deterministic sk: prefixed id', () => {
+  const key = 'agent:main:telegram:group:-1003893734334:topic:6529';
+  const lane1 = deriveGroupLane(key);
+  const lane2 = deriveGroupLane(key);
+  assert.equal(lane1, lane2, 'must be deterministic');
+  assert.ok(lane1.startsWith('sk:'), 'must have sk: prefix');
+  // prefix is 16 hex chars → total length = 19
+  assert.equal(lane1.length, 19);
+  // must not contain any fragment of the original key
+  assert.ok(!lane1.includes('telegram'), 'must not embed platform name');
+  assert.ok(!lane1.includes('1003893734334'), 'must not embed numeric chat id');
+});
+
+test('deriveGroupLane produces different ids for different keys', () => {
+  const a = deriveGroupLane('session-alpha');
+  const b = deriveGroupLane('session-beta');
+  assert.notEqual(a, b);
+});
+
+test('recall hook uses hashed lane when only sessionKey is available', async () => {
+  let capturedGroupIds: string[] | undefined;
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {},
+  });
+
+  const sessionKey = 'agent:main:telegram:group:-1003893734334:topic:6529';
+  await hook(
+    { prompt: 'lane hashing check for recall' },
+    { sessionKey },
+  );
+
+  const expected = deriveGroupLane(sessionKey);
+  assert.deepEqual(capturedGroupIds, [expected], 'recall must use hashed lane');
+  assert.ok(!capturedGroupIds![0].includes('1003893734334'), 'raw key must not appear in lane');
+});
+
+test('capture hook uses hashed lane when only sessionKey is available', async () => {
+  let capturedGroupId: string | undefined;
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    config: {},
+  });
+
+  const sessionKey = 'agent:main:telegram:group:-1003893734334:topic:6529';
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ],
+    },
+    { sessionKey },
+  );
+
+  const expected = deriveGroupLane(sessionKey);
+  assert.equal(capturedGroupId, expected, 'capture must use hashed lane');
+  assert.ok(!capturedGroupId!.includes('1003893734334'), 'raw key must not appear in lane');
+});
+
+test('recall and capture use the same hashed lane for the same sessionKey', async () => {
+  const sessionKey = 'agent:main:some:session:key';
+  let recallLane: string | undefined;
+  let captureLane: string | undefined;
+
+  const recallHook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        recallLane = groupIds?.[0];
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {},
+  });
+
+  const captureHook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        captureLane = groupId;
+      },
+    },
+    config: {},
+  });
+
+  await recallHook({ prompt: 'consistency check' }, { sessionKey });
+  await captureHook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+      ],
+    },
+    { sessionKey },
+  );
+
+  assert.equal(recallLane, captureLane, 'recall and capture must share the same hashed lane');
+});
+
+test('recall hook still uses raw provider groupId (not hashed) when available', async () => {
+  let capturedGroupIds: string[] | undefined;
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {},
+  });
+
+  await hook(
+    { prompt: 'provider group should not be hashed' },
+    {
+      sessionKey: 'agent:main:telegram:group:-1003893734334',
+      messageProvider: { groupId: 'telegram:-1003893734334', chatType: 'group' },
+    },
+  );
+
+  // Provider groupId is passed as-is — only sessionKey fallback is hashed.
+  assert.deepEqual(capturedGroupIds, ['telegram:-1003893734334']);
+});
+
+test('capture hook still uses raw provider groupId (not hashed) when available', async () => {
+  let capturedGroupId: string | undefined;
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    config: {},
+  });
+
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ],
+    },
+    {
+      sessionKey: 'agent:main:telegram:group:-1003893734334',
+      messageProvider: { groupId: 'telegram:-1003893734334', chatType: 'group' },
+    },
+  );
+
+  assert.equal(capturedGroupId, 'telegram:-1003893734334');
 });
