@@ -35,8 +35,26 @@ export interface PluginConfig {
   recallTimeoutMs: number;
   captureTimeoutMs: number;
   maxFacts: number;
-  /** Canonical Graphiti group lane used when sessionKey is unavailable. */
+  /**
+   * Canonical Graphiti group lane used when sessionKey is unavailable.
+   *
+   * SAFETY: this override pins every request to a single group lane.
+   * It is ONLY safe in single-tenant deployments (i.e. exactly one user /
+   * logical namespace behind the plugin instance).  Multi-tenant operators
+   * MUST leave this unset and rely on per-session lanes (`provider.groupId`
+   * or `sessionKey`) to prevent cross-tenant memory leakage.
+   *
+   * This field has no effect unless `singleTenant: true` is also set.
+   */
   memoryGroupId?: string;
+  /**
+   * Declare that this plugin instance serves a single tenant.
+   *
+   * Required to unlock `memoryGroupId` overrides.  When `false` (the safe
+   * default), `memoryGroupId` is ignored and per-session lanes are used
+   * instead, preventing accidental cross-tenant memory fan-out.
+   */
+  singleTenant: boolean;
   minPromptChars: number;
   enableSticky: boolean;
   stickyMaxWords: number;
@@ -67,6 +85,9 @@ export const DEFAULT_CONFIG: PluginConfig = {
   allowedProviderOverrides: [],
   allowedModelOverrides: [],
   maxOverrideTokenLength: 128,
+  // Safe default: multi-tenant mode. memoryGroupId overrides are disabled
+  // unless the operator explicitly opts in via singleTenant: true.
+  singleTenant: false,
   debug: false,
 };
 

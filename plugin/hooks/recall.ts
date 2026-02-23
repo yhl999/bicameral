@@ -51,11 +51,14 @@ const sanitizeReason = (reason: string): string => {
   return `${chars.slice(0, 180).join('')}...`;
 };
 
-const formatFallback = (safeReason: string): string => {
+const formatFallback = (): string => {
+  // Surface only a generic message to the model / user-visible output.
+  // The real error reason is logged internally via console.warn so it is
+  // never leaked through the model context.
   return [
     '<graphiti-fallback>',
     `ERROR_CODE: ${FALLBACK_ERROR_CODE}`,
-    `WARNING: Graphiti recall failed (${safeReason}). This turn is using QMD fallback.`,
+    'WARNING: Graphiti recall failed (Service unavailable). This turn is using QMD fallback.',
     'Use memory_search or memory_get if you want to inspect fallback retrieval directly.',
     '</graphiti-fallback>',
   ].join('\n');
@@ -65,9 +68,14 @@ const resolveGroupIds = (
   ctx: PackInjectorContext,
   config: PluginConfig,
 ): string[] | undefined => {
-  // Prefer configured canonical lane when explicitly set.
-  // Otherwise preserve historical lane order: provider-group first, then session key.
-  const groupId = config.memoryGroupId ?? ctx.messageProvider?.groupId ?? ctx.sessionKey;
+  // SAFETY: memoryGroupId is a single-tenant override that pins all requests
+  // to one group lane. Only allow it when the operator has explicitly declared
+  // singleTenant: true. In multi-tenant mode (the safe default), fall through
+  // to per-session lanes so different users cannot read each other's memories.
+  const groupId =
+    (config.singleTenant && config.memoryGroupId)
+      ? config.memoryGroupId
+      : (ctx.messageProvider?.groupId ?? ctx.sessionKey);
   return groupId ? [groupId] : undefined;
 };
 
@@ -94,7 +102,7 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
           `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${effectiveGroup} reason=${safeReason}`,
         );
         logger(`Graphiti recall failed: ${safeReason}`);
-        parts.push(formatFallback(safeReason));
+        parts.push(formatFallback());
       }
     } else {
       parts.push('');
