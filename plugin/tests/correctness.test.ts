@@ -170,7 +170,12 @@ test('invalid regex patterns log debug output', () => {
   assert.ok(logs.some((entry) => entry.includes('Invalid regex pattern')));
 });
 
-test('pack context escapes XML attributes', async () => {
+test('pack context escapes XML attributes', async (t: any) => {
+  const tempDir = makeTempDir(t, 'graphiti-xml-attr-');
+  const packSubDir = path.join(tempDir, 'workflows');
+  fs.mkdirSync(packSubDir, { recursive: true });
+  fs.writeFileSync(path.join(packSubDir, 'example_summary.pack.yaml'), 'pack content', 'utf8');
+
   const intentId = 'intent "alpha" & <beta>';
   const packId = 'pack "alpha" & <beta>';
   const injector = createPackInjector({
@@ -200,6 +205,9 @@ test('pack context escapes XML attributes', async () => {
           scope: 'public',
         },
       ],
+    },
+    config: {
+      packRouterRepoRoot: tempDir,
     },
   });
 
