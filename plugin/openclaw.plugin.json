@@ -25,7 +25,7 @@
       "recallTimeoutMs": { "type": "number" },
       "captureTimeoutMs": { "type": "number" },
       "maxFacts": { "type": "number" },
-      "memoryGroupId": { "type": "string" },
+      "memoryGroupId": { "type": "string", "minLength": 1 },
       "minPromptChars": { "type": "number" },
       "enableSticky": { "type": "boolean" },
       "stickyMaxWords": { "type": "number" },

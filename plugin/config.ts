@@ -70,10 +70,19 @@ export const DEFAULT_CONFIG: PluginConfig = {
   debug: false,
 };
 
+const normalizeOptionalString = (value?: string): string | undefined => {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
 export const normalizeConfig = (config?: Partial<PluginConfig>): PluginConfig => {
   return {
     ...DEFAULT_CONFIG,
     ...config,
+    memoryGroupId: normalizeOptionalString(config?.memoryGroupId),
     stickySignals: config?.stickySignals ?? DEFAULT_CONFIG.stickySignals,
     allowedProviderOverrides:
       config?.allowedProviderOverrides ?? DEFAULT_CONFIG.allowedProviderOverrides,

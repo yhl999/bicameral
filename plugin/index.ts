@@ -113,6 +113,20 @@ export const buildGraphitiHooks = (options?: GraphitiPluginOptions) => {
   };
 };
 
+export interface OpenClawPlugin {
+  name: string;
+  hooks: ReturnType<typeof buildGraphitiHooks>;
+}
+
+/**
+ * @deprecated Prefer the default register() plugin export.
+ * Kept for backwards compatibility with older consumers that construct hooks directly.
+ */
+export const createGraphitiPlugin = (options?: GraphitiPluginOptions): OpenClawPlugin => ({
+  name: 'graphiti-openclaw',
+  hooks: buildGraphitiHooks(options),
+});
+
 const graphitiPlugin = {
   id: 'graphiti-openclaw',
   name: 'Graphiti OpenClaw',
