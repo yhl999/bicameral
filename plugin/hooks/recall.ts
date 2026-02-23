@@ -40,16 +40,34 @@ const formatGraphitiContext = (results: GraphitiSearchResults): string => {
   return lines.join('\n');
 };
 
+const FALLBACK_ERROR_CODE = 'GRAPHITI_QMD_FAILOVER';
+
+const sanitizeReason = (reason: string): string => {
+  const compact = reason.replace(/\s+/g, ' ').trim();
+  if (compact.length <= 180) {
+    return compact;
+  }
+  return `${compact.slice(0, 180)}...`;
+};
+
 const formatFallback = (reason: string): string => {
+  const safeReason = sanitizeReason(reason);
   return [
     '<graphiti-fallback>',
-    `Graphiti recall unavailable (${reason}). Use memory_search or memory_get for QMD fallback.`,
+    `ERROR_CODE: ${FALLBACK_ERROR_CODE}`,
+    `⚠️ Graphiti recall failed (${safeReason}). This turn is using QMD fallback.`,
+    'Use memory_search or memory_get if you want to inspect fallback retrieval directly.',
     '</graphiti-fallback>',
   ].join('\n');
 };
 
-const resolveGroupIds = (ctx: PackInjectorContext): string[] | undefined => {
-  const groupId = ctx.messageProvider?.groupId ?? ctx.sessionKey;
+const resolveGroupIds = (
+  ctx: PackInjectorContext,
+  config: PluginConfig,
+): string[] | undefined => {
+  // Prefer configured canonical lane for now (backfilled corpus is on s1_sessions_main).
+  // Fall back to session/provider IDs when no explicit lane is configured.
+  const groupId = config.memoryGroupId ?? ctx.sessionKey ?? ctx.messageProvider?.groupId;
   return groupId ? [groupId] : undefined;
 };
 
@@ -63,13 +81,19 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
     let graphitiResults: GraphitiSearchResults | null = null;
 
     if (prompt.trim().length >= config.minPromptChars) {
+      const groupIds = resolveGroupIds(ctx, config);
       try {
-        graphitiResults = await deps.client.search(prompt, resolveGroupIds(ctx));
+        graphitiResults = await deps.client.search(prompt, groupIds);
         parts.push(formatGraphitiContext(graphitiResults));
       } catch (error) {
         const message = (error as Error).message || 'unknown error';
-        logger(`Graphiti recall failed: ${message}`);
-        parts.push(formatFallback(message));
+        const safeReason = sanitizeReason(message);
+        const effectiveGroup = groupIds?.[0] ?? 'unknown';
+        console.warn(
+          `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${effectiveGroup} reason=${safeReason}`,
+        );
+        logger(`Graphiti recall failed: ${safeReason}`);
+        parts.push(formatFallback(safeReason));
       }
     } else {
       parts.push('');

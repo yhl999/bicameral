@@ -1,3 +1,5 @@
+import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
+
 import { createCaptureHook } from './hooks/capture.ts';
 import {
   createLegacyBeforeAgentStartHook,
@@ -25,16 +27,6 @@ export interface GraphitiPluginOptions {
   packRegistry?: PackRegistry | null;
 }
 
-export interface OpenClawPlugin {
-  name: string;
-  hooks: {
-    before_model_resolve: ReturnType<typeof createModelResolveHook>;
-    before_prompt_build: ReturnType<typeof createRecallHook>;
-    before_agent_start: ReturnType<typeof createLegacyBeforeAgentStartHook>;
-    agent_end: ReturnType<typeof createCaptureHook>;
-  };
-}
-
 const loadConfigFromEnv = (): Partial<PluginConfig> => {
   const raw = process.env.GRAPHITI_PLUGIN_CONFIG;
   if (!raw) {
@@ -47,7 +39,7 @@ const loadConfigFromEnv = (): Partial<PluginConfig> => {
   }
 };
 
-export const createGraphitiPlugin = (options?: GraphitiPluginOptions): OpenClawPlugin => {
+export const buildGraphitiHooks = (options?: GraphitiPluginOptions) => {
   const config = normalizeConfig({
     ...loadConfigFromEnv(),
     ...(options?.config ?? {}),
@@ -111,37 +103,31 @@ export const createGraphitiPlugin = (options?: GraphitiPluginOptions): OpenClawP
   };
 
   return {
-    name: 'graphiti-openclaw',
-    hooks: {
-      before_model_resolve: createModelResolveHook({ config }),
-      before_prompt_build: beforePromptBuildHook,
-      before_agent_start: createLegacyBeforeAgentStartHook(promptBuildHook),
-      agent_end: createCaptureHook({
-        client,
-        config,
-      }),
-    },
+    before_model_resolve: createModelResolveHook({ config }),
+    before_prompt_build: beforePromptBuildHook,
+    before_agent_start: createLegacyBeforeAgentStartHook(promptBuildHook),
+    agent_end: createCaptureHook({
+      client,
+      config,
+    }),
   };
 };
 
-// OpenClaw plugin host runs in a single-threaded event loop per process;
-// a per-process lazy singleton avoids import-time side effects while keeping
-// initialization predictable.
-let defaultPlugin: OpenClawPlugin | null = null;
-const getDefaultPlugin = (): OpenClawPlugin => {
-  if (!defaultPlugin) {
-    defaultPlugin = createGraphitiPlugin();
-  }
-  return defaultPlugin;
-};
+const graphitiPlugin = {
+  id: 'graphiti-openclaw',
+  name: 'Graphiti OpenClaw',
+  description: 'Graphiti runtime context injection plugin',
 
-const plugin: OpenClawPlugin = {
-  get name() {
-    return getDefaultPlugin().name;
-  },
-  get hooks() {
-    return getDefaultPlugin().hooks;
+  register(api: OpenClawPluginApi) {
+    const hooks = buildGraphitiHooks({
+      config: (api.pluginConfig as Partial<PluginConfig> | undefined) ?? {},
+    });
+
+    api.on('before_model_resolve', hooks.before_model_resolve);
+    api.on('before_prompt_build', hooks.before_prompt_build);
+    api.on('before_agent_start', hooks.before_agent_start);
+    api.on('agent_end', hooks.agent_end);
   },
 };
 
-export default plugin;
+export default graphitiPlugin;

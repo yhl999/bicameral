@@ -35,6 +35,8 @@ export interface PluginConfig {
   recallTimeoutMs: number;
   captureTimeoutMs: number;
   maxFacts: number;
+  /** Canonical Graphiti group lane used when sessionKey is unavailable. */
+  memoryGroupId?: string;
   minPromptChars: number;
   enableSticky: boolean;
   stickyMaxWords: number;
