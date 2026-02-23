@@ -56,6 +56,12 @@ DEFAULT_SUBCHUNK_SIZE = 10_000
 _SUBCHUNK_GROUP_IDS = {'s1_sessions_main'}
 
 
+_META_BLOCK_RE = re.compile(
+    r"(?:Conversation info|Sender \(untrusted metadata\)|Replied message \(untrusted, for context\)|Conversation info \(untrusted metadata\)):\s*```json[\s\S]*?```",
+    re.MULTILINE,
+)
+
+
 def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tuple[str, str]]:
     """Split content into deterministic sub-chunks if it exceeds max_chars.
 
@@ -63,7 +69,8 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     If content fits in a single chunk, returns [(chunk_key, content)].
 
     Sub-chunk keys use :p0, :p1, ... suffixes for deterministic idempotent keys.
-    Splits on paragraph boundaries (double newline) when possible to keep context
+    Strips enormous untrusted metadata JSON payloads before sub-chunking, then
+    splits on paragraph boundaries (double newline) when possible to keep context
     coherent. Falls back to hard split at max_chars if no good boundary exists.
 
     Raises:
@@ -72,10 +79,15 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     if max_chars <= 0:
         raise ValueError(f'max_chars must be positive, got {max_chars}')
 
+    # Strip enormous metadata injections before we count length
+    content = _META_BLOCK_RE.sub('', content)
+
     if len(content) <= max_chars:
         return [(chunk_key, content)]
 
     parts: list[str] = []
+    # To avoid cutting message boundaries weirdly when possible, if remaining doesn't 
+    # find double newline, we'll strip leading/trailing spaces as we go
     remaining = content
 
     while remaining:
