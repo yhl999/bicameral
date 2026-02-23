@@ -25,6 +25,14 @@ export interface RecallHookDeps {
   config?: Partial<PluginConfig>;
 }
 
+/**
+ * Escape XML/HTML special characters in recalled fact text so that adversarial
+ * or malformed fact content cannot inject tags that break the surrounding
+ * <graphiti-context> block or confuse the model parser.
+ */
+const escapeXml = (text: string): string =>
+  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 const formatGraphitiContext = (results: GraphitiSearchResults): string => {
   const lines: string[] = [];
   lines.push('<graphiti-context>');
@@ -33,7 +41,7 @@ const formatGraphitiContext = (results: GraphitiSearchResults): string => {
     lines.push('No relevant facts found.');
   } else {
     for (const fact of results.facts) {
-      lines.push(`- ${fact.fact}`);
+      lines.push(`- ${escapeXml(fact.fact)}`);
     }
   }
   lines.push('</graphiti-context>');
@@ -49,6 +57,19 @@ const sanitizeReason = (reason: string): string => {
     return compact;
   }
   return `${chars.slice(0, 180).join('')}...`;
+};
+
+/**
+ * Sanitize a group/session identifier before emitting it in log output.
+ * Raw identifiers can contain platform-specific data (e.g. Telegram chat IDs,
+ * session routing keys) that should not leak verbatim into system logs.
+ * Truncates to 32 chars and replaces whitespace so the output is safe to
+ * embed in a single log line without quoting.
+ */
+const sanitizeIdentifier = (id: string): string => {
+  const compact = id.replace(/\s+/g, '_').trim();
+  if (compact.length <= 32) return compact;
+  return `${compact.slice(0, 32)}…`;
 };
 
 const formatFallback = (): string => {
@@ -96,10 +117,11 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
       } catch (error) {
         const message = (error as Error).message || 'unknown error';
         const safeReason = sanitizeReason(message);
-        const effectiveGroup = groupIds?.[0] ?? 'unknown';
+        // Sanitize identifier to avoid leaking raw session keys / platform IDs into logs.
+        const safeGroup = sanitizeIdentifier(groupIds?.[0] ?? 'unknown');
         // Always emit failover warnings, even when debug logging is disabled.
         console.warn(
-          `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${effectiveGroup} reason=${safeReason}`,
+          `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=${safeReason}`,
         );
         logger(`Graphiti recall failed: ${safeReason}`);
         parts.push(formatFallback());
