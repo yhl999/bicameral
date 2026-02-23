@@ -45,6 +45,7 @@
       "packRouterRepoRoot": { "type": "string" },
       "packRouterTimeoutMs": { "type": "number" },
       "defaultMinConfidence": { "type": "number" },
+      "singleTenant": { "type": "boolean" },
       "debug": { "type": "boolean" },
       "configPathRoots": {
         "type": "array",
