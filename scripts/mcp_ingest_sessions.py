@@ -56,6 +56,60 @@ DEFAULT_SUBCHUNK_SIZE = 10_000
 _SUBCHUNK_GROUP_IDS = {'s1_sessions_main'}
 
 
+def strip_untrusted_metadata(content: str) -> str:
+    """Remove untrusted metadata blocks while preventing ReDoS and early termination.
+    
+    Parses line-by-line to correctly pair backtick fences and avoid early termination
+    if the JSON payload itself contains embedded triple backticks inside strings.
+    Collapses resulting multiple empty lines to maintain paragraph boundaries.
+    """
+    prefixes = (
+        "Conversation info:",
+        "Sender (untrusted metadata):",
+        "Replied message (untrusted, for context):",
+        "Conversation info (untrusted metadata):",
+    )
+    
+    lines = content.splitlines(keepends=True)
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped_line = line.strip()
+        
+        # Fast path prefix check
+        matched = False
+        for p in prefixes:
+            if stripped_line == p:
+                matched = True
+                break
+                
+        if matched and i + 1 < n and lines[i+1].strip() == "```json":
+            # We found a header followed by ```json
+            # Find the true closing ``` which is unindented and on its own line.
+            # Real JSON doesn't contain unescaped newlines, so any "```" on its own line is the end.
+            k = i + 2
+            found_end = False
+            while k < n:
+                if lines[k].strip() == "```":
+                    found_end = True
+                    break
+                k += 1
+                
+            if found_end:
+                # Skip all lines from i to k
+                i = k + 1
+                continue
+                
+        out.append(line)
+        i += 1
+        
+    result = "".join(out)
+    # Collapse 3+ newlines into 2 to prevent empty paragraph chunks
+    return re.sub(r'\n{3,}', '\n\n', result).strip()
+
+
 def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tuple[str, str]]:
     """Split content into deterministic sub-chunks if it exceeds max_chars.
 
@@ -63,7 +117,8 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     If content fits in a single chunk, returns [(chunk_key, content)].
 
     Sub-chunk keys use :p0, :p1, ... suffixes for deterministic idempotent keys.
-    Splits on paragraph boundaries (double newline) when possible to keep context
+    Strips enormous untrusted metadata JSON payloads before sub-chunking, then
+    splits on paragraph boundaries (double newline) when possible to keep context
     coherent. Falls back to hard split at max_chars if no good boundary exists.
 
     Raises:
@@ -71,6 +126,9 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     """
     if max_chars <= 0:
         raise ValueError(f'max_chars must be positive, got {max_chars}')
+
+    # Strip enormous metadata injections before we count length
+    content = strip_untrusted_metadata(content)
 
     if len(content) <= max_chars:
         return [(chunk_key, content)]
