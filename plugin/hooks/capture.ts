@@ -28,8 +28,9 @@ export const stripInjectedContext = (content: string): string => {
 };
 
 const resolveGroupId = (ctx: PackInjectorContext, config: PluginConfig): string | null => {
-  // Prefer configured canonical lane so capture stays aligned with recall corpus.
-  return config.memoryGroupId ?? ctx.sessionKey ?? ctx.messageProvider?.groupId ?? null;
+  // Prefer configured canonical lane when explicitly set.
+  // Otherwise preserve historical lane order: provider-group first, then session key.
+  return config.memoryGroupId ?? ctx.messageProvider?.groupId ?? ctx.sessionKey ?? null;
 };
 
 const extractTurn = (messages: Array<{ role?: string; content: string }>): GraphitiMessage[] => {

@@ -5,13 +5,13 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { createPackInjector } from '../hooks/pack-injector.ts';
-import { stripInjectedContext } from '../hooks/capture.ts';
+import { createCaptureHook, stripInjectedContext } from '../hooks/capture.ts';
 import { createLegacyBeforeAgentStartHook } from '../hooks/legacy-before-agent-start.ts';
 import { createModelResolveHook } from '../hooks/model-resolve.ts';
 import { createRecallHook } from '../hooks/recall.ts';
 import { detectIntent } from '../intent/detector.ts';
 import type { IntentRuleSet } from '../intent/types.ts';
-import { loadIntentRules } from '../config.ts';
+import { loadIntentRules, normalizeConfig } from '../config.ts';
 import type { PackRegistry } from '../config.ts';
 
 const rules: IntentRuleSet = {
@@ -703,4 +703,125 @@ test('recall hook emits explicit fallback error block when Graphiti fails', asyn
   assert.ok(context.includes('<graphiti-fallback>'));
   assert.ok(context.includes('ERROR_CODE: GRAPHITI_QMD_FAILOVER'));
   assert.ok(context.includes('This turn is using QMD fallback'));
+});
+
+test('normalizeConfig drops empty memoryGroupId values', () => {
+  const normalized = normalizeConfig({ memoryGroupId: '   ' });
+  assert.equal(normalized.memoryGroupId, undefined);
+});
+
+test('recall hook prefers provider group over session key when memoryGroupId is unset', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {},
+  });
+
+  await hook(
+    { prompt: 'provider precedence check' },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.deepEqual(capturedGroupIds, ['provider-lane']);
+});
+
+test('recall hook prefers configured memoryGroupId over provider/session lanes', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      memoryGroupId: 'canonical-lane',
+    },
+  });
+
+  await hook(
+    { prompt: 'memoryGroup override check' },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.deepEqual(capturedGroupIds, ['canonical-lane']);
+});
+
+test('capture hook prefers provider group over session key when memoryGroupId is unset', async () => {
+  let capturedGroupId: string | undefined;
+
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    config: {},
+  });
+
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ],
+    },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.equal(capturedGroupId, 'provider-lane');
+});
+
+test('capture hook prefers configured memoryGroupId over provider/session lanes', async () => {
+  let capturedGroupId: string | undefined;
+
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    config: {
+      memoryGroupId: 'canonical-lane',
+    },
+  });
+
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ],
+    },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.equal(capturedGroupId, 'canonical-lane');
 });

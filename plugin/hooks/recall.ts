@@ -44,18 +44,18 @@ const FALLBACK_ERROR_CODE = 'GRAPHITI_QMD_FAILOVER';
 
 const sanitizeReason = (reason: string): string => {
   const compact = reason.replace(/\s+/g, ' ').trim();
-  if (compact.length <= 180) {
+  const chars = Array.from(compact);
+  if (chars.length <= 180) {
     return compact;
   }
-  return `${compact.slice(0, 180)}...`;
+  return `${chars.slice(0, 180).join('')}...`;
 };
 
-const formatFallback = (reason: string): string => {
-  const safeReason = sanitizeReason(reason);
+const formatFallback = (safeReason: string): string => {
   return [
     '<graphiti-fallback>',
     `ERROR_CODE: ${FALLBACK_ERROR_CODE}`,
-    `⚠️ Graphiti recall failed (${safeReason}). This turn is using QMD fallback.`,
+    `WARNING: Graphiti recall failed (${safeReason}). This turn is using QMD fallback.`,
     'Use memory_search or memory_get if you want to inspect fallback retrieval directly.',
     '</graphiti-fallback>',
   ].join('\n');
@@ -65,9 +65,9 @@ const resolveGroupIds = (
   ctx: PackInjectorContext,
   config: PluginConfig,
 ): string[] | undefined => {
-  // Prefer configured canonical lane for now (backfilled corpus is on s1_sessions_main).
-  // Fall back to session/provider IDs when no explicit lane is configured.
-  const groupId = config.memoryGroupId ?? ctx.sessionKey ?? ctx.messageProvider?.groupId;
+  // Prefer configured canonical lane when explicitly set.
+  // Otherwise preserve historical lane order: provider-group first, then session key.
+  const groupId = config.memoryGroupId ?? ctx.messageProvider?.groupId ?? ctx.sessionKey;
   return groupId ? [groupId] : undefined;
 };
 
@@ -89,6 +89,7 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
         const message = (error as Error).message || 'unknown error';
         const safeReason = sanitizeReason(message);
         const effectiveGroup = groupIds?.[0] ?? 'unknown';
+        // Always emit failover warnings, even when debug logging is disabled.
         console.warn(
           `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${effectiveGroup} reason=${safeReason}`,
         );
