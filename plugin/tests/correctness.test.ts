@@ -749,6 +749,8 @@ test('recall hook prefers configured memoryGroupId over provider/session lanes',
     },
     packInjector: async () => null,
     config: {
+      // singleTenant must be true to allow memoryGroupId override (tenant isolation fix).
+      singleTenant: true,
       memoryGroupId: 'canonical-lane',
     },
   });
@@ -805,6 +807,8 @@ test('capture hook prefers configured memoryGroupId over provider/session lanes'
       },
     },
     config: {
+      // singleTenant must be true to allow memoryGroupId override (tenant isolation fix).
+      singleTenant: true,
       memoryGroupId: 'canonical-lane',
     },
   });
@@ -824,4 +828,95 @@ test('capture hook prefers configured memoryGroupId over provider/session lanes'
   );
 
   assert.equal(capturedGroupId, 'canonical-lane');
+});
+
+// ── Tenant isolation tests ─────────────────────────────────────────────────
+
+test('recall hook ignores memoryGroupId when singleTenant is not set', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    // memoryGroupId without singleTenant: true — must NOT take effect.
+    config: { memoryGroupId: 'pinned-lane' },
+  });
+
+  await hook(
+    { prompt: 'tenant isolation check' },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  // Must fall through to provider-group lane, not the pinned override.
+  assert.deepEqual(capturedGroupIds, ['provider-lane']);
+});
+
+test('capture hook ignores memoryGroupId when singleTenant is not set', async () => {
+  let capturedGroupId: string | undefined;
+
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    // memoryGroupId without singleTenant: true — must NOT take effect.
+    config: { memoryGroupId: 'pinned-lane' },
+  });
+
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ],
+    },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  // Must fall through to provider-group lane, not the pinned override.
+  assert.equal(capturedGroupId, 'provider-lane');
+});
+
+test('recall hook fallback block contains "Service unavailable" not raw error text', async () => {
+  const hook = createRecallHook({
+    client: {
+      search: async () => {
+        throw new Error('Internal DB error: connection refused on 127.0.0.1:5432');
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {},
+  });
+
+  const result = await hook(
+    { prompt: 'sanitization check' },
+    { sessionKey: 'session-x' },
+  );
+
+  const context = result.prependContext ?? '';
+  assert.ok(context.includes('Service unavailable'), 'fallback should say "Service unavailable"');
+  assert.ok(
+    !context.includes('connection refused'),
+    'raw error must not appear in model-visible output',
+  );
+  assert.ok(
+    !context.includes('127.0.0.1'),
+    'internal host must not appear in model-visible output',
+  );
 });

@@ -28,9 +28,13 @@ export const stripInjectedContext = (content: string): string => {
 };
 
 const resolveGroupId = (ctx: PackInjectorContext, config: PluginConfig): string | null => {
-  // Prefer configured canonical lane when explicitly set.
-  // Otherwise preserve historical lane order: provider-group first, then session key.
-  return config.memoryGroupId ?? ctx.messageProvider?.groupId ?? ctx.sessionKey ?? null;
+  // SAFETY: memoryGroupId is a single-tenant override that pins all requests
+  // to one group lane. Only allow it when the operator has explicitly declared
+  // singleTenant: true. In multi-tenant mode (the safe default), fall through
+  // to per-session lanes so different users cannot read each other's memories.
+  return (config.singleTenant && config.memoryGroupId)
+    ? config.memoryGroupId
+    : (ctx.messageProvider?.groupId ?? ctx.sessionKey ?? null);
 };
 
 const extractTurn = (messages: Array<{ role?: string; content: string }>): GraphitiMessage[] => {
