@@ -516,11 +516,110 @@ test('legacy before_agent_start shim delegates when messages are present', async
   assert.equal(result.prependContext, '<graphiti-context>ok</graphiti-context>');
 });
 
-test('before_model_resolve hook returns configured overrides', async () => {
+test('legacy before_agent_start shim marks context after first delegation', async () => {
+  let delegatedCount = 0;
+  const shim = createLegacyBeforeAgentStartHook(async () => {
+    delegatedCount += 1;
+    return { prependContext: '<graphiti-context>ok</graphiti-context>' };
+  });
+
+  const ctx: Record<string, unknown> = {};
+  await shim(
+    {
+      prompt: 'hello',
+      messages: [{ role: 'user', content: 'hello' }],
+    },
+    ctx,
+  );
+  const second = await shim(
+    {
+      prompt: 'hello again',
+      messages: [{ role: 'user', content: 'hello again' }],
+    },
+    ctx,
+  );
+
+  assert.equal(delegatedCount, 1);
+  assert.deepEqual(second, {});
+});
+
+test('legacy before_agent_start shim remains safe for frozen context objects', async () => {
+  let delegatedCount = 0;
+  const shim = createLegacyBeforeAgentStartHook(async () => {
+    delegatedCount += 1;
+    return { prependContext: '<graphiti-context>ok</graphiti-context>' };
+  });
+
+  const frozenCtx = Object.freeze({}) as Record<string, unknown>;
+  await shim(
+    {
+      prompt: 'hello',
+      messages: [{ role: 'user', content: 'hello' }],
+    },
+    frozenCtx,
+  );
+  const second = await shim(
+    {
+      prompt: 'hello again',
+      messages: [{ role: 'user', content: 'hello again' }],
+    },
+    frozenCtx,
+  );
+
+  assert.equal(delegatedCount, 1);
+  assert.deepEqual(second, {});
+});
+
+test('legacy before_agent_start shim skips when messages list is empty', async () => {
+  let delegated = false;
+  const shim = createLegacyBeforeAgentStartHook(async () => {
+    delegated = true;
+    return { prependContext: 'should-not-run' };
+  });
+
+  const result = await shim({ prompt: 'hello', messages: [] }, {});
+  assert.deepEqual(result, {});
+  assert.equal(delegated, false);
+});
+
+test('legacy before_agent_start shim skips if prompt build already executed', async () => {
+  let delegated = false;
+  const shim = createLegacyBeforeAgentStartHook(async () => {
+    delegated = true;
+    return { prependContext: 'should-not-run' };
+  });
+
+  const ctx: Record<string, unknown> = {};
+  const marker = Symbol.for('graphiti.plugin.prompt-build-ran');
+  ctx[marker] = true;
+
+  const result = await shim(
+    {
+      prompt: 'hello',
+      messages: [{ role: 'user', content: 'hello' }],
+    },
+    ctx,
+  );
+
+  assert.deepEqual(result, {});
+  assert.equal(delegated, false);
+});
+
+test('before_model_resolve hook with no config returns no overrides', async () => {
+  const hook = createModelResolveHook();
+  const result = await hook({ prompt: 'route this' }, {});
+  assert.equal(result.providerOverride, undefined);
+  assert.equal(result.modelOverride, undefined);
+});
+
+test('before_model_resolve hook requires explicit opt-in + allowlist', async () => {
   const hook = createModelResolveHook({
     config: {
+      allowModelRoutingOverride: true,
       providerOverride: ' openai ',
       modelOverride: ' gpt-5.2 ',
+      allowedProviderOverrides: ['openai'],
+      allowedModelOverrides: ['gpt-5.2'],
     },
   });
 
@@ -529,11 +628,46 @@ test('before_model_resolve hook returns configured overrides', async () => {
   assert.equal(result.modelOverride, 'gpt-5.2');
 });
 
-test('before_model_resolve hook drops blank overrides', async () => {
+test('before_model_resolve hook blocks non-allowlisted overrides', async () => {
   const hook = createModelResolveHook({
     config: {
-      providerOverride: '   ',
-      modelOverride: '',
+      allowModelRoutingOverride: true,
+      providerOverride: 'openai',
+      modelOverride: 'gpt-5.2',
+      allowedProviderOverrides: ['anthropic'],
+      allowedModelOverrides: ['claude-sonnet-4-6'],
+    },
+  });
+
+  const result = await hook({ prompt: 'route this' }, {});
+  assert.equal(result.providerOverride, undefined);
+  assert.equal(result.modelOverride, undefined);
+});
+
+test('before_model_resolve hook blocks invalid override tokens', async () => {
+  const hook = createModelResolveHook({
+    config: {
+      allowModelRoutingOverride: true,
+      providerOverride: 'openai;rm -rf /',
+      modelOverride: 'gpt-5.2\nmalicious',
+      allowedProviderOverrides: ['openai;rm -rf /'],
+      allowedModelOverrides: ['gpt-5.2\nmalicious'],
+    },
+  });
+
+  const result = await hook({ prompt: 'route this' }, {});
+  assert.equal(result.providerOverride, undefined);
+  assert.equal(result.modelOverride, undefined);
+});
+
+test('before_model_resolve hook blocks path traversal token shapes', async () => {
+  const hook = createModelResolveHook({
+    config: {
+      allowModelRoutingOverride: true,
+      providerOverride: '../../openai',
+      modelOverride: '/unsafe/model',
+      allowedProviderOverrides: ['../../openai'],
+      allowedModelOverrides: ['/unsafe/model'],
     },
   });
 

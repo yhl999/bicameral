@@ -1,5 +1,9 @@
 import { createCaptureHook } from './hooks/capture.ts';
-import { createLegacyBeforeAgentStartHook } from './hooks/legacy-before-agent-start.ts';
+import {
+  createLegacyBeforeAgentStartHook,
+  hasPromptBuildExecuted,
+  markPromptBuildExecuted,
+} from './hooks/legacy-before-agent-start.ts';
 import { createModelResolveHook } from './hooks/model-resolve.ts';
 import { createPackInjector } from './hooks/pack-injector.ts';
 import { createRecallHook } from './hooks/recall.ts';
@@ -98,11 +102,19 @@ export const createGraphitiPlugin = (options?: GraphitiPluginOptions): OpenClawP
     config,
   });
 
+  const beforePromptBuildHook: ReturnType<typeof createRecallHook> = async (event, ctx) => {
+    if (hasPromptBuildExecuted(ctx)) {
+      return {};
+    }
+    markPromptBuildExecuted(ctx);
+    return promptBuildHook(event, ctx);
+  };
+
   return {
     name: 'graphiti-openclaw',
     hooks: {
       before_model_resolve: createModelResolveHook({ config }),
-      before_prompt_build: promptBuildHook,
+      before_prompt_build: beforePromptBuildHook,
       before_agent_start: createLegacyBeforeAgentStartHook(promptBuildHook),
       agent_end: createCaptureHook({
         client,

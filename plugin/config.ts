@@ -24,6 +24,14 @@ export interface PluginConfig {
   providerOverride?: string;
   /** Optional explicit model override (used by before_model_resolve). */
   modelOverride?: string;
+  /** Explicit opt-in for model/provider overrides (secure-by-default). */
+  allowModelRoutingOverride: boolean;
+  /** Allowed provider override values. Required when providerOverride is set. */
+  allowedProviderOverrides: string[];
+  /** Allowed model override values. Required when modelOverride is set. */
+  allowedModelOverrides: string[];
+  /** Max allowed length for model/provider override tokens. */
+  maxOverrideTokenLength: number;
   recallTimeoutMs: number;
   captureTimeoutMs: number;
   maxFacts: number;
@@ -53,6 +61,10 @@ export const DEFAULT_CONFIG: PluginConfig = {
   stickySignals: ['also', 'and', 'continue', 'what about', 'follow up'],
   packRouterTimeoutMs: 2000,
   defaultMinConfidence: 0.3,
+  allowModelRoutingOverride: false,
+  allowedProviderOverrides: [],
+  allowedModelOverrides: [],
+  maxOverrideTokenLength: 128,
   debug: false,
 };
 
@@ -61,6 +73,9 @@ export const normalizeConfig = (config?: Partial<PluginConfig>): PluginConfig =>
     ...DEFAULT_CONFIG,
     ...config,
     stickySignals: config?.stickySignals ?? DEFAULT_CONFIG.stickySignals,
+    allowedProviderOverrides:
+      config?.allowedProviderOverrides ?? DEFAULT_CONFIG.allowedProviderOverrides,
+    allowedModelOverrides: config?.allowedModelOverrides ?? DEFAULT_CONFIG.allowedModelOverrides,
   };
 };
 

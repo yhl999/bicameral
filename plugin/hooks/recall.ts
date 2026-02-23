@@ -13,7 +13,7 @@ export interface BeforeAgentStartEvent {
 export type RecallHook = (
   event: BeforeAgentStartEvent,
   ctx: PackInjectorContext,
-) => Promise<{ prependContext: string }>;
+) => Promise<{ prependContext?: string }>;
 
 export interface RecallHookDeps {
   client: GraphitiClient;

@@ -28,8 +28,11 @@ Configuration is passed as JSON through `GRAPHITI_PLUGIN_CONFIG` or OpenClaw's p
 ```json
 {
   "graphitiBaseUrl": "http://localhost:8000",
+  "allowModelRoutingOverride": true,
   "providerOverride": "openai",
   "modelOverride": "gpt-5.2",
+  "allowedProviderOverrides": ["openai", "anthropic"],
+  "allowedModelOverrides": ["gpt-5.2", "claude-sonnet-4-6"],
   "intentRulesPath": "config/example_intent_rules.json",
   "compositionRulesPath": "config/example_pack_composition.json",
   "packRegistryPath": "config/example_pack_registry.json",
@@ -79,8 +82,10 @@ Example: `config/example_pack_registry.json`.
 ## Hooks
 
 - `before_model_resolve`: deterministic model/provider override surface (`modelOverride`, `providerOverride`).
+  - Secure-by-default: requires `allowModelRoutingOverride: true`.
+  - Overrides must be explicitly allowlisted (`allowedProviderOverrides`, `allowedModelOverrides`).
 - `before_prompt_build`: recall + intent routing + pack composition. Returns `{ prependContext }`.
-- `before_agent_start` (legacy): compatibility shim; only delegates when `messages` are available to avoid duplicate injection on modern runtimes.
+- `before_agent_start` (legacy): compatibility shim; only delegates when a **non-empty** `messages` list is present and prompt-build injection has not already run for the same turn.
 - `agent_end`: strips injected blocks and ingests the clean turn into Graphiti.
 
 ## Correctness Guarantees (Milestone 1)
