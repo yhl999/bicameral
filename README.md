@@ -1,4 +1,4 @@
-# Graphiti OpenClaw — Dual-Brain Memory Runtime for Agents
+# Bicameral — Dual-Brain Memory Runtime for Agents
 
 This repository is a **production delta layer** on top of [upstream Graphiti](https://github.com/getzep/graphiti). It turns Graphiti from a graph-memory library into a **dual-brain, policy-governed memory runtime** for OpenClaw agents.
 
