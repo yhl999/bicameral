@@ -111,20 +111,33 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
 
     if (prompt.trim().length >= config.minPromptChars) {
       const groupIds = resolveGroupIds(ctx, config);
-      try {
-        graphitiResults = await deps.client.search(prompt, groupIds);
-        parts.push(formatGraphitiContext(graphitiResults));
-      } catch (error) {
-        const message = (error as Error).message || 'unknown error';
-        const safeReason = sanitizeReason(message);
-        // Sanitize identifier to avoid leaking raw session keys / platform IDs into logs.
-        const safeGroup = sanitizeIdentifier(groupIds?.[0] ?? 'unknown');
-        // Always emit failover warnings, even when debug logging is disabled.
+
+      // Fail safe: never issue an unscoped Graphiti search.
+      // If we cannot resolve a group/session lane, force fallback instead of
+      // calling search() with undefined and risking cross-tenant recall.
+      if (!groupIds || groupIds.length === 0) {
+        const safeGroup = sanitizeIdentifier('missing-group-scope');
         console.warn(
-          `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=${safeReason}`,
+          `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=missing_group_scope`,
         );
-        logger(`Graphiti recall failed: ${safeReason}`);
+        logger('Graphiti recall skipped: missing group scope');
         parts.push(formatFallback());
+      } else {
+        try {
+          graphitiResults = await deps.client.search(prompt, groupIds);
+          parts.push(formatGraphitiContext(graphitiResults));
+        } catch (error) {
+          const message = (error as Error).message || 'unknown error';
+          const safeReason = sanitizeReason(message);
+          // Sanitize identifier to avoid leaking raw session keys / platform IDs into logs.
+          const safeGroup = sanitizeIdentifier(groupIds[0] ?? 'unknown');
+          // Always emit failover warnings, even when debug logging is disabled.
+          console.warn(
+            `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=${safeReason}`,
+          );
+          logger(`Graphiti recall failed: ${safeReason}`);
+          parts.push(formatFallback());
+        }
       }
     } else {
       parts.push('');
