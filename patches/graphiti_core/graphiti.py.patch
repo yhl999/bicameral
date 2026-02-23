@@ -1,0 +1,67 @@
+diff --git a/graphiti_core/graphiti.py b/graphiti_core/graphiti.py
+index 619607a..1598850 100644
+--- a/graphiti_core/graphiti.py
++++ b/graphiti_core/graphiti.py
+@@ -17,6 +17,7 @@ limitations under the License.
+ import logging
+ from datetime import datetime
+ from time import time
++from typing import Literal
+ from uuid import uuid4
+ 
+ from dotenv import load_dotenv
+@@ -457,16 +458,14 @@ class Graphiti:
+         nodes: list[EntityNode],
+         uuid_map: dict[str, str],
+         custom_extraction_instructions: str | None = None,
++        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
+     ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
+         """Extract edges from episode and resolve against existing graph.
+ 
+         Returns
+         -------
+         tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]
+-            A tuple of (resolved_edges, invalidated_edges, new_edges) where:
+-            - resolved_edges: All edges after resolution
+-            - invalidated_edges: Edges invalidated by new information
+-            - new_edges: Only edges that are new to the graph (not duplicates)
++            A tuple of (resolved_edges, invalidated_edges, new_edges).
+         """
+         extracted_edges = await extract_edges(
+             self.clients,
+@@ -488,6 +487,7 @@ class Graphiti:
+             nodes,
+             edge_types or {},
+             edge_type_map,
++            dedupe_mode=dedupe_mode,
+         )
+ 
+         return resolved_edges, invalidated_edges, new_edges
+@@ -803,6 +803,7 @@ class Graphiti:
+         custom_extraction_instructions: str | None = None,
+         saga: str | SagaNode | None = None,
+         saga_previous_episode_uuid: str | None = None,
++        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
+     ) -> AddEpisodeResults:
+         """
+         Process an episode and update the graph.
+@@ -850,6 +851,11 @@ class Graphiti:
+             query to find the most recent episode. Useful for efficiently adding multiple episodes
+             to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
+             as this parameter for the next episode.
++        dedupe_mode : Literal['semantic', 'deterministic']
++            Edge deduplication strategy.
++            - 'semantic' (default): uses LLM duplicate + contradiction resolution.
++            - 'deterministic': migration-safe mode that skips semantic duplicate/contradiction
++              resolution (exact-match dedupe still runs). Intended for controlled backfills.
+ 
+         Returns
+         -------
+@@ -959,6 +965,7 @@ class Graphiti:
+                     nodes,
+                     uuid_map,
+                     custom_extraction_instructions,
++                    dedupe_mode=dedupe_mode,
+                 )
+ 
+                 entity_edges = resolved_edges + invalidated_edges
