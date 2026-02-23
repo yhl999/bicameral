@@ -6,6 +6,8 @@ import test from 'node:test';
 
 import { createPackInjector } from '../hooks/pack-injector.ts';
 import { stripInjectedContext } from '../hooks/capture.ts';
+import { createLegacyBeforeAgentStartHook } from '../hooks/legacy-before-agent-start.ts';
+import { createModelResolveHook } from '../hooks/model-resolve.ts';
 import { detectIntent } from '../intent/detector.ts';
 import type { IntentRuleSet } from '../intent/types.ts';
 import { loadIntentRules } from '../config.ts';
@@ -484,4 +486,58 @@ test('config path allowlist rejects non-existent roots', (t) => {
     () => loadIntentRules(rulesPath, [missingRoot]),
     /Unable to resolve config root/,
   );
+});
+
+test('legacy before_agent_start shim skips when messages are absent', async () => {
+  let delegated = false;
+  const shim = createLegacyBeforeAgentStartHook(async () => {
+    delegated = true;
+    return { prependContext: 'should-not-run' };
+  });
+
+  const result = await shim({ prompt: 'hello' }, {});
+  assert.deepEqual(result, {});
+  assert.equal(delegated, false);
+});
+
+test('legacy before_agent_start shim delegates when messages are present', async () => {
+  const shim = createLegacyBeforeAgentStartHook(async () => ({
+    prependContext: '<graphiti-context>ok</graphiti-context>',
+  }));
+
+  const result = await shim(
+    {
+      prompt: 'hello',
+      messages: [{ role: 'user', content: 'hello' }],
+    },
+    {},
+  );
+
+  assert.equal(result.prependContext, '<graphiti-context>ok</graphiti-context>');
+});
+
+test('before_model_resolve hook returns configured overrides', async () => {
+  const hook = createModelResolveHook({
+    config: {
+      providerOverride: ' openai ',
+      modelOverride: ' gpt-5.2 ',
+    },
+  });
+
+  const result = await hook({ prompt: 'route this' }, {});
+  assert.equal(result.providerOverride, 'openai');
+  assert.equal(result.modelOverride, 'gpt-5.2');
+});
+
+test('before_model_resolve hook drops blank overrides', async () => {
+  const hook = createModelResolveHook({
+    config: {
+      providerOverride: '   ',
+      modelOverride: '',
+    },
+  });
+
+  const result = await hook({ prompt: 'route this' }, {});
+  assert.equal(result.providerOverride, undefined);
+  assert.equal(result.modelOverride, undefined);
 });

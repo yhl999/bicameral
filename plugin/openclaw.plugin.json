@@ -3,5 +3,5 @@
   "version": "0.1.0",
   "description": "Graphiti runtime context injection plugin",
   "entry": "index.ts",
-  "hooks": ["before_agent_start", "agent_end"]
+  "hooks": ["before_model_resolve", "before_prompt_build", "before_agent_start", "agent_end"]
 }

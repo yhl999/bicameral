@@ -20,6 +20,10 @@ export interface PackRegistry {
 export interface PluginConfig {
   graphitiBaseUrl: string;
   graphitiApiKey?: string;
+  /** Optional explicit provider override (used by before_model_resolve). */
+  providerOverride?: string;
+  /** Optional explicit model override (used by before_model_resolve). */
+  modelOverride?: string;
   recallTimeoutMs: number;
   captureTimeoutMs: number;
   maxFacts: number;
