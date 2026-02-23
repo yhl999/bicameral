@@ -5,6 +5,10 @@
   "type": "module",
   "scripts": {
     "test": "node --experimental-strip-types --test tests/correctness.test.ts",
-    "check": "node --experimental-strip-types --check index.ts"
+    "check": "node --experimental-strip-types --check index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }
