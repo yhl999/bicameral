@@ -27,8 +27,9 @@ export const stripInjectedContext = (content: string): string => {
     .trim();
 };
 
-const resolveGroupId = (ctx: PackInjectorContext): string | null => {
-  return ctx.messageProvider?.groupId ?? ctx.sessionKey ?? null;
+const resolveGroupId = (ctx: PackInjectorContext, config: PluginConfig): string | null => {
+  // Prefer configured canonical lane so capture stays aligned with recall corpus.
+  return config.memoryGroupId ?? ctx.sessionKey ?? ctx.messageProvider?.groupId ?? null;
 };
 
 const extractTurn = (messages: Array<{ role?: string; content: string }>): GraphitiMessage[] => {
@@ -61,7 +62,7 @@ export const createCaptureHook = (deps: CaptureHookDeps): CaptureHook => {
       return;
     }
 
-    const groupId = resolveGroupId(ctx);
+    const groupId = resolveGroupId(ctx, config);
     if (!groupId) {
       logger('Capture skipped: missing group ID.');
       return;

@@ -8,6 +8,7 @@ import { createPackInjector } from '../hooks/pack-injector.ts';
 import { stripInjectedContext } from '../hooks/capture.ts';
 import { createLegacyBeforeAgentStartHook } from '../hooks/legacy-before-agent-start.ts';
 import { createModelResolveHook } from '../hooks/model-resolve.ts';
+import { createRecallHook } from '../hooks/recall.ts';
 import { detectIntent } from '../intent/detector.ts';
 import type { IntentRuleSet } from '../intent/types.ts';
 import { loadIntentRules } from '../config.ts';
@@ -674,4 +675,32 @@ test('before_model_resolve hook blocks path traversal token shapes', async () =>
   const result = await hook({ prompt: 'route this' }, {});
   assert.equal(result.providerOverride, undefined);
   assert.equal(result.modelOverride, undefined);
+});
+
+test('recall hook emits explicit fallback error block when Graphiti fails', async () => {
+  const hook = createRecallHook({
+    client: {
+      search: async () => {
+        throw new Error('Graphiti API error 503');
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      memoryGroupId: 's1_sessions_main',
+    },
+  });
+
+  const result = await hook(
+    { prompt: 'test fallback emission' },
+    {
+      sessionKey: 'agent:main:telegram:group:-1003893734334',
+      messageProvider: { groupId: 'telegram:-1003893734334', chatType: 'group' },
+    },
+  );
+
+  const context = result.prependContext ?? '';
+  assert.ok(context.includes('<graphiti-fallback>'));
+  assert.ok(context.includes('ERROR_CODE: GRAPHITI_QMD_FAILOVER'));
+  assert.ok(context.includes('This turn is using QMD fallback'));
 });
