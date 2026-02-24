@@ -284,6 +284,7 @@ For the full sync procedure, see [Upstream Sync Runbook](docs/runbooks/upstream-
 - [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md)
 - [State Migration Runbook](docs/runbooks/state-migration.md)
 - [Publicization & Backup](docs/runbooks/publicization-backup-cutover.md)
+- [OpenClaw Plugin Troubleshooting](docs/runbooks/openclaw-plugin-troubleshooting.md) — handling strict schema validation crashes and gateway port exhaustion
 
 ### Technical Contracts
 - [Boundary Contract](docs/public/BOUNDARY-CONTRACT.md)

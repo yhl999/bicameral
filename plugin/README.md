@@ -23,6 +23,8 @@ openclaw plugins install /path/to/graphiti-openclaw/plugin
 
 ## Configuration
 
+> **⚠️ IMPORTANT: Do not add an `"id"` key to this configuration.** OpenClaw's plugin config schema is extremely strict (`additionalProperties: false`). Adding an `id` key under `.plugins.entries.<name>` in your `openclaw.json` will cause the gateway to crash hard and loop.
+
 Configuration is passed as JSON through `GRAPHITI_PLUGIN_CONFIG` or OpenClaw's plugin config system. Example JSON:
 
 ```json
