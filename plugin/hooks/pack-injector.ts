@@ -306,6 +306,7 @@ const runPackRouter = (
   command: string | string[],
   args: string[],
   timeoutMs: number,
+  repoRoot: string,
 ): Promise<string> => {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -341,6 +342,7 @@ const runPackRouter = (
     const child = spawn(cmd, [...baseArgs, ...args], {
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      cwd: repoRoot,
     });
     let stdout = '';
     let stderr = '';
@@ -494,6 +496,7 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
           config.packRouterCommand,
           args,
           config.packRouterTimeoutMs,
+          repoRoot,
         );
         plan = parseRouterOutput(output);
         const primaryEntry = plan.packs[0];
