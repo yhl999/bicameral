@@ -1,0 +1,135 @@
+name: Gemini Security Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: gemini-security-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Gate (fork + GEMINI_API_KEY)
+        id: gate
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "GEMINI_API_KEY not found. Skipping."
+            exit 0
+          fi
+          # Check if fork PR (secrets are generally not available)
+          if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.event.pull_request.base.repo.full_name }}" ]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "Fork PR detected. Skipping security review securely."
+            exit 0
+          fi
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Gemini CLI & Security Extension
+        if: steps.gate.outputs.should_run == 'true'
+        run: |
+          npm install -g @google/gemini-cli
+          gemini extensions install https://github.com/gemini-cli-extensions/security --consent
+
+      - name: Run Gemini Security Build/Review
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          
+          # Fetch PR diff
+          gh pr diff $PR_NUMBER > pr_diff.patch
+          
+          # We write the prompt to a file and read it in using node to avoid any argument length limits
+          cat << 'PROMPT' > review_prompt.txt
+          You are a highly skilled senior security engineer.
+          Use the gemini-cli-security extension MCP tools to audit the repository worktree for the current Pull Request.
+
+          Allowed tools (use ONLY these):
+          - get_audit_scope
+          - search_file_content
+          - read_file
+          - find_line_numbers
+
+          Do NOT create or modify any files. Do NOT run PoCs. Do NOT run shell commands.
+
+          Step 1 (scope): call get_audit_scope and extract the list of changed file paths. 
+          Step 2 (fallback): if that scope is empty OR you cannot use it, use the fallback file list provided below (this is the worktree scope).
+          Step 3 (analysis): for each in-scope file (ignore lockfiles), read relevant sections and look for:
+          - path traversal/LFI, injection, SSRF, authz/authn bugs, secrets leakage, unsafe logging, TOCTOU/races, insecure defaults
+          Step 4 (line numbers): for each finding, call find_line_numbers(filePath, snippet) to get exact lines.
+
+          Git diff (patch) for context:
+          PROMPT
+          
+          cat pr_diff.patch >> review_prompt.txt
+          
+          echo "Output MUST be formatted as a PR review comment in Markdown. Provide detailed vulnerabilities, how to exploit, and how to fix." >> review_prompt.txt
+
+          echo "Running Gemini Security Scan..."
+          
+          # Run via a quick Node script to pass the prompt exactly as CLR does
+          cat << 'SCRIPT' > run_gemini.js
+          const { spawnSync } = require('child_process');
+          const fs = require('fs');
+          
+          const prompt = fs.readFileSync('review_prompt.txt', 'utf8');
+          const args = [
+            '--sandbox=false',
+            '--model', 'gemini-2.5-flash',
+            '--extensions', 'gemini-cli-security',
+            '--allowed-tools', 'get_audit_scope',
+            '--allowed-tools', 'search_file_content',
+            '--allowed-tools', 'read_file',
+            '--allowed-tools', 'find_line_numbers',
+            '--prompt', prompt
+          ];
+          
+          const result = spawnSync('gemini', args, { encoding: 'utf8', env: process.env, maxBuffer: 1024 * 1024 * 10 });
+          
+          if (result.stdout) {
+             fs.writeFileSync('gemini-security.md', result.stdout);
+          }
+          if (result.stderr) {
+             console.error(result.stderr);
+          }
+          if (result.status !== 0) {
+             process.exit(0); // Proceed anyway to try to post what we have
+          }
+          SCRIPT
+          
+          node run_gemini.js || true
+          
+          if [ -s gemini-security.md ]; then
+            # Filter ANSI escape codes if any exist in the output from the CLI
+            sed -i -e 's/\x1b\[[0-9;]*m//g' gemini-security.md
+            
+            echo "Posting review output to PR..."
+            gh pr comment $PR_NUMBER -F gemini-security.md || echo "Failed to post comment"
+          else
+            echo "Gemini output was empty."
+          fi
