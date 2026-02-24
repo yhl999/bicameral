@@ -8,50 +8,119 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "graphitiBaseUrl": { "type": "string" },
-      "graphitiApiKey": { "type": "string" },
-      "providerOverride": { "type": "string" },
-      "modelOverride": { "type": "string" },
-      "allowModelRoutingOverride": { "type": "boolean" },
+      "graphitiBaseUrl": {
+        "type": "string"
+      },
+      "graphitiApiKey": {
+        "type": "string"
+      },
+      "providerOverride": {
+        "type": "string"
+      },
+      "modelOverride": {
+        "type": "string"
+      },
+      "allowModelRoutingOverride": {
+        "type": "boolean"
+      },
       "allowedProviderOverrides": {
         "type": "array",
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
       },
       "allowedModelOverrides": {
         "type": "array",
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
       },
-      "maxOverrideTokenLength": { "type": "number" },
-      "recallTimeoutMs": { "type": "number" },
-      "captureTimeoutMs": { "type": "number" },
-      "maxFacts": { "type": "number" },
-      "memoryGroupId": { "type": "string", "minLength": 1 },
-      "minPromptChars": { "type": "number" },
-      "enableSticky": { "type": "boolean" },
-      "stickyMaxWords": { "type": "number" },
+      "maxOverrideTokenLength": {
+        "type": "number"
+      },
+      "recallTimeoutMs": {
+        "type": "number"
+      },
+      "captureTimeoutMs": {
+        "type": "number"
+      },
+      "maxFacts": {
+        "type": "number"
+      },
+      "memoryGroupId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minPromptChars": {
+        "type": "number"
+      },
+      "enableSticky": {
+        "type": "boolean"
+      },
+      "stickyMaxWords": {
+        "type": "number"
+      },
       "stickySignals": {
         "type": "array",
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
       },
-      "intentRulesPath": { "type": "string" },
-      "compositionRulesPath": { "type": "string" },
-      "packRegistryPath": { "type": "string" },
+      "intentRulesPath": {
+        "type": "string"
+      },
+      "compositionRulesPath": {
+        "type": "string"
+      },
+      "packRegistryPath": {
+        "type": "string"
+      },
       "packRouterCommand": {
         "oneOf": [
-          { "type": "string" },
-          { "type": "array", "items": { "type": "string" } }
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         ]
       },
-      "packRouterRepoRoot": { "type": "string" },
-      "packRouterTimeoutMs": { "type": "number" },
-      "defaultMinConfidence": { "type": "number" },
-      "singleTenant": { "type": "boolean" },
-      "debug": { "type": "boolean" },
+      "packRouterRepoRoot": {
+        "type": "string"
+      },
+      "packRouterTimeoutMs": {
+        "type": "number"
+      },
+      "defaultMinConfidence": {
+        "type": "number"
+      },
+      "singleTenant": {
+        "type": "boolean"
+      },
+      "debug": {
+        "type": "boolean"
+      },
       "configPathRoots": {
         "type": "array",
-        "items": { "type": "string" }
+        "items": {
+          "type": "string"
+        }
+      },
+      "trustedGroupIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
       }
     }
   },
-  "hooks": ["before_model_resolve", "before_prompt_build", "before_agent_start", "agent_end"]
+  "hooks": [
+    "before_model_resolve",
+    "before_prompt_build",
+    "before_agent_start",
+    "agent_end"
+  ]
 }

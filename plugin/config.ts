@@ -68,6 +68,9 @@ export interface PluginConfig {
   defaultMinConfidence: number;
   debug: boolean;
   configPathRoots?: string[];
+  trustedGroupIds?: string[];
+  singleTenant?: boolean;
+  memoryGroupId?: string;
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {

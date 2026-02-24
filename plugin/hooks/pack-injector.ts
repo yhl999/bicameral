@@ -57,8 +57,19 @@ interface PackInjectorDeps {
   config?: Partial<PluginConfig>;
 }
 
-const isGroupChat = (ctx: PackInjectorContext): boolean => {
-  return ctx.messageProvider?.chatType === 'group';
+const isUntrustedGroupChat = (ctx: PackInjectorContext, trustedGroupIds?: string[]): boolean => {
+  if (ctx.messageProvider?.chatType !== 'group') {
+    return false;
+  }
+  const groupId = ctx.messageProvider?.groupId;
+  if (groupId && trustedGroupIds && trustedGroupIds.length > 0) {
+    return !trustedGroupIds.some((t) => 
+      groupId === t || 
+      groupId.startsWith(`${t}:`) ||
+      (t.includes('-') && groupId.includes(t)) // specifically handles telegram target formats like ...:group:-123...:topic:456
+    );
+  }
+  return true;
 };
 
 const resolveRegistryEntry = (registry: PackRegistry, packType: string) => {
@@ -454,8 +465,8 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         return null;
       }
 
-      if (decision.rule.scope === 'private' && isGroupChat(input.ctx)) {
-        logger('Skipping private intent in group chat.');
+      if (decision.rule.scope === 'private' && isUntrustedGroupChat(input.ctx, config.trustedGroupIds)) {
+        logger('Skipping private intent in untrusted group chat.');
         state.delete(sessionKey);
         return null;
       }
@@ -502,8 +513,8 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         return null;
       }
 
-      if (primaryPack.scope === 'private' && isGroupChat(input.ctx)) {
-        logger('Skipping private pack in group chat.');
+      if (primaryPack.scope === 'private' && isUntrustedGroupChat(input.ctx, config.trustedGroupIds)) {
+        logger('Skipping private pack in untrusted group chat.');
         state.delete(sessionKey);
         return null;
       }
@@ -516,7 +527,7 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         logger,
       );
 
-      if (isGroupChat(input.ctx)) {
+      if (isUntrustedGroupChat(input.ctx, config.trustedGroupIds)) {
         additional = additional.filter((pack) => pack.scope !== 'private');
       }
 
