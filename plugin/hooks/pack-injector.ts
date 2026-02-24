@@ -473,7 +473,8 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         return null;
       }
 
-      const repoRoot = config.packRouterRepoRoot ?? process.cwd();
+      const rawRepoRoot = config.packRouterRepoRoot ?? process.cwd();
+      const repoRoot = toCanonicalPath(path.resolve(rawRepoRoot), 'packRouterRepoRoot');
       let primaryPack: PackMaterialized | null = null;
       let plan: PackPlan | null = null;
 
