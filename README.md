@@ -260,13 +260,13 @@ Ingestion is idempotent (content-hash dedup), incremental (delta since last wate
 
 ## Keeping Up with Upstream
 
-This fork tracks `getzep/graphiti` via a deterministic PR-based sync lane.
+This fork tracks `getzep/graphiti` via a deterministic PR-based sync lane using an explicit patch stack for `graphiti_core` hotfixes.
 
 - **Default cadence:** Weekly (Monday) via GitHub Action.
-- **Manual:** `workflow_dispatch` for on-demand sync.
-- **Conflict policy:** Clean merges auto-PR. Conflicts fail fast — resolve locally.
+- **Conflict policy:** Upstream wins. If conflicts arise in `graphiti_core/**`, accept upstream's version and re-apply our local patch stack located in `patches/graphiti_core/`.
+- **Core Guardrail:** CI automatically enforces that no undocumented `graphiti_core` files drift from upstream.
 
-For the full sync procedure, see [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md).
+For the full sync and patch application procedure, see the [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md) and [`HOTFIXES.md`](HOTFIXES.md).
 
 ---
 

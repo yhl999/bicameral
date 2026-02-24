@@ -58,14 +58,20 @@ Manual inputs:
 3. Push branch.
 4. Open/update PR into `main`.
 
-### Conflict path
-If merge conflicts occur:
+### Conflict path (Graphiti Core Patches)
+If merge conflicts occur, the primary rule is that **upstream always wins in `graphiti_core/**`**. Do not try to manually reconstruct logic during Git conflict resolution. Instead, we use a deterministic `.patch` stack.
+
 1. Workflow fails fast and does **not** push a conflicted branch.
-2. Operator creates the same branch locally and resolves conflicts explicitly.
-3. Operator pushes resolved branch and reuses/open PR.
+2. Operator creates the same branch locally and resolves conflicts explicitly:
+   - For `graphiti_core/**`, accept the upstream version (`--theirs`) to reset the baseline.
+3. Completely resolve git conflicts and commit the merge.
+4. Run `git apply patches/graphiti_core/*.patch` to neatly lay our local hotfixes back over the fresh upstream baseline.
+5. If upstream structural changes occurred (causing the patch to apply with a large offset or fuzz), run `scripts/export-core-patches.sh` post-validation to update the line numbers in the stored `.patch` files.
+6. Push the updated branch.
 
 Known hotspot policy:
-- `signatures/version1/cla.json` is fork-owned CLA state; resolve with `--ours` unless there is an explicit maintainer decision to import upstream content for that file.
+- `signatures/version1/cla.json` is fork-owned CLA state; resolve with `--ours`.
+- `graphiti_core/**`: See rule above (Upstream baseline > local patch re-application).
 
 Recommended local conflict flow:
 
@@ -75,12 +81,31 @@ git fetch origin main --prune
 git fetch upstream main --prune
 git checkout -B upstream-sync/$(TZ=America/New_York date +%F) origin/main
 git merge --no-ff upstream/main
-# resolve conflicts (example hotspot):
+# -> CONFLICTS
+
+# resolve fork state hotspots:
 git checkout --ours signatures/version1/cla.json
-git add signatures/version1/cla.json
-# resolve any remaining conflicts, then:
+
+# resolve core hotspots (upstream wins!):
+git checkout --theirs graphiti_core/
+# continue resolving any non-core files...
+
 git add -A
 git commit
+
+# 📦 Re-apply our local core mutations!
+git apply patches/graphiti_core/*.patch
+git add graphiti_core/
+git commit -m "chore: re-apply local graphiti_core patch stack"
+
+# 📸 Snapshot the clean stack offsets for next time
+./scripts/export-core-patches.sh
+git add patches/
+git commit -m "chore: snapshot core patch offsets against upstream/main"
+
+git push --set-upstream origin HEAD
+gh pr create --base main --head "$(git branch --show-current)"
+```
 git push --set-upstream origin HEAD
 gh pr create --base main --head "$(git branch --show-current)"
 ```
@@ -105,13 +130,19 @@ Why strict:
 
 ## Graphiti Core Patch-Stack Guardrail
 
+**Reference Documentation:** `HOTFIXES.md` (root repo)
+**Patch Directory:** `patches/graphiti_core/*.patch`
+**Patch Generator:** `scripts/export-core-patches.sh`
+
 Policy file: `config/graphiti_core_allowlist.txt`
 
 CI check: `scripts/ci/check_graphiti_core_allowlist.sh` (wired into `.github/workflows/ci.yml`)
 
-Rule:
+Rules:
 - Any PR touching `graphiti_core/**` must be limited to the allowlisted files.
 - Non-allowlisted `graphiti_core/**` changes fail CI by default.
+- You must explain the intent behind your `graphiti_core` hotfix inside `HOTFIXES.md`.
+- After modifying a `graphiti_core` file locally, you *must* run `./scripts/export-core-patches.sh` so the patch artifact is checked into git line-for-line to survive upstream conflicts.
 
 Operational intent:
 - keep `graphiti_core` local drift explicit and small,
