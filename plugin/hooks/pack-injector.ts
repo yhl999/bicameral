@@ -63,7 +63,11 @@ const isUntrustedGroupChat = (ctx: PackInjectorContext, trustedGroupIds?: string
   }
   const groupId = ctx.messageProvider?.groupId;
   if (groupId && trustedGroupIds && trustedGroupIds.length > 0) {
-    return !trustedGroupIds.includes(groupId);
+    return !trustedGroupIds.some((t) => 
+      groupId === t || 
+      groupId.startsWith(`${t}:`) ||
+      (t.includes('-') && groupId.includes(t)) // specifically handles telegram target formats like ...:group:-123...:topic:456
+    );
   }
   return true;
 };
