@@ -863,6 +863,110 @@ async def health_check(request) -> JSONResponse:
     return JSONResponse({'status': 'healthy', 'service': 'graphiti-mcp'})
 
 
+@mcp.custom_route('/search', methods=['POST'])
+async def search_bridge(request) -> JSONResponse:
+    """HTTP bridge for fact search — used by OpenClaw graphiti-openclaw plugin."""
+    global graphiti_service
+
+    try:
+        if graphiti_service is None:
+            raise RuntimeError('Graphiti service not initialized')
+
+        payload = await request.json()
+        query = payload.get('query')
+        group_ids = payload.get('group_ids')
+        max_facts = payload.get('max_facts', 10)
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError('query must be a non-empty string')
+
+        if group_ids is not None and not isinstance(group_ids, list):
+            raise ValueError('group_ids must be a list of strings')
+
+        if not isinstance(max_facts, int) or max_facts <= 0:
+            max_facts = 10
+
+        effective_group_ids = (
+            group_ids
+            if group_ids is not None
+            else [config.graphiti.group_id]
+            if config.graphiti.group_id
+            else []
+        )
+
+        primary_group = effective_group_ids[0] if effective_group_ids else config.graphiti.group_id
+        client = await graphiti_service.get_client_for_group(primary_group)
+
+        relevant_edges = await client.search(
+            group_ids=effective_group_ids,
+            query=query,
+            num_results=max_facts,
+        )
+
+        facts = []
+        for edge in relevant_edges or []:
+            fact = format_fact_result(edge)
+            facts.append({
+                'uuid': fact.get('uuid'),
+                'name': fact.get('name'),
+                'fact': fact.get('fact'),
+            })
+
+        return JSONResponse({'facts': facts})
+    except Exception as e:
+        logger.error(f'Error handling /search bridge: {e}')
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@mcp.custom_route('/messages', methods=['POST'])
+async def messages_bridge(request) -> JSONResponse:
+    """HTTP bridge for message ingestion — used by OpenClaw graphiti-openclaw plugin."""
+    global graphiti_service
+
+    try:
+        if graphiti_service is None:
+            raise RuntimeError('Graphiti service not initialized')
+
+        payload = await request.json()
+        group_id = payload.get('group_id')
+        messages = payload.get('messages')
+
+        if not isinstance(group_id, str) or not group_id.strip():
+            raise ValueError('group_id must be a non-empty string')
+
+        if not isinstance(messages, list):
+            raise ValueError('messages must be an array')
+
+        lines = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get('content')
+            role_type = msg.get('role_type', 'user')
+            if isinstance(content, str) and content.strip():
+                lines.append(f'{role_type}: {content.strip()}')
+
+        episode_body = '\n'.join(lines).strip()
+        if not episode_body:
+            raise ValueError('messages must include at least one non-empty content item')
+
+        result = await add_memory(
+            name='OpenClaw Turn',
+            episode_body=episode_body,
+            group_id=group_id,
+            source='message',
+            source_description='openclaw_messages',
+        )
+
+        if isinstance(result, ErrorResponse):
+            raise RuntimeError(result.error)
+
+        return JSONResponse({'status': 'ok'})
+    except Exception as e:
+        logger.error(f'Error handling /messages bridge: {e}')
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
     global config, graphiti_service, queue_service, graphiti_client, semaphore
