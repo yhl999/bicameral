@@ -1169,3 +1169,63 @@ test('capture hook still uses raw provider groupId (not hashed) when available',
 
   assert.equal(capturedGroupId, 'telegram:-1003893734334');
 });
+
+test('pack router resolves relative script path from packRouterRepoRoot, not process.cwd()', async (t) => {
+  // Create a temp dir that is NOT process.cwd(). The relative script path
+  // "./test-router.js" must be resolved against packRouterRepoRoot so that
+  // spawn can find and execute it without an ENOENT error.
+  const repoRoot = makeTempDir(t, 'graphiti-relative-cwd-');
+
+  const packFile = path.join(repoRoot, 'pack.yaml');
+  fs.writeFileSync(packFile, 'relative cwd pack content', 'utf8');
+
+  const plan = {
+    consumer: 'main_session_example_summary',
+    workflow_id: 'example_summary',
+    step_id: 'draft',
+    scope: 'public',
+    task: '',
+    injection_text: '',
+    packs: [{ pack_id: 'router_pack', query: 'pack.yaml' }],
+  };
+
+  // Write the router script directly inside repoRoot.
+  const scriptName = 'test-router.js';
+  fs.writeFileSync(
+    path.join(repoRoot, scriptName),
+    `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`,
+    'utf8',
+  );
+
+  const injector = createPackInjector({
+    intentRules: {
+      schema_version: 1,
+      rules: [
+        {
+          id: 'summary',
+          consumerProfile: 'main_session_example_summary',
+          workflowId: 'example_summary',
+          stepId: 'draft',
+          keywords: ['summary'],
+        },
+      ],
+    },
+    config: {
+      // Relative path — spawn must use repoRoot as cwd so the file is found.
+      packRouterCommand: ['node', `./${scriptName}`],
+      packRouterRepoRoot: repoRoot,
+    },
+  });
+
+  const result = await injector({
+    prompt: 'summary',
+    ctx: {},
+    graphitiResults: null,
+  });
+
+  // If spawn used process.cwd() instead of repoRoot, the script would not be
+  // found and the injector would return null (ENOENT). A non-null result proves
+  // that spawn received the correct cwd.
+  assert.ok(result, 'injector must succeed when relative script path is resolved from repoRoot');
+  assert.ok(result.context.includes('relative cwd pack content'));
+});
