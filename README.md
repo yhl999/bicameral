@@ -218,8 +218,8 @@ This fork operates on an **Engine/Fuel** split:
 
 ```bash
 # Clone
-git clone https://github.com/yhl999/graphiti-openclaw.git
-cd graphiti-openclaw
+git clone https://github.com/yhl999/bicameral.git
+cd bicameral
 
 # Install dependencies
 uv sync
