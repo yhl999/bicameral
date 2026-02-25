@@ -339,10 +339,23 @@ GRAPHITI_MAX_EPISODE_BODY_CHARS=12000
 
 | Cron | Script | Frequency | Notes |
 |------|--------|-----------|-------|
-| sessions | `mcp_ingest_sessions.py --incremental` | Every 30 min | Delta since last watermark |
+| sessions | `run_incremental_ingest.py --once` | Every 30 min | Durable queue worker; enqueues/runs scheduled `sessions_incremental` for `s1_sessions_main` |
 | content groups | `ingest_content_groups.py` | After new content | Triggered by new data |
 | dedupe_nodes | `dedupe_nodes.py --backend neo4j` | Daily | Merge duplicate entities |
 | repair_timeline | `repair_timeline.py --backend neo4j` | Daily (after dedup) | Rebuild NEXT_EPISODE chains |
+
+### Sessions Incremental Worker Behavior (`s1_sessions_main`)
+
+- Schedule gate is internal to the worker and runs on a 30-minute period (`SCHEDULE_PERIOD_S = 30 * 60`), 24/7.
+- The worker runs a cheap mtime gate before parsing sessions evidence:
+  - refresh if `evidence/sessions_v1/main/all_evidence.json` is missing
+  - refresh if any `~/.clawdbot/agents/main/sessions/*.jsonl` file is newer than evidence
+  - otherwise skip refresh and log: `SKIP sessions_evidence_refresh agent=main reason=up_to_date`
+- If refresh fails but last evidence exists, the worker continues incremental ingest with that evidence and logs:
+  - `WARN sessions_evidence_refresh_failed agent=main action=continue_with_last_evidence`
+- For manual override/debugging, force a refresh with:
+  - `python3 scripts/run_incremental_ingest.py --once --force-refresh-sessions-evidence`
+- `/done` enqueue behavior is unchanged (`scripts/ingest_trigger_done.py` still creates queue jobs; worker executes them).
 
 ### Switching from Batch to Steady-State
 
