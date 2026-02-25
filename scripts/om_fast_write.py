@@ -2,7 +2,8 @@
 """Fast-write append path for Observational Memory transcript primitives.
 
 This script writes Episode/Message nodes immediately and enforces:
-- embedding_model="embeddinggemma" with 768 dims
+- embedding_model/dim defaults (embeddinggemma/768), configurable via
+  OM_EMBEDDING_MODEL and OM_EMBEDDING_DIM
 - extraction lifecycle defaults on new Message rows
 - FAST_WRITE_DISABLED / FAST_WRITE_ENABLED state file semantics
 """
@@ -22,9 +23,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-LOCKSTEP_EMBEDDING_MODEL = "embeddinggemma"
-LOCKSTEP_EMBEDDING_DIM = 768
+DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
+DEFAULT_EMBEDDING_DIM = 768
 DEFAULT_STATE_FILE = "state/om_fast_write_state.json"
+
+
+def _embedding_config() -> tuple[str, int]:
+    """Resolve embedding config from env with compatibility defaults.
+
+    Env overrides:
+    - OM_EMBEDDING_MODEL (default: embeddinggemma)
+    - OM_EMBEDDING_DIM (default: 768)
+    """
+
+    model = (os.environ.get("OM_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL).strip()
+    if not model:
+        model = DEFAULT_EMBEDDING_MODEL
+
+    raw_dim = (os.environ.get("OM_EMBEDDING_DIM") or str(DEFAULT_EMBEDDING_DIM)).strip()
+    try:
+        dim = int(raw_dim)
+    except ValueError as exc:
+        raise RuntimeError(f"OM_EMBEDDING_DIM must be an integer, got: {raw_dim!r}") from exc
+    if dim <= 0:
+        raise RuntimeError(f"OM_EMBEDDING_DIM must be > 0, got: {dim}")
+
+    return model, dim
 
 
 def _now_iso() -> str:
@@ -120,7 +144,7 @@ def _validated_embedding_base_url() -> str:
     return base.rstrip("/")
 
 
-def embed_text(content: str) -> list[float]:
+def embed_text(content: str, *, embedding_model: str, embedding_dim: int) -> list[float]:
     """Embed text through an OpenAI-compatible /embeddings endpoint.
 
     Fast-write is fail-closed if embedding fails.
@@ -130,7 +154,7 @@ def embed_text(content: str) -> list[float]:
     url = base + "/embeddings"
 
     payload = {
-        "model": LOCKSTEP_EMBEDDING_MODEL,
+        "model": embedding_model,
         "input": content,
     }
     timeout = int(os.environ.get("OM_EMBED_TIMEOUT_SECONDS", "20"))
@@ -148,9 +172,9 @@ def embed_text(content: str) -> list[float]:
     except Exception as exc:
         raise RuntimeError("embedding vector contains non-numeric values") from exc
 
-    if len(vector) != LOCKSTEP_EMBEDDING_DIM:
+    if len(vector) != embedding_dim:
         raise RuntimeError(
-            f"embedding dimension mismatch: got {len(vector)} expected {LOCKSTEP_EMBEDDING_DIM}"
+            f"embedding dimension mismatch: got {len(vector)} expected {embedding_dim}"
         )
     return vector
 
@@ -219,7 +243,8 @@ def _coerce_payload(raw: dict[str, Any]) -> FastWritePayload:
 
 
 def fast_write(payload: FastWritePayload) -> dict[str, Any]:
-    vector = embed_text(payload.content)
+    embedding_model, embedding_dim = _embedding_config()
+    vector = embed_text(payload.content, embedding_model=embedding_model, embedding_dim=embedding_dim)
 
     query = """
     MERGE (e:Episode {episode_id:$episode_id})
@@ -258,8 +283,8 @@ def fast_write(payload: FastWritePayload) -> dict[str, Any]:
         "role": payload.role,
         "content": payload.content,
         "content_embedding": vector,
-        "embedding_model": LOCKSTEP_EMBEDDING_MODEL,
-        "embedding_dim": LOCKSTEP_EMBEDDING_DIM,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
     }
 
     driver = _neo4j_driver_from_env()
@@ -272,8 +297,8 @@ def fast_write(payload: FastWritePayload) -> dict[str, Any]:
     return {
         "message_id": payload.message_id,
         "episode_id": payload.episode_id,
-        "embedding_model": LOCKSTEP_EMBEDDING_MODEL,
-        "embedding_dim": LOCKSTEP_EMBEDDING_DIM,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
     }
 
 

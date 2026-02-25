@@ -40,6 +40,8 @@ MAX_PARENT_CHUNK_SIZE = 50
 MAX_CHILD_CHUNK_SIZE = 10
 DEFAULT_MAX_CHUNKS_PER_RUN = 10
 DEAD_LETTER_ATTEMPTS = 3
+DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
+DEFAULT_EMBEDDING_DIM = 768
 
 STATUS_ACTIVE = {"open", "monitoring", "reopened"}
 STATUS_POOL = STATUS_ACTIVE | {"closed"}
@@ -244,12 +246,35 @@ def _validated_embedding_base_url() -> str:
     return base.rstrip("/")
 
 
-def _embed_text(content: str) -> list[float]:
+def _embedding_config() -> tuple[str, int]:
+    """Resolve embedding config from env with compatibility defaults.
+
+    Env overrides:
+    - OM_EMBEDDING_MODEL (default: embeddinggemma)
+    - OM_EMBEDDING_DIM (default: 768)
+    """
+
+    model = (os.environ.get("OM_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL).strip()
+    if not model:
+        model = DEFAULT_EMBEDDING_MODEL
+
+    raw_dim = (os.environ.get("OM_EMBEDDING_DIM") or str(DEFAULT_EMBEDDING_DIM)).strip()
+    try:
+        dim = int(raw_dim)
+    except ValueError as exc:
+        raise OMCompressorError(f"OM_EMBEDDING_DIM must be an integer, got: {raw_dim!r}") from exc
+    if dim <= 0:
+        raise OMCompressorError(f"OM_EMBEDDING_DIM must be > 0, got: {dim}")
+
+    return model, dim
+
+
+def _embed_text(content: str, *, embedding_model: str, embedding_dim: int) -> list[float]:
     base = _validated_embedding_base_url()
     url = base + "/embeddings"
 
     payload = {
-        "model": "embeddinggemma",
+        "model": embedding_model,
         "input": content,
     }
     body = json.dumps(payload).encode("utf-8")
@@ -280,8 +305,8 @@ def _embed_text(content: str) -> list[float]:
         raise OMCompressorError("embedding response missing embedding")
 
     vector = [float(v) for v in emb]
-    if len(vector) != 768:
-        raise OMCompressorError(f"embedding dim mismatch: got={len(vector)} expected=768")
+    if len(vector) != embedding_dim:
+        raise OMCompressorError(f"embedding dim mismatch: got={len(vector)} expected={embedding_dim}")
     return vector
 
 
@@ -1019,6 +1044,7 @@ def _process_chunk_tx(
     ranked_nodes = _rank_extraction_nodes(extracted.nodes)
 
     rewrite_embeddings = os.environ.get("OM_REWRITE_EMBEDDINGS") == "1"
+    embedding_model, embedding_dim = _embedding_config()
     now = now_iso()
 
     node_ids: set[str] = set()
@@ -1038,7 +1064,11 @@ def _process_chunk_tx(
                 incoming_hash=sha256_hex(incoming_content),
             )
 
-        embedding = _embed_text(incoming_content)
+        embedding = _embed_text(
+            incoming_content,
+            embedding_model=embedding_model,
+            embedding_dim=embedding_dim,
+        )
 
         tx.run(
             """
@@ -1048,8 +1078,8 @@ def _process_chunk_tx(
               n.semantic_domain = $semantic_domain,
               n.content = $content,
               n.content_embedding = $embedding,
-              n.embedding_model = 'embeddinggemma',
-              n.embedding_dim = 768,
+              n.embedding_model = $embedding_model,
+              n.embedding_dim = $embedding_dim,
               n.urgency_score = $urgency_score,
               n.status = $status,
               n.source_session_id = $source_session_id,
@@ -1075,6 +1105,8 @@ def _process_chunk_tx(
                 "source_session_id": node.source_session_id,
                 "source_message_ids": node.source_message_ids,
                 "created_at": now,
+                "embedding_model": embedding_model,
+                "embedding_dim": embedding_dim,
             },
         ).consume()
 
@@ -1084,13 +1116,15 @@ def _process_chunk_tx(
                 MATCH (n:OMNode {node_id:$node_id})
                 SET n.content = $content,
                     n.content_embedding = $embedding,
-                    n.embedding_model = 'embeddinggemma',
-                    n.embedding_dim = 768
+                    n.embedding_model = $embedding_model,
+                    n.embedding_dim = $embedding_dim
                 """,
                 {
                     "node_id": node.node_id,
                     "content": incoming_content,
                     "embedding": embedding,
+                    "embedding_model": embedding_model,
+                    "embedding_dim": embedding_dim,
                 },
             ).consume()
 
