@@ -28,7 +28,7 @@ export interface GraphitiPluginOptions {
 }
 
 const loadConfigFromEnv = (): Partial<PluginConfig> => {
-  const raw = process.env.GRAPHITI_PLUGIN_CONFIG;
+  const raw = process.env.BICAMERAL_PLUGIN_CONFIG ?? process.env.GRAPHITI_PLUGIN_CONFIG;
   if (!raw) {
     return {};
   }
@@ -52,7 +52,7 @@ export const buildGraphitiHooks = (options?: GraphitiPluginOptions) => {
       return loader();
     } catch (error) {
       const message = `Config load failed for ${label}: ${(error as Error).message}`;
-      console.warn(`[graphiti-openclaw] ${message}`);
+      console.warn(`[bicameral] ${message}`);
       logger(message);
       return null;
     }
@@ -123,14 +123,14 @@ export interface OpenClawPlugin {
  * Kept for backwards compatibility with older consumers that construct hooks directly.
  */
 export const createGraphitiPlugin = (options?: GraphitiPluginOptions): OpenClawPlugin => ({
-  name: 'graphiti-openclaw',
+  name: 'bicameral',
   hooks: buildGraphitiHooks(options),
 });
 
-const graphitiPlugin = {
-  id: 'graphiti-openclaw',
-  name: 'Graphiti OpenClaw',
-  description: 'Graphiti runtime context injection plugin',
+const bicameralPlugin = {
+  id: 'bicameral',
+  name: 'Bicameral',
+  description: 'Bicameral runtime context injection plugin',
 
   register(api: OpenClawPluginApi) {
     const hooks = buildGraphitiHooks({
@@ -144,4 +144,4 @@ const graphitiPlugin = {
   },
 };
 
-export default graphitiPlugin;
+export default bicameralPlugin;

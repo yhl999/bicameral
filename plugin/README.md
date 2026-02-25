@@ -1,4 +1,4 @@
-# Graphiti OpenClaw Runtime Injection Plugin (v1 Scaffold)
+# Bicameral OpenClaw Runtime Injection Plugin (v1 Scaffold)
 
 This plugin injects Graphiti recall and workflow pack context on every agent turn using OpenClaw's explicit phase hooks (`before_model_resolve`, `before_prompt_build`) with a legacy `before_agent_start` compatibility shim and `agent_end` capture.
 
@@ -18,14 +18,14 @@ This plugin injects Graphiti recall and workflow pack context on every agent tur
 This repo only provides the plugin scaffold. Install via your OpenClaw runtime using a local path:
 
 ```bash
-openclaw plugins install /path/to/graphiti-openclaw/plugin
+openclaw plugins install /path/to/bicameral/plugin
 ```
 
 ## Configuration
 
 > **⚠️ IMPORTANT: Do not add an `"id"` key to this configuration.** OpenClaw's plugin config schema is extremely strict (`additionalProperties: false`). Adding an `id` key under `.plugins.entries.<name>` in your `openclaw.json` will cause the gateway to crash hard and loop.
 
-Configuration is passed as JSON through `GRAPHITI_PLUGIN_CONFIG` or OpenClaw's plugin config system. Example JSON:
+Configuration is passed as JSON through `BICAMERAL_PLUGIN_CONFIG` (legacy fallback: `GRAPHITI_PLUGIN_CONFIG`) or OpenClaw's plugin config system. Example JSON:
 
 ```json
 {

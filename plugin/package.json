@@ -1,5 +1,5 @@
 {
-  "name": "@graphiti/openclaw-plugin",
+  "name": "@bicameral/openclaw-plugin",
   "version": "0.1.0",
   "private": true,
   "type": "module",

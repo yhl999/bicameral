@@ -5,7 +5,7 @@ export interface GraphitiCliStatus {
 }
 
 export const graphitiCliStatus = (): GraphitiCliStatus => ({
-  plugin: 'graphiti-openclaw',
+  plugin: 'bicameral',
   healthy: true,
-  detail: 'Plugin scaffold is installed. Use /graphiti status in runtime for live checks.',
+  detail: 'Plugin scaffold is installed. Use /bicameral status in runtime for live checks.',
 });
