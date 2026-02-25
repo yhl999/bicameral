@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -103,16 +104,30 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any
         raise RuntimeError(f"embedding request failed status={exc.code} body={details}") from exc
 
 
+def _validated_embedding_base_url() -> str:
+    base = (os.environ.get("EMBEDDER_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip()
+    if not base:
+        base = "http://localhost:11434/v1"
+
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("embedding base URL must be absolute http(s) URL")
+    if parsed.username or parsed.password:
+        raise RuntimeError("embedding base URL must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise RuntimeError("embedding base URL must not include query/fragment")
+
+    return base.rstrip("/")
+
+
 def embed_text(content: str) -> list[float]:
     """Embed text through an OpenAI-compatible /embeddings endpoint.
 
     Fast-write is fail-closed if embedding fails.
     """
 
-    base = (os.environ.get("EMBEDDER_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip()
-    if not base:
-        base = "http://localhost:11434/v1"
-    url = base.rstrip("/") + "/embeddings"
+    base = _validated_embedding_base_url()
+    url = base + "/embeddings"
 
     payload = {
         "model": LOCKSTEP_EMBEDDING_MODEL,

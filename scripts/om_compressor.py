@@ -20,6 +20,7 @@ import re
 import sys
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ RELATION_TYPES = {
     "ADDRESSES",
     "RESOLVES",
 }
+RELATION_TYPE_TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 
 class OMCompressorError(RuntimeError):
@@ -223,11 +225,25 @@ def tokenize_len(text: str) -> int:
         return max(1, len(text) // 4)
 
 
-def _embed_text(content: str) -> list[float]:
+def _validated_embedding_base_url() -> str:
     base = (os.environ.get("EMBEDDER_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip()
     if not base:
         base = "http://localhost:11434/v1"
-    url = base.rstrip("/") + "/embeddings"
+
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise OMCompressorError("embedding base URL must be absolute http(s) URL")
+    if parsed.username or parsed.password:
+        raise OMCompressorError("embedding base URL must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise OMCompressorError("embedding base URL must not include query/fragment")
+
+    return base.rstrip("/")
+
+
+def _embed_text(content: str) -> list[float]:
+    base = _validated_embedding_base_url()
+    url = base + "/embeddings"
 
     payload = {
         "model": "embeddinggemma",
@@ -896,6 +912,15 @@ def _legal_edge(edge: ExtractionEdge) -> bool:
     return edge.relation_type in RELATION_TYPES
 
 
+def _validated_relation_type_for_cypher(raw_relation_type: str) -> str:
+    rel = str(raw_relation_type or "").strip().upper()
+    if rel not in RELATION_TYPES:
+        raise OMCompressorError(f"illegal relation type interpolation blocked: {raw_relation_type!r}")
+    if not RELATION_TYPE_TOKEN_RE.fullmatch(rel):
+        raise OMCompressorError(f"invalid relation type token: {raw_relation_type!r}")
+    return rel
+
+
 def _rank_extraction_nodes(nodes: list[ExtractionNode]) -> list[ExtractionNode]:
     ranked = sorted(
         nodes,
@@ -1000,7 +1025,7 @@ def _process_chunk_tx(
     for edge in extracted.edges:
         if not _legal_edge(edge):
             continue
-        rel = edge.relation_type
+        rel = _validated_relation_type_for_cypher(edge.relation_type)
         tx.run(
             f"""
             MATCH (s:OMNode {{node_id:$source_node_id}})

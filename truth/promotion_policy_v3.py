@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib
 import json
 import os
 from collections.abc import Callable
@@ -47,31 +46,78 @@ class VerificationRecord:
     verified_at: str
 
 
-def _resolve_hard_block_check() -> Callable[[str], bool]:
-    """Resolve hard_block_check(candidate_id) from existing policy module.
+HardBlockCheck = Callable[[str], bool]
+HardBlockLoader = Callable[[], HardBlockCheck]
+
+
+def _load_policy_scanner_hard_block_check() -> HardBlockCheck:
+    from truth import policy_scanner  # type: ignore
+
+    fn = getattr(policy_scanner, "hard_block_check", None)
+    if not callable(fn):
+        raise RuntimeError("truth.policy_scanner.hard_block_check unavailable")
+    return fn
+
+
+def _load_security_policy_hard_block_check() -> HardBlockCheck:
+    from truth import security_policy  # type: ignore
+
+    fn = getattr(security_policy, "hard_block_check", None)
+    if not callable(fn):
+        raise RuntimeError("truth.security_policy.hard_block_check unavailable")
+    return fn
+
+
+def _load_promotion_policy_hard_block_check() -> HardBlockCheck:
+    from truth import promotion_policy  # type: ignore
+
+    fn = getattr(promotion_policy, "hard_block_check", None)
+    if not callable(fn):
+        raise RuntimeError("truth.promotion_policy.hard_block_check unavailable")
+    return fn
+
+
+ALLOWED_HARD_BLOCK_LOADERS: dict[str, HardBlockLoader] = {
+    "policy_scanner": _load_policy_scanner_hard_block_check,
+    "security_policy": _load_security_policy_hard_block_check,
+    "promotion_policy": _load_promotion_policy_hard_block_check,
+}
+ALLOWED_HARD_BLOCK_IMPORT_ALIASES = {
+    "truth.policy_scanner:hard_block_check": "policy_scanner",
+    "truth.security_policy:hard_block_check": "security_policy",
+    "truth.promotion_policy:hard_block_check": "promotion_policy",
+}
+DEFAULT_HARD_BLOCK_ORDER = ("policy_scanner", "security_policy", "promotion_policy")
+
+
+def _resolve_hard_block_check() -> HardBlockCheck:
+    """Resolve hard_block_check(candidate_id) from approved policy module allowlist.
 
     Contract is fail-closed when the function is unavailable.
     """
 
-    configured = os.environ.get("OM_HARD_BLOCK_IMPORT", "").strip()
-    candidates = [configured] if configured else []
-    candidates.extend(
-        [
-            "truth.policy_scanner:hard_block_check",
-            "truth.security_policy:hard_block_check",
-            "truth.promotion_policy:hard_block_check",
-        ]
-    )
+    configured_raw = os.environ.get("OM_HARD_BLOCK_IMPORT", "").strip()
+    configured_key = ALLOWED_HARD_BLOCK_IMPORT_ALIASES.get(configured_raw, configured_raw)
 
-    for ref in candidates:
-        if not ref or ":" not in ref:
-            continue
-        module_name, _, attr = ref.partition(":")
+    candidate_keys: list[str] = []
+    if configured_raw:
+        if configured_key in ALLOWED_HARD_BLOCK_LOADERS:
+            candidate_keys.append(configured_key)
+        else:
+            _event(
+                "OM_PROMOTION_HARD_BLOCK_IMPORT_REJECTED",
+                configured=configured_raw,
+                reason="not_in_allowlist",
+            )
+
+    for key in DEFAULT_HARD_BLOCK_ORDER:
+        if key not in candidate_keys:
+            candidate_keys.append(key)
+
+    for key in candidate_keys:
+        loader = ALLOWED_HARD_BLOCK_LOADERS[key]
         try:
-            module = importlib.import_module(module_name)
-            fn = getattr(module, attr)
-            if callable(fn):
-                return fn
+            return loader()
         except Exception:
             continue
 
