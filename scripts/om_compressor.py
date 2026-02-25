@@ -35,6 +35,7 @@ from truth import candidates as candidates_store
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[1]
 DEFAULT_LOCK_FILENAME = "om_graph_write.lock"
+NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
 DEFAULT_ONTOLOGY_CONFIG_REL = Path("mcp_server/config/extraction_ontologies.yaml")
 MAX_PARENT_CHUNK_SIZE = 50
 MAX_CHILD_CHUNK_SIZE = 10
@@ -469,11 +470,29 @@ def _extract_items(messages: list[MessageRow], _cfg: ExtractorConfig) -> Extract
     return _extract_with_rules(messages)
 
 
+def _load_neo4j_env_fallback() -> None:
+    if os.environ.get("NEO4J_PASSWORD"):
+        return
+    if not NEO4J_ENV_FALLBACK_FILE.exists():
+        return
+
+    for raw_line in NEO4J_ENV_FALLBACK_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in {"NEO4J_PASSWORD", "NEO4J_USER", "NEO4J_URI"} and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
 def _neo4j_driver() -> Any:
     try:
         from neo4j import GraphDatabase  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise OMCompressorError("neo4j driver is required") from exc
+
+    _load_neo4j_env_fallback()
 
     uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     user = os.environ.get("NEO4J_USER", "neo4j")
