@@ -1,0 +1,247 @@
+schema_version: "2026-02-17"
+
+om_extractor:
+  model_id: "gpt-5.1-codex-mini"
+  prompt_template: |-
+    You are the Observational Memory extractor.
+    Produce deterministic mutation candidates from transcript chunks.
+    Preserve source provenance and avoid speculative claims.
+
+# Lane-Specific Extraction Ontologies
+#
+# Maps group_id → entity types, relationship types, and extraction emphasis.
+# Adding a new lane requires ONLY a new block here — zero code changes.
+#
+# Schema per lane:
+#   <group_id>:
+#     entity_types:
+#       - name: <EntityTypeName>
+#         description: <what the LLM should extract>
+#     relationship_types:
+#       - name: <RELATIONSHIP_NAME>
+#         description: <meaning>
+#     extraction_emphasis: <prompt hint guiding the LLM's focus>
+
+# ─────────────────────────────────────────────
+# Content Inspiration — Short-Form
+# ─────────────────────────────────────────────
+s1_inspiration_short_form:
+  extraction_emphasis: >-
+    Focus on hooks, compression, punch, and engagement triggers.
+    Prioritize rhetorical moves and voice/tone over topic or thesis.
+    Extract what makes short-form content effective — first-line formulas,
+    compression techniques, and engagement signals.
+
+  entity_types:
+    - name: RhetoricalMove
+      description: "A specific technique used in the piece (e.g. cold open with absurd analogy, one-liner callback)"
+    - name: HookPattern
+      description: "First-line or opening strategy (e.g. provocative question, contrarian statement, unexpected juxtaposition)"
+    - name: VoiceQuality
+      description: "Tone or register characteristic (e.g. irreverent-casual, deadpan-authoritative, erudite-compressed)"
+    - name: EngagementSignal
+      description: "What made the piece resonate or go viral (e.g. ratio bait, tribal identity signal, counterintuitive data point)"
+    - name: AuthorStyle
+      description: "The writer's broader style archetype (e.g. Tyler Cowen — compressed erudition, Balaji — thread-as-essay)"
+    - name: CompressionTechnique
+      description: "How complex ideas are compressed (e.g. metaphor substitution, assumed shared context, implication over statement)"
+
+  relationship_types:
+    - name: USES_MOVE
+      description: "Piece → RhetoricalMove"
+    - name: OPENS_WITH
+      description: "Piece → HookPattern"
+    - name: EXHIBITS
+      description: "Piece → VoiceQuality"
+    - name: TRIGGERED
+      description: "Piece → EngagementSignal"
+    - name: AUTHORED_BY
+      description: "Piece → AuthorStyle"
+    - name: COMPRESSES_VIA
+      description: "Piece → CompressionTechnique"
+
+# ─────────────────────────────────────────────
+# Content Inspiration — Long-Form
+# ─────────────────────────────────────────────
+s1_inspiration_long_form:
+  extraction_emphasis: >-
+    Focus on argument structure, narrative arc, transitions, and sustained voice.
+    Extract how long-form pieces build and maintain reader engagement across sections.
+    Prioritize structural and rhetorical patterns over individual facts or claims.
+
+  entity_types:
+    - name: RhetoricalMove
+      description: "Long-form technique (e.g. extended analogy across sections, dialectical pivot, callback close)"
+    - name: NarrativeArc
+      description: "Overall structural pattern (e.g. thesis-antithesis-synthesis, chronological buildup to reveal, nested stories)"
+    - name: ArgumentStructure
+      description: "How the argument is built (e.g. evidence stacking, concession-then-reframe, first-principles derivation)"
+    - name: VoiceQuality
+      description: "Tone or register in long-form (e.g. essayistic-intimate, academic-accessible, storyteller-with-data)"
+    - name: TransitionTechnique
+      description: "How sections or ideas connect (e.g. rhetorical question bridge, anecdote pivot, tempo shift)"
+    - name: EngagementSignal
+      description: "What made the piece resonate (e.g. shareable thesis statement, quotable paragraph, unexpected conclusion)"
+    - name: AuthorStyle
+      description: "Writer's archetype (e.g. Arthur Hayes — storytelling + macro thesis, Paul Graham — simple clarity)"
+    - name: OpeningStrategy
+      description: "Long-form hook approach (e.g. in-medias-res anecdote, bold claim first sentence, scene-setting)"
+
+  relationship_types:
+    - name: USES_MOVE
+      description: "Piece → RhetoricalMove"
+    - name: STRUCTURED_AS
+      description: "Piece → NarrativeArc or ArgumentStructure"
+    - name: EXHIBITS
+      description: "Piece → VoiceQuality"
+    - name: TRANSITIONS_VIA
+      description: "Section → TransitionTechnique"
+    - name: AUTHORED_BY
+      description: "Piece → AuthorStyle"
+    - name: OPENS_WITH
+      description: "Piece → OpeningStrategy"
+    - name: TRIGGERED
+      description: "Piece → EngagementSignal"
+
+# ─────────────────────────────────────────────
+# Writing Samples — Yuan's Own
+# ─────────────────────────────────────────────
+s1_writing_samples:
+  extraction_emphasis: >-
+    Focus on voice fingerprint, structural patterns, and register variation.
+    Extract what makes this writing uniquely Yuan's — characteristic moves,
+    signature phrases, tone shifts. Keep topic extraction light.
+    Weight unassisted and unedited samples higher for voice authenticity.
+
+  entity_types:
+    - name: VoiceFingerprint
+      description: "Characteristic writing move unique to the author (e.g. Machiavelli-meets-f-bomb register shift, parenthetical self-deprecation)"
+    - name: StructuralPattern
+      description: "How the author builds or organizes (e.g. hook → context → thesis → evidence → callback, list-with-commentary)"
+    - name: RegisterMarker
+      description: "Signal of register level (e.g. slang density, citation formality, sentence length variation)"
+    - name: SignaturePhrase
+      description: "Recurring distinctive language — specific phrases, characteristic word choices, verbal tics"
+    - name: ToneShift
+      description: "Where or how register changes within a piece (e.g. opens casual, pivots to technical, closes with joke)"
+
+  relationship_types:
+    - name: DEMONSTRATES
+      description: "Sample → VoiceFingerprint"
+    - name: FOLLOWS
+      description: "Sample → StructuralPattern"
+    - name: SIGNALS
+      description: "Sample → RegisterMarker"
+    - name: CONTAINS
+      description: "Sample → SignaturePhrase"
+    - name: SHIFTS_VIA
+      description: "Sample → ToneShift"
+
+# ─────────────────────────────────────────────
+# Content Strategy
+# ─────────────────────────────────────────────
+s1_content_strategy:
+  extraction_emphasis: >-
+    Focus on actionable platform knowledge and engagement mechanics.
+    Extract concrete tactics, proven formulas, and anti-patterns.
+    Prioritize specificity — platform-specific mechanics over generic advice.
+
+  entity_types:
+    - name: PlatformMechanic
+      description: "How a platform's algorithm or system works (e.g. Twitter rewards early engagement velocity, quote tweets boost less than replies)"
+    - name: HookTemplate
+      description: "Proven first-line formula (e.g. Thread: Here's what nobody tells you about X, 'Unpopular opinion:' framing)"
+    - name: DistributionTactic
+      description: "Strategy for reach or engagement (e.g. reply to high-follower accounts within 15 min, thread with standalone first tweet)"
+    - name: AntiPattern
+      description: "What kills engagement or looks bad (e.g. hashtag spam, self-promotional tone, engagement bait without substance)"
+    - name: AudiencePsychology
+      description: "What specific audiences respond to (e.g. crypto audience rewards contrarian takes with evidence, VC audience shares builder insight content)"
+
+  relationship_types:
+    - name: EXPLOITS
+      description: "Tactic → PlatformMechanic"
+    - name: TARGETS
+      description: "Tactic → AudiencePsychology"
+    - name: COUNTERS
+      description: "AntiPattern → what it prevents"
+    - name: USES_HOOK
+      description: "Tactic → HookTemplate"
+    - name: SUPERSEDED_BY
+      description: "Old mechanic → new mechanic (staleness chain)"
+
+# ─────────────────────────────────────────────
+# Engineering Learnings
+# ─────────────────────────────────────────────
+engineering_learnings:
+  extraction_emphasis: >-
+    Focus on what worked, what failed, why, and how to prevent recurrence.
+    Extract specific tool behaviors, architecture decisions, and performance patterns.
+    Capture root causes and remediation steps, not just symptoms.
+
+  entity_types:
+    - name: FailurePattern
+      description: "What went wrong and why (e.g. FalkorDB GRAPH.QUERY on empty graph returns no rows, not error)"
+    - name: SuccessPattern
+      description: "What worked well (e.g. nohup + log redirect prevents CLR output-buffer SIGKILL)"
+    - name: ReviewPattern
+      description: "What reviewers consistently catch (e.g. missing error handling on async graph operations)"
+    - name: SecurityFinding
+      description: "Security-relevant discovery (e.g. content scanner missed canary phrase injection pattern)"
+    - name: ToolApiBehavior
+      description: "Specific tool or API quirk or gotcha (e.g. gh issue comment with backticks in zsh requires heredoc)"
+    - name: ArchitectureDecision
+      description: "Why we chose X over Y (e.g. chose per-group FalkorDB graphs over namespace-only segregation)"
+    - name: PerformancePattern
+      description: "What is slow or fast and why (e.g. long-form extraction ~3 min/episode due to dense chunk size)"
+    - name: DependencyCompatibility
+      description: "Library or version interaction (e.g. FalkorDB v4.16.3 doesn't support EXISTS subquery)"
+
+  relationship_types:
+    - name: CAUSED_BY
+      description: "Failure → root cause"
+    - name: FIXED_BY
+      description: "Failure → remediation or success pattern"
+    - name: PREVENTS
+      description: "Pattern → future failure"
+    - name: AFFECTS
+      description: "ToolApiBehavior → specific tool or service"
+    - name: SUPERSEDES
+      description: "New learning → stale old learning"
+    - name: DECIDED_BECAUSE
+      description: "ArchitectureDecision → tradeoff or rationale"
+    - name: CONSTRAINS
+      description: "DependencyCompatibility → what it limits"
+
+# ─────────────────────────────────────────────
+# Self-Audit / Operational Learnings
+# ─────────────────────────────────────────────
+learning_self_audit:
+  extraction_emphasis: >-
+    Focus on what went wrong in assistant operations, why, and how to prevent it.
+    Weight MISSes higher than HITs for entity creation priority.
+    Extract concrete operational rules and remediation steps.
+
+  entity_types:
+    - name: ToolBehavior
+      description: "Tool-specific operational quirk (e.g. TFL releases 2 months ahead, not 1 — Feb drop covers through March)"
+    - name: OperationalRule
+      description: "Process or policy that should be followed (e.g. Always use update-with-hotfixes.sh for OpenClaw updates)"
+    - name: SecurityGap
+      description: "Discovered security weakness in operations (e.g. Content scanner missed canary phrase injection)"
+    - name: PreferenceMiss
+      description: "User preference that was wrong or missed (e.g. Yuan prefers pushy instant pings, not daily digests)"
+    - name: Remediation
+      description: "The fix applied to prevent recurrence (e.g. Added canary pattern to content-scanner rules)"
+
+  relationship_types:
+    - name: CAUSED_BY
+      description: "Gap or Miss → root cause"
+    - name: FIXED_BY
+      description: "Gap or Miss → Remediation"
+    - name: PREVENTS
+      description: "Rule or Remediation → future gap"
+    - name: AFFECTS
+      description: "ToolBehavior → specific tool or service"
+    - name: SUPERSEDES
+      description: "New learning → old stale learning"
