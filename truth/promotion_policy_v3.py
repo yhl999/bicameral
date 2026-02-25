@@ -11,6 +11,7 @@ Contracts implemented from EXEC-OBSERVATIONAL-MEMORY-SYNTHESIS PRD:
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -89,6 +90,8 @@ ALLOWED_HARD_BLOCK_IMPORT_ALIASES = {
 }
 DEFAULT_HARD_BLOCK_ORDER = ("policy_scanner", "security_policy", "promotion_policy")
 
+_NEO4J_DRIVER_SINGLETON: Any | None = None
+
 
 def _resolve_hard_block_check() -> HardBlockCheck:
     """Resolve hard_block_check(candidate_id) from approved policy module allowlist.
@@ -158,11 +161,32 @@ def _neo4j_driver_from_env() -> Any:
     return GraphDatabase.driver(uri, auth=(user, password))
 
 
+def _shared_neo4j_driver() -> Any:
+    global _NEO4J_DRIVER_SINGLETON
+    if _NEO4J_DRIVER_SINGLETON is None:
+        _NEO4J_DRIVER_SINGLETON = _neo4j_driver_from_env()
+    return _NEO4J_DRIVER_SINGLETON
+
+
+def _close_shared_neo4j_driver() -> None:
+    global _NEO4J_DRIVER_SINGLETON
+    if _NEO4J_DRIVER_SINGLETON is None:
+        return
+    try:
+        _NEO4J_DRIVER_SINGLETON.close()
+    finally:
+        _NEO4J_DRIVER_SINGLETON = None
+
+
+atexit.register(_close_shared_neo4j_driver)
+
+
 def promote_candidate(
     *,
     candidate_id: str,
     verification: VerificationRecord,
     hard_block_check: Callable[[str], bool],
+    neo4j_driver: Any | None = None,
 ) -> dict[str, Any]:
     promoted_at = _now_iso()
     core_memory_id = sha256_hex(f"core|{candidate_id}")
@@ -193,7 +217,7 @@ def promote_candidate(
             "reason": "hard_blocked",
         }
 
-    driver = _neo4j_driver_from_env()
+    driver = neo4j_driver or _shared_neo4j_driver()
     created = False
     linked_edges = 0
 
@@ -221,18 +245,20 @@ def promote_candidate(
     RETURN count(r) AS rel_count
     """
 
-    with driver, driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
-        row = session.run(
+    with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
+        core_result = session.run(
             core_query,
             {
                 "candidate_id": candidate_id,
                 "core_memory_id": core_memory_id,
                 "promoted_at": promoted_at,
             },
-        ).single()
+        )
+        row = core_result.single()
+        summary = core_result.consume()
         if row is None:
             raise RuntimeError(f"OMNode not found for candidate_id={candidate_id}")
-        created = bool(row.get("promoted_at") == promoted_at)
+        created = bool(summary.counters.nodes_created > 0)
 
         for message_id in verification.evidence_source_ids:
             sid = str(message_id).strip()

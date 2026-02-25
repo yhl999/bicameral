@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -31,8 +32,10 @@ import yaml
 
 from truth import candidates as candidates_store
 
-LOCK_PATH = Path("/tmp/om_graph_write.lock")
-ONTOLOGY_CONFIG_PATH = Path("mcp_server/config/extraction_ontologies.yaml")
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_ROOT = SCRIPT_PATH.parents[1]
+DEFAULT_LOCK_FILENAME = "om_graph_write.lock"
+DEFAULT_ONTOLOGY_CONFIG_REL = Path("mcp_server/config/extraction_ontologies.yaml")
 MAX_PARENT_CHUNK_SIZE = 50
 MAX_CHILD_CHUNK_SIZE = 10
 DEFAULT_MAX_CHUNKS_PER_RUN = 10
@@ -290,6 +293,55 @@ def _safe_list(value: Any) -> list[Any]:
 
 def _safe_str_list(value: Any) -> list[str]:
     return [str(v) for v in _safe_list(value)]
+
+
+def _resolve_repo_path(value: str | Path) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate
+    return REPO_ROOT / candidate
+
+
+def _resolve_ontology_config_path(config_arg: str | None) -> Path:
+    env_override = (os.environ.get("OM_ONTOLOGY_CONFIG_PATH") or "").strip()
+    if env_override:
+        return _resolve_repo_path(env_override)
+
+    raw = (config_arg or "").strip()
+    if raw:
+        cli_path = Path(raw)
+        if cli_path.is_absolute():
+            return cli_path
+        cwd_resolved = Path.cwd() / cli_path
+        if cwd_resolved.exists():
+            return cwd_resolved
+        return REPO_ROOT / cli_path
+
+    return REPO_ROOT / DEFAULT_ONTOLOGY_CONFIG_REL
+
+
+def _resolve_lock_path() -> Path:
+    env_override = (os.environ.get("OM_COMPRESSOR_LOCK_PATH") or "").strip()
+    if env_override:
+        return _resolve_repo_path(env_override)
+
+    candidate_dirs: list[Path] = []
+    runtime_dir = (os.environ.get("XDG_RUNTIME_DIR") or "").strip()
+    if runtime_dir:
+        candidate_dirs.append(Path(runtime_dir) / "bicameral")
+    candidate_dirs.append(REPO_ROOT / "state" / "locks")
+    candidate_dirs.append(Path.home() / ".cache" / "bicameral" / "locks")
+    candidate_dirs.append(Path(tempfile.gettempdir()) / "bicameral" / "locks")
+
+    for lock_dir in candidate_dirs:
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(lock_dir, os.W_OK | os.X_OK):
+            return lock_dir / DEFAULT_LOCK_FILENAME
+
+    return Path(tempfile.gettempdir()) / "bicameral" / "locks" / DEFAULT_LOCK_FILENAME
 
 
 def _load_extractor_config(path: Path) -> ExtractorConfig:
@@ -921,6 +973,28 @@ def _validated_relation_type_for_cypher(raw_relation_type: str) -> str:
     return rel
 
 
+def _assert_relation_type_safe_for_interpolation(rel: str, edge: ExtractionEdge) -> str:
+    if rel not in RELATION_TYPES:
+        emit_event(
+            "OM_RELATION_TYPE_INTERPOLATION_BLOCKED",
+            relation_type=rel,
+            source_node_id=edge.source_node_id,
+            target_node_id=edge.target_node_id,
+            reason="not_allowlisted",
+        )
+        raise OMCompressorError(f"illegal relation type interpolation blocked: {rel!r}")
+    if not RELATION_TYPE_TOKEN_RE.fullmatch(rel):
+        emit_event(
+            "OM_RELATION_TYPE_INTERPOLATION_BLOCKED",
+            relation_type=rel,
+            source_node_id=edge.source_node_id,
+            target_node_id=edge.target_node_id,
+            reason="regex_mismatch",
+        )
+        raise OMCompressorError(f"invalid relation type token: {rel!r}")
+    return rel
+
+
 def _rank_extraction_nodes(nodes: list[ExtractionNode]) -> list[ExtractionNode]:
     ranked = sorted(
         nodes,
@@ -1024,8 +1098,16 @@ def _process_chunk_tx(
 
     for edge in extracted.edges:
         if not _legal_edge(edge):
+            emit_event(
+                "OM_RELATION_TYPE_INTERPOLATION_BLOCKED",
+                relation_type=edge.relation_type,
+                source_node_id=edge.source_node_id,
+                target_node_id=edge.target_node_id,
+                reason="not_allowlisted",
+            )
             continue
         rel = _validated_relation_type_for_cypher(edge.relation_type)
+        rel = _assert_relation_type_safe_for_interpolation(rel, edge)
         tx.run(
             f"""
             MATCH (s:OMNode {{node_id:$source_node_id}})
@@ -1257,7 +1339,7 @@ def _process_structured_parent(session: Any, parent: ParentState, cfg: Extractor
 
 
 def run(args: argparse.Namespace) -> int:
-    cfg = _load_extractor_config(Path(args.config))
+    cfg = _load_extractor_config(_resolve_ontology_config_path(args.config))
 
     driver = _neo4j_driver()
     with driver, driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
@@ -1326,7 +1408,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OM compressor")
     parser.add_argument(
         "--config",
-        default=str(ONTOLOGY_CONFIG_PATH),
+        default=None,
         help="Path to extraction_ontologies.yaml",
     )
     parser.add_argument("--force", action="store_true", help="process regardless of trigger threshold")
@@ -1340,9 +1422,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _resolve_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with LOCK_PATH.open("a+") as lock_file:
+    with lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             return run(args)

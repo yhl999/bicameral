@@ -60,7 +60,7 @@ def _build_entity_types(raw_types: list[dict[str, str]]) -> dict[str, type[BaseM
                 f"Invalid entity type name {name!r} — must match {_SAFE_TYPE_NAME_RE.pattern}"
             )
         description = entry.get("description", "")
-        model = type(name, (BaseModel,), {"__doc__": description})
+        model = type(name, (BaseModel,), {"__doc__": description, "__module__": __name__})
         result[name] = model
     return result
 
