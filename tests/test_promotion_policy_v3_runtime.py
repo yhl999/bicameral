@@ -27,7 +27,7 @@ class _FakeSession:
         self.nodes_created = nodes_created
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def __enter__(self) -> "_FakeSession":
+    def __enter__(self) -> _FakeSession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
