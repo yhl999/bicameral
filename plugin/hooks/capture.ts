@@ -6,7 +6,7 @@ import type { PackInjectorContext } from './pack-injector.ts';
 
 export interface AgentEndEvent {
   success?: boolean;
-  messages?: Array<{ role?: string; content: string; name?: string }>;
+  messages?: Array<{ role?: string; content?: unknown; name?: string }>;
 }
 
 export type CaptureHook = (event: AgentEndEvent, ctx: PackInjectorContext) => Promise<void>;
@@ -20,8 +20,44 @@ const GRAPHITI_CONTEXT_RE = /<graphiti-context>[\s\S]*?<\/graphiti-context>/gi;
 const PACK_CONTEXT_RE = /<pack-context[\s\S]*?<\/pack-context>/gi;
 const FALLBACK_CONTEXT_RE = /<graphiti-fallback>[\s\S]*?<\/graphiti-fallback>/gi;
 
-export const stripInjectedContext = (content: string): string => {
-  return content
+const normalizeMessageContent = (content: unknown): string | null => {
+  if (typeof content === 'string') {
+    const trimmed = content.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const chunks: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') {
+      continue;
+    }
+    const maybeType = (block as { type?: unknown }).type;
+    if (maybeType !== 'text') {
+      continue;
+    }
+    const maybeText = (block as { text?: unknown }).text;
+    if (typeof maybeText !== 'string') {
+      continue;
+    }
+    if (maybeText.trim()) {
+      chunks.push(maybeText);
+    }
+  }
+
+  if (chunks.length === 0) {
+    return null;
+  }
+  const joined = chunks.join(' ').replace(/\s+/g, ' ').trim();
+  return joined.length > 0 ? joined : null;
+};
+
+export const stripInjectedContext = (content: unknown): string => {
+  const text = normalizeMessageContent(content) ?? '';
+  return text
     .replace(GRAPHITI_CONTEXT_RE, '')
     .replace(PACK_CONTEXT_RE, '')
     .replace(FALLBACK_CONTEXT_RE, '')
@@ -50,23 +86,29 @@ const resolveGroupId = (ctx: PackInjectorContext, config: PluginConfig): string 
   return null;
 };
 
-const extractTurn = (messages: Array<{ role?: string; content: string }>): GraphitiMessage[] => {
+const extractTurn = (messages: Array<{ role?: string; content?: unknown }>): GraphitiMessage[] => {
   const reversed = [...messages].reverse();
   const assistant = reversed.find((message) => message.role === 'assistant');
   const user = reversed.find((message) => message.role === 'user');
 
   const cleaned: GraphitiMessage[] = [];
   if (user) {
-    cleaned.push({
-      content: stripInjectedContext(user.content),
-      role_type: 'user',
-    });
+    const userContent = stripInjectedContext(user.content);
+    if (userContent) {
+      cleaned.push({
+        content: userContent,
+        role_type: 'user',
+      });
+    }
   }
   if (assistant) {
-    cleaned.push({
-      content: stripInjectedContext(assistant.content),
-      role_type: 'assistant',
-    });
+    const assistantContent = stripInjectedContext(assistant.content);
+    if (assistantContent) {
+      cleaned.push({
+        content: assistantContent,
+        role_type: 'assistant',
+      });
+    }
   }
   return cleaned;
 };

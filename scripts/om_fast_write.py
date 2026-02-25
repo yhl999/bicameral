@@ -26,6 +26,7 @@ from typing import Any
 DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
 DEFAULT_EMBEDDING_DIM = 768
 DEFAULT_STATE_FILE = "state/om_fast_write_state.json"
+NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
 
 
 def _embedding_config() -> tuple[str, int]:
@@ -179,11 +180,29 @@ def embed_text(content: str, *, embedding_model: str, embedding_dim: int) -> lis
     return vector
 
 
+def _load_neo4j_env_fallback() -> None:
+    if os.environ.get("NEO4J_PASSWORD"):
+        return
+    if not NEO4J_ENV_FALLBACK_FILE.exists():
+        return
+
+    for raw_line in NEO4J_ENV_FALLBACK_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in {"NEO4J_PASSWORD", "NEO4J_USER", "NEO4J_URI"} and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
 def _neo4j_driver_from_env() -> Any:
     try:
         from neo4j import GraphDatabase  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("neo4j driver is required (pip install neo4j)") from exc
+
+    _load_neo4j_env_fallback()
 
     uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     user = os.environ.get("NEO4J_USER", "neo4j")
