@@ -49,6 +49,8 @@ jobs:
 
       - name: Install Gemini CLI & Security Extension
         if: steps.gate.outputs.should_run == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           npm install -g @google/gemini-cli
           gemini extensions install https://github.com/gemini-cli-extensions/security --consent

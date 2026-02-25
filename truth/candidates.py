@@ -21,11 +21,11 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
-
+from typing import Any
 
 DB_PATH_DEFAULT = Path(__file__).resolve().parents[1] / "state" / "candidates.db"
 
@@ -150,7 +150,7 @@ def new_ulid() -> str:
 # -----------------------------
 
 
-def _parse_iso8601(s: str) -> Optional[datetime]:
+def _parse_iso8601(s: str) -> datetime | None:
     if not s:
         return None
     try:
@@ -203,7 +203,7 @@ def evidence_ref_key(ref: dict[str, Any]) -> str:
     return sha256_hex(json_c14n(nref))
 
 
-def _source_family_from_ref(ref: dict[str, Any]) -> Optional[str]:
+def _source_family_from_ref(ref: dict[str, Any]) -> str | None:
     family = ref.get("source_family")
     if isinstance(family, str):
         normalized = family.strip().lower()
@@ -258,7 +258,7 @@ def compute_evidence_stats(evidence_refs: list[dict[str, Any]]) -> dict[str, Any
             continue
         source_family_counts[sf] = source_family_counts.get(sf, 0) + 1
 
-    def ref_ts(r: dict[str, Any]) -> Optional[datetime]:
+    def ref_ts(r: dict[str, Any]) -> datetime | None:
         ts = None
         if r.get("observed_at"):
             ts = _parse_iso8601(str(r.get("observed_at")))
@@ -296,7 +296,7 @@ def compute_evidence_stats(evidence_refs: list[dict[str, Any]]) -> dict[str, Any
 
     if len(dts) >= 2:
         span = max(dts) - min(dts)
-        time_span_days: Optional[int] = int(span.total_seconds() // 86400)
+        time_span_days: int | None = int(span.total_seconds() // 86400)
     else:
         time_span_days = None
 
@@ -496,7 +496,7 @@ def compute_policy_trace(candidate: dict[str, Any], evidence_stats: dict[str, An
         {"check": "explicit_update", "pass": explicit_update, "explicit_update": explicit_update},
         {
             "check": "medium_requires_additional_evidence",
-            "pass": not (risk_level == "medium") or medium_requires_additional_evidence,
+            "pass": risk_level != "medium" or medium_requires_additional_evidence,
             "independent_source_families": independent_source_families,
         },
         {"check": "independent_source_families", "pass": independent_source_families >= 1, "independent_source_families": independent_source_families},
@@ -530,13 +530,7 @@ def compute_policy_trace(candidate: dict[str, Any], evidence_stats: dict[str, An
     elif needs_ttl:
         recommendation = "needs_ttl"
         status_suggested = "requires_approval"
-    elif effective_risk_level == "high":
-        recommendation = "requires_approval"
-        status_suggested = "requires_approval"
-    elif not owner_speaker:
-        recommendation = "requires_approval"
-        status_suggested = "requires_approval"
-    elif not auto_promote_enabled:
+    elif effective_risk_level == "high" or not owner_speaker or not auto_promote_enabled:
         recommendation = "requires_approval"
         status_suggested = "requires_approval"
     elif conflict:
@@ -559,10 +553,7 @@ def compute_policy_trace(candidate: dict[str, Any], evidence_stats: dict[str, An
     elif auto_promote_eligible:
         recommendation = "auto_promote"
         status_suggested = "auto_promoted"
-    elif meets_recommend_confidence and explicit_update:
-        recommendation = "recommended_approve"
-        status_suggested = "pending"
-    elif meets_recommend_confidence:
+    elif meets_recommend_confidence and explicit_update or meets_recommend_confidence:
         recommendation = "recommended_approve"
         status_suggested = "pending"
     else:
@@ -680,7 +671,7 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _sanitize_decision_reason(decision_reason: Optional[str]) -> Optional[str]:
+def _sanitize_decision_reason(decision_reason: str | None) -> str | None:
     """Normalize error decision tags so raw exception messages are never stored."""
 
     if decision_reason is None:
@@ -707,9 +698,9 @@ def refresh_candidate_policy_state(
     conn: sqlite3.Connection,
     candidate_id: str,
     *,
-    conflict_with_fact_id: Optional[str] = None,
-    status_override: Optional[str] = None,
-    decision_reason: Optional[str] = None,
+    conflict_with_fact_id: str | None = None,
+    status_override: str | None = None,
+    decision_reason: str | None = None,
     preserve_terminal_status: bool = True,
 ) -> dict[str, Any]:
     """Recompute and persist policy trace/status for an existing candidate row."""
@@ -755,10 +746,7 @@ def refresh_candidate_policy_state(
     reason = str(trace_prev.get("reason") or origin)
     explicit_update = _coerce_bool(trace_prev.get("explicit_update"))
     content_cues = trace_prev.get("content_cues")
-    if isinstance(content_cues, (list, tuple, set)):
-        content_cues = list(content_cues)
-    else:
-        content_cues = None
+    content_cues = list(content_cues) if isinstance(content_cues, (list, tuple, set)) else None
     seeded_supersede_ok = bool(trace_prev.get("seeded_supersede_ok"))
 
     trace = compute_policy_trace(
@@ -835,16 +823,16 @@ def upsert_candidate(
     assertion_type: str,
     value: Any,
     evidence_refs: list[dict[str, Any]],
-    evidence_quote: Optional[str] = None,
-    speaker_id: Optional[str] = None,
-    confidence: Optional[float] = None,
-    source_trust: Optional[str] = None,
-    conflict_with_fact_id: Optional[str] = None,
+    evidence_quote: str | None = None,
+    speaker_id: str | None = None,
+    confidence: float | None = None,
+    source_trust: str | None = None,
+    conflict_with_fact_id: str | None = None,
     # policy inputs
     origin: str = "extracted",
-    reason: Optional[str] = None,
+    reason: str | None = None,
     explicit_update: bool = False,
-    content_cues: Optional[list[str]] = None,
+    content_cues: list[str] | None = None,
     seeded_supersede_ok: bool = False,
     # preserve terminal states
     preserve_decision_status: bool = True,
@@ -1061,7 +1049,7 @@ def _decision_for_actor(actor_id: str) -> str:
     return "approved"
 
 
-def _normalize_reason(reason: Optional[str], *, fallback: str) -> str:
+def _normalize_reason(reason: str | None, *, fallback: str) -> str:
     safe = _sanitize_decision_reason(reason)
     return safe if safe else fallback
 
@@ -1072,7 +1060,7 @@ def promote_candidate(
     actor_id: str,
     reason: str,
     ledger: Any | None = None,
-) -> tuple[int, Optional[str]]:
+) -> tuple[int, str | None]:
     """Promote a candidate to the personal fact ledger."""
 
     row = conn.execute(
@@ -1134,7 +1122,7 @@ def deny_candidate(
     actor_id: str,
     reason: str,
     ledger: Any | None = None,
-) -> tuple[int, Optional[str]]:
+) -> tuple[int, str | None]:
     """Deny a candidate."""
 
     row = conn.execute(
@@ -1233,7 +1221,7 @@ def upsert_candidate_verification(
     verification_status: str,
     evidence_source_ids: list[str],
     verifier_version: str,
-    verified_at: Optional[str] = None,
+    verified_at: str | None = None,
 ) -> dict[str, Any]:
     """Insert a verification record for a candidate.
 
@@ -1274,7 +1262,7 @@ def upsert_candidate_verification(
 def get_latest_candidate_verification(
     conn: sqlite3.Connection,
     candidate_id: str,
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     row = conn.execute(
         """
         SELECT candidate_id, verification_status, evidence_source_ids, verifier_version, verified_at
@@ -1308,7 +1296,7 @@ def upsert_om_dead_letter(
     last_error: str,
     first_failed_at: str,
     last_failed_at: str,
-    last_chunk_id: Optional[str],
+    last_chunk_id: str | None,
 ) -> dict[str, Any]:
     """UPSERT one row in om_dead_letter_queue keyed by message_id."""
 

@@ -11,6 +11,9 @@ allowlist:
   - "tests/**"
   - "workflows/**"
   - "plugin/**"
+  - "schemas/**"
+  - "truth/**"
+  - "patches/**"
 
   # Public docs/spec/reporting
   - "docs/**"

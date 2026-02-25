@@ -248,12 +248,11 @@ def fast_write(payload: FastWritePayload) -> dict[str, Any]:
     }
 
     driver = _neo4j_driver_from_env()
-    with driver:
-        with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
-            _ensure_constraints(session)
-            row = session.run(query, params).single()
-            if row is None:
-                raise RuntimeError("fast-write did not return message row")
+    with driver, driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
+        _ensure_constraints(session)
+        row = session.run(query, params).single()
+        if row is None:
+            raise RuntimeError("fast-write did not return message row")
 
     return {
         "message_id": payload.message_id,

@@ -24,7 +24,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import yaml
 
@@ -178,7 +178,7 @@ def parse_iso(value: str | None) -> datetime | None:
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     na = sum(x * x for x in a) ** 0.5
     nb = sum(y * y for y in b) ** 0.5
     if na == 0.0 or nb == 0.0:
@@ -813,7 +813,7 @@ def _activate_energy_scores(
             last_observed_at=str(row.get("last_observed_at")) if row.get("last_observed_at") else None,
             content_embedding=emb,
         )
-        setattr(candidate, "_score", score)  # lightweight internal annotation
+        candidate._score = score  # lightweight internal annotation
         candidates.append(candidate)
 
     candidates.sort(
@@ -891,12 +891,9 @@ def _increment_message_attempt(session: Any, message: MessageRow, error: str, ch
 
 
 def _legal_edge(edge: ExtractionEdge) -> bool:
-    if edge.relation_type not in RELATION_TYPES:
-        return False
-
     # Node type legality is enforced by upstream extraction contract;
     # fallback extractor currently emits no structural edges.
-    return True
+    return edge.relation_type in RELATION_TYPES
 
 
 def _rank_extraction_nodes(nodes: list[ExtractionNode]) -> list[ExtractionNode]:
@@ -1238,18 +1235,17 @@ def run(args: argparse.Namespace) -> int:
     cfg = _load_extractor_config(Path(args.config))
 
     driver = _neo4j_driver()
-    with driver:
-        with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
-            _ensure_neo4j_constraints(session)
+    with driver, driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
+        _ensure_neo4j_constraints(session)
 
-            parent = _fetch_structured_parent(session)
-            if parent is not None:
-                _process_structured_parent(session, parent, cfg)
-                return 0
+        parent = _fetch_structured_parent(session)
+        if parent is not None:
+            _process_structured_parent(session, parent, cfg)
+            return 0
 
-            processed = 0
-            max_chunks = max(1, int(args.max_chunks_per_run))
-            while processed < max_chunks:
+        processed = 0
+        max_chunks = max(1, int(args.max_chunks_per_run))
+        while processed < max_chunks:
                 backlog_count, oldest_hours = _fetch_backlog_stats(session)
                 trigger = backlog_count >= 50 or (oldest_hours is not None and oldest_hours >= 48.0)
                 if not args.force and not trigger:

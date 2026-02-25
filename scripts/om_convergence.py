@@ -227,35 +227,34 @@ def run(args: argparse.Namespace) -> int:
     run_started_at = now_iso()
 
     driver = neo4j_driver()
-    with driver:
-        with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
-            state = _ensure_state(session, run_started_at)
+    with driver, driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
+        state = _ensure_state(session, run_started_at)
 
-            emit(
-                "OM_CONVERGENCE_WINDOW",
-                last_convergence_at=state.last_convergence_at,
-                run_started_at=run_started_at,
-            )
+        emit(
+            "OM_CONVERGENCE_WINDOW",
+            last_convergence_at=state.last_convergence_at,
+            run_started_at=run_started_at,
+        )
 
-            updated_monitoring = _backfill_monitoring_started_at(session)
-            upserted, deleted, dead_letter_queue_size = reconcile_dead_letter_queue(session)
+        updated_monitoring = _backfill_monitoring_started_at(session)
+        upserted, deleted, dead_letter_queue_size = reconcile_dead_letter_queue(session)
 
-            deleted_messages = 0
-            deleted_episodes = 0
-            if args.run_gc:
-                deleted_messages, deleted_episodes = run_gc(session, args.gc_days)
+        deleted_messages = 0
+        deleted_episodes = 0
+        if args.run_gc:
+            deleted_messages, deleted_episodes = run_gc(session, args.gc_days)
 
-            update_watermark(session, run_started_at)
+        update_watermark(session, run_started_at)
 
-            emit(
-                "OM_CONVERGENCE_DONE",
-                monitoring_backfilled=updated_monitoring,
-                dead_letter_upserted=upserted,
-                dead_letter_deleted=deleted,
-                dead_letter_queue_size=dead_letter_queue_size,
-                deleted_messages=deleted_messages,
-                deleted_episodes=deleted_episodes,
-            )
+        emit(
+            "OM_CONVERGENCE_DONE",
+            monitoring_backfilled=updated_monitoring,
+            dead_letter_upserted=upserted,
+            dead_letter_deleted=deleted,
+            dead_letter_queue_size=dead_letter_queue_size,
+            deleted_messages=deleted_messages,
+            deleted_episodes=deleted_episodes,
+        )
 
     return 0
 

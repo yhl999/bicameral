@@ -15,11 +15,11 @@ import hashlib
 import importlib
 import json
 import os
-import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from truth import candidates as candidates_store
 
@@ -175,34 +175,33 @@ def promote_candidate(
     RETURN count(r) AS rel_count
     """
 
-    with driver:
-        with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
-            row = session.run(
-                core_query,
-                {
-                    "candidate_id": candidate_id,
-                    "core_memory_id": core_memory_id,
-                    "promoted_at": promoted_at,
-                },
-            ).single()
-            if row is None:
-                raise RuntimeError(f"OMNode not found for candidate_id={candidate_id}")
-            created = bool(row.get("promoted_at") == promoted_at)
+    with driver, driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
+        row = session.run(
+            core_query,
+            {
+                "candidate_id": candidate_id,
+                "core_memory_id": core_memory_id,
+                "promoted_at": promoted_at,
+            },
+        ).single()
+        if row is None:
+            raise RuntimeError(f"OMNode not found for candidate_id={candidate_id}")
+        created = bool(row.get("promoted_at") == promoted_at)
 
-            for message_id in verification.evidence_source_ids:
-                sid = str(message_id).strip()
-                if not sid:
-                    continue
-                session.run(
-                    support_query,
-                    {
-                        "message_id": sid,
-                        "core_memory_id": core_memory_id,
-                        "candidate_id": candidate_id,
-                        "linked_at": promoted_at,
-                    },
-                ).consume()
-                linked_edges += 1
+        for message_id in verification.evidence_source_ids:
+            sid = str(message_id).strip()
+            if not sid:
+                continue
+            session.run(
+                support_query,
+                {
+                    "message_id": sid,
+                    "core_memory_id": core_memory_id,
+                    "candidate_id": candidate_id,
+                    "linked_at": promoted_at,
+                },
+            ).consume()
+            linked_edges += 1
 
     return {
         "candidate_id": candidate_id,
