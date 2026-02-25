@@ -129,7 +129,7 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
       if (!groupIds || groupIds.length === 0) {
         const safeGroup = sanitizeIdentifier('missing-group-scope');
         console.warn(
-          `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=missing_group_scope`,
+          `[bicameral] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=missing_group_scope`,
         );
         logger('Graphiti recall skipped: missing group scope');
         parts.push(formatFallback());
@@ -144,7 +144,7 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
           const safeGroup = sanitizeIdentifier(groupIds[0] ?? 'unknown');
           // Always emit failover warnings, even when debug logging is disabled.
           console.warn(
-            `[graphiti-openclaw] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=${safeReason}`,
+            `[bicameral] ${FALLBACK_ERROR_CODE} group=${safeGroup} reason=${safeReason}`,
           );
           logger(`Graphiti recall failed: ${safeReason}`);
           parts.push(formatFallback());

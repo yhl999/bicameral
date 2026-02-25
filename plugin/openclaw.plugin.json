@@ -1,8 +1,8 @@
 {
-  "id": "graphiti-openclaw",
-  "name": "graphiti-openclaw",
+  "id": "bicameral",
+  "name": "bicameral",
   "version": "0.1.0",
-  "description": "Graphiti runtime context injection plugin",
+  "description": "Bicameral runtime context injection plugin",
   "entry": "index.ts",
   "configSchema": {
     "type": "object",
