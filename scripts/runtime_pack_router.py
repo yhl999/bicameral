@@ -97,6 +97,7 @@ GRAPHITI_DEFAULT_BASE_URL = 'http://localhost:8000'
 GRAPHITI_SEARCH_PATH = '/search'
 MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE = 'graphiti_content_voice_style'
 MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES = 'graphiti_content_writing_samples'
+MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS = 'graphiti_content_long_form_artifacts'
 
 
 class OMIndexMismatchError(ValueError):
@@ -832,6 +833,8 @@ def _materialize_content_pack(
         header = f'Live voice-style signals (mode={mode}, lanes={lane_label})'
     elif source == MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES:
         header = f'Live writing-sample signals (mode={mode}, lanes={lane_label})'
+    elif source == MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS:
+        header = f'Live long-form artifact signals (mode={mode}, lanes={lane_label})'
     else:
         return ''
 
@@ -857,6 +860,7 @@ def materialize(
     if normalized_source in {
         MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE,
         MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES,
+        MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS,
     }:
         try:
             dynamic = _materialize_content_pack(

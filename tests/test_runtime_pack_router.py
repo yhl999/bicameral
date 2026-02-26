@@ -724,6 +724,182 @@ class RuntimePackRouterTests(unittest.TestCase):
             self.assertEqual(selected.get('content'), 'STATIC VOICE FALLBACK')
 
 
+    def test_materialize_content_long_form_artifacts_uses_live_graph_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'content_long_form_artifacts.pack.yaml').write_text(
+                'domain_context: |\n  STATIC ARTIFACTS FALLBACK',
+                encoding='utf-8',
+            )
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'content_long_form_artifacts',
+                        'path': 'workflows/content_long_form_artifacts.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {
+                                'default': ['s1_inspiration_long_form', 's1_content_strategy'],
+                            },
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_long_form_artifacts',
+                            'min_coverage_items': 2,
+                            'max_items': 4,
+                        },
+                    }
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_artifacts_only',
+                        'workflow_id': 'artifacts_only',
+                        'step_id': 'reference',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Artifacts-only test',
+                        'injection_text': 'Artifacts-only workflow',
+                        'pack_ids': ['content_long_form_artifacts'],
+                        'chatgpt_mode': 'off',
+                        'pack_modes': {
+                            'content_long_form_artifacts': 'formal',
+                        },
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            with GraphitiStubServer(
+                facts_by_group_id={
+                    's1_inspiration_long_form': [
+                        'Inversion: state the conventional wisdom, then dismantle it.',
+                        'Cold open with a surprising fact that reframes the topic.',
+                    ],
+                    's1_content_strategy': [
+                        'Bridge sentence: restate prior conclusion as next premise.',
+                        'Use nested conditionals for nuanced argument structures.',
+                    ],
+                }
+            ) as base_url:
+                plan = self._route(
+                    repo,
+                    consumer='main_session_artifacts_only',
+                    workflow_id='artifacts_only',
+                    step_id='reference',
+                    task='Artifacts-only test',
+                    materialize=True,
+                    scope='private',
+                    env={
+                        'GRAPHITI_BASE_URL': base_url,
+                    },
+                )
+
+            selected = plan['selected_packs'][0]
+            self.assertEqual(selected['pack_id'], 'content_long_form_artifacts')
+            self.assertIn('content', selected)
+            artifacts_content = selected['content']
+            self.assertIn('Live long-form artifact signals', artifacts_content)
+            self.assertNotIn('STATIC ARTIFACTS FALLBACK', artifacts_content)
+
+    def test_materialize_content_long_form_artifacts_low_coverage_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'content_long_form_artifacts.pack.yaml').write_text(
+                'domain_context: |\n  STATIC ARTIFACTS FALLBACK',
+                encoding='utf-8',
+            )
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'content_long_form_artifacts',
+                        'path': 'workflows/content_long_form_artifacts.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {
+                                'default': ['s1_inspiration_long_form', 's1_content_strategy'],
+                            },
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_long_form_artifacts',
+                            'min_coverage_items': 2,
+                            'max_items': 4,
+                        },
+                    }
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_artifacts_only',
+                        'workflow_id': 'artifacts_only',
+                        'step_id': 'reference',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Artifacts-only test',
+                        'injection_text': 'Artifacts-only workflow',
+                        'pack_ids': ['content_long_form_artifacts'],
+                        'chatgpt_mode': 'off',
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            with GraphitiStubServer(
+                facts_by_group_id={
+                    's1_inspiration_long_form': ['Only one fact, below coverage.'],
+                }
+            ) as base_url:
+                plan = self._route(
+                    repo,
+                    consumer='main_session_artifacts_only',
+                    workflow_id='artifacts_only',
+                    step_id='reference',
+                    task='Artifacts-only test',
+                    materialize=True,
+                    scope='private',
+                    env={
+                        'GRAPHITI_BASE_URL': base_url,
+                    },
+                )
+
+            selected = plan['selected_packs'][0]
+            self.assertEqual(selected['pack_id'], 'content_long_form_artifacts')
+            self.assertEqual(selected.get('content'), 'STATIC ARTIFACTS FALLBACK')
+
+
 class RuntimePackRouterFixturesTests(unittest.TestCase):
     def test_misconfigured_profile_type_rejects_non_string_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
