@@ -6,11 +6,78 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'runtime_pack_router.py'
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _GraphitiStubHandler(BaseHTTPRequestHandler):
+    facts_by_query_keyword: dict[str, list[str]] = {}
+    facts_by_group_id: dict[str, list[str]] = {}
+
+    def do_POST(self) -> None:  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get('Content-Length', '0') or '0'))
+        payload = json.loads(raw.decode('utf-8') or '{}')
+        query = str(payload.get('query') or '')
+        group_ids = payload.get('group_ids') if isinstance(payload.get('group_ids'), list) else []
+
+        facts: list[dict[str, str]] = []
+        for group_id in group_ids:
+            if not isinstance(group_id, str):
+                continue
+            values = self.facts_by_group_id.get(group_id)
+            if values:
+                facts = [{'fact': value} for value in values]
+                break
+
+        if not facts:
+            for keyword, values in self.facts_by_query_keyword.items():
+                if keyword in query:
+                    facts = [{'fact': value} for value in values]
+                    break
+
+        body = json.dumps({'facts': facts}).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class GraphitiStubServer:
+    def __init__(
+        self,
+        *,
+        facts_by_query_keyword: dict[str, list[str]] | None = None,
+        facts_by_group_id: dict[str, list[str]] | None = None,
+    ):
+        self._facts = facts_by_query_keyword or {}
+        self._facts_by_group = facts_by_group_id or {}
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> str:
+        _GraphitiStubHandler.facts_by_query_keyword = self._facts
+        _GraphitiStubHandler.facts_by_group_id = self._facts_by_group
+        self._server = ThreadingHTTPServer(('127.0.0.1', 0), _GraphitiStubHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._server.server_address
+        return f'http://{host}:{port}'
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
 
 
 class RuntimePackRouterTests(unittest.TestCase):
@@ -444,6 +511,217 @@ class RuntimePackRouterTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn('OMIndexMismatchError', result.stderr)
             self.assertIn('vector_dim mismatch', result.stderr)
+
+
+    def test_materialize_content_packs_uses_live_graph_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'content_long_form.pack.yaml').write_text(
+                'domain_context: |\n  deterministic long-form scaffold',
+                encoding='utf-8',
+            )
+            (repo / 'workflows' / 'content_voice_style.pack.yaml').write_text(
+                'domain_context: |\n  STATIC VOICE FALLBACK',
+                encoding='utf-8',
+            )
+            (repo / 'workflows' / 'content_writing_samples.pack.yaml').write_text(
+                'domain_context: |\n  STATIC WRITING FALLBACK',
+                encoding='utf-8',
+            )
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'content_long_form',
+                        'path': 'workflows/content_long_form.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                    },
+                    {
+                        'pack_id': 'content_voice_style',
+                        'path': 'workflows/content_voice_style.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_content_strategy']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_voice_style',
+                            'min_coverage_items': 2,
+                            'max_items': 4,
+                        },
+                    },
+                    {
+                        'pack_id': 'content_writing_samples',
+                        'path': 'workflows/content_writing_samples.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_writing_samples']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_writing_samples',
+                            'min_coverage_items': 2,
+                            'max_items': 4,
+                        },
+                    },
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_content_long_form',
+                        'workflow_id': 'content_long_form',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Draft long-form content',
+                        'injection_text': 'Long-form writing workflow',
+                        'pack_ids': [
+                            'content_long_form',
+                            'content_voice_style',
+                            'content_writing_samples',
+                        ],
+                        'chatgpt_mode': 'off',
+                        'pack_modes': {
+                            'content_long_form': 'long',
+                            'content_voice_style': 'formal',
+                            'content_writing_samples': 'formal',
+                        },
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            with GraphitiStubServer(
+                facts_by_group_id={
+                    's1_content_strategy': [
+                        'Lead with a specific observation and immediate thesis.',
+                        'Use concrete verbs and avoid ornamental metaphors.',
+                    ],
+                    's1_writing_samples': [
+                        'Growth quality matters more than top-line speed in underwriting.',
+                        'A strong memo pairs every claim with auditable evidence.',
+                    ],
+                }
+            ) as base_url:
+                plan = self._route(
+                    repo,
+                    consumer='main_session_content_long_form',
+                    workflow_id='content_long_form',
+                    step_id='draft',
+                    task='Draft long-form content',
+                    materialize=True,
+                    scope='private',
+                    env={
+                        'GRAPHITI_BASE_URL': base_url,
+                    },
+                )
+
+            selected = {pack['pack_id']: pack for pack in plan['selected_packs']}
+            self.assertNotIn('content', selected['content_long_form'])
+            self.assertIn('content', selected['content_voice_style'])
+            self.assertIn('content', selected['content_writing_samples'])
+
+            voice_content = selected['content_voice_style']['content']
+            writing_content = selected['content_writing_samples']['content']
+            self.assertIn('Live voice-style signals', voice_content)
+            self.assertIn('Live writing-sample signals', writing_content)
+            self.assertNotIn('STATIC VOICE FALLBACK', voice_content)
+            self.assertNotIn('STATIC WRITING FALLBACK', writing_content)
+
+    def test_materialize_content_pack_low_coverage_falls_back_to_static_domain_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'content_voice_style.pack.yaml').write_text(
+                'domain_context: |\n  STATIC VOICE FALLBACK',
+                encoding='utf-8',
+            )
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'content_voice_style',
+                        'path': 'workflows/content_voice_style.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_content_strategy']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_voice_style',
+                            'min_coverage_items': 2,
+                            'max_items': 4,
+                        },
+                    }
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_voice_only',
+                        'workflow_id': 'voice_only',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Voice-only test',
+                        'injection_text': 'Voice-only workflow',
+                        'pack_ids': ['content_voice_style'],
+                        'chatgpt_mode': 'off',
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            with GraphitiStubServer(
+                facts_by_group_id={
+                    's1_content_strategy': ['Only one fact, below coverage threshold.'],
+                }
+            ) as base_url:
+                plan = self._route(
+                    repo,
+                    consumer='main_session_voice_only',
+                    workflow_id='voice_only',
+                    step_id='draft',
+                    task='Voice-only test',
+                    materialize=True,
+                    scope='private',
+                    env={
+                        'GRAPHITI_BASE_URL': base_url,
+                    },
+                )
+
+            selected = plan['selected_packs'][0]
+            self.assertEqual(selected['pack_id'], 'content_voice_style')
+            self.assertEqual(selected.get('content'), 'STATIC VOICE FALLBACK')
 
 
 class RuntimePackRouterFixturesTests(unittest.TestCase):
