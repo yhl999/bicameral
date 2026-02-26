@@ -69,8 +69,18 @@ export interface PluginConfig {
   debug: boolean;
   configPathRoots?: string[];
   trustedGroupIds?: string[];
-  singleTenant?: boolean;
-  memoryGroupId?: string;
+  /** Enable per-turn capability subset injection. Default false. */
+  enableCapabilityInjection: boolean;
+  /** Command to run the capability subset selector (e.g. "python3 scripts/select_capability_subset.py"). */
+  capabilitySelectorCommand?: string | string[];
+  /** Path to capability-index.json (passed as --index). */
+  capabilityIndexPath?: string;
+  /** Path to capability_intent_overrides.json (passed as --overrides). */
+  capabilityOverridesPath?: string;
+  /** Timeout for the capability selector process. Default 2000ms. */
+  capabilitySelectorTimeoutMs: number;
+  /** Number of Top-N capabilities to inject per turn. Default 8. */
+  capabilityTopN: number;
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -92,6 +102,9 @@ export const DEFAULT_CONFIG: PluginConfig = {
   // unless the operator explicitly opts in via singleTenant: true.
   singleTenant: false,
   debug: false,
+  enableCapabilityInjection: false,
+  capabilitySelectorTimeoutMs: 2000,
+  capabilityTopN: 8,
 };
 
 const normalizeOptionalString = (value?: string): string | undefined => {

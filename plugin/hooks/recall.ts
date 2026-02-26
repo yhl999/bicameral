@@ -5,6 +5,7 @@ import type { PluginConfig } from '../config.ts';
 import { deriveGroupLane } from '../lane-utils.ts';
 import type { PackContextResult } from './pack-injector.ts';
 import type { PackInjectorContext } from './pack-injector.ts';
+import { createCapabilityInjector } from './capability-injector.ts';
 
 export interface BeforeAgentStartEvent {
   prompt: string;
@@ -114,6 +115,7 @@ const resolveGroupIds = (
 export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
   const config = normalizeConfig(deps.config);
   const logger = config.debug ? (message: string) => console.log(message) : () => undefined;
+  const capabilityInjector = createCapabilityInjector({ config });
 
   return async (event, ctx) => {
     const parts: string[] = [];
@@ -154,6 +156,7 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
       parts.push('');
     }
 
+    let packIntentId: string | undefined;
     try {
       const packResult = await deps.packInjector({
         prompt,
@@ -162,9 +165,22 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
       });
       if (packResult?.context) {
         parts.push(packResult.context);
+        packIntentId = packResult.intentId;
       }
     } catch (error) {
       logger(`Pack injection failed: ${(error as Error).message}`);
+    }
+
+    try {
+      const capabilityContext = await capabilityInjector({
+        prompt,
+        intentId: packIntentId,
+      });
+      if (capabilityContext) {
+        parts.push(capabilityContext);
+      }
+    } catch (error) {
+      logger(`Capability injection failed: ${(error as Error).message}`);
     }
 
     return { prependContext: parts.filter((part) => part.trim().length > 0).join('\n\n') };
