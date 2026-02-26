@@ -65,6 +65,73 @@ rather than raw exception messages to avoid leaking internal state.
 `shell=True`), preventing shell injection even if an identifier were to bypass
 validation.
 
+## OM Fast-Write Wiring
+
+The OM fast-write path is a separate write lane that bypasses the MCP server's
+ingestion queue. Use it when you need sub-second writes from live transcript streams.
+
+### Enabling Fast-Write
+
+```bash
+# 1. Wire the state file into your runtime repo
+python3 scripts/om_fast_write.py set-state \
+  --runtime-repo /path/to/runtime-repo \
+  --enabled \
+  --reason "hook_wired"
+
+# 2. Write messages directly
+python3 scripts/om_fast_write.py write \
+  --session-id "<session_id>" \
+  --role user \
+  --content "<message text>" \
+  --created-at "2026-02-26T12:00:00Z"
+```
+
+### Fast-Write Integration Points
+
+| Hook | How |
+|---|---|
+| **OpenClaw plugin** | `om_fast_write.py write --payload-file <tmpfile>` on each transcript message |
+| **Cron drain** | `om_fast_write.py write --payload-json '{"source_session_id":...}'` |
+| **Runtime repo state** | `state/om_fast_write_state.json` (gitignored) — read by runtime health checks |
+
+### OM Wiring Paths
+
+```
+Transcript message
+        │
+        ├─► [MCP path]   mcp_ingest_sessions.py → Graphiti extraction queue
+        │                (sets graphiti_extracted_at on Message)
+        │
+        └─► [OM path]    om_fast_write.py write  → Neo4j Message/Episode nodes
+                                │
+                                ▼
+                         om_compressor.py        → OMNode extraction
+                                │
+                                ▼
+                         om_convergence.py       → Lifecycle state machine
+                                │
+                                ▼
+                         promotion_policy_v3.py  → CoreMemory (on corroboration)
+```
+
+Both paths are independent and can run concurrently. A `Message` node can be
+processed by both Graphiti (sets `graphiti_extracted_at`) and OM (sets `om_extracted`).
+
+GC eligibility requires **both** `graphiti_extracted_at IS NOT NULL` and `om_extracted = true`,
+so messages on only one path are retained until the other path also completes.
+
+### Environment Variables
+
+| Var | Default | Description |
+|---|---|---|
+| `OM_EMBEDDING_MODEL` | `embeddinggemma` | Embedding model |
+| `OM_EMBEDDING_DIM` | `768` | Expected vector dimension |
+| `EMBEDDER_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible embedding endpoint |
+| `RUNTIME_REPO_ROOT` | (none) | If set, fast-write updates the state file automatically |
+
+---
+
 ## Runtime pack injection policy (Graphiti/CLR)
 
 Runtime pack routing is performed by `scripts/runtime_pack_router.py`.

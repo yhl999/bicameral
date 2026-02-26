@@ -133,9 +133,68 @@ We bet the complexity was worth it.
 
 ---
 
+## Brain 3: Observational Memory (OM)
+
+After shipping, a third cognitive layer was added between Brain 1 and the promotion
+pipeline: **Observational Memory (OM)**.
+
+The Dual Brain addresses *governance* — which facts to trust. But it doesn't address
+*velocity*: raw transcript messages accumulate faster than the MCP server's full
+extraction pipeline can drain them. OM solves this with a two-stage design:
+
+### Stage 1 — Fast-Write (`scripts/om_fast_write.py`)
+
+Transcript messages are written directly into Neo4j as `Message` and `Episode` nodes
+**without** going through the MCP extraction queue. This is a lightweight, fail-closed
+path: embed the content, write the node, done. Latency is bounded by the embedding
+endpoint (~20s timeout), not by LLM extraction.
+
+Each new `Message` node is stamped with extraction lifecycle defaults:
+- `om_extracted = false` — queued for OM compressor
+- `om_dead_letter = false` — not yet failed
+- `graphiti_extracted_at = NULL` — not yet processed by Graphiti/MCP
+
+### Stage 2 — Compressor (`scripts/om_compressor.py`)
+
+A background process drains the unextracted `Message` backlog into `OMNode`
+observations. Trigger: backlog ≥ 50 messages **or** oldest message ≥ 48 hours old.
+Each run processes up to 10 chunks of 50 messages each (500 messages max per run).
+
+Extracted `OMNode` types: `WorldState`, `Judgment`, `OperationalRule`, `Commitment`,
+`Friction`. Nodes are linked back to their source messages via `EVIDENCE_FOR` edges.
+
+### Stage 3 — Convergence (`scripts/om_convergence.py`)
+
+The convergence engine runs the OMNode lifecycle state machine
+(`OPEN → MONITORING → CLOSED/ABANDONED, REOPENED` paths), reconciles the dead-letter
+queue between Neo4j and the candidates SQLite DB, and optionally runs GC (90-day TTL
+with retention gates for `EVIDENCE_FOR` and `SUPPORTS_CORE` edges).
+
+### Stage 4 — CoreMemory Promotion (`truth/promotion_policy_v3.py`)
+
+Corroborated OMNode candidates are promoted to `CoreMemory` nodes, which carry
+`retention_status = 'active'` and are linked to their source `Message` evidence via
+`SUPPORTS_CORE` edges. CoreMemory nodes are exempt from GC.
+
+### Why This Matters
+
+OM closes a gap in the Dual Brain: Brain 1 (Neo4j) was populated via MCP ingestion,
+which requires full LLM extraction. OM allows Brain 1 to populate from **live
+transcript stream** without MCP latency. Observations arrive in near-real-time, are
+governed by the same convergence policy, and — when corroborated — feed Brain 2's
+fact ledger via CoreMemory promotion.
+
+The three brains:
+- **Brain 1 (Neo4j):** Semantic engine — LLM-extracted entities and relationships
+- **Brain 2 (SQLite Fact Ledger):** Logic ledger — deterministic, auditable truth
+- **Brain 3 (OM):** Observational layer — fast-write transcript stream → structured observations
+
+---
+
 ## See Also
 
 - [Retrieval Trust Scoring](retrieval-trust-scoring.md) — How the trust multiplier actually works in code
 - [Custom Ontologies](custom-ontologies.md) — How to teach each graph lane what to extract
 - [Promotion Policy](promotion-policy.md) — How to decide what becomes truth
 - [Fact Ledger](fact-ledger-schema.md) — The SQLite schema and hash-chain design
+- [OM Operations Runbook](runbooks/om-operations.md) — Trigger math, lock ordering, GC invariants, convergence state machine

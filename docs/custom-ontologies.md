@@ -165,9 +165,108 @@ Behavior:
 
 Default remains `dedupe_mode='semantic'` for normal operation.
 
+## OM Ontology: `s1_observational_memory`
+
+The Observational Memory (OM) pipeline uses a dedicated semantic domain. Unlike normal
+lane ontologies (which govern Graphiti/MCP extraction), the OM ontology governs the
+`om_extractor` block in `mcp_server/config/extraction_ontologies.yaml` and the entity
+types emitted by `scripts/om_compressor.py`.
+
+### Built-in OM Entity Types
+
+The compressor's deterministic extractor uses these types (no config required):
+
+| Type | When extracted |
+|---|---|
+| `Judgment` | Content contains "because" or "decision" |
+| `OperationalRule` | Content contains "rule" or "always" |
+| `Commitment` | Content contains "commit" or "promise" |
+| `Friction` | Content contains "problem", "friction", or "blocked" |
+| `WorldState` | Default fallback |
+
+### Allowed OM Edge Types
+
+The following edge types are enforced via an allowlist in the compressor (free-form
+relation type strings are blocked at write time):
+
+```
+MOTIVATES   GENERATES   SUPERSEDES   ADDRESSES   RESOLVES
+```
+
+### YAML Config for OM Extractor
+
+The `om_extractor` block in `mcp_server/config/extraction_ontologies.yaml` controls
+the model and prompt used for LLM-backed extraction (when enabled):
+
+```yaml
+schema_version: "2026-02-17"
+
+om_extractor:
+  model_id: "gpt-5.1-codex-mini"
+  prompt_template: |-
+    You are the Observational Memory extractor.
+    Produce deterministic mutation candidates from transcript chunks.
+    Preserve source provenance and avoid speculative claims.
+```
+
+### Adding a Dedicated OM Lane
+
+To add a `s1_observational_memory` group for OM-specific extraction via Graphiti:
+
+```yaml
+s1_observational_memory:
+  extraction_emphasis: >-
+    Focus on durable observations: decisions, commitments, friction points,
+    and operational rules. Extract only claims the speaker asserts as fact.
+    Avoid hypotheticals, questions, and third-party assertions.
+
+  entity_types:
+    - name: WorldState
+      description: >-
+        A factual assertion about the current state of the world
+        (e.g. "Neo4j is running on port 7687", "the team uses Slack").
+    - name: Judgment
+      description: >-
+        A decision or reasoned conclusion (e.g. "we decided to use FalkorDB
+        because it's faster for graph traversal"). Look for "because", "decided",
+        "so we chose".
+    - name: OperationalRule
+      description: >-
+        A standing policy or recurring process rule (e.g. "always use
+        update-with-hotfixes.sh", "run ruff before committing"). Look for "always",
+        "rule", "policy", "never".
+    - name: Commitment
+      description: >-
+        An explicit promise or stated intent (e.g. "I'll ship the PR by Friday",
+        "we're committed to the migration by end of Q1").
+    - name: Friction
+      description: >-
+        A blocker, problem, or source of friction (e.g. "the migration is blocked
+        by the FalkorDB schema drift", "backfill keeps failing on chunk 3").
+
+  relationship_types:
+    - name: MOTIVATES
+      description: "WorldState or Judgment → the Commitment or action it motivates"
+    - name: GENERATES
+      description: "Friction → Judgment (friction generates a decision to address it)"
+    - name: SUPERSEDES
+      description: "New WorldState/Rule → older stale WorldState/Rule it replaces"
+    - name: ADDRESSES
+      description: "Judgment → Friction or Commitment it directly addresses"
+    - name: RESOLVES
+      description: "Judgment → Friction that it closes (written automatically on CLOSED transition)"
+```
+
+> **Note:** The compressor's built-in extractor does not require this YAML config. The
+> YAML `s1_observational_memory` block is only used if you ingest OM content via the
+> MCP `add_episode()` path with `group_id="s1_observational_memory"`.
+
+---
+
 ## Related Docs
 
 - [Graphiti upstream docs](https://help.getzep.com/graphiti) — core runtime, drivers, entity types API
 - [`config/extraction_ontologies.example.yaml`](../config/extraction_ontologies.example.yaml) — example config
 - [`mcp_server/src/config/schema.py`](../mcp_server/src/config/schema.py) — `EntityTypeConfig` and `GraphitiConfig` schemas
 - [`mcp_server/src/models/entity_types.py`](../mcp_server/src/models/entity_types.py) — built-in default entity types
+- [OM Operations Runbook](runbooks/om-operations.md) — compressor config, chunk semantics, lock ordering

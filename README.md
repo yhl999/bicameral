@@ -191,6 +191,78 @@ For engineering learnings, the router supports `--materialize` which reads the l
 
 ---
 
+## Observational Memory (OM)
+
+OM is a fourth runtime layer that sits between the fast-write transcript stream and the
+Dual Brain's promotion pipeline. It turns raw conversation messages into structured
+observations — without waiting for the full Graphiti/MCP extraction queue.
+
+### The Problem OM Solves
+
+The Dual Brain governs *what to trust*. But the MCP server's ingestion pipeline has
+non-trivial latency (LLM extraction per episode). In a high-throughput agent runtime,
+messages accumulate faster than the pipeline can drain. OM closes this gap with a
+lightweight two-stage path that works in parallel with Graphiti.
+
+### How OM Works
+
+```
+Live transcript
+      │
+      ▼
+om_fast_write.py          ← Embeds message content + writes Message/Episode to Neo4j
+      │                      Fail-closed (no embedding = no write)
+      ▼
+om_compressor.py          ← Background: drains Message backlog into OMNode observations
+      │                      Trigger: backlog ≥ 50 OR oldest ≥ 48h
+      │                      Chunks: N = min(50, backlog), max 10 chunks/run
+      ▼
+om_convergence.py         ← Drives OMNode lifecycle state machine
+      │                      States: OPEN → MONITORING → CLOSED / ABANDONED / REOPENED
+      │                      Watermark: max 500 nodes/pass, cursor-based resumption
+      ▼
+promotion_policy_v3.py    ← Promotes corroborated nodes to CoreMemory (retained by GC)
+```
+
+### Quick Commands
+
+```bash
+# Fast-write a message
+python3 scripts/om_fast_write.py write \
+  --session-id "<session_id>" --role user \
+  --content "<text>" --created-at "2026-02-26T12:00:00Z"
+
+# Run the compressor (respects trigger threshold)
+python3 scripts/om_compressor.py
+
+# Run convergence (state machine + dead-letter sync)
+PYTHONPATH=. python3 scripts/om_convergence.py
+
+# GC dry-run (90-day TTL, no deletions)
+PYTHONPATH=. python3 scripts/om_convergence.py --run-gc --gc-dry-run
+
+# Promote a corroborated candidate to CoreMemory
+PYTHONPATH=. python3 truth/promotion_policy_v3.py --candidate-id <id>
+```
+
+### Key Numbers
+
+| Parameter | Value |
+|---|---|
+| Compressor trigger (backlog) | ≥ 50 messages |
+| Compressor trigger (age) | ≥ 48 hours |
+| Messages per chunk | min(50, backlog) |
+| Max chunks per run | 10 (configurable) |
+| Dead-letter threshold | 3 failed attempts |
+| Convergence pass limit | 500 nodes |
+| GC TTL (default) | 90 days |
+| GC retention gate | EVIDENCE\_FOR active OMNode OR SUPPORTS\_CORE active CoreMemory |
+
+For the full operations guide including lock ordering, split/isolate failure recovery,
+and convergence state machine details, see [OM Operations Runbook](docs/runbooks/om-operations.md).
+
+---
+
 ## Public/Private Split Model
 
 This fork operates on an **Engine/Fuel** split:
@@ -279,6 +351,7 @@ For the full sync and patch application procedure, see the [Upstream Sync Runboo
 - [Runtime Pack Overlay](docs/runbooks/runtime-pack-overlay.md) — how private packs map to agents
 
 ### Operations
+- [OM Operations](docs/runbooks/om-operations.md) — Observational Memory: fast-write, compressor, convergence, GC, promotion
 - [Sessions Ingestion](docs/runbooks/sessions-ingestion.md) — architecture, batch & steady-state config, high-throughput tuning, sub-chunking, post-processing, troubleshooting
 - [Adding Data Sources](docs/runbooks/adding-data-sources.md) — onboarding new content: group_id, ontology design, adapter patterns, cron setup
 - [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md)
