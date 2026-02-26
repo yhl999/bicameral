@@ -8,6 +8,8 @@ import os
 import re
 import sys
 import unicodedata
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
@@ -86,6 +88,15 @@ INDEX_SCHEMA_VERSION = 1
 INDEX_BM25_SCHEMA_VERSION = 1
 INDEX_VECTOR_SCHEMA_VERSION = 1
 MATERIALIZE_DEFAULT_MAX_ITEMS = 10
+MATERIALIZE_DEFAULT_TIMEOUT_SEC = 0.8
+MATERIALIZE_MIN_COVERAGE_ITEMS = 2
+MATERIALIZE_MAX_FACT_CHARS = 240
+MATERIALIZE_DEFAULT_MAX_BLOCK_TOKENS = 320
+MATERIALIZE_MAX_BLOCK_TOKENS = 700
+GRAPHITI_DEFAULT_BASE_URL = 'http://localhost:8000'
+GRAPHITI_SEARCH_PATH = '/search'
+MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE = 'graphiti_content_voice_style'
+MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES = 'graphiti_content_writing_samples'
 
 
 class OMIndexMismatchError(ValueError):
@@ -679,6 +690,156 @@ def _load_yaml_domain_context(*, repo_root: Path, pack_yaml_path: str) -> str:
     return ''
 
 
+def _materialize_timeout_seconds(materialization: dict[str, object] | None) -> float:
+    if isinstance(materialization, dict):
+        value = materialization.get('timeout_seconds')
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return MATERIALIZE_DEFAULT_TIMEOUT_SEC
+
+
+def _materialize_max_block_tokens(materialization: dict[str, object] | None) -> int:
+    if isinstance(materialization, dict):
+        value = materialization.get('max_block_tokens')
+        if isinstance(value, int) and value > 0:
+            return min(value, MATERIALIZE_MAX_BLOCK_TOKENS)
+    return MATERIALIZE_DEFAULT_MAX_BLOCK_TOKENS
+
+
+def _materialize_min_coverage_items(materialization: dict[str, object] | None) -> int:
+    if isinstance(materialization, dict):
+        value = materialization.get('min_coverage_items')
+        if isinstance(value, int) and value > 0:
+            return value
+    return MATERIALIZE_MIN_COVERAGE_ITEMS
+
+
+def _normalize_fact_text(text: str) -> str:
+    collapsed = _normalize_whitespace(text)
+    if len(collapsed) <= MATERIALIZE_MAX_FACT_CHARS:
+        return collapsed
+    return collapsed[:MATERIALIZE_MAX_FACT_CHARS].rstrip() + '…'
+
+
+def _graphiti_search_facts(
+    *,
+    query: str,
+    group_ids: list[str],
+    max_items: int,
+    timeout_seconds: float,
+) -> list[str]:
+    base_url = os.environ.get('GRAPHITI_BASE_URL', GRAPHITI_DEFAULT_BASE_URL).rstrip('/')
+    endpoint = os.environ.get('GRAPHITI_SEARCH_PATH', GRAPHITI_SEARCH_PATH)
+    if not endpoint.startswith('/'):
+        endpoint = f'/{endpoint}'
+
+    request_body = {
+        'query': query,
+        'group_ids': group_ids if group_ids else None,
+        'max_facts': max(1, max_items),
+    }
+    data = json.dumps(request_body).encode('utf-8')
+
+    headers = {
+        'Content-Type': 'application/json',
+    }
+    api_key = os.environ.get('GRAPHITI_API_KEY')
+    auth_header = os.environ.get('GRAPHITI_AUTH_HEADER', 'Authorization')
+    if api_key and auth_header:
+        headers[auth_header] = f'Bearer {api_key}'
+
+    req = urllib.request.Request(
+        f'{base_url}{endpoint}',
+        data=data,
+        headers=headers,
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            payload_raw = response.read().decode('utf-8')
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f'graphiti_http_{exc.code}') from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'graphiti_unreachable:{exc.reason}') from exc
+
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError('graphiti_invalid_json') from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError('graphiti_invalid_payload')
+
+    facts_raw = payload.get('facts')
+    if not isinstance(facts_raw, list):
+        raise RuntimeError('graphiti_invalid_facts')
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in facts_raw:
+        if not isinstance(item, dict):
+            continue
+        fact = item.get('fact')
+        if not isinstance(fact, str):
+            continue
+        cleaned = _normalize_fact_text(fact)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+        if len(normalized) >= max(1, max_items):
+            break
+
+    return normalized
+
+
+def _cap_block_by_token_budget(text: str, max_tokens: int) -> str:
+    cap_chars = max(120, max_tokens * 4)
+    if len(text) <= cap_chars:
+        return text
+    return text[:cap_chars].rstrip() + '\n…(truncated)…'
+
+
+def _materialize_content_pack(
+    *,
+    source: str,
+    query: str,
+    group_ids: list[str],
+    mode: str,
+    max_items: int,
+    materialization: dict[str, object] | None,
+) -> str:
+    timeout_seconds = _materialize_timeout_seconds(materialization)
+    min_coverage = _materialize_min_coverage_items(materialization)
+    max_block_tokens = _materialize_max_block_tokens(materialization)
+
+    lane_label = ', '.join(group_ids) if group_ids else 'default lane'
+    facts = _graphiti_search_facts(
+        query=query,
+        group_ids=group_ids,
+        max_items=max_items,
+        timeout_seconds=timeout_seconds,
+    )
+
+    if len(facts) < min_coverage:
+        return ''
+
+    if source == MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE:
+        header = f'Live voice-style signals (mode={mode}, lanes={lane_label})'
+    elif source == MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES:
+        header = f'Live writing-sample signals (mode={mode}, lanes={lane_label})'
+    else:
+        return ''
+
+    bullets = [f'- {fact}' for fact in facts]
+    block = '\n'.join([header, *bullets]).strip()
+    return _cap_block_by_token_budget(block, max_block_tokens)
+
+
 def materialize(
     source: str,
     pack_yaml_path: str,
@@ -686,7 +847,31 @@ def materialize(
     repo_root: Path,
     mode: str = 'default',
     max_items: int = MATERIALIZE_DEFAULT_MAX_ITEMS,
+    query: str = '',
+    group_ids: list[str] | None = None,
+    materialization: dict[str, object] | None = None,
 ) -> str:
+    normalized_source = source.strip().lower()
+    effective_groups = [gid for gid in (group_ids or []) if isinstance(gid, str) and gid.strip()]
+
+    if normalized_source in {
+        MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE,
+        MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES,
+    }:
+        try:
+            dynamic = _materialize_content_pack(
+                source=normalized_source,
+                query=query,
+                group_ids=effective_groups,
+                mode=mode,
+                max_items=max_items,
+                materialization=materialization,
+            )
+        except Exception:
+            dynamic = ''
+        if dynamic:
+            return dynamic
+
     static = _load_yaml_domain_context(repo_root=repo_root, pack_yaml_path=pack_yaml_path)
     if static:
         return static
@@ -702,6 +887,7 @@ def _build_selected_pack(
     pack_entry: dict[str, object],
     repo_root: Path,
     query: str,
+    task: str,
     materialize_requested: bool,
     scope: str,
     decision_path: list[str],
@@ -757,6 +943,9 @@ def _build_selected_pack(
                     repo_root=repo_root,
                     mode=mode,
                     max_items=max_items,
+                    query=task,
+                    group_ids=group_ids,
+                    materialization=materialization,
                 ).strip()
             except Exception as exc:
                 decision_path.append(
@@ -1244,6 +1433,7 @@ def main(argv: list[str] | None = None) -> int:
                 pack_entry=pack_entry,
                 repo_root=repo_root,
                 query=query,
+                task=args.task,
                 materialize_requested=bool(args.materialize),
                 scope=run_scope,
                 decision_path=decision_path,
