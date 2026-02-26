@@ -62,6 +62,7 @@ REQUIRED_PLAN_KEYS = (
 
 DEFAULT_TIER_C_FIXED_TOKENS = 3000
 DEFAULT_OUTPUT_RESERVE_TOKENS = 2500
+# Cross-repo contract copy: must stay in sync with config/runtime_tier_c_pins.json.
 PINNED_TIER_C_PROFILES: dict[str, int] = {
     'main_session_dining_recs': 3000,
     'main_session_content_tweet': 3500,
