@@ -25,6 +25,7 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 _SAFE_TYPE_NAME_RE = re.compile(r'^[A-Z][A-Za-z0-9_]{0,63}$')
+_KNOWN_METADATA_KEYS = {"om_extractor"}
 
 
 @dataclass(frozen=True)
@@ -100,10 +101,14 @@ class OntologyRegistry:
 
         profiles: dict[str, OntologyProfile] = {}
         for group_id, definition in raw.items():
-            # Allow top-level metadata keys (ex: schema_version, om_extractor)
-            # without treating them as ontology lane profiles.
-            if not isinstance(definition, dict) or 'entity_types' not in definition:
-                logger.debug("Skipping non-ontology key: %s", group_id)
+            if not isinstance(definition, dict):
+                logger.debug("Skipping non-dict ontology key: %s", group_id)
+                continue
+            if "entity_types" not in definition:
+                if group_id not in _KNOWN_METADATA_KEYS:
+                    logger.warning(
+                        "Skipping dict ontology key without entity_types: %s", group_id
+                    )
                 continue
             entity_types = _build_entity_types(definition.get("entity_types", []))
             relationship_types = definition.get("relationship_types", [])
