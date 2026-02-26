@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,7 @@ class RuntimePackRouterTests(unittest.TestCase):
         task: str,
         materialize: bool = False,
         scope: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> dict:
         out = repo / 'plan.json'
         cmd = [
@@ -74,6 +76,7 @@ class RuntimePackRouterTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            env={**os.environ, **(env or {})},
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         return json.loads(out.read_text(encoding='utf-8'))
@@ -113,6 +116,14 @@ class RuntimePackRouterTests(unittest.TestCase):
                 self.assertIn('dropped_packs', plan)
                 self.assertIn('decision_path', plan)
                 self.assertIn('budget_summary', plan)
+                self.assertIn('normalized_query', plan)
+                self.assertIn('query_hash', plan)
+                self.assertEqual(len(plan['query_hash']), 64)
+                self.assertIn('index_health', plan)
+                self.assertIn('vector_errors', plan)
+                for selected in plan['selected_packs']:
+                    self.assertIn('rank_bm25', selected)
+                    self.assertIn('rank_vector', selected)
 
             replay = self._route(
                 repo,
@@ -236,6 +247,203 @@ class RuntimePackRouterTests(unittest.TestCase):
                     for w in warnings
                 )
             )
+
+
+    def test_query_normalization_and_hash_are_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            self._seed_repo(repo)
+
+            task = '  Ｄraft\tSUMMARY   '
+            plan = self._route(
+                repo,
+                consumer='main_session_example_summary',
+                workflow_id='example_summary',
+                step_id='draft',
+                task=task,
+            )
+
+            self.assertEqual(plan['normalized_query'], 'draft summary')
+            self.assertEqual(
+                plan['query_hash'],
+                'a528f240ef53e68ca0de136406f816cd21591e44c389ace8ccd1637809cb1dc6',
+            )
+
+            replay = self._route(
+                repo,
+                consumer='main_session_example_summary',
+                workflow_id='example_summary',
+                step_id='draft',
+                task=task,
+            )
+            self.assertEqual(plan['normalized_query'], replay['normalized_query'])
+            self.assertEqual(plan['query_hash'], replay['query_hash'])
+
+    def test_embedding_failure_emits_structured_vector_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            self._seed_repo(repo)
+
+            plan = self._route(
+                repo,
+                consumer='main_session_example_summary',
+                workflow_id='example_summary',
+                step_id='draft',
+                task='Draft summary',
+                env={'OM_VECTOR_EMBEDDING_FORCE_FAIL': '1'},
+            )
+
+            self.assertGreaterEqual(len(plan['vector_errors']), 1)
+            event = plan['vector_errors'][0]
+            self.assertEqual(event['event'], 'OM_VECTOR_QUERY_EMBEDDING_FAILED')
+            self.assertEqual(event['query_hash'], plan['query_hash'])
+            self.assertIn('error_message', event)
+            self.assertRegex(event['timestamp'], r'^\d{4}-\d{2}-\d{2}T')
+            self.assertTrue(event['timestamp'].endswith('Z'))
+
+    def test_rank_tie_breaks_by_pack_id_and_includes_rank_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'a.pack.yaml').write_text('A', encoding='utf-8')
+            (repo / 'workflows' / 'b.pack.yaml').write_text('B', encoding='utf-8')
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'z_pack',
+                        'path': 'workflows/a.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                    },
+                    {
+                        'pack_id': 'a_pack',
+                        'path': 'workflows/b.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                    },
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_rank_test',
+                        'workflow_id': 'rank_test',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Rank test',
+                        'injection_text': 'Rank test',
+                        'pack_ids': ['z_pack', 'a_pack'],
+                        'chatgpt_mode': 'off',
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(json.dumps(registry, indent=2), encoding='utf-8')
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            plan = self._route(
+                repo,
+                consumer='main_session_rank_test',
+                workflow_id='rank_test',
+                step_id='draft',
+                task='zzz',
+                env={'OM_VECTOR_EMBEDDING_FORCE_FAIL': '1'},
+            )
+
+            ordered_ids = [item['pack_id'] for item in plan['selected_packs']]
+            self.assertEqual(ordered_ids, ['a_pack', 'z_pack'])
+            self.assertEqual(plan['selected_packs'][0]['rank_bm25'], 1)
+            self.assertEqual(plan['selected_packs'][0]['rank_vector'], 1)
+            self.assertEqual(plan['selected_packs'][1]['rank_bm25'], 2)
+            self.assertEqual(plan['selected_packs'][1]['rank_vector'], 2)
+
+    def test_index_schema_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'mismatch.pack.yaml').write_text('Mismatch', encoding='utf-8')
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'mismatch_pack',
+                        'path': 'workflows/mismatch.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'index': {
+                                'schema_version': 1,
+                                'bm25_schema_version': 1,
+                                'vector_schema_version': 1,
+                                'vector_dim': 123,
+                            }
+                        },
+                    }
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_mismatch_test',
+                        'workflow_id': 'mismatch_test',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Mismatch test',
+                        'injection_text': 'Mismatch test',
+                        'pack_ids': ['mismatch_pack'],
+                        'chatgpt_mode': 'off',
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(json.dumps(registry, indent=2), encoding='utf-8')
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    '--consumer',
+                    'main_session_mismatch_test',
+                    '--workflow-id',
+                    'mismatch_test',
+                    '--step-id',
+                    'draft',
+                    '--repo',
+                    str(repo),
+                    '--task',
+                    'Mismatch test',
+                    '--validate',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('OMIndexMismatchError', result.stderr)
+            self.assertIn('vector_dim mismatch', result.stderr)
 
 
 class RuntimePackRouterFixturesTests(unittest.TestCase):

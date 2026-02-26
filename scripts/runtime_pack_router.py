@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import os
 import re
 import sys
+import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
 
@@ -50,6 +55,10 @@ REQUIRED_PLAN_KEYS = (
     'scope',
     'schema_version',
     'task',
+    'normalized_query',
+    'query_hash',
+    'index_health',
+    'vector_errors',
     'injection_text',
     'packs',
     'selected_packs',
@@ -69,6 +78,17 @@ PINNED_TIER_C_PROFILES: dict[str, int] = {
     'main_session_vc_ic_prep': 6500,
     'main_session_content_long_form': 7500,
 }
+
+QUERY_TEXT_NORMALIZATION_V1 = 'unicode_nfkc_trim_collapse_ws_lower'
+RRF_K = 60
+VECTOR_EMBEDDING_DIM = 768
+INDEX_SCHEMA_VERSION = 1
+INDEX_BM25_SCHEMA_VERSION = 1
+INDEX_VECTOR_SCHEMA_VERSION = 1
+
+
+class OMIndexMismatchError(ValueError):
+    """Raised when retrieval index metadata does not match canonical schema."""
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -153,6 +173,24 @@ def _resolve_config_path(repo_root: Path, candidates: tuple[str, ...], label: st
 
 def _normalize_whitespace(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def _normalize_query_text(text: str) -> str:
+    normalized = unicodedata.normalize('NFKC', text)
+    normalized = _normalize_whitespace(normalized)
+    return normalized.lower()
+
+
+def _query_hash(normalized_query: str) -> str:
+    return hashlib.sha256(normalized_query.encode('utf-8')).hexdigest()
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+
+
+def _tokenize_for_rank(text: str) -> list[str]:
+    return re.findall(r'[0-9a-z]+', _normalize_query_text(text))
 
 
 def _normalize_secret_for_match(secret: str) -> str:
@@ -709,6 +747,245 @@ def _build_injection_text(profile: dict[str, object], selected_packs: list[dict[
     return '\n'.join(lines).strip()
 
 
+def _canonical_index_spec() -> dict[str, object]:
+    return {
+        'schema_version': INDEX_SCHEMA_VERSION,
+        'bm25': {
+            'schema_version': INDEX_BM25_SCHEMA_VERSION,
+            'normalization': QUERY_TEXT_NORMALIZATION_V1,
+        },
+        'vector': {
+            'schema_version': INDEX_VECTOR_SCHEMA_VERSION,
+            'embedding_dim': VECTOR_EMBEDDING_DIM,
+            'normalization': 'l2',
+        },
+    }
+
+
+def _validate_index_schema(*, pack_id: str, retrieval_cfg: dict[str, object] | None) -> None:
+    if not isinstance(retrieval_cfg, dict):
+        return
+
+    index_cfg = retrieval_cfg.get('index') if isinstance(retrieval_cfg.get('index'), dict) else None
+    if index_cfg is None:
+        return
+
+    schema_version = index_cfg.get('schema_version')
+    bm25_schema = index_cfg.get('bm25_schema_version')
+    vector_schema = index_cfg.get('vector_schema_version')
+    vector_dim = index_cfg.get('vector_dim')
+
+    bm25_nested = index_cfg.get('bm25') if isinstance(index_cfg.get('bm25'), dict) else None
+    if bm25_schema is None and isinstance(bm25_nested, dict):
+        bm25_schema = bm25_nested.get('schema_version')
+
+    vector_nested = index_cfg.get('vector') if isinstance(index_cfg.get('vector'), dict) else None
+    if vector_schema is None and isinstance(vector_nested, dict):
+        vector_schema = vector_nested.get('schema_version')
+    if vector_dim is None and isinstance(vector_nested, dict):
+        vector_dim = vector_nested.get('embedding_dim')
+
+    checks = (
+        ('schema_version', schema_version, INDEX_SCHEMA_VERSION),
+        ('bm25_schema_version', bm25_schema, INDEX_BM25_SCHEMA_VERSION),
+        ('vector_schema_version', vector_schema, INDEX_VECTOR_SCHEMA_VERSION),
+        ('vector_dim', vector_dim, VECTOR_EMBEDDING_DIM),
+    )
+    for field_name, actual, expected in checks:
+        if actual is None:
+            continue
+        if not isinstance(actual, int) or actual != expected:
+            raise OMIndexMismatchError(
+                f'pack_id={pack_id} {field_name} mismatch expected={expected} actual={actual!r}'
+            )
+
+
+def _bootstrap_or_validate_indexes(
+    *,
+    selected_packs: list[dict[str, object]],
+    registry: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    validated_pack_ids: list[str] = []
+    for pack in selected_packs:
+        pack_id = _ensure_non_empty_string(pack.get('pack_id'), context='selected.pack_id')
+        registry_entry = registry.get(pack_id)
+        if registry_entry is None:
+            raise ValueError(f'pack_id not found in registry during index validation: {pack_id}')
+        retrieval_cfg = registry_entry.get('retrieval') if isinstance(registry_entry.get('retrieval'), dict) else None
+        _validate_index_schema(pack_id=pack_id, retrieval_cfg=retrieval_cfg)
+        validated_pack_ids.append(pack_id)
+
+    canonical = _canonical_index_spec()
+    canonical_bm25 = _ensure_dict(canonical.get('bm25'), context='index.canonical.bm25')
+    canonical_vector = _ensure_dict(canonical.get('vector'), context='index.canonical.vector')
+    return {
+        'status': 'ok',
+        'validated_pack_ids': sorted(validated_pack_ids),
+        'canonical': canonical,
+        'bm25': {
+            'status': 'ready',
+            'schema_version': canonical_bm25['schema_version'],
+        },
+        'vector': {
+            'status': 'ready',
+            'schema_version': canonical_vector['schema_version'],
+            'embedding_dim': canonical_vector['embedding_dim'],
+        },
+    }
+
+
+def _term_freq(tokens: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def _bm25_scores(*, query_tokens: list[str], docs: dict[str, list[str]]) -> dict[str, float]:
+    if not docs:
+        return {}
+
+    doc_lengths = {pack_id: len(tokens) for pack_id, tokens in docs.items()}
+    avg_doc_len = sum(doc_lengths.values()) / max(1, len(doc_lengths))
+
+    doc_freq: dict[str, int] = {}
+    for tokens in docs.values():
+        for token in set(tokens):
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+
+    query_counts = _term_freq(query_tokens)
+    n_docs = len(docs)
+    k1 = 1.5
+    b = 0.75
+
+    out: dict[str, float] = {}
+    for pack_id, tokens in docs.items():
+        tf = _term_freq(tokens)
+        score = 0.0
+        doc_len = max(1, len(tokens))
+        for term, qf in query_counts.items():
+            df = doc_freq.get(term, 0)
+            if df == 0:
+                continue
+            idf = math.log(1.0 + ((n_docs - df + 0.5) / (df + 0.5)))
+            term_tf = tf.get(term, 0)
+            if term_tf == 0:
+                continue
+            numer = term_tf * (k1 + 1.0)
+            denom = term_tf + k1 * (1.0 - b + b * (doc_len / max(1.0, avg_doc_len)))
+            score += idf * (numer / denom) * (1.0 + 0.25 * max(0, qf - 1))
+        out[pack_id] = score
+
+    return out
+
+
+def _rank_from_scores(scores: dict[str, float], *, pack_ids: list[str]) -> dict[str, int]:
+    ordered = sorted(pack_ids, key=lambda pid: (-float(scores.get(pid, 0.0)), pid))
+    return {pack_id: idx + 1 for idx, pack_id in enumerate(ordered)}
+
+
+def _deterministic_embedding(text: str, *, dim: int = VECTOR_EMBEDDING_DIM) -> list[float]:
+    tokens = _tokenize_for_rank(text)
+    if not tokens:
+        return [0.0] * dim
+
+    vector = [0.0] * dim
+    for token in tokens:
+        digest = hashlib.sha256(token.encode('utf-8')).digest()
+        seed = int.from_bytes(digest[:2], byteorder='big', signed=False)
+        for i, byte in enumerate(digest):
+            idx = (seed + i) % dim
+            vector[idx] += byte / 255.0
+
+    norm = math.sqrt(sum(v * v for v in vector))
+    if norm == 0.0:
+        return vector
+    return [v / norm for v in vector]
+
+
+def _generate_query_embedding(normalized_query: str) -> list[float]:
+    if os.environ.get('OM_VECTOR_EMBEDDING_FORCE_FAIL') == '1':
+        raise RuntimeError('forced embedding failure (OM_VECTOR_EMBEDDING_FORCE_FAIL=1)')
+    return _deterministic_embedding(normalized_query)
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b, strict=False))
+
+
+def _rank_selected_packs(
+    *,
+    selected_packs: list[dict[str, object]],
+    normalized_query: str,
+    query_hash: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if not selected_packs:
+        return (selected_packs, [])
+
+    docs: dict[str, list[str]] = {}
+    pack_ids: list[str] = []
+    for pack in selected_packs:
+        pack_id = _ensure_non_empty_string(pack.get('pack_id'), context='selected.pack_id')
+        query = _ensure_non_empty_string(pack.get('query', ''), context=f'{pack_id}.query')
+        docs[pack_id] = _tokenize_for_rank(f'{pack_id} {query}')
+        pack_ids.append(pack_id)
+
+    query_tokens = _tokenize_for_rank(normalized_query)
+    bm25_scores = _bm25_scores(query_tokens=query_tokens, docs=docs)
+    bm25_ranks = _rank_from_scores(bm25_scores, pack_ids=pack_ids)
+
+    vector_errors: list[dict[str, object]] = []
+    vector_scores: dict[str, float]
+    vector_ranks: dict[str, int]
+
+    try:
+        query_embedding = _generate_query_embedding(normalized_query)
+        vector_scores = {
+            pack_id: _cosine_similarity(query_embedding, _deterministic_embedding(' '.join(docs[pack_id])))
+            for pack_id in pack_ids
+        }
+        vector_ranks = _rank_from_scores(vector_scores, pack_ids=pack_ids)
+    except Exception as exc:
+        vector_errors.append(
+            {
+                'event': 'OM_VECTOR_QUERY_EMBEDDING_FAILED',
+                'query_hash': query_hash,
+                'error_message': str(exc),
+                'timestamp': _utc_timestamp(),
+            }
+        )
+        vector_scores = dict(bm25_scores)
+        vector_ranks = dict(bm25_ranks)
+
+    enriched: list[dict[str, object]] = []
+    for pack in selected_packs:
+        pack_id = _ensure_non_empty_string(pack.get('pack_id'), context='selected.pack_id')
+        rank_bm25 = int(bm25_ranks[pack_id])
+        rank_vector = int(vector_ranks[pack_id])
+        fusion_rrf = (1.0 / (RRF_K + rank_bm25)) + (1.0 / (RRF_K + rank_vector))
+
+        updated = dict(pack)
+        updated['rank_bm25'] = rank_bm25
+        updated['rank_vector'] = rank_vector
+        updated['score_rrf'] = round(fusion_rrf, 12)
+        updated['score_bm25'] = round(float(bm25_scores.get(pack_id, 0.0)), 12)
+        updated['score_vector'] = round(float(vector_scores.get(pack_id, 0.0)), 12)
+        enriched.append(updated)
+
+    enriched.sort(
+        key=lambda item: (
+            -float(item.get('score_rrf', 0.0)),
+            int(item.get('rank_bm25', 0)),
+            int(item.get('rank_vector', 0)),
+            _ensure_non_empty_string(item.get('pack_id'), context='selected.pack_id'),
+        )
+    )
+
+    return enriched, vector_errors
+
+
 def _validate_alignment(
     registry: dict[str, dict[str, object]],
     profiles: list[dict[str, object]],
@@ -750,9 +1027,25 @@ def _validate_plan(plan: dict[str, object], *, repo_root: Path) -> None:
         if not query_path.exists():
             raise ValueError(f'plan.packs[{index}].query does not exist: {query_path}')
 
+    normalized_query = _ensure_non_empty_string(plan.get('normalized_query'), context='plan.normalized_query')
+    query_hash = _ensure_non_empty_string(plan.get('query_hash'), context='plan.query_hash')
+    if query_hash != _query_hash(normalized_query):
+        raise ValueError('plan.query_hash does not match plan.normalized_query')
+
+    _ensure_dict(plan.get('index_health'), context='plan.index_health')
+    vector_errors = _ensure_list(plan.get('vector_errors', []), context='plan.vector_errors')
+    for index, event in enumerate(vector_errors):
+        event_dict = _ensure_dict(event, context=f'plan.vector_errors[{index}]')
+        _ensure_non_empty_string(event_dict.get('event'), context=f'plan.vector_errors[{index}].event')
+        _ensure_non_empty_string(event_dict.get('query_hash'), context=f'plan.vector_errors[{index}].query_hash')
+        _ensure_non_empty_string(event_dict.get('error_message'), context=f'plan.vector_errors[{index}].error_message')
+        _ensure_non_empty_string(event_dict.get('timestamp'), context=f'plan.vector_errors[{index}].timestamp')
+
     for index, item in enumerate(selected):
         item_dict = _ensure_dict(item, context=f'plan.selected_packs[{index}]')
         _ensure_non_empty_string(item_dict.get('pack_id'), context=f'plan.selected_packs[{index}].pack_id')
+        _ensure_int(item_dict.get('rank_bm25'), context=f'plan.selected_packs[{index}].rank_bm25', min_value=1)
+        _ensure_int(item_dict.get('rank_vector'), context=f'plan.selected_packs[{index}].rank_vector', min_value=1)
 
     for index, item in enumerate(dropped):
         item_dict = _ensure_dict(item, context=f'plan.dropped_packs[{index}]')
@@ -881,8 +1174,23 @@ def main(argv: list[str] | None = None) -> int:
                 dropped_packs.append(dropped)
                 decision_path.append(f'pack:{pack_id}:dropped:{dropped.get("reason_code")}')
 
-        selected_packs.sort(key=lambda item: str(item.get('pack_id', '')))
         dropped_packs.sort(key=lambda item: str(item.get('pack_id', '')))
+
+        normalized_query = _normalize_query_text(args.task)
+        query_hash = _query_hash(normalized_query)
+        decision_path.append(f'query_normalization={QUERY_TEXT_NORMALIZATION_V1}')
+
+        index_health = _bootstrap_or_validate_indexes(selected_packs=selected_packs, registry=registry)
+        decision_path.append('index_health=ok')
+
+        selected_packs, vector_errors = _rank_selected_packs(
+            selected_packs=selected_packs,
+            normalized_query=normalized_query,
+            query_hash=query_hash,
+        )
+        decision_path.append(f'ranking=rrf(k={RRF_K})')
+        if vector_errors:
+            decision_path.append('vector_errors=present')
 
         plan: dict[str, object] = {
             'consumer': consumer,
@@ -891,6 +1199,11 @@ def main(argv: list[str] | None = None) -> int:
             'scope': run_scope,
             'schema_version': _ensure_int(profile['schema_version'], context='profile.schema_version', min_value=1),
             'task': _ensure_non_empty_string(profile.get('task', ''), context='profile.task'),
+            'normalized_query': normalized_query,
+            'query_hash': query_hash,
+            'query_normalization_contract': QUERY_TEXT_NORMALIZATION_V1,
+            'index_health': index_health,
+            'vector_errors': vector_errors,
             'injection_text': '',
             'packs': [
                 {
@@ -942,6 +1255,9 @@ def main(argv: list[str] | None = None) -> int:
         required_drops = [d for d in dropped_packs if bool(d.get('required'))]
         return 1 if required_drops else 0
 
+    except OMIndexMismatchError as exc:
+        print(f'ERROR: OMIndexMismatchError: {exc}', file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
         return 1
