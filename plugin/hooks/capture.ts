@@ -1,3 +1,7 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+
 import type { GraphitiClient, GraphitiMessage } from '../client.ts';
 import { normalizeConfig } from '../config.ts';
 import type { PluginConfig } from '../config.ts';
@@ -11,14 +15,23 @@ export interface AgentEndEvent {
 
 export type CaptureHook = (event: AgentEndEvent, ctx: PackInjectorContext) => Promise<void>;
 
+interface FastWritePayload {
+  source_session_id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  created_at: string;
+}
+
 export interface CaptureHookDeps {
   client: GraphitiClient;
   config?: Partial<PluginConfig>;
+  fastWriteRunner?: (payload: FastWritePayload, runtimeRepoRoot: string) => Promise<void>;
 }
 
 const GRAPHITI_CONTEXT_RE = /<graphiti-context>[\s\S]*?<\/graphiti-context>/gi;
 const PACK_CONTEXT_RE = /<pack-context[\s\S]*?<\/pack-context>/gi;
 const FALLBACK_CONTEXT_RE = /<graphiti-fallback>[\s\S]*?<\/graphiti-fallback>/gi;
+const FAST_WRITE_SCRIPT_RELATIVE = path.join('scripts', 'om_fast_write.py');
 
 const normalizeMessageContent = (content: unknown): string | null => {
   if (typeof content === 'string') {
@@ -86,6 +99,18 @@ const resolveGroupId = (ctx: PackInjectorContext, config: PluginConfig): string 
   return null;
 };
 
+const resolveFastWriteSessionId = (ctx: PackInjectorContext): string | null => {
+  const providerGroup = ctx.messageProvider?.groupId?.trim();
+  if (providerGroup) {
+    return providerGroup;
+  }
+  const sessionKey = ctx.sessionKey?.trim();
+  if (sessionKey) {
+    return sessionKey;
+  }
+  return null;
+};
+
 const extractTurn = (messages: Array<{ role?: string; content?: unknown }>): GraphitiMessage[] => {
   const reversed = [...messages].reverse();
   const assistant = reversed.find((message) => message.role === 'assistant');
@@ -113,18 +138,57 @@ const extractTurn = (messages: Array<{ role?: string; content?: unknown }>): Gra
   return cleaned;
 };
 
+const defaultFastWriteRunner = async (
+  payload: FastWritePayload,
+  runtimeRepoRoot: string,
+): Promise<void> => {
+  const scriptPath = path.join(runtimeRepoRoot, FAST_WRITE_SCRIPT_RELATIVE);
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`fast-write script missing at ${scriptPath}`);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      'python3',
+      [
+        scriptPath,
+        'write',
+        '--runtime-repo',
+        runtimeRepoRoot,
+        '--payload-json',
+        JSON.stringify(payload),
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
+        cwd: runtimeRepoRoot,
+      },
+    );
+
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (error) => reject(error as Error));
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      const detail = stderr.trim() || `exit code ${code}`;
+      reject(new Error(`fast-write failed: ${detail}`));
+    });
+  });
+};
+
 export const createCaptureHook = (deps: CaptureHookDeps): CaptureHook => {
   const config = normalizeConfig(deps.config);
   const logger = config.debug ? (message: string) => console.log(message) : () => undefined;
+  const runFastWrite = deps.fastWriteRunner ?? defaultFastWriteRunner;
 
   return async (event, ctx) => {
     if (!event.success) {
-      return;
-    }
-
-    const groupId = resolveGroupId(ctx, config);
-    if (!groupId) {
-      logger('Capture skipped: missing group ID.');
       return;
     }
 
@@ -135,6 +199,35 @@ export const createCaptureHook = (deps: CaptureHookDeps): CaptureHook => {
 
     const turnMessages = extractTurn(messages);
     if (turnMessages.length === 0) {
+      return;
+    }
+
+    const runtimeRepoRoot = config.packRouterRepoRoot?.trim() || process.env.RUNTIME_REPO_ROOT || process.cwd();
+    const fastWriteSessionId = resolveFastWriteSessionId(ctx);
+    if (fastWriteSessionId) {
+      for (const turn of turnMessages) {
+        const role = turn.role_type === 'assistant' ? 'assistant' : 'user';
+        try {
+          await runFastWrite(
+            {
+              source_session_id: fastWriteSessionId,
+              role,
+              content: turn.content,
+              created_at: new Date().toISOString(),
+            },
+            runtimeRepoRoot,
+          );
+        } catch (error) {
+          logger(`OM_FAST_WRITE_FAILED ${(error as Error).message}`);
+        }
+      }
+    } else {
+      logger('FAST_WRITE_DISABLED missing_session_id');
+    }
+
+    const groupId = resolveGroupId(ctx, config);
+    if (!groupId) {
+      logger('Capture skipped: missing group ID.');
       return;
     }
 
