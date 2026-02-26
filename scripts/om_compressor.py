@@ -30,10 +30,15 @@ from typing import Any
 
 import yaml
 
-from truth import candidates as candidates_store
-
+# Ensure repo root is on sys.path so truth/ package is importable
+# when this script is invoked directly (not via -m).
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from truth import candidates as candidates_store  # noqa: E402
+
 DEFAULT_LOCK_FILENAME = "om_graph_write.lock"
 NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
 NEO4J_NON_DEV_FALLBACK_OPT_IN_ENV = "OM_NEO4J_ENV_FALLBACK_NON_DEV"
