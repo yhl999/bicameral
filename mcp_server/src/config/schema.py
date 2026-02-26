@@ -218,6 +218,10 @@ class GraphitiAppConfig(BaseModel):
     group_id: str = Field(default='main', description='Group ID')
     episode_id_prefix: str | None = Field(default='', description='Episode ID prefix')
     user_id: str = Field(default='mcp_user', description='User ID')
+    lane_aliases: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description='Alias -> group_id list mapping for lane-targeted manual search',
+    )
     entity_types: list[EntityTypeConfig] = Field(default_factory=list)
 
     def model_post_init(self, __context) -> None:
