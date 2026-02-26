@@ -50,6 +50,19 @@ interface PackPlan {
   packs: { pack_id: string; query: string; content?: string }[];
 }
 
+interface PlanPackSection {
+  packId: string;
+  startLine: number;
+  endLine: number;
+  hasMaterializedContent: boolean;
+}
+
+interface RenderContract {
+  injectionText: string;
+  renderPrimary: boolean;
+  renderAdditionalIds: Set<string>;
+}
+
 interface PackInjectorDeps {
   intentRules: IntentRuleSet;
   compositionRules?: CompositionRuleSet | null;
@@ -128,6 +141,166 @@ const resolveRouterPackContent = (
   return loadPackContent(repoRoot, pack.query);
 };
 
+const PLAN_PACK_HEADER_RE = /^\[([^\]]+)\](?:\s|$)/;
+
+const hasMaterializedSectionContent = (
+  lines: string[],
+  startLine: number,
+  endLine: number,
+): boolean => {
+  for (let i = startLine + 1; i < endLine; i += 1) {
+    const line = lines[i].trim();
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith('query=')) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+};
+
+const extractPlanPackSections = (
+  injectionText: string,
+  knownPackIds: string[],
+): Map<string, PlanPackSection> => {
+  if (!injectionText.trim() || knownPackIds.length === 0) {
+    return new Map();
+  }
+
+  const known = new Set(knownPackIds);
+  const lines = injectionText.split(/\r?\n/);
+  const sections = new Map<string, PlanPackSection>();
+
+  let activePackId: string | null = null;
+  let activeStartLine = -1;
+
+  const closeActive = (endLine: number) => {
+    if (!activePackId || activeStartLine < 0 || sections.has(activePackId)) {
+      activePackId = null;
+      activeStartLine = -1;
+      return;
+    }
+
+    sections.set(activePackId, {
+      packId: activePackId,
+      startLine: activeStartLine,
+      endLine,
+      hasMaterializedContent: hasMaterializedSectionContent(lines, activeStartLine, endLine),
+    });
+    activePackId = null;
+    activeStartLine = -1;
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(PLAN_PACK_HEADER_RE);
+    if (!match) {
+      continue;
+    }
+
+    closeActive(i);
+
+    const packId = match[1]?.trim();
+    if (!packId || !known.has(packId) || sections.has(packId)) {
+      continue;
+    }
+
+    activePackId = packId;
+    activeStartLine = i;
+  }
+
+  closeActive(lines.length);
+  return sections;
+};
+
+const stripPlanPackSections = (injectionText: string, sections: PlanPackSection[]): string => {
+  if (sections.length === 0) {
+    return injectionText;
+  }
+
+  const lines = injectionText.split(/\r?\n/);
+  const stripLineIndexes = new Set<number>();
+  for (const section of sections) {
+    for (let i = section.startLine; i < section.endLine; i += 1) {
+      stripLineIndexes.add(i);
+    }
+  }
+
+  const kept = lines.filter((_, index) => !stripLineIndexes.has(index));
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+};
+
+const resolveRenderContract = (
+  plan: PackPlan | null,
+  primary: PackMaterialized,
+  additional: PackMaterialized[],
+): RenderContract => {
+  const defaultAdditionalIds = new Set(additional.map((pack) => pack.packId));
+  if (!plan || !plan.injection_text.trim()) {
+    return {
+      injectionText: plan?.injection_text ?? '',
+      renderPrimary: true,
+      renderAdditionalIds: defaultAdditionalIds,
+    };
+  }
+
+  const packIds = [primary.packId, ...additional.map((pack) => pack.packId)];
+  const sections = extractPlanPackSections(plan.injection_text, packIds);
+  if (sections.size === 0) {
+    return {
+      injectionText: plan.injection_text,
+      renderPrimary: true,
+      renderAdditionalIds: defaultAdditionalIds,
+    };
+  }
+
+  let renderPrimary = true;
+  const renderAdditionalIds = new Set<string>();
+  const sectionsToStrip: PlanPackSection[] = [];
+
+  const sectionForPrimary = sections.get(primary.packId);
+  if (sectionForPrimary?.hasMaterializedContent) {
+    renderPrimary = false;
+  } else {
+    renderPrimary = true;
+    if (sectionForPrimary) {
+      sectionsToStrip.push(sectionForPrimary);
+    }
+  }
+
+  for (const pack of additional) {
+    const section = sections.get(pack.packId);
+    if (section?.hasMaterializedContent) {
+      continue;
+    }
+    renderAdditionalIds.add(pack.packId);
+    if (section) {
+      sectionsToStrip.push(section);
+    }
+  }
+
+  return {
+    injectionText: stripPlanPackSections(plan.injection_text, sectionsToStrip),
+    renderPrimary,
+    renderAdditionalIds,
+  };
+};
+
+const dedupeAdditionalPacks = (
+  primaryPackId: string,
+  packs: PackMaterialized[],
+): PackMaterialized[] => {
+  const deduped = new Map<string, PackMaterialized>();
+  for (const pack of packs) {
+    if (pack.packId === primaryPackId) {
+      continue;
+    }
+    deduped.set(pack.packId, pack);
+  }
+  return Array.from(deduped.values());
+};
+
 const formatPackContext = (
   intentId: string,
   primary: PackMaterialized,
@@ -135,6 +308,7 @@ const formatPackContext = (
   additional: PackMaterialized[],
 ): string => {
   const lines: string[] = [];
+  const renderContract = resolveRenderContract(plan, primary, additional);
   const safeIntentId = escapeXmlAttr(intentId);
   const safePackId = escapeXmlAttr(primary.packId);
   const safeScope = escapeXmlAttr(primary.scope);
@@ -146,23 +320,33 @@ const formatPackContext = (
     if (plan.task) {
       lines.push(`Task: ${escapeXmlText(plan.task)}`);
     }
-    if (plan.injection_text) {
-      lines.push(escapeXmlText(plan.injection_text));
+    if (renderContract.injectionText) {
+      lines.push(escapeXmlText(renderContract.injectionText));
     }
   } else {
     lines.push(`## Active Workflow: ${escapeXmlText(primary.packId)}`);
   }
-  lines.push('');
-  // Pack files are trusted operator-authored markdown/yaml content and are intentionally
-  // injected verbatim (not XML-escaped) so instructions remain machine-readable.
-  lines.push(primary.content);
 
-  for (const pack of additional) {
+  const shouldRenderPrimary = !plan || renderContract.renderPrimary;
+  const packsToRender = additional.filter(
+    (pack) => !plan || renderContract.renderAdditionalIds.has(pack.packId),
+  );
+
+  if (shouldRenderPrimary || packsToRender.length > 0) {
     lines.push('');
-    const safePackId = escapeXmlText(pack.packId);
-    const modeLabel = pack.mode ? ` (${escapeXmlText(pack.mode)})` : '';
-    lines.push(`### Composition: ${safePackId}${modeLabel}`);
-    lines.push(pack.content);
+    // Pack files are trusted operator-authored markdown/yaml content and are intentionally
+    // injected verbatim (not XML-escaped) so instructions remain machine-readable.
+    if (shouldRenderPrimary) {
+      lines.push(primary.content);
+    }
+
+    for (const pack of packsToRender) {
+      lines.push('');
+      const safePackId = escapeXmlText(pack.packId);
+      const modeLabel = pack.mode ? ` (${escapeXmlText(pack.mode)})` : '';
+      lines.push(`### Composition: ${safePackId}${modeLabel}`);
+      lines.push(pack.content);
+    }
   }
 
   lines.push('</pack-context>');
@@ -562,6 +746,8 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
       if (isUntrustedGroupChat(input.ctx, config.trustedGroupIds)) {
         additional = additional.filter((pack) => pack.scope !== 'private');
       }
+
+      additional = dedupeAdditionalPacks(primaryPack.packId, additional);
 
       const context = formatPackContext(decision.rule.id, primaryPack, plan, additional);
       state.set(sessionKey, decision.rule.id);

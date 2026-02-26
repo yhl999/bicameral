@@ -75,6 +75,9 @@ const makeTempDir = (t: { after: (fn: () => void) => void }, prefix: string): st
   return dir;
 };
 
+const countOccurrences = (text: string, needle: string): number =>
+  text.split(needle).length - 1;
+
 test('P1: no keyword match yields no pack', () => {
   const { decision } = detectIntent(rules, { prompt: 'hello there', defaultMinConfidence: 0.3 });
   assert.equal(decision.matched, false);
@@ -397,6 +400,158 @@ test('pack router inline content is preferred and does not require pack file fal
   assert.ok(result.context.includes('primary inline content'));
   assert.ok(result.context.includes('### Composition: secondary_pack'));
   assert.ok(result.context.includes('secondary inline content'));
+});
+
+
+test('pack context does not duplicate packs when plan.injection_text already has materialized content', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti pack router dedupe materialized ');
+  const plan = {
+    consumer: 'main_session_example_summary',
+    workflow_id: 'example_summary',
+    step_id: 'draft',
+    scope: 'public',
+    task: '',
+    injection_text: [
+      '[primary_pack] mode=long groups=s1_content_strategy',
+      'primary materialized from live graph',
+      '',
+      '[secondary_pack] mode=formal groups=s1_writing_samples',
+      'secondary materialized from live graph',
+    ].join('\n'),
+    packs: [
+      {
+        pack_id: 'primary_pack',
+        query: 'missing-primary.yaml',
+        content: 'primary materialized from live graph',
+      },
+      {
+        pack_id: 'secondary_pack',
+        query: 'missing-secondary.yaml',
+        content: 'secondary materialized from live graph',
+      },
+    ],
+  };
+
+  const scriptPath = path.join(tempDir, 'pack-router.js');
+  fs.writeFileSync(
+    scriptPath,
+    `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`,
+    'utf8',
+  );
+
+  const injector = createPackInjector({
+    intentRules: {
+      schema_version: 1,
+      rules: [
+        {
+          id: 'summary',
+          consumerProfile: 'main_session_example_summary',
+          workflowId: 'example_summary',
+          stepId: 'draft',
+          keywords: ['summary'],
+        },
+      ],
+    },
+    config: {
+      packRouterCommand: ['node', scriptPath],
+      packRouterRepoRoot: tempDir,
+    },
+  });
+
+  const result = await injector({
+    prompt: 'summary',
+    ctx: {},
+    graphitiResults: null,
+  });
+
+  assert.ok(result);
+  assert.equal(
+    countOccurrences(result.context, 'primary materialized from live graph'),
+    1,
+    'primary pack should render once',
+  );
+  assert.equal(
+    countOccurrences(result.context, 'secondary materialized from live graph'),
+    1,
+    'secondary pack should render once',
+  );
+  assert.equal(
+    countOccurrences(result.context, '### Composition: secondary_pack'),
+    0,
+    'composition block should not be re-appended when plan already rendered it',
+  );
+});
+
+test('pack router query-only sections fall back to file content without duplicate sections', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti pack router query-only fallback ');
+  fs.writeFileSync(path.join(tempDir, 'primary.yaml'), 'primary from yaml fallback', 'utf8');
+  fs.writeFileSync(path.join(tempDir, 'secondary.yaml'), 'secondary from yaml fallback', 'utf8');
+
+  const plan = {
+    consumer: 'main_session_example_summary',
+    workflow_id: 'example_summary',
+    step_id: 'draft',
+    scope: 'public',
+    task: '',
+    injection_text: [
+      '[primary_pack] mode=long groups=s1_content_strategy',
+      'query=primary.yaml',
+      '',
+      '[secondary_pack] mode=formal groups=s1_writing_samples',
+      'query=secondary.yaml',
+    ].join('\n'),
+    packs: [
+      { pack_id: 'primary_pack', query: 'primary.yaml' },
+      { pack_id: 'secondary_pack', query: 'secondary.yaml' },
+    ],
+  };
+
+  const scriptPath = path.join(tempDir, 'pack-router.js');
+  fs.writeFileSync(
+    scriptPath,
+    `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`,
+    'utf8',
+  );
+
+  const injector = createPackInjector({
+    intentRules: {
+      schema_version: 1,
+      rules: [
+        {
+          id: 'summary',
+          consumerProfile: 'main_session_example_summary',
+          workflowId: 'example_summary',
+          stepId: 'draft',
+          keywords: ['summary'],
+        },
+      ],
+    },
+    config: {
+      packRouterCommand: ['node', scriptPath],
+      packRouterRepoRoot: tempDir,
+    },
+  });
+
+  const result = await injector({
+    prompt: 'summary',
+    ctx: {},
+    graphitiResults: null,
+  });
+
+  assert.ok(result);
+  assert.ok(result.context.includes('primary from yaml fallback'));
+  assert.ok(result.context.includes('secondary from yaml fallback'));
+  assert.equal(countOccurrences(result.context, '### Composition: secondary_pack'), 1);
+  assert.equal(
+    countOccurrences(result.context, 'query=primary.yaml'),
+    0,
+    'query-only plan section should be stripped when falling back to file content',
+  );
+  assert.equal(
+    countOccurrences(result.context, 'query=secondary.yaml'),
+    0,
+    'query-only plan section should be stripped when falling back to file content',
+  );
 });
 
 test('pack router rejects non-string inline content', async (t) => {
