@@ -27,6 +27,9 @@ DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
 DEFAULT_EMBEDDING_DIM = 768
 DEFAULT_STATE_FILE = "state/om_fast_write_state.json"
 NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
+NEO4J_NON_DEV_FALLBACK_OPT_IN_ENV = "OM_NEO4J_ENV_FALLBACK_NON_DEV"
+_NON_DEV_ENV_MARKERS = {"prod", "production", "staging", "stage", "preprod", "preview"}
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def _embedding_config() -> tuple[str, int]:
@@ -180,8 +183,31 @@ def embed_text(content: str, *, embedding_model: str, embedding_dim: int) -> lis
     return vector
 
 
+def _is_truthy_env(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _is_non_dev_mode() -> bool:
+    for key in ("OM_ENV", "APP_ENV", "ENVIRONMENT", "NODE_ENV"):
+        value = os.environ.get(key)
+        if value and value.strip().lower() in _NON_DEV_ENV_MARKERS:
+            return True
+    return _is_truthy_env("CI")
+
+
+def _allow_neo4j_env_fallback() -> bool:
+    if not _is_non_dev_mode():
+        return True
+    return _is_truthy_env(NEO4J_NON_DEV_FALLBACK_OPT_IN_ENV)
+
+
 def _load_neo4j_env_fallback() -> None:
     if os.environ.get("NEO4J_PASSWORD"):
+        return
+    if not _allow_neo4j_env_fallback():
         return
     if not NEO4J_ENV_FALLBACK_FILE.exists():
         return

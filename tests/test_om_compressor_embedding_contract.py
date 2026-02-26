@@ -75,35 +75,39 @@ class OMCompressorEmbeddingContractTests(unittest.TestCase):
 
     def test_node_content_mismatch_raises_when_rewrite_disabled(self) -> None:
         tx = _FakeTx(existing_content='old content')
-        with patch.object(om_compressor, '_extract_items', return_value=self._extracted('new content')):
-            with patch.object(om_compressor, '_embedding_config', return_value=('embeddinggemma', 2)):
-                with patch.object(om_compressor, '_embed_text', return_value=[0.3, 0.4]):
-                    os.environ.pop('OM_REWRITE_EMBEDDINGS', None)
-                    with self.assertRaises(om_compressor.NodeContentMismatchError):
-                        om_compressor._process_chunk_tx(
-                            tx,
-                            messages=[self.message],
-                            chunk_id='chunk-1',
-                            cfg=self.cfg,
-                            observed_node_ids=[],
-                        )
+        with (
+            patch.object(om_compressor, '_extract_items', return_value=self._extracted('new content')),
+            patch.object(om_compressor, '_embedding_config', return_value=('embeddinggemma', 2)),
+            patch.object(om_compressor, '_embed_text', return_value=[0.3, 0.4]),
+        ):
+            os.environ.pop('OM_REWRITE_EMBEDDINGS', None)
+            with self.assertRaises(om_compressor.NodeContentMismatchError):
+                om_compressor._process_chunk_tx(
+                    tx,
+                    messages=[self.message],
+                    chunk_id='chunk-1',
+                    cfg=self.cfg,
+                    observed_node_ids=[],
+                )
 
         rewrite_queries = [q for q in tx.queries if 'SET n.content = $content' in q]
         self.assertEqual(rewrite_queries, [])
 
     def test_node_content_rewrite_requires_flag(self) -> None:
         tx = _FakeTx(existing_content='old content')
-        with patch.object(om_compressor, '_extract_items', return_value=self._extracted('new content')):
-            with patch.object(om_compressor, '_embedding_config', return_value=('embeddinggemma', 2)):
-                with patch.object(om_compressor, '_embed_text', return_value=[0.3, 0.4]):
-                    os.environ['OM_REWRITE_EMBEDDINGS'] = '1'
-                    result = om_compressor._process_chunk_tx(
-                        tx,
-                        messages=[self.message],
-                        chunk_id='chunk-1',
-                        cfg=self.cfg,
-                        observed_node_ids=[],
-                    )
+        with (
+            patch.object(om_compressor, '_extract_items', return_value=self._extracted('new content')),
+            patch.object(om_compressor, '_embedding_config', return_value=('embeddinggemma', 2)),
+            patch.object(om_compressor, '_embed_text', return_value=[0.3, 0.4]),
+        ):
+            os.environ['OM_REWRITE_EMBEDDINGS'] = '1'
+            result = om_compressor._process_chunk_tx(
+                tx,
+                messages=[self.message],
+                chunk_id='chunk-1',
+                cfg=self.cfg,
+                observed_node_ids=[],
+            )
 
         self.assertEqual(result['nodes'], 1)
         rewrite_queries = [q for q in tx.queries if 'SET n.content = $content' in q]

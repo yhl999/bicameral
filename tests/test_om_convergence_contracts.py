@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -75,16 +76,18 @@ class OMConvergenceDeterminismTests(unittest.TestCase):
         status_window_events = [self._event()]
         monitoring_window_events = [self._event()]
 
-        with patch.object(om_convergence, '_has_addresses', return_value=True):
-            with patch.object(om_convergence, '_has_fresh_addresses', return_value=True):
-                target, reason = om_convergence._determine_transition(
-                    _FakeSession(),
-                    node=node,
-                    convergence_events=convergence_events,
-                    status_window_events=status_window_events,
-                    monitoring_window_events=monitoring_window_events,
-                    now_utc=self.NOW,
-                )
+        with (
+            patch.object(om_convergence, '_has_addresses', return_value=True),
+            patch.object(om_convergence, '_has_fresh_addresses', return_value=True),
+        ):
+            target, reason = om_convergence._determine_transition(
+                _FakeSession(),
+                node=node,
+                convergence_events=convergence_events,
+                status_window_events=status_window_events,
+                monitoring_window_events=monitoring_window_events,
+                now_utc=self.NOW,
+            )
 
         self.assertEqual(target, 'reopened')
         self.assertEqual(reason, 'reappearance_in_convergence_window')
@@ -96,16 +99,18 @@ class OMConvergenceDeterminismTests(unittest.TestCase):
             monitoring_started_at='2025-12-01T00:00:00Z',
         )
 
-        with patch.object(om_convergence, '_has_addresses', return_value=True):
-            with patch.object(om_convergence, '_has_fresh_addresses', return_value=False):
-                target, reason = om_convergence._determine_transition(
-                    _FakeSession(),
-                    node=node,
-                    convergence_events=[],
-                    status_window_events=[],
-                    monitoring_window_events=[],
-                    now_utc=self.NOW,
-                )
+        with (
+            patch.object(om_convergence, '_has_addresses', return_value=True),
+            patch.object(om_convergence, '_has_fresh_addresses', return_value=False),
+        ):
+            target, reason = om_convergence._determine_transition(
+                _FakeSession(),
+                node=node,
+                convergence_events=[],
+                status_window_events=[],
+                monitoring_window_events=[],
+                now_utc=self.NOW,
+            )
 
         self.assertEqual(target, 'monitoring')
         self.assertEqual(reason, 'addresses_link_detected')
@@ -113,16 +118,18 @@ class OMConvergenceDeterminismTests(unittest.TestCase):
     def test_monitoring_ages_to_abandoned_without_mentions(self) -> None:
         node = self._base_node(status='monitoring', monitoring_started_at='2026-01-01T00:00:00Z')
 
-        with patch.object(om_convergence, '_has_addresses', return_value=False):
-            with patch.object(om_convergence, '_has_fresh_addresses', return_value=False):
-                target, reason = om_convergence._determine_transition(
-                    _FakeSession(),
-                    node=node,
-                    convergence_events=[],
-                    status_window_events=[],
-                    monitoring_window_events=[],
-                    now_utc=self.NOW,
-                )
+        with (
+            patch.object(om_convergence, '_has_addresses', return_value=False),
+            patch.object(om_convergence, '_has_fresh_addresses', return_value=False),
+        ):
+            target, reason = om_convergence._determine_transition(
+                _FakeSession(),
+                node=node,
+                convergence_events=[],
+                status_window_events=[],
+                monitoring_window_events=[],
+                now_utc=self.NOW,
+            )
 
         self.assertEqual(target, 'abandoned')
         self.assertEqual(reason, 'monitoring_aged_without_mentions')
@@ -134,19 +141,42 @@ class OMConvergenceDeterminismTests(unittest.TestCase):
             monitoring_started_at='2025-12-01T00:00:00Z',
         )
 
-        with patch.object(om_convergence, '_has_addresses', return_value=False):
-            with patch.object(om_convergence, '_has_fresh_addresses', return_value=False):
-                target, reason = om_convergence._determine_transition(
-                    _FakeSession(),
-                    node=node,
-                    convergence_events=[],
-                    status_window_events=[],
-                    monitoring_window_events=[],
-                    now_utc=self.NOW,
-                )
+        with (
+            patch.object(om_convergence, '_has_addresses', return_value=False),
+            patch.object(om_convergence, '_has_fresh_addresses', return_value=False),
+        ):
+            target, reason = om_convergence._determine_transition(
+                _FakeSession(),
+                node=node,
+                convergence_events=[],
+                status_window_events=[],
+                monitoring_window_events=[],
+                now_utc=self.NOW,
+            )
 
         self.assertEqual(target, 'abandoned')
         self.assertEqual(reason, 'reopened_aged_without_mentions_or_addresses')
+
+
+class OMConvergenceNeo4jFallbackPolicyTests(unittest.TestCase):
+    def test_non_dev_requires_opt_in_for_fallback_file(self) -> None:
+        with patch.dict(os.environ, {"NODE_ENV": "production"}, clear=True):
+            self.assertFalse(om_convergence._allow_neo4j_env_fallback())
+
+    def test_non_dev_opt_in_enables_fallback_file(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "NODE_ENV": "production",
+                "OM_NEO4J_ENV_FALLBACK_NON_DEV": "1",
+            },
+            clear=True,
+        ):
+            self.assertTrue(om_convergence._allow_neo4j_env_fallback())
+
+    def test_local_dev_defaults_to_allow_fallback_file(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(om_convergence._allow_neo4j_env_fallback())
 
 
 class OMConvergenceWatermarkAndGCTests(unittest.TestCase):

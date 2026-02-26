@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import type { GraphitiClient, GraphitiMessage } from '../client.ts';
 import { normalizeConfig } from '../config.ts';
@@ -32,6 +33,13 @@ const GRAPHITI_CONTEXT_RE = /<graphiti-context>[\s\S]*?<\/graphiti-context>/gi;
 const PACK_CONTEXT_RE = /<pack-context[\s\S]*?<\/pack-context>/gi;
 const FALLBACK_CONTEXT_RE = /<graphiti-fallback>[\s\S]*?<\/graphiti-fallback>/gi;
 const FAST_WRITE_SCRIPT_RELATIVE = path.join('scripts', 'om_fast_write.py');
+const FAST_WRITE_TIMEOUT_MS = 8_000;
+const FAST_WRITE_SCRIPT_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  FAST_WRITE_SCRIPT_RELATIVE,
+);
 
 const normalizeMessageContent = (content: unknown): string | null => {
   if (typeof content === 'string') {
@@ -142,12 +150,28 @@ const defaultFastWriteRunner = async (
   payload: FastWritePayload,
   runtimeRepoRoot: string,
 ): Promise<void> => {
-  const scriptPath = path.join(runtimeRepoRoot, FAST_WRITE_SCRIPT_RELATIVE);
+  const scriptPath = FAST_WRITE_SCRIPT_PATH;
   if (!fs.existsSync(scriptPath)) {
     throw new Error(`fast-write script missing at ${scriptPath}`);
   }
 
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const resolveOnce = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve();
+    };
+    const rejectOnce = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    };
+
     const child = spawn(
       'python3',
       [
@@ -165,19 +189,28 @@ const defaultFastWriteRunner = async (
       },
     );
 
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      rejectOnce(new Error(`fast-write timed out after ${FAST_WRITE_TIMEOUT_MS}ms`));
+    }, FAST_WRITE_TIMEOUT_MS);
+
     let stderr = '';
     child.stderr.on('data', (chunk: Buffer) => {
       stderr += chunk.toString('utf8');
     });
 
-    child.on('error', (error) => reject(error as Error));
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      rejectOnce(error as Error);
+    });
     child.on('close', (code) => {
+      clearTimeout(timeout);
       if (code === 0) {
-        resolve();
+        resolveOnce();
         return;
       }
       const detail = stderr.trim() || `exit code ${code}`;
-      reject(new Error(`fast-write failed: ${detail}`));
+      rejectOnce(new Error(`fast-write failed: ${detail}`));
     });
   });
 };

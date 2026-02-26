@@ -6,8 +6,6 @@ import re
 import sys
 from pathlib import Path
 from string import Template
-from typing import Any
-
 
 ALLOWED_SCOPE: dict[str, int] = {
     'public': 0,
@@ -496,9 +494,10 @@ def _resolve_group_ids(
         allow_scoped = bool(chatgpt_cfg.get('allow_scoped', False))
         allow_global = bool(chatgpt_cfg.get('allow_global', False))
 
-        if chatgpt_mode == 'global' and allow_global:
-            include_chatgpt = chatgpt_group is not None
-        elif chatgpt_mode == 'scoped' and allow_scoped:
+        if (
+            (chatgpt_mode == 'global' and allow_global)
+            or (chatgpt_mode == 'scoped' and allow_scoped)
+        ):
             include_chatgpt = chatgpt_group is not None
 
     if include_chatgpt and chatgpt_group is not None:
@@ -824,16 +823,19 @@ def main(argv: list[str] | None = None) -> int:
         model_context_limit = profile.get('model_context_limit')
         budget_warnings = [*startup_warnings, *tier_c_warnings]
 
-        if isinstance(model_context_limit, int) and model_context_limit > 0:
-            if tier_c_fixed_tokens > int(model_context_limit * 0.40):
-                budget_warnings.append(
-                    _build_warning(
-                        'TIER_C_OVERSIZED',
-                        consumer=consumer,
-                        tier_c_fixed_tokens=tier_c_fixed_tokens,
-                        model_context_limit=model_context_limit,
-                    )
+        if (
+            isinstance(model_context_limit, int)
+            and model_context_limit > 0
+            and tier_c_fixed_tokens > int(model_context_limit * 0.40)
+        ):
+            budget_warnings.append(
+                _build_warning(
+                    'TIER_C_OVERSIZED',
+                    consumer=consumer,
+                    tier_c_fixed_tokens=tier_c_fixed_tokens,
+                    model_context_limit=model_context_limit,
                 )
+            )
 
         selected_pack_ids = _ensure_string_list(profile['pack_ids'], context='profile.pack_ids')
         seen: set[str] = set()

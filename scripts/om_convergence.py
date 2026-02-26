@@ -28,6 +28,9 @@ STATE_ID = "singleton"
 MAX_NODES_PER_CONVERGENCE_PASS = 500
 SIMILARITY_THRESHOLD = 0.85
 NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
+NEO4J_NON_DEV_FALLBACK_OPT_IN_ENV = "OM_NEO4J_ENV_FALLBACK_NON_DEV"
+_NON_DEV_ENV_MARKERS = {"prod", "production", "staging", "stage", "preprod", "preview"}
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -66,8 +69,31 @@ def emit(event: str, **payload: Any) -> None:
     print(json.dumps({"event": event, "timestamp": now_iso(), **payload}, ensure_ascii=True))
 
 
+def _is_truthy_env(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _is_non_dev_mode() -> bool:
+    for key in ("OM_ENV", "APP_ENV", "ENVIRONMENT", "NODE_ENV"):
+        value = os.environ.get(key)
+        if value and value.strip().lower() in _NON_DEV_ENV_MARKERS:
+            return True
+    return _is_truthy_env("CI")
+
+
+def _allow_neo4j_env_fallback() -> bool:
+    if not _is_non_dev_mode():
+        return True
+    return _is_truthy_env(NEO4J_NON_DEV_FALLBACK_OPT_IN_ENV)
+
+
 def _load_neo4j_env_fallback() -> None:
     if os.environ.get("NEO4J_PASSWORD"):
+        return
+    if not _allow_neo4j_env_fallback():
         return
     if not NEO4J_ENV_FALLBACK_FILE.exists():
         return
