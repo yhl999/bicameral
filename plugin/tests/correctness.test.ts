@@ -282,6 +282,172 @@ test('pack router command supports quoted paths with spaces', async (t) => {
   assert.ok(result.context.includes('router pack content'));
 });
 
+test('pack router legacy plan without inline content still loads YAML from query', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti pack router legacy yaml ');
+  fs.writeFileSync(path.join(tempDir, 'primary.yaml'), 'primary from yaml', 'utf8');
+  fs.writeFileSync(path.join(tempDir, 'secondary.yaml'), 'secondary from yaml', 'utf8');
+
+  const plan = {
+    consumer: 'main_session_example_summary',
+    workflow_id: 'example_summary',
+    step_id: 'draft',
+    scope: 'public',
+    task: '',
+    injection_text: '',
+    packs: [
+      { pack_id: 'primary_pack', query: 'primary.yaml' },
+      { pack_id: 'secondary_pack', query: 'secondary.yaml' },
+    ],
+  };
+
+  const scriptPath = path.join(tempDir, 'pack-router.js');
+  fs.writeFileSync(
+    scriptPath,
+    `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`,
+    'utf8',
+  );
+
+  const injector = createPackInjector({
+    intentRules: {
+      schema_version: 1,
+      rules: [
+        {
+          id: 'summary',
+          consumerProfile: 'main_session_example_summary',
+          workflowId: 'example_summary',
+          stepId: 'draft',
+          keywords: ['summary'],
+        },
+      ],
+    },
+    config: {
+      packRouterCommand: ['node', scriptPath],
+      packRouterRepoRoot: tempDir,
+    },
+  });
+
+  const result = await injector({
+    prompt: 'summary',
+    ctx: {},
+    graphitiResults: null,
+  });
+
+  assert.ok(result);
+  assert.ok(result.context.includes('primary from yaml'));
+  assert.ok(result.context.includes('### Composition: secondary_pack'));
+  assert.ok(result.context.includes('secondary from yaml'));
+});
+
+test('pack router inline content is preferred and does not require pack file fallback', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti pack router inline content ');
+  const plan = {
+    consumer: 'main_session_example_summary',
+    workflow_id: 'example_summary',
+    step_id: 'draft',
+    scope: 'public',
+    task: '',
+    injection_text: '',
+    packs: [
+      {
+        pack_id: 'primary_pack',
+        query: 'missing-primary.yaml',
+        content: 'primary inline content',
+      },
+      {
+        pack_id: 'secondary_pack',
+        query: 'missing-secondary.yaml',
+        content: 'secondary inline content',
+      },
+    ],
+  };
+
+  const scriptPath = path.join(tempDir, 'pack-router.js');
+  fs.writeFileSync(
+    scriptPath,
+    `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`,
+    'utf8',
+  );
+
+  const injector = createPackInjector({
+    intentRules: {
+      schema_version: 1,
+      rules: [
+        {
+          id: 'summary',
+          consumerProfile: 'main_session_example_summary',
+          workflowId: 'example_summary',
+          stepId: 'draft',
+          keywords: ['summary'],
+        },
+      ],
+    },
+    config: {
+      packRouterCommand: ['node', scriptPath],
+      packRouterRepoRoot: tempDir,
+    },
+  });
+
+  const result = await injector({
+    prompt: 'summary',
+    ctx: {},
+    graphitiResults: null,
+  });
+
+  assert.ok(result);
+  assert.ok(result.context.includes('primary inline content'));
+  assert.ok(result.context.includes('### Composition: secondary_pack'));
+  assert.ok(result.context.includes('secondary inline content'));
+});
+
+test('pack router rejects non-string inline content', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti pack router invalid inline ');
+  fs.writeFileSync(path.join(tempDir, 'pack.yaml'), 'fallback', 'utf8');
+
+  const plan = {
+    consumer: 'main_session_example_summary',
+    workflow_id: 'example_summary',
+    step_id: 'draft',
+    scope: 'public',
+    task: '',
+    injection_text: '',
+    packs: [{ pack_id: 'router_pack', query: 'pack.yaml', content: 123 }],
+  };
+
+  const scriptPath = path.join(tempDir, 'pack-router.js');
+  fs.writeFileSync(
+    scriptPath,
+    `process.stdout.write(${JSON.stringify(JSON.stringify(plan))});`,
+    'utf8',
+  );
+
+  const injector = createPackInjector({
+    intentRules: {
+      schema_version: 1,
+      rules: [
+        {
+          id: 'summary',
+          consumerProfile: 'main_session_example_summary',
+          workflowId: 'example_summary',
+          stepId: 'draft',
+          keywords: ['summary'],
+        },
+      ],
+    },
+    config: {
+      packRouterCommand: ['node', scriptPath],
+      packRouterRepoRoot: tempDir,
+    },
+  });
+
+  const result = await injector({
+    prompt: 'summary',
+    ctx: {},
+    graphitiResults: null,
+  });
+
+  assert.equal(result, null);
+});
+
 test('invalid pack router output falls back to null', async (t) => {
   const tempDir = makeTempDir(t, 'graphiti pack router invalid ');
   const scriptPath = path.join(tempDir, 'pack router.js');

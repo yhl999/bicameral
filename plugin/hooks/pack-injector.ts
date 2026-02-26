@@ -47,7 +47,7 @@ interface PackPlan {
   scope: string;
   task: string;
   injection_text: string;
-  packs: { pack_id: string; query: string }[];
+  packs: { pack_id: string; query: string; content?: string }[];
 }
 
 interface PackInjectorDeps {
@@ -118,6 +118,16 @@ const loadPackContent = (repoRoot: string, packPath: string): string => {
   return fs.readFileSync(resolved, 'utf8').trim();
 };
 
+const resolveRouterPackContent = (
+  repoRoot: string,
+  pack: { query: string; content?: string },
+): string => {
+  if (typeof pack.content === 'string' && pack.content.trim().length > 0) {
+    return pack.content.trim();
+  }
+  return loadPackContent(repoRoot, pack.query);
+};
+
 const formatPackContext = (
   intentId: string,
   primary: PackMaterialized,
@@ -185,7 +195,15 @@ const parseRouterOutput = (raw: string): PackPlan => {
     if (!isNonEmptyString(packId) || !isNonEmptyString(query)) {
       throw new Error(`Pack router returned invalid packs[${index}]`);
     }
-    return { pack_id: packId, query };
+    const content = pack.content;
+    if (content !== undefined && typeof content !== 'string') {
+      throw new Error(`Pack router returned invalid packs[${index}]`);
+    }
+    return {
+      pack_id: packId,
+      query,
+      ...(typeof content === 'string' ? { content } : {}),
+    };
   });
 
   const consumer = parsed.consumer;
@@ -504,7 +522,7 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         primaryPack = {
           packId: primaryEntry.pack_id,
           scope: plan.scope,
-          content: loadPackContent(repoRoot, primaryEntry.query),
+          content: resolveRouterPackContent(repoRoot, primaryEntry),
         };
       } else if (deps.packRegistry) {
         const packType = decision.rule.packType ?? decision.rule.id;
@@ -530,6 +548,16 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
         composition,
         logger,
       );
+
+      if (plan && plan.packs.length > 1) {
+        additional.push(
+          ...plan.packs.slice(1).map((pack) => ({
+            packId: pack.pack_id,
+            scope: plan.scope,
+            content: resolveRouterPackContent(repoRoot, pack),
+          })),
+        );
+      }
 
       if (isUntrustedGroupChat(input.ctx, config.trustedGroupIds)) {
         additional = additional.filter((pack) => pack.scope !== 'private');
