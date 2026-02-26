@@ -85,6 +85,7 @@ VECTOR_EMBEDDING_DIM = 768
 INDEX_SCHEMA_VERSION = 1
 INDEX_BM25_SCHEMA_VERSION = 1
 INDEX_VECTOR_SCHEMA_VERSION = 1
+MATERIALIZE_DEFAULT_MAX_ITEMS = 10
 
 
 class OMIndexMismatchError(ValueError):
@@ -501,6 +502,19 @@ def _resolve_pack_mode(profile: dict[str, object], pack_id: str) -> str:
     return 'default'
 
 
+def _resolve_materialize_max_items(materialization: dict[str, object], mode: str) -> int:
+    mode_key = f"max_items_{mode.strip().lower().replace('-', '_')}"
+    mode_value = materialization.get(mode_key)
+    if isinstance(mode_value, int) and mode_value > 0:
+        return mode_value
+
+    default_value = materialization.get('max_items')
+    if isinstance(default_value, int) and default_value > 0:
+        return default_value
+
+    return MATERIALIZE_DEFAULT_MAX_ITEMS
+
+
 def _resolve_group_ids(
     *,
     retrieval_cfg: dict[str, object] | None,
@@ -642,6 +656,46 @@ def _read_pack_excerpt(path: Path, *, limit_chars: int = 1000) -> str:
     return text[:limit_chars].rstrip() + '\n…(truncated)…'
 
 
+def _load_yaml_domain_context(*, repo_root: Path, pack_yaml_path: str) -> str:
+    if not pack_yaml_path:
+        return ''
+
+    candidate = Path(pack_yaml_path).expanduser()
+    resolved = candidate.resolve() if candidate.is_absolute() else (repo_root / candidate).resolve()
+    if not _is_relative_to(resolved, repo_root.resolve()):
+        raise ValueError(f'pack_yaml path escapes repo root: {pack_yaml_path}')
+
+    if not resolved.exists() or not resolved.is_file():
+        return ''
+
+    try:
+        data = _load_file(resolved)
+    except Exception:
+        return ''
+
+    domain_context = data.get('domain_context')
+    if isinstance(domain_context, str):
+        return domain_context.strip()
+    return ''
+
+
+def materialize(
+    source: str,
+    pack_yaml_path: str,
+    *,
+    repo_root: Path,
+    mode: str = 'default',
+    max_items: int = MATERIALIZE_DEFAULT_MAX_ITEMS,
+) -> str:
+    static = _load_yaml_domain_context(repo_root=repo_root, pack_yaml_path=pack_yaml_path)
+    if static:
+        return static
+    return (
+        f'[NOTE] runtime_pack_router fallback for source={source} mode={mode} '
+        f'max_items={max_items}: no static domain_context found.'
+    )
+
+
 def _build_selected_pack(
     *,
     pack_id: str,
@@ -649,7 +703,7 @@ def _build_selected_pack(
     pack_entry: dict[str, object],
     repo_root: Path,
     query: str,
-    materialize: bool,
+    materialize_requested: bool,
     scope: str,
     decision_path: list[str],
 ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
@@ -684,14 +738,36 @@ def _build_selected_pack(
     materialized_excerpt = ''
     materialized_items = 0
     materialized_sources: list[str] = []
+    content = ''
 
-    if materialize:
-        materialization = pack_entry.get('materialization')
-        mat_source = None
-        if isinstance(materialization, dict):
-            src = materialization.get('source')
-            if isinstance(src, str):
-                mat_source = src.strip()
+    materialization = pack_entry.get('materialization') if isinstance(pack_entry.get('materialization'), dict) else None
+    mat_source = None
+    if isinstance(materialization, dict):
+        src = materialization.get('source')
+        if isinstance(src, str):
+            mat_source = src.strip()
+
+    if materialize_requested:
+        if mat_source:
+            pack_yaml_path = _ensure_non_empty_string(pack_entry.get('path', ''), context=f'pack[{pack_id}].path')
+            max_items = _resolve_materialize_max_items(materialization, mode) if materialization else MATERIALIZE_DEFAULT_MAX_ITEMS
+            try:
+                content = materialize(
+                    mat_source,
+                    pack_yaml_path=pack_yaml_path,
+                    repo_root=repo_root,
+                    mode=mode,
+                    max_items=max_items,
+                ).strip()
+            except Exception as exc:
+                decision_path.append(
+                    f'pack:{pack_id}:materialize_failed:{type(exc).__name__}:{str(exc).strip()}'
+                )
+            else:
+                if content:
+                    decision_path.append(f'pack:{pack_id}:materialized_content')
+                    if materialized_items == 0:
+                        materialized_items = 1
 
         if pack_id == 'engineering_learnings' or mat_source == 'engineering_loops_latest':
             materialized_excerpt, materialized_items, materialized_sources = _materialize_engineering(
@@ -722,6 +798,8 @@ def _build_selected_pack(
         'materialized_sources': materialized_sources,
         'materialized_excerpt': materialized_excerpt,
     }
+    if content:
+        selected['content'] = content
     return (selected, None)
 
 
@@ -736,6 +814,11 @@ def _build_injection_text(profile: dict[str, object], selected_packs: list[dict[
         group_text = ', '.join(str(g) for g in groups) if groups else '(none declared)'
         lines.append('')
         lines.append(f'[{pack_id}] mode={mode} groups={group_text}')
+
+        content = pack.get('content')
+        if isinstance(content, str) and content.strip():
+            lines.append(content.strip())
+            continue
 
         excerpt = pack.get('materialized_excerpt')
         if isinstance(excerpt, str) and excerpt.strip():
@@ -1162,7 +1245,7 @@ def main(argv: list[str] | None = None) -> int:
                 pack_entry=pack_entry,
                 repo_root=repo_root,
                 query=query,
-                materialize=bool(args.materialize),
+                materialize_requested=bool(args.materialize),
                 scope=run_scope,
                 decision_path=decision_path,
             )
