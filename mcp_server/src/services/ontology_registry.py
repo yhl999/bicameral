@@ -102,8 +102,8 @@ class OntologyRegistry:
         for group_id, definition in raw.items():
             # Allow top-level metadata keys (ex: schema_version, om_extractor)
             # without treating them as ontology lane profiles.
-            if not isinstance(definition, dict):
-                logger.debug("Skipping non-profile ontology key: %s", group_id)
+            if not isinstance(definition, dict) or 'entity_types' not in definition:
+                logger.debug("Skipping non-ontology key: %s", group_id)
                 continue
             entity_types = _build_entity_types(definition.get("entity_types", []))
             relationship_types = definition.get("relationship_types", [])

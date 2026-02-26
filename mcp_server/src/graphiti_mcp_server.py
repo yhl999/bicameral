@@ -383,6 +383,21 @@ class GraphitiService:
                 return profile.entity_types
         return self.entity_types
 
+    def resolve_ontology(self, group_id: str) -> tuple[dict | None, str]:
+        """Resolve entity types AND extraction emphasis for a group.
+
+        Returns:
+            A tuple of (entity_types, extraction_emphasis).
+            entity_types falls back to the global default when the group has
+            no explicit ontology profile. extraction_emphasis defaults to ''
+            when no profile is configured.
+        """
+        if self.ontology_registry is not None:
+            profile = self.ontology_registry.get(group_id)
+            if profile is not None:
+                return profile.entity_types, profile.extraction_emphasis
+        return self.entity_types, ''
+
     async def get_client(self) -> Graphiti:
         """Get the Graphiti client, initializing if necessary."""
         if self.client is None:
@@ -1001,6 +1016,7 @@ async def initialize_server() -> ServerConfig:
     await queue_service.initialize(
         graphiti_client=graphiti_client,
         client_resolver=graphiti_service.get_client_for_group,
+        ontology_resolver=graphiti_service.resolve_ontology,
     )
 
     # Set MCP server settings
