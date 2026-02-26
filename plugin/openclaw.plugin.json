@@ -114,6 +114,33 @@
         "items": {
           "type": "string"
         }
+      },
+      "enableCapabilityInjection": {
+        "type": "boolean",
+        "description": "Enable per-turn capability subset injection."
+      },
+      "capabilitySelectorCommand": {
+        "oneOf": [
+          { "type": "string" },
+          { "type": "array", "items": { "type": "string" } }
+        ],
+        "description": "Command to run the capability subset selector."
+      },
+      "capabilityIndexPath": {
+        "type": "string",
+        "description": "Path to capability-index.json."
+      },
+      "capabilityOverridesPath": {
+        "type": "string",
+        "description": "Path to capability_intent_overrides.json."
+      },
+      "capabilitySelectorTimeoutMs": {
+        "type": "number",
+        "description": "Timeout for capability selector (ms)."
+      },
+      "capabilityTopN": {
+        "type": "number",
+        "description": "Number of Top-N capabilities to inject per turn."
       }
     }
   },
