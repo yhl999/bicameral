@@ -690,10 +690,9 @@ def materialize(
     static = _load_yaml_domain_context(repo_root=repo_root, pack_yaml_path=pack_yaml_path)
     if static:
         return static
-    return (
-        f'[NOTE] runtime_pack_router fallback for source={source} mode={mode} '
-        f'max_items={max_items}: no static domain_context found.'
-    )
+    # Return empty string so callers can gracefully fall back to excerpt/query
+    # handling instead of injecting debug NOTE text into model context.
+    return ''
 
 
 def _build_selected_pack(
