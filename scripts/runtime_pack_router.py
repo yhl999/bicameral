@@ -1292,6 +1292,16 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     'pack_id': _ensure_non_empty_string(pack['pack_id'], context='selected.pack_id'),
                     'query': _ensure_non_empty_string(pack['query'], context='selected.query'),
+                    **(
+                        {
+                            'content': _ensure_non_empty_string(
+                                pack.get('content', ''),
+                                context='selected.content',
+                            )
+                        }
+                        if isinstance(pack.get('content'), str) and str(pack.get('content')).strip()
+                        else {}
+                    ),
                 }
                 for pack in selected_packs
             ],
