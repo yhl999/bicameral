@@ -193,16 +193,17 @@ For engineering learnings, the router supports `--materialize` which reads the l
 
 ## Observational Memory (OM)
 
-OM is a fourth runtime layer that sits between the fast-write transcript stream and the
-Dual Brain's promotion pipeline. It turns raw conversation messages into structured
-observations — without waiting for the full Graphiti/MCP extraction queue.
+OM is the runtime synthesis/control ("metabolism") loop for the Dual Brain stack.
+It is not a separate sovereign brain or truth authority. Instead, it coordinates
+high-throughput transcript intake in Brain 1 with governed promotion pathways into
+Brain 2.
 
 ### The Problem OM Solves
 
 The Dual Brain governs *what to trust*. But the MCP server's ingestion pipeline has
 non-trivial latency (LLM extraction per episode). In a high-throughput agent runtime,
 messages accumulate faster than the pipeline can drain. OM closes this gap with a
-lightweight two-stage path that works in parallel with Graphiti.
+lightweight control loop that runs in parallel with Graphiti.
 
 ### How OM Works
 

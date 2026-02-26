@@ -598,7 +598,7 @@ fuser state/locks/om_graph_write.lock 2>/dev/null
 ## See Also
 
 - [Custom Ontologies](../custom-ontologies.md) — OM lane ontology config (`s1_observational_memory`)
-- [Dual-Brain Architecture](../DUAL-BRAIN-ARCHITECTURE.md) — OM as the third cognitive layer
+- [Dual-Brain Architecture](../DUAL-BRAIN-ARCHITECTURE.md) — OM as the Dual Brain synthesis/control layer
 - [Memory Runtime Wiring](../MEMORY-RUNTIME-WIRING.md) — fast-write integration paths
 - `scripts/om_fast_write.py --help`
 - `scripts/om_compressor.py --help`

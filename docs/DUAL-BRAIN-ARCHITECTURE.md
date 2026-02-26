@@ -133,14 +133,18 @@ We bet the complexity was worth it.
 
 ---
 
-## Brain 3: Observational Memory (OM)
+## Observational Memory (OM): Synthesis + Control Layer
 
-After shipping, a third cognitive layer was added between Brain 1 and the promotion
-pipeline: **Observational Memory (OM)**.
+After shipping, we added **Observational Memory (OM)** as a synthesis/control
+("metabolism") layer for the Dual Brain runtime.
+
+OM is **not** an independent third authority on truth. Its job is to coordinate flow:
+rapid intake into Brain 1, structured observation lifecycle, and governed promotion
+signals into Brain 2.
 
 The Dual Brain addresses *governance* — which facts to trust. But it doesn't address
 *velocity*: raw transcript messages accumulate faster than the MCP server's full
-extraction pipeline can drain them. OM solves this with a two-stage design:
+extraction pipeline can drain them. OM closes that gap:
 
 ### Stage 1 — Fast-Write (`scripts/om_fast_write.py`)
 
@@ -184,10 +188,10 @@ transcript stream** without MCP latency. Observations arrive in near-real-time, 
 governed by the same convergence policy, and — when corroborated — feed Brain 2's
 fact ledger via CoreMemory promotion.
 
-The three brains:
+The Dual Brain with an OM control loop:
 - **Brain 1 (Neo4j):** Semantic engine — LLM-extracted entities and relationships
 - **Brain 2 (SQLite Fact Ledger):** Logic ledger — deterministic, auditable truth
-- **Brain 3 (OM):** Observational layer — fast-write transcript stream → structured observations
+- **OM (synthesis/control layer):** Fast-write + observation lifecycle + convergence to coordinate how evidence moves from transcript stream into Brain 2 promotion paths
 
 ---
 
