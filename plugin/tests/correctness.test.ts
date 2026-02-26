@@ -839,6 +839,91 @@ test('capture hook prefers configured memoryGroupId over provider/session lanes'
   assert.equal(capturedGroupId, 'canonical-lane');
 });
 
+test('capture hook forwards user+assistant turn to fast-write runner', async () => {
+  const fastWritePayloads: Array<{ source_session_id: string; role: string; content: string }> = [];
+  let capturedGroupId: string | undefined;
+
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    fastWriteRunner: async (payload) => {
+      fastWritePayloads.push({
+        source_session_id: payload.source_session_id,
+        role: payload.role,
+        content: payload.content,
+      });
+    },
+    config: {},
+  });
+
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: ' user says hi ' },
+        { role: 'assistant', content: ' assistant replies ' },
+      ],
+    },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.equal(capturedGroupId, 'provider-lane');
+  assert.deepEqual(fastWritePayloads, [
+    {
+      source_session_id: 'provider-lane',
+      role: 'user',
+      content: 'user says hi',
+    },
+    {
+      source_session_id: 'provider-lane',
+      role: 'assistant',
+      content: 'assistant replies',
+    },
+  ]);
+});
+
+test('capture hook still ingests Graphiti when fast-write runner fails', async () => {
+  let capturedGroupId: string | undefined;
+
+  const hook = createCaptureHook({
+    client: {
+      search: async () => ({ facts: [] }),
+      ingestMessages: async (groupId: string) => {
+        capturedGroupId = groupId;
+      },
+    },
+    fastWriteRunner: async () => {
+      throw new Error('boom');
+    },
+    config: {
+      debug: true,
+    },
+  });
+
+  await hook(
+    {
+      success: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ],
+    },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.equal(capturedGroupId, 'provider-lane');
+});
+
 // ── Tenant isolation tests ─────────────────────────────────────────────────
 
 test('recall hook ignores memoryGroupId when singleTenant is not set', async () => {

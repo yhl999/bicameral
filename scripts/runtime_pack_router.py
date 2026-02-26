@@ -6,8 +6,6 @@ import re
 import sys
 from pathlib import Path
 from string import Template
-from typing import Any
-
 
 ALLOWED_SCOPE: dict[str, int] = {
     'public': 0,
@@ -59,6 +57,18 @@ REQUIRED_PLAN_KEYS = (
     'decision_path',
     'budget_summary',
 )
+
+DEFAULT_TIER_C_FIXED_TOKENS = 3000
+DEFAULT_OUTPUT_RESERVE_TOKENS = 2500
+PINNED_TIER_C_PROFILES: dict[str, int] = {
+    'main_session_dining_recs': 3000,
+    'main_session_content_tweet': 3500,
+    'main_session_vc_memo': 6500,
+    'main_session_vc_deal_brief': 6000,
+    'main_session_vc_diligence_questions': 5500,
+    'main_session_vc_ic_prep': 6500,
+    'main_session_content_long_form': 7500,
+}
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -258,9 +268,120 @@ def _load_profiles(path: Path) -> list[dict[str, object]]:
         else:
             entry['pack_modes'] = {}
 
+        if 'tier_c_fixed_tokens' in entry and entry['tier_c_fixed_tokens'] is not None:
+            entry['tier_c_fixed_tokens'] = _ensure_int(
+                entry['tier_c_fixed_tokens'],
+                context=f'{path}.profiles[{index}].tier_c_fixed_tokens',
+                min_value=0,
+            )
+
+        if 'output_reserve_tokens' in entry and entry['output_reserve_tokens'] is not None:
+            entry['output_reserve_tokens'] = _ensure_int(
+                entry['output_reserve_tokens'],
+                context=f'{path}.profiles[{index}].output_reserve_tokens',
+                min_value=0,
+            )
+
+        if 'model_context_limit' in entry and entry['model_context_limit'] is not None:
+            entry['model_context_limit'] = _ensure_int(
+                entry['model_context_limit'],
+                context=f'{path}.profiles[{index}].model_context_limit',
+                min_value=1,
+            )
+
         profiles.append(entry)
 
     return profiles
+
+
+def _build_warning(event: str, **payload: object) -> dict[str, object]:
+    body: dict[str, object] = {'event': event}
+    body.update(payload)
+    return body
+
+
+def _validate_tier_c_profile_pins(
+    profiles: list[dict[str, object]],
+) -> tuple[dict[str, int], list[dict[str, object]]]:
+    by_consumer: dict[str, dict[str, object]] = {}
+    for profile in profiles:
+        consumer = profile.get('consumer')
+        if isinstance(consumer, str) and consumer.strip():
+            by_consumer[consumer.strip()] = profile
+
+    forced_fallback: dict[str, int] = {}
+    warnings: list[dict[str, object]] = []
+
+    for consumer, expected in sorted(PINNED_TIER_C_PROFILES.items()):
+        profile = by_consumer.get(consumer)
+        if profile is None:
+            forced_fallback[consumer] = DEFAULT_TIER_C_FIXED_TOKENS
+            warnings.append(
+                _build_warning(
+                    'TIER_C_PROFILE_MISMATCH',
+                    consumer=consumer,
+                    expected=expected,
+                    actual='missing',
+                )
+            )
+            continue
+
+        actual = profile.get('tier_c_fixed_tokens')
+        if not isinstance(actual, int) or actual != expected:
+            forced_fallback[consumer] = DEFAULT_TIER_C_FIXED_TOKENS
+            warnings.append(
+                _build_warning(
+                    'TIER_C_PROFILE_MISMATCH',
+                    consumer=consumer,
+                    expected=expected,
+                    actual=actual,
+                )
+            )
+
+    return forced_fallback, warnings
+
+
+def _resolve_tier_c_fixed_tokens(
+    profile: dict[str, object],
+    *,
+    consumer: str,
+    forced_fallback: dict[str, int],
+) -> tuple[int, list[dict[str, object]]]:
+    warnings: list[dict[str, object]] = []
+
+    if consumer in forced_fallback:
+        return forced_fallback[consumer], warnings
+
+    value = profile.get('tier_c_fixed_tokens')
+    if value is None:
+        warnings.append(
+            _build_warning(
+                'TIER_C_DEFAULT_FALLBACK_USED',
+                consumer=consumer,
+                value=DEFAULT_TIER_C_FIXED_TOKENS,
+            )
+        )
+        return DEFAULT_TIER_C_FIXED_TOKENS, warnings
+
+    if not isinstance(value, int) or value < 0:
+        warnings.append(
+            _build_warning(
+                'TIER_C_DEFAULT_FALLBACK_USED',
+                consumer=consumer,
+                value=DEFAULT_TIER_C_FIXED_TOKENS,
+                reason='invalid_tier_c_fixed_tokens',
+            )
+        )
+        return DEFAULT_TIER_C_FIXED_TOKENS, warnings
+
+    return int(value), warnings
+
+
+def _resolve_output_reserve_tokens(profile: dict[str, object]) -> int:
+    value = profile.get('output_reserve_tokens')
+    if isinstance(value, int) and value >= 0:
+        return value
+    return DEFAULT_OUTPUT_RESERVE_TOKENS
 
 
 def _build_query(profile: dict[str, object], registry_entry: dict[str, object], *, repo_path: Path) -> str:
@@ -373,9 +494,10 @@ def _resolve_group_ids(
         allow_scoped = bool(chatgpt_cfg.get('allow_scoped', False))
         allow_global = bool(chatgpt_cfg.get('allow_global', False))
 
-        if chatgpt_mode == 'global' and allow_global:
-            include_chatgpt = chatgpt_group is not None
-        elif chatgpt_mode == 'scoped' and allow_scoped:
+        if (
+            (chatgpt_mode == 'global' and allow_global)
+            or (chatgpt_mode == 'scoped' and allow_scoped)
+        ):
             include_chatgpt = chatgpt_group is not None
 
     if include_chatgpt and chatgpt_group is not None:
@@ -670,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
         registry = _load_registry(registry_path)
         profiles = _load_profiles(profiles_path)
         _validate_alignment(registry, profiles)
+        forced_tier_c_fallback, startup_warnings = _validate_tier_c_profile_pins(profiles)
 
         consumer = args.consumer
         workflow_id = args.workflow_id
@@ -689,6 +812,29 @@ def main(argv: list[str] | None = None) -> int:
         if ALLOWED_SCOPE[run_scope] > ALLOWED_SCOPE[profile_scope]:
             raise ValueError(
                 f'run scope {run_scope} exceeds profile scope {profile_scope} for consumer profile'
+            )
+
+        tier_c_fixed_tokens, tier_c_warnings = _resolve_tier_c_fixed_tokens(
+            profile,
+            consumer=consumer,
+            forced_fallback=forced_tier_c_fallback,
+        )
+        output_reserve_tokens = _resolve_output_reserve_tokens(profile)
+        model_context_limit = profile.get('model_context_limit')
+        budget_warnings = [*startup_warnings, *tier_c_warnings]
+
+        if (
+            isinstance(model_context_limit, int)
+            and model_context_limit > 0
+            and tier_c_fixed_tokens > int(model_context_limit * 0.40)
+        ):
+            budget_warnings.append(
+                _build_warning(
+                    'TIER_C_OVERSIZED',
+                    consumer=consumer,
+                    tier_c_fixed_tokens=tier_c_fixed_tokens,
+                    model_context_limit=model_context_limit,
+                )
             )
 
         selected_pack_ids = _ensure_string_list(profile['pack_ids'], context='profile.pack_ids')
@@ -764,6 +910,10 @@ def main(argv: list[str] | None = None) -> int:
                     for p in selected_packs
                     if isinstance(p.get('materialized_items', 0), int)
                 ),
+                'tier_c_fixed_tokens': tier_c_fixed_tokens,
+                'output_reserve_tokens': output_reserve_tokens,
+                'warning_count': len(budget_warnings),
+                'warnings': budget_warnings,
             },
             'config_paths': {
                 'registry': str(registry_path.relative_to(repo_root)),

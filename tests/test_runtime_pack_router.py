@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'runtime_pack_router.py'
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -146,6 +145,97 @@ class RuntimePackRouterTests(unittest.TestCase):
             self.assertEqual(selected['pack_id'], 'example_research_pack')
             self.assertIn('materialized_excerpt', selected)
             self.assertEqual(plan['budget_summary']['selected_count'], 1)
+
+    def test_budget_summary_defaults_tier_c_when_profile_field_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            self._seed_repo(repo)
+
+            plan = self._route(
+                repo,
+                consumer='main_session_example_summary',
+                workflow_id='example_summary',
+                step_id='draft',
+                task='Draft summary',
+            )
+
+            self.assertEqual(plan['budget_summary']['tier_c_fixed_tokens'], 3000)
+            events = [w.get('event') for w in plan['budget_summary']['warnings']]
+            self.assertIn('TIER_C_DEFAULT_FALLBACK_USED', events)
+
+    def test_budget_summary_forces_3000_when_pinned_profile_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'vc_memo.pack.yaml').write_text('memo pack', encoding='utf-8')
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'vc_memo_pack',
+                        'path': 'workflows/vc_memo.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                    }
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_vc_memo',
+                        'workflow_id': 'vc_memo_drafting',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'Draft memo',
+                        'injection_text': 'Memo',
+                        'pack_ids': ['vc_memo_pack'],
+                        'chatgpt_mode': 'scoped',
+                        'tier_c_fixed_tokens': 3200,
+                        'model_context_limit': 6000,
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            plan = self._route(
+                repo,
+                consumer='main_session_vc_memo',
+                workflow_id='vc_memo_drafting',
+                step_id='draft',
+                task='Draft memo',
+            )
+
+            self.assertEqual(plan['budget_summary']['tier_c_fixed_tokens'], 3000)
+            warnings = plan['budget_summary']['warnings']
+            self.assertTrue(
+                any(
+                    w.get('event') == 'TIER_C_PROFILE_MISMATCH'
+                    and w.get('consumer') == 'main_session_vc_memo'
+                    for w in warnings
+                )
+            )
+            self.assertTrue(
+                any(
+                    w.get('event') == 'TIER_C_OVERSIZED'
+                    and w.get('consumer') == 'main_session_vc_memo'
+                    for w in warnings
+                )
+            )
 
 
 class RuntimePackRouterFixturesTests(unittest.TestCase):
