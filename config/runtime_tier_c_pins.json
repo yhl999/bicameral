@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "description": "Pinned Tier C fixed-token allocations that private runtime profiles must mirror.",
+  "profiles": {
+    "main_session_dining_recs": 3000,
+    "main_session_content_tweet": 3500,
+    "main_session_vc_memo": 6500,
+    "main_session_vc_deal_brief": 6000,
+    "main_session_vc_diligence_questions": 5500,
+    "main_session_vc_ic_prep": 6500,
+    "main_session_content_long_form": 7500
+  }
+}
