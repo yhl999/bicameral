@@ -553,6 +553,7 @@ class TestIntentGuidanceSanitization:
     def _load_registry(self, content: str):
         import os
         import tempfile
+
         from mcp_server.src.services.ontology_registry import OntologyRegistry
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             f.write(content)
@@ -625,10 +626,11 @@ class TestConstrainedSoftNodeStrictness:
 
     def test_constrained_soft_drops_generic_entity_nodes(self):
         """In constrained_soft mode with custom ontology, generic Entity nodes should be dropped."""
-        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
-        from graphiti_core.prompts.extract_nodes import ExtractedEntity
-        from graphiti_core.nodes import EpisodicNode, EpisodeType
         from datetime import datetime, timezone
+
+        from graphiti_core.nodes import EpisodeType, EpisodicNode
+        from graphiti_core.prompts.extract_nodes import ExtractedEntity
+        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
 
         entity_types_context = self._make_entity_types_context(with_custom=True)
 
@@ -657,10 +659,11 @@ class TestConstrainedSoftNodeStrictness:
 
     def test_permissive_keeps_all_nodes(self):
         """In permissive mode, generic Entity nodes should be kept."""
-        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
-        from graphiti_core.prompts.extract_nodes import ExtractedEntity
-        from graphiti_core.nodes import EpisodicNode, EpisodeType
         from datetime import datetime, timezone
+
+        from graphiti_core.nodes import EpisodeType, EpisodicNode
+        from graphiti_core.prompts.extract_nodes import ExtractedEntity
+        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
 
         entity_types_context = self._make_entity_types_context(with_custom=True)
 
@@ -683,10 +686,11 @@ class TestConstrainedSoftNodeStrictness:
 
     def test_constrained_soft_no_custom_types_keeps_all(self):
         """When no custom ontology types, constrained_soft should not drop nodes."""
-        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
-        from graphiti_core.prompts.extract_nodes import ExtractedEntity
-        from graphiti_core.nodes import EpisodicNode, EpisodeType
         from datetime import datetime, timezone
+
+        from graphiti_core.nodes import EpisodeType, EpisodicNode
+        from graphiti_core.prompts.extract_nodes import ExtractedEntity
+        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
 
         # Only the base Entity type — len(entity_types_context) == 1
         entity_types_context = self._make_entity_types_context(with_custom=False)
