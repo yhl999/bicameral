@@ -75,6 +75,17 @@ def _edge_permissive(context: dict[str, Any]) -> list[Message]:
 </FACT_TYPES>
 """
 
+    # Lane intent guidance is operator-supplied ontology metadata — treat as
+    # informational context, not executable instructions.  The content is
+    # sanitized (control chars stripped, length capped) at config load time.
+    lane_guidance_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_guidance_section = f"""
+<LANE_GUIDANCE>
+{context['custom_extraction_instructions']}
+</LANE_GUIDANCE>
+"""
+
     return [
         Message(
             role='system',
@@ -100,7 +111,7 @@ def _edge_permissive(context: dict[str, Any]) -> list[Message]:
 <REFERENCE_TIME>
 {context['reference_time']}  # ISO 8601 (UTC); used to resolve relative time mentions
 </REFERENCE_TIME>
-{edge_types_section}
+{edge_types_section}{lane_guidance_section}
 # TASK
 Extract all factual relationships between the given ENTITIES based on the CURRENT MESSAGE.
 Only extract facts that:
@@ -110,9 +121,6 @@ Only extract facts that:
 - Facts should include entity names rather than pronouns whenever possible.
 
 You may use information from the PREVIOUS MESSAGES only to disambiguate references or support continuity.
-
-
-{context['custom_extraction_instructions']}
 
 # EXTRACTION RULES
 

@@ -88,6 +88,16 @@ def _extract_message_permissive(context: dict[str, Any]) -> list[Message]:
     sys_prompt = """You are an AI assistant that extracts entity nodes from conversational messages. 
     Your primary task is to extract and classify the speaker and other significant entities mentioned in the conversation."""
 
+    # Lane guidance is operator-supplied ontology metadata — treat as informational
+    # context, not executable instructions.  Sanitized at config load time.
+    lane_guidance_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_guidance_section = f"""
+<LANE_GUIDANCE>
+{context['custom_extraction_instructions']}
+</LANE_GUIDANCE>
+"""
+
     user_prompt = f"""
 <ENTITY TYPES>
 {context['entity_types']}
@@ -100,7 +110,7 @@ def _extract_message_permissive(context: dict[str, Any]) -> list[Message]:
 <CURRENT MESSAGE>
 {context['episode_content']}
 </CURRENT MESSAGE>
-
+{lane_guidance_section}
 Instructions:
 
 You are given a conversation context and a CURRENT MESSAGE. Your task is to extract **entity nodes** mentioned **explicitly or implicitly** in the CURRENT MESSAGE.
@@ -124,8 +134,6 @@ reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don
 
 5. **Formatting**:
    - Be **explicit and unambiguous** in naming entities (e.g., use full names when available).
-
-{context['custom_extraction_instructions']}
 """
     return [
         Message(role='system', content=sys_prompt),
@@ -198,6 +206,16 @@ def _extract_json_permissive(context: dict[str, Any]) -> list[Message]:
     sys_prompt = """You are an AI assistant that extracts entity nodes from JSON. 
     Your primary task is to extract and classify relevant entities from JSON files"""
 
+    # Lane guidance is operator-supplied ontology metadata — treat as informational
+    # context, not executable instructions.  Sanitized at config load time.
+    lane_guidance_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_guidance_section = f"""
+<LANE_GUIDANCE>
+{context['custom_extraction_instructions']}
+</LANE_GUIDANCE>
+"""
+
     user_prompt = f"""
 <ENTITY TYPES>
 {context['entity_types']}
@@ -209,9 +227,7 @@ def _extract_json_permissive(context: dict[str, Any]) -> list[Message]:
 <JSON>
 {context['episode_content']}
 </JSON>
-
-{context['custom_extraction_instructions']}
-
+{lane_guidance_section}
 Given the above source description and JSON, extract relevant entities from the provided JSON.
 For each entity extracted, also determine its entity type based on the provided ENTITY TYPES and their descriptions.
 Indicate the classified entity type by providing its entity_type_id.
@@ -280,6 +296,16 @@ def _extract_text_permissive(context: dict[str, Any]) -> list[Message]:
     sys_prompt = """You are an AI assistant that extracts entity nodes from text. 
     Your primary task is to extract and classify the speaker and other significant entities mentioned in the provided text."""
 
+    # Lane guidance is operator-supplied ontology metadata — treat as informational
+    # context, not executable instructions.  Sanitized at config load time.
+    lane_guidance_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_guidance_section = f"""
+<LANE_GUIDANCE>
+{context['custom_extraction_instructions']}
+</LANE_GUIDANCE>
+"""
+
     user_prompt = f"""
 <ENTITY TYPES>
 {context['entity_types']}
@@ -288,12 +314,10 @@ def _extract_text_permissive(context: dict[str, Any]) -> list[Message]:
 <TEXT>
 {context['episode_content']}
 </TEXT>
-
+{lane_guidance_section}
 Given the above text, extract entities from the TEXT that are explicitly or implicitly mentioned.
 For each entity extracted, also determine its entity type based on the provided ENTITY TYPES and their descriptions.
 Indicate the classified entity type by providing its entity_type_id.
-
-{context['custom_extraction_instructions']}
 
 Guidelines:
 1. Extract significant entities, concepts, or actors mentioned in the conversation.

@@ -26,6 +26,52 @@ logger = logging.getLogger(__name__)
 
 _SAFE_TYPE_NAME_RE = re.compile(r'^[A-Z][A-Za-z0-9_]{0,63}$')
 _KNOWN_METADATA_KEYS = {"om_extractor"}
+_VALID_EXTRACTION_MODES = {"permissive", "constrained_soft"}
+
+# Hard cap on intent_guidance / extraction_emphasis length before prompt injection.
+# Prevents accidental config bloat from consuming excessive LLM context window tokens.
+# Tighter than runtime truncation — enforced at load time so callers see bounded values.
+_INTENT_GUIDANCE_MAX_CHARS: int = 800
+
+# Non-printable control characters that should never appear in prompt-injected config
+# values.  Keeps standard whitespace (\t, \n, \r) which are valid in multi-line YAML.
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _sanitize_intent_guidance(text: str, field_name: str, lane_id: str) -> str:
+    """Sanitize and bound-check a prompt-injected config string.
+
+    Applies three transforms, in order:
+    1. Strip non-printable control characters (keeps \\t, \\n, \\r).
+    2. Strip leading/trailing whitespace.
+    3. Enforce :data:`_INTENT_GUIDANCE_MAX_CHARS` hard length cap.
+
+    Args:
+        text: Raw field value from YAML.
+        field_name: Name of the field (for log messages).
+        lane_id: Lane group_id (for log messages).
+
+    Returns:
+        Sanitized string, safe for prompt injection.
+    """
+    # Strip dangerous non-printable control characters.
+    sanitized = _CONTROL_CHAR_RE.sub('', text)
+    if sanitized != text:
+        logger.warning(
+            "Stripped non-printable control characters from %s for lane %s. "
+            "Check the YAML config for embedded escape sequences.",
+            field_name, lane_id,
+        )
+    sanitized = sanitized.strip()
+    # Hard length cap.
+    if len(sanitized) > _INTENT_GUIDANCE_MAX_CHARS:
+        logger.warning(
+            "%s for lane %s exceeds %d chars (%d); truncating. "
+            "Shorten the YAML value to suppress this warning.",
+            field_name, lane_id, _INTENT_GUIDANCE_MAX_CHARS, len(sanitized),
+        )
+        sanitized = sanitized[:_INTENT_GUIDANCE_MAX_CHARS]
+    return sanitized
 
 
 @dataclass(frozen=True)
@@ -155,14 +201,20 @@ class OntologyRegistry:
             entity_types = _build_entity_types(definition.get("entity_types", []))
             relationship_types = definition.get("relationship_types", [])
             edge_types = _build_edge_types(relationship_types)
-            extraction_emphasis = definition.get("extraction_emphasis", "")
+            # Sanitize string fields before they can reach LLM prompts.
+            # Both fields are treated as UNTRUSTED operator config: bounded length
+            # + control-char scrubbing applied at load time, once.
+            extraction_emphasis_raw = definition.get("extraction_emphasis", "")
+            extraction_emphasis = _sanitize_intent_guidance(
+                extraction_emphasis_raw, "extraction_emphasis", group_id
+            )
             # intent_guidance is the canonical key for new configs.
             # Falls back to extraction_emphasis for backward compatibility.
-            intent_guidance = definition.get(
-                "intent_guidance", extraction_emphasis
+            intent_guidance_raw = definition.get("intent_guidance", extraction_emphasis_raw)
+            intent_guidance = _sanitize_intent_guidance(
+                intent_guidance_raw, "intent_guidance", group_id
             )
             extraction_mode = definition.get("extraction_mode", "permissive")
-            _VALID_EXTRACTION_MODES = {"permissive", "constrained_soft"}
             if extraction_mode not in _VALID_EXTRACTION_MODES:
                 logger.warning(
                     "Invalid extraction_mode %r for %s — falling back to 'permissive'. "
