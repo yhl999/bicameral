@@ -736,12 +736,15 @@ class TestSearchRateLimiter(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
         ).read_text(encoding='utf-8')
-        # The trusted pattern: key derived from effective_group_ids
-        trusted_calls = src.count('_derive_rate_limit_key(effective_group_ids)')
+        # The trusted pattern: key derived from effective_group_ids (+ caller principal)
+        trusted_calls = src.count(
+            '_derive_rate_limit_key(effective_group_ids, caller_principal)'
+        )
         self.assertGreaterEqual(
-            trusted_calls, 2,
-            f'Expected _derive_rate_limit_key called with effective_group_ids in at least 2 '
-            f'endpoints, found {trusted_calls}',
+            trusted_calls,
+            2,
+            f'Expected _derive_rate_limit_key called with effective_group_ids + caller_principal '
+            f'in at least 2 endpoints, found {trusted_calls}',
         )
 
     def test_key_cardinality_bound_evicts_lru(self):
