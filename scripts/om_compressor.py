@@ -1423,6 +1423,7 @@ def _process_structured_parent(session: Any, parent: ParentState, cfg: Extractor
 
 
 def run(args: argparse.Namespace) -> int:
+    dry_run = getattr(args, 'dry_run', False)
     cfg = _load_extractor_config(_resolve_ontology_config_path(args.config))
 
     driver = _neo4j_driver()
@@ -1431,6 +1432,9 @@ def run(args: argparse.Namespace) -> int:
 
         parent = _fetch_structured_parent(session)
         if parent is not None:
+            if dry_run:
+                print(f"DRY RUN: would process structured parent chunk")
+                return 0
             _process_structured_parent(session, parent, cfg)
             return 0
 
@@ -1453,6 +1457,14 @@ def run(args: argparse.Namespace) -> int:
                     break
 
                 chunk_id = _chunk_id(chunk_messages, cfg.extractor_version)
+                if dry_run:
+                    print(
+                        f"DRY RUN: would process chunk {chunk_id} "
+                        f"({len(chunk_messages)} messages, "
+                        f"backlog={backlog_count}, oldest={oldest_hours:.1f}h)"
+                    )
+                    processed += 1
+                    continue
                 try:
                     _, observed_ids = _activate_energy_scores(session, chunk_messages)
                     result = _process_chunk(

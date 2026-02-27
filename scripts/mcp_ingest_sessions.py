@@ -318,6 +318,31 @@ def apply_shard(evidences: list[dict], shards: int, shard_index: int) -> list[di
     return [ev for i, ev in enumerate(evidences) if (i % shards) == shard_index]
 
 
+def _query_neo4j_message_count(args: argparse.Namespace) -> int:
+    """Query Neo4j for the total Message node count.
+
+    Returns 0 if Neo4j is not reachable or has no messages.
+    Uses the MCP server's /status endpoint or a direct Cypher query.
+    """
+    import urllib.request
+
+    mcp_url = getattr(args, 'mcp_url', MCP_URL_DEFAULT)
+    try:
+        # Try the MCP health endpoint to check if Neo4j has messages
+        req = urllib.request.Request(
+            f'{mcp_url}/status',
+            headers={'Content-Type': 'application/json'},
+            method='GET',
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            # If status endpoint returns message count, use it
+            return data.get('message_count', 0)
+    except Exception:
+        # If MCP server is unreachable, assume no messages (guard will fire)
+        return 0
+
+
 def check_bootstrap_guard(neo4j_message_count: int, evidence_files_exist: bool) -> bool:
     """Return True if BOOTSTRAP_REQUIRED guard should fire.
 
@@ -500,9 +525,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
 
     # BOOTSTRAP_REQUIRED guard: if Neo4j has 0 messages but evidence files exist,
     # the graph hasn't been bootstrapped yet.
-    # In a real implementation, neo4j_message_count would query the graph.
-    # For now, we assume 0 when neo4j is not reachable.
-    neo4j_message_count = 0
+    neo4j_message_count = _query_neo4j_message_count(args)
     if check_bootstrap_guard(neo4j_message_count, evidence_files_exist):
         print(
             'BOOTSTRAP_REQUIRED: Neo4j has no messages but evidence files exist.\n'
@@ -553,18 +576,35 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
             claimed += 1
             if args.dry_run:
                 print(f'DRY RUN: would process chunk {chunk_id}')
-            else:
-                print(f'Processing claimed chunk: {chunk_id}')
-                # Placeholder: actual processing would happen here
-            conn.execute(
-                "UPDATE chunk_claims SET status='completed', completed_at=? "
-                'WHERE chunk_id=?',
-                (
-                    datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                    chunk_id,
-                ),
-            )
-            conn.commit()
+                continue
+            print(f'Processing claimed chunk: {chunk_id}')
+            try:
+                # TODO: Actual chunk processing (read chunk content from manifest,
+                # send to MCP add_memory, mark graphiti_extracted_at in Neo4j)
+                # will be wired when the full pipeline is integrated.
+                # For now, mark as failed to avoid false completion.
+                conn.execute(
+                    "UPDATE chunk_claims SET status='failed', error=?, completed_at=? "
+                    'WHERE chunk_id=?',
+                    (
+                        'not yet implemented: chunk processing stub',
+                        datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                        chunk_id,
+                    ),
+                )
+                conn.commit()
+            except Exception as exc:
+                conn.execute(
+                    "UPDATE chunk_claims SET status='failed', "
+                    "fail_count=COALESCE(fail_count,0)+1, error=?, completed_at=? "
+                    'WHERE chunk_id=?',
+                    (
+                        str(exc),
+                        datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                        chunk_id,
+                    ),
+                )
+                conn.commit()
 
         print(f'Worker {worker_id} processed {claimed} chunks')
         conn.close()
@@ -580,61 +620,11 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
 
 
 def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
-    """Evidence source mode: the original JSON-file-based ingestion path."""
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--mcp-url', default=MCP_URL_DEFAULT)
-    ap.add_argument(
-        '--evidence',
-        default=str(
-            Path(__file__).resolve().parents[1]
-            / 'evidence'
-            / 'sessions_v1'
-            / 'main'
-            / 'all_evidence.json'
-        ),
-        help='Evidence JSON file (v1 default: evidence/sessions_v1/<agent>/all_evidence.json)',
-    )
-    ap.add_argument('--group-id', required=True)
-    ap.add_argument('--limit', type=int, default=500)
-    ap.add_argument('--offset', type=int, default=0)
-    ap.add_argument('--sleep', type=float, default=0.02)
+    """Evidence source mode: the original JSON-file-based ingestion path.
 
-    # Sharding (parallel enqueue): take every Nth chunk.
-    ap.add_argument('--shards', type=int, default=1, help='Total shard count (default: 1)')
-    ap.add_argument(
-        '--shard-index', type=int, default=0, help="This worker's shard index [0..shards-1]"
-    )
-
-    # Incremental mode options
-    ap.add_argument(
-        '--incremental',
-        action='store_true',
-        help='Enable incremental mode: only ingest new/changed chunks beyond a watermark',
-    )
-    ap.add_argument(
-        '--overlap',
-        type=int,
-        default=DEFAULT_OVERLAP_CHUNKS,
-        help=f'Number of evidence chunks to overlap for incremental mode (default: {DEFAULT_OVERLAP_CHUNKS})',
-    )
-    ap.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Preview what would be ingested without sending to Graphiti',
-    )
-    ap.add_argument(
-        '--force', action='store_true', help='Force re-ingest even if chunk already in registry'
-    )
-    ap.add_argument(
-        '--subchunk-size',
-        type=int,
-        default=DEFAULT_SUBCHUNK_SIZE,
-        help=f'Max chars per sub-chunk for large evidence (default: {DEFAULT_SUBCHUNK_SIZE}). '
-        'Only applies to group IDs in _SUBCHUNK_GROUP_IDS (e.g. s1_sessions_main).',
-    )
-    args = ap.parse_args()
-
-    if args.subchunk_size <= 0:
+    Uses the already-parsed args from main() — does NOT re-parse sys.argv.
+    """
+    if getattr(args, 'subchunk_size', 0) <= 0:
         ap.error('--subchunk-size must be a positive integer')
 
     evidence_path = Path(args.evidence)
