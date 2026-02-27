@@ -502,14 +502,6 @@ class GraphitiService:
                 default_group = self._validate_group_id(self.config.graphiti.group_id)
                 self._clients_by_group[default_group] = self.client
 
-            # Load lane-specific extraction ontologies if config file exists.
-            ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
-            if ontology_path.exists():
-                try:
-                    self.ontology_registry = OntologyRegistry.load(ontology_path)
-                except Exception as e:
-                    logger.warning('Failed to load extraction ontologies from %s: %s', ontology_path, e)
-
             logger.info('Successfully initialized Graphiti client')
 
             # Log configuration details
