@@ -83,6 +83,12 @@ try:
 except (ValueError, TypeError):
     TRUST_WEIGHT = 0.0
 
+# Defense-in-depth caps: callers may request arbitrarily large result sets.
+# These hard ceilings prevent accidental or adversarial result-set blowup
+# regardless of what value the client passes in max_nodes / max_facts.
+_MAX_NODES_CAP = 200
+_MAX_FACTS_CAP = 200
+
 
 # Configure structured logging with timestamps
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -162,8 +168,8 @@ def _resolve_effective_group_ids(
     effective_group_ids: list[str] = []
     invalid_aliases: list[str] = []
 
-    # 1) Explicit group_ids has highest precedence
-    if group_ids:
+    # 1) Explicit group_ids has highest precedence (including explicit empty list)
+    if group_ids is not None:
         effective_group_ids = _unique_preserve_order(group_ids)
 
     # 2) Resolve lane aliases (if provided)
@@ -737,8 +743,11 @@ async def search_nodes(
             node_labels=entity_types,
         )
 
+        # Apply defense-in-depth cap before building backend search config.
+        effective_max_nodes = min(max_nodes, _MAX_NODES_CAP)
+
         # Build mode-specific search config (trust-aware)
-        search_config = _build_node_search_config(normalized_mode, max_nodes)
+        search_config = _build_node_search_config(normalized_mode, effective_max_nodes)
 
         results = await client.search_(
             query=query,
@@ -747,8 +756,7 @@ async def search_nodes(
             search_filter=search_filters,
         )
 
-        # Extract nodes from results
-        nodes = results.nodes[:max_nodes] if results.nodes else []
+        nodes = results.nodes[:effective_max_nodes] if results.nodes else []
 
         if not nodes:
             return NodeSearchResponse(message='No relevant nodes found', nodes=[])
@@ -805,9 +813,10 @@ async def search_memory_facts(
         return ErrorResponse(error='Graphiti service not initialized')
 
     try:
-        # Validate max_facts parameter
+        # Validate max_facts parameter and apply defense-in-depth cap.
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
+        max_facts = min(max_facts, _MAX_FACTS_CAP)
 
         normalized_mode = (search_mode or 'hybrid').strip().lower()
         if normalized_mode not in VALID_SEARCH_MODES:
@@ -849,7 +858,7 @@ async def search_memory_facts(
             center_node_uuid=center_node_uuid,
         )
 
-        relevant_edges = results.edges[:max_facts] if results.edges else []
+        relevant_edges = results.edges[:max_facts] if results.edges else []  # already capped above
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])

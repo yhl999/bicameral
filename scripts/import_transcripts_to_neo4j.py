@@ -35,10 +35,11 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -67,6 +68,7 @@ class ImportStats:
     messages_updated: int = 0
     embeddings_computed: int = 0
     embeddings_skipped: int = 0
+    quarantined_count: int = 0  # messages rejected at ingest boundary (malformed timestamps)
     errors: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +79,7 @@ class ImportStats:
             'messages_updated': self.messages_updated,
             'embeddings_computed': self.embeddings_computed,
             'embeddings_skipped': self.embeddings_skipped,
+            'quarantined_count': self.quarantined_count,
             'errors': self.errors,
         }
 
@@ -105,6 +108,12 @@ def now_iso() -> str:
 
 
 def parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 string to a UTC-aware datetime.
+
+    Returns None when value is absent/empty; also returns None for malformed
+    strings (lenient parser for internal use).  The ingest boundary uses
+    ``validate_ingest_timestamp`` for strict validation.
+    """
     if not value:
         return None
     txt = str(value).strip()
@@ -121,6 +130,59 @@ def parse_iso(value: str | None) -> datetime | None:
         return None
 
 
+def validate_ingest_timestamp(raw: str | None) -> tuple[str, str | None]:
+    """Strict timestamp validation at the ingest boundary.
+
+    Accepts ISO-8601 strings (with or without timezone) and common epoch
+    integers / floats.  Absent or empty values are treated as "no timestamp"
+    (valid; returns empty string).
+
+    Args:
+        raw: Raw timestamp value from the JSONL file.
+
+    Returns:
+        A ``(normalized_iso, error)`` tuple where:
+        - ``normalized_iso`` is the UTC ISO string (``"YYYY-MM-DDTHH:MM:SSZ"``)
+          or ``""`` when the timestamp is absent.
+        - ``error`` is ``None`` when valid, or a human-readable description of
+          the problem for malformed values.
+
+    This function is intentionally strict: any timestamp that is present but
+    not parseable is returned with a non-None error so the caller can quarantine
+    the affected record rather than silently swallowing the problem.
+    """
+    if raw is None:
+        return ('', None)
+
+    txt: str
+    if isinstance(raw, (int, float)):
+        # Unix epoch seconds — convert to ISO.
+        try:
+            dt = datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            return (dt.replace(microsecond=0).isoformat().replace('+00:00', 'Z'), None)
+        except (ValueError, OverflowError, OSError) as exc:
+            return ('', f'epoch timestamp out of range {raw!r}: {exc}')
+
+    txt = str(raw).strip()
+    if not txt:
+        return ('', None)  # absent — allowed
+
+    # Try ISO-8601 parsing (covers YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]).
+    try:
+        if txt.endswith('Z'):
+            dt = datetime.fromisoformat(txt[:-1]).replace(tzinfo=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        normalized = dt.astimezone(timezone.utc).replace(microsecond=0)
+        return (normalized.isoformat().replace('+00:00', 'Z'), None)
+    except (ValueError, TypeError):
+        pass  # fall through to rejection
+
+    return ('', f'malformed timestamp {txt!r}: not parseable as ISO-8601')
+
+
 def iso_or_none(dt: datetime | None) -> str | None:
     if not dt:
         return None
@@ -132,7 +194,7 @@ def iso_or_none(dt: datetime | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 def read_jsonl(file_path: Path) -> Iterator[dict[str, Any]]:
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -165,8 +227,8 @@ def extract_text_content(
 
 def parse_session_messages(
     file_path: Path,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Parse a session JSONL file, returning (session_id, messages).
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse a session JSONL file, returning (session_id, messages, quarantined).
 
     Applies the same filtering as ingest/parse_sessions_v1.py:
     - type == "message" entries only
@@ -174,7 +236,16 @@ def parse_session_messages(
     - Exclude assistant when provider == "clawdbot" or model == "delivery-mirror"
     - Exclude empty content and thinking blocks
 
-    Each message dict has keys: role, content, created_at, line_index.
+    **Boundary strictness (ingest boundary):** timestamps that are *present* but
+    *malformed* are rejected at this boundary.  The affected message is added to
+    the ``quarantined`` list (not included in ``messages``) with a clear error
+    description.  Absent/empty timestamps are allowed and stored as ``""`` so
+    downstream components can handle them gracefully.
+
+    Returns:
+        session_id: Session identifier.
+        messages: Valid message dicts with keys: role, content, created_at, line_index.
+        quarantined: Dicts with keys: line_index, role, error — one per rejected msg.
     """
     entries = list(read_jsonl(file_path))
 
@@ -183,6 +254,8 @@ def parse_session_messages(
     session_id = str(session_meta.get('id') or file_path.stem)
 
     messages: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
+
     for line_index, entry in enumerate(entries):
         if entry.get('type') != 'message':
             continue
@@ -202,15 +275,27 @@ def parse_session_messages(
         if not txt.strip():
             continue
 
-        ts = entry.get('timestamp') or ''
+        # Strict timestamp validation at the ingest boundary.
+        raw_ts = entry.get('timestamp')
+        normalized_ts, ts_error = validate_ingest_timestamp(raw_ts)
+        if ts_error:
+            # Present but malformed — quarantine this message with a clear error path.
+            quarantined.append({
+                'line_index': line_index,
+                'role': role,
+                'error': ts_error,
+                'raw_timestamp': str(raw_ts),
+            })
+            continue
+
         messages.append({
             'role': role,
             'content': txt.strip(),
-            'created_at': str(ts),
+            'created_at': normalized_ts,  # UTC ISO or '' (absent)
             'line_index': line_index,
         })
 
-    return session_id, messages
+    return session_id, messages, quarantined
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +539,6 @@ def discover_session_files(sessions_dir: Path, max_files: int | None = None) -> 
         files.extend(direct)
 
     # Layout 2: agents/*/sessions/*.jsonl (look under sessions_dir)
-    agents_pattern = sessions_dir / 'agents' / '*' / 'sessions' / '*.jsonl'
     agents_files = sorted(sessions_dir.glob('agents/*/sessions/*.jsonl'))
     if agents_files:
         seen = {f.resolve() for f in files}
@@ -576,7 +660,17 @@ def upsert_episode_and_messages(
                 and existing_model == embedding_model
                 and existing_dim == embedding_dim
             ):
-                # Content unchanged, embedding valid - skip.
+                # Content unchanged, embedding valid - skip re-embedding.
+                # Still MERGE the relationship to heal partial-failure edge gaps
+                # from prior interrupted runs.
+                session.run(
+                    """
+                    MATCH (e:Episode {episode_id: $episode_id})
+                    MATCH (m:Message {message_id: $message_id})
+                    MERGE (e)-[:HAS_MESSAGE]->(m)
+                    """,
+                    {'episode_id': episode_id, 'message_id': message_id},
+                ).consume()
                 stats.embeddings_skipped += 1
                 continue
 
@@ -613,6 +707,15 @@ def upsert_episode_and_messages(
                     'embedding_model': embedding_model,
                     'embedding_dim': embedding_dim,
                 },
+            ).consume()
+            # MERGE relationship to heal partial-failure edge gaps on reruns.
+            session.run(
+                """
+                MATCH (e:Episode {episode_id: $episode_id})
+                MATCH (m:Message {message_id: $message_id})
+                MERGE (e)-[:HAS_MESSAGE]->(m)
+                """,
+                {'episode_id': episode_id, 'message_id': message_id},
             ).consume()
             continue
 
@@ -704,8 +807,15 @@ def run_import(args: argparse.Namespace) -> ImportStats:
         for file_path in files:
             stats.files_seen += 1
             try:
-                session_id, messages = parse_session_messages(file_path)
-                for msg in messages:
+                session_id, messages, quarantined = parse_session_messages(file_path)
+                # Record quarantined messages in stats so operators can see them.
+                for q in quarantined:
+                    stats.quarantined_count += 1
+                    stats.errors.append({
+                        'file': str(file_path),
+                        'error': f'quarantined line {q["line_index"]}: {q["error"]}',
+                    })
+                for _ in messages:
                     if args.max_messages and stats.messages_seen >= args.max_messages:
                         break
                     stats.messages_seen += 1
@@ -722,41 +832,49 @@ def run_import(args: argparse.Namespace) -> ImportStats:
     driver = neo4j_driver()
     database = os.environ.get('NEO4J_DATABASE', 'neo4j')
 
-    with driver:
-        with driver.session(database=database) as neo_session:
-            ensure_constraints(neo_session)
+    with driver, driver.session(database=database) as neo_session:
+        ensure_constraints(neo_session)
 
-            # Migration: backfill content_hash on pre-existing rows.
-            migrated = run_migration(neo_session)
-            if migrated > 0:
-                print(f'Migration: backfilled content_hash on {migrated} pre-existing row(s)')
+        # Migration: backfill content_hash on pre-existing rows.
+        migrated = run_migration(neo_session)
+        if migrated > 0:
+            print(f'Migration: backfilled content_hash on {migrated} pre-existing row(s)')
 
-            for file_path in files:
-                if args.max_messages and stats.messages_seen >= args.max_messages:
-                    break
+        for file_path in files:
+            if args.max_messages and stats.messages_seen >= args.max_messages:
+                break
 
-                stats.files_seen += 1
-                try:
-                    session_id, messages = parse_session_messages(file_path)
-                    if not messages:
-                        continue
+            stats.files_seen += 1
+            try:
+                session_id, messages, quarantined = parse_session_messages(file_path)
 
-                    upsert_episode_and_messages(
-                        neo_session,
-                        file_path=file_path,
-                        session_id=session_id,
-                        messages=messages,
-                        embedding_model=embedding_model,
-                        embedding_dim=embedding_dim,
-                        dry_run=False,
-                        stats=stats,
-                        max_messages=args.max_messages,
-                    )
-                except Exception as exc:
+                # Record quarantined messages (malformed timestamps at ingest boundary).
+                for q in quarantined:
+                    stats.quarantined_count += 1
                     stats.errors.append({
                         'file': str(file_path),
-                        'error': str(exc),
+                        'error': f'quarantined line {q["line_index"]}: {q["error"]}',
                     })
+
+                if not messages:
+                    continue
+
+                upsert_episode_and_messages(
+                    neo_session,
+                    file_path=file_path,
+                    session_id=session_id,
+                    messages=messages,
+                    embedding_model=embedding_model,
+                    embedding_dim=embedding_dim,
+                    dry_run=False,
+                    stats=stats,
+                    max_messages=args.max_messages,
+                )
+            except Exception as exc:
+                stats.errors.append({
+                    'file': str(file_path),
+                    'error': str(exc),
+                })
 
     return stats
 
