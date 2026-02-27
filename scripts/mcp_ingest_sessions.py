@@ -701,6 +701,40 @@ def _claim_neo4j_retry(conn: sqlite3.Connection, worker_id: str) -> str | None:
     return chunk_id
 
 
+def _snapshot_sent_not_marked(conn: sqlite3.Connection) -> list[str]:
+    """Return all chunk IDs currently in 'sent_not_marked' status.
+
+    Called once at the start of Phase A to bound the retry set for this run.
+    Processing each chunk at most once prevents a persistently-failing chunk
+    from starving Phase B pending work (liveness guarantee).
+    """
+    cursor = conn.execute(
+        "SELECT chunk_id FROM chunk_claims WHERE status='sent_not_marked'"
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def _claim_neo4j_retry_targeted(
+    conn: sqlite3.Connection, worker_id: str, chunk_id: str
+) -> bool:
+    """Atomically claim a specific 'sent_not_marked' chunk for Neo4j-mark-only retry.
+
+    Returns True if the chunk was successfully claimed (status was 'sent_not_marked'),
+    False if the chunk is no longer in that state (e.g. claimed by another worker).
+    Workers must NOT call add_memory for claimed chunks — only _mark_neo4j_extracted.
+    """
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    conn.execute('BEGIN IMMEDIATE')
+    conn.execute(
+        "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
+        "WHERE chunk_id=? AND status='sent_not_marked'",
+        (worker_id, now, chunk_id),
+    )
+    rows_changed = conn.execute('SELECT changes()').fetchone()[0]
+    conn.commit()
+    return rows_changed > 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser for mcp_ingest_sessions."""
     ap = argparse.ArgumentParser()
@@ -1018,10 +1052,16 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
             # ------------------------------------------------------------------
 
             # --- Phase A: Neo4j-mark-only retries ---
-            while True:
-                chunk_id = _claim_neo4j_retry(conn, worker_id)
-                if chunk_id is None:
-                    break
+            # Snapshot all sent_not_marked IDs upfront so each chunk is attempted at
+            # most once per run.  A persistently-failing chunk is put back to
+            # sent_not_marked but will NOT be re-visited in this run because the
+            # snapshot is bounded — Phase B pending chunks are always reachable.
+            phase_a_ids = _snapshot_sent_not_marked(conn)
+            for chunk_id in phase_a_ids:
+                claimed = _claim_neo4j_retry_targeted(conn, worker_id, chunk_id)
+                if not claimed:
+                    # Another worker already claimed or completed this chunk; skip.
+                    continue
 
                 chunk_data = manifest.get(chunk_id)
                 if not chunk_data:
@@ -1036,16 +1076,19 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     ok += 1
                     _logger.info('neo4j-retry ok: chunk %s', chunk_id[:12])
                 except Exception as neo4j_exc:
-                    # Put back to sent_not_marked so the next run retries again.
+                    # Increment fail_count and restore sent_not_marked for future runs.
+                    # This chunk will NOT be re-processed in Phase A of the current run
+                    # (snapshot was taken upfront), so Phase B is always reachable.
                     conn.execute(
-                        "UPDATE chunk_claims SET status='sent_not_marked', error=? "
+                        "UPDATE chunk_claims SET status='sent_not_marked', "
+                        "fail_count=COALESCE(fail_count, 0) + 1, error=? "
                         'WHERE chunk_id=?',
                         (str(neo4j_exc)[:500], chunk_id),
                     )
                     conn.commit()
                     errors += 1
                     _logger.warning(
-                        'neo4j-retry still failing for chunk %s: %s',
+                        'neo4j-retry still failing for chunk %s (fail_count incremented): %s',
                         chunk_id[:12],
                         neo4j_exc,
                     )

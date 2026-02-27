@@ -127,6 +127,23 @@ _search_rate_limiter = _SlidingWindowRateLimiter(
 )
 
 
+def _derive_rate_limit_key(
+    group_ids: list[str] | None,
+    lane_alias: list[str] | None,
+) -> str:
+    """Return a stable per-caller rate-limit key derived from request context.
+
+    Priority: explicit group_ids → lane_alias → global fallback.
+    Using the caller's group scope as the key ensures that different callers
+    get independent rate-limit buckets and cannot starve one another.
+    """
+    if group_ids:
+        return f'group:{group_ids[0]}'
+    if lane_alias:
+        return f'alias:{lane_alias[0]}'
+    return '__global__'
+
+
 # Configure structured logging with timestamps
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -745,8 +762,9 @@ async def search_nodes(
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
-    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed():
-        logger.warning('search_nodes rate limit exceeded')
+    caller_key = _derive_rate_limit_key(group_ids, lane_alias)
+    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
+        logger.warning('search_nodes rate limit exceeded (key=%s)', caller_key)
         return ErrorResponse(error='rate limit exceeded; retry later')
 
     try:
@@ -853,8 +871,9 @@ async def search_memory_facts(
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
-    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed():
-        logger.warning('search_memory_facts rate limit exceeded')
+    caller_key = _derive_rate_limit_key(group_ids, lane_alias)
+    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
+        logger.warning('search_memory_facts rate limit exceeded (key=%s)', caller_key)
         return ErrorResponse(error='rate limit exceeded; retry later')
 
     try:

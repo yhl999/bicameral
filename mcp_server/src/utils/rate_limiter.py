@@ -60,7 +60,13 @@ class SlidingWindowRateLimiter:
             # Evict timestamps outside the window (list stays O(max_requests) in length).
             while ts and ts[0] < cutoff:
                 ts.pop(0)
+            # Cleanup: delete empty keys to prevent unbounded dict growth when
+            # unique caller keys cycle through and their windows expire.
+            if not ts:
+                del self._timestamps[key]
+                ts = []
             if len(ts) >= self._max:
                 return False
             ts.append(now)
+            self._timestamps[key] = ts
             return True

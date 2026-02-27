@@ -5,6 +5,13 @@ import sys
 # Without this file, you might encounter ModuleNotFoundError when trying to import modules from your project, especially when running tests.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from tests.helpers_test import graph_driver, mock_embedder
+try:
+    from tests.helpers_test import graph_driver, mock_embedder
 
-__all__ = ['graph_driver', 'mock_embedder']
+    __all__ = ['graph_driver', 'mock_embedder']
+except ImportError:
+    # Integration-test fixtures are unavailable (e.g. missing optional deps
+    # such as python-dotenv or numpy when running lightweight unit tests with
+    # the system Python interpreter).  Non-integration tests run fine without
+    # these fixtures.
+    pass
