@@ -35,7 +35,9 @@ schema_version: 1
 |---|---|---|---|
 | `schema_version` | `int` | Yes | Schema version. Currently `1`. |
 | `<group_id>` | mapping key | — | The `group_id` this ontology applies to. Must match the group_id used when calling `add_episode()`. |
-| `extraction_emphasis` | `string` | No | Free-text prompt injected into the LLM extraction call. Tells the extractor what to prioritize. |
+| `extraction_mode` | `string` | No | Extraction behaviour: `permissive` (default) or `constrained_soft`. See [Extraction Modes](#extraction-modes). |
+| `intent_guidance` | `string` | No | Canonical field for per-lane LLM focus instructions. In `constrained_soft` mode, placed in a dedicated `<LANE_INTENT>` block (not appended). Falls back to `extraction_emphasis` if not set. |
+| `extraction_emphasis` | `string` | No | Legacy alias for `intent_guidance`. Still works; prefer `intent_guidance` for new configs. |
 | `entity_types` | `list[{name, description}]` | No | Entity types to extract for this lane. Each becomes a Pydantic model at runtime. |
 | `entity_types[].name` | `string` | Yes | PascalCase entity type name (e.g., `RootCause`, `FeatureRequest`). |
 | `entity_types[].description` | `string` | Yes | Extraction instructions for the LLM. Be specific — this is the primary lever for extraction quality. |
@@ -139,13 +141,90 @@ See [`config/extraction_ontologies.example.yaml`](../config/extraction_ontologie
 - **Relationship descriptions should name their endpoints.** "CustomerIssue → ResolutionStep that fixed it" is better than "connects issues to fixes".
 - **Review and iterate.** Run extraction on a sample, review the entities created, and refine descriptions based on what the LLM gets right/wrong.
 
+## Extraction Modes
+
+The ontology config supports two extraction modes per lane:
+
+| Mode | Default? | Behaviour |
+|---|---|---|
+| `permissive` | ✅ Yes | Extract broadly; all relationship types allowed. Extraction emphasis/intent guidance is appended as additional context. |
+| `constrained_soft` | No | Ontology-conformant mode. Uses dedicated prompt branches (not appended text) and code-level enforcement to reduce noise. |
+
+### When to use `constrained_soft`
+
+Use constrained_soft for lanes where:
+- The graph should closely mirror a defined domain model (e.g. voice fingerprint analysis, rhetorical pattern extraction)
+- Generic connector edges (RELATES_TO, MENTIONS, IS_RELATED_TO) create noise that harms retrieval precision
+- Edge canonicalization is needed to snap near-miss names to ontology names
+
+**Do not** use constrained_soft for general-purpose or exploratory lanes — it reduces recall for off-ontology content.
+
+### `intent_guidance` — Lane-Level LLM Focus
+
+`intent_guidance` is the canonical field for per-lane LLM instructions. In `constrained_soft` mode, it is placed in a dedicated `<LANE_INTENT>` block in the prompt (not appended to generic instructions, which would create conflicting directives).
+
+`extraction_emphasis` is a backward-compatible alias — if `intent_guidance` is not set, `extraction_emphasis` is used as the fallback.
+
+### Schema Example — constrained_soft lane
+
+```yaml
+schema_version: 1
+
+voice_analysis:
+  extraction_mode: constrained_soft
+  intent_guidance: >
+    Focus on rhetorical techniques, voice patterns, and structural moves.
+    Extract what makes this writing distinctive — characteristic phrases,
+    tone shifts, structural patterns. Do not extract generic topic nodes.
+    Conform to the defined FACT_TYPES.
+
+  entity_types:
+    - name: RhetoricalMove
+      description: >
+        A specific writing technique used in the piece
+        (e.g. cold open with absurd analogy, callback close, one-liner pivot).
+        Extract the technique name and brief description.
+
+    - name: VoiceQuality
+      description: >
+        A tone or register characteristic
+        (e.g. irreverent-casual, deadpan-authoritative, erudite-compressed).
+
+  relationship_types:
+    - name: USES_MOVE
+      description: "Piece → RhetoricalMove it employs"
+
+    - name: EXHIBITS
+      description: "Piece → VoiceQuality it demonstrates"
+```
+
+In this example:
+- The LLM extraction prompt uses a **dedicated constrained_soft branch** (not the permissive prompt with appended instructions)
+- Intent guidance is placed in `<LANE_INTENT>` block — not appended after conflicting base instructions
+- After LLM extraction: near-miss edge names are snapped to ontology (e.g. `USE_MOVE` → `USES_MOVE`)
+- Generic edges (RELATES_TO, MENTIONS, etc.) with no ontology match are dropped in code
+- Off-ontology but semantically specific edges (e.g. `WRITTEN_IN_RESPONSE_TO`) are kept
+
+### Code enforcement in constrained_soft
+
+Two enforcement passes run after LLM extraction (in code, not prompt):
+
+1. **Canonicalization**: near-miss relation types are snapped to the closest ontology name using `difflib.SequenceMatcher` (threshold ≥ 0.78).
+2. **Noise filter**: relation types in a known generic set (`RELATES_TO`, `MENTIONS`, `IS_RELATED_TO`, `CONNECTED_TO`, etc.) are dropped when they have no ontology match.
+
+Domain-specific off-ontology edges (e.g. `CRITICIZED_BY`, `WRITTEN_IN_RESPONSE_TO`) are **kept** — only generic connector noise is filtered.
+
 ## Operational Safety Notes
 
-### Relationship type enforcement is guidance, not a hard gate
+### Relationship type enforcement
 
-Current extraction uses ontology relationship types as prompt guidance. It does **not** guarantee that every emitted edge label is one of `relationship_types[].name`.
+**Permissive mode (default):** Extraction uses ontology relationship types as prompt guidance only. It does **not** guarantee that every emitted edge label is one of `relationship_types[].name`. Off-ontology edges may appear.
 
-For governance-critical workflows, do not key policy logic directly off free-form relation labels unless you add a separate canonical mapping/validation layer.
+**constrained_soft mode:** After LLM extraction, two code-level enforcement passes run:
+1. Near-miss canonicalization (difflib ≥ 0.78 threshold) snaps edge names to ontology names.
+2. Generic off-ontology edges (RELATES_TO, MENTIONS, etc.) are dropped.
+
+For governance-critical workflows, use `constrained_soft` mode and do not key policy logic directly off free-form relation labels without a separate validation layer.
 
 ### Defensive filtering for malformed legacy edges
 
