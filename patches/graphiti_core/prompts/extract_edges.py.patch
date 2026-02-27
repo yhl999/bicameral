@@ -1,0 +1,145 @@
+diff --git a/graphiti_core/prompts/extract_edges.py b/graphiti_core/prompts/extract_edges.py
+index 80534ca..c2bfdef 100644
+--- a/graphiti_core/prompts/extract_edges.py
++++ b/graphiti_core/prompts/extract_edges.py
+@@ -21,6 +21,10 @@ from pydantic import BaseModel, Field
+ from .models import Message, PromptFunction, PromptVersion
+ from .prompt_helpers import to_prompt_json
+ 
++# Extraction modes for constrained_soft routing.
++_EXTRACTION_MODE_PERMISSIVE = 'permissive'
++_EXTRACTION_MODE_CONSTRAINED_SOFT = 'constrained_soft'
++
+ 
+ class Edge(BaseModel):
+     source_entity_name: str = Field(
+@@ -61,7 +65,8 @@ class Versions(TypedDict):
+     extract_attributes: PromptFunction
+ 
+ 
+-def edge(context: dict[str, Any]) -> list[Message]:
++def _edge_permissive(context: dict[str, Any]) -> list[Message]:
++    """Permissive extraction prompt — default behaviour, extract broadly."""
+     edge_types_section = ''
+     if context.get('edge_types'):
+         edge_types_section = f"""
+@@ -137,6 +142,119 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
+     ]
+ 
+ 
++def _edge_constrained_soft(context: dict[str, Any]) -> list[Message]:
++    """Constrained-soft extraction prompt.
++
++    Uses a dedicated prompt structure rather than appending to the permissive
++    prompt to avoid conflicting directives.  Key differences vs permissive:
++
++    - System message declares ontology-conformant focus upfront.
++    - LANE_INTENT section embeds intent_guidance in a named block (not appended).
++    - RELATION TYPE RULES strongly prefer FACT_TYPES; off-ontology extraction
++      is explicitly limited to semantically central relationships.
++    - Noise rule: generic/connector relations (RELATES_TO, MENTIONS, etc.) with
++      no ontology match must NOT be emitted.
++    """
++    edge_types_section = ''
++    if context.get('edge_types'):
++        edge_types_section = f"""
++<FACT_TYPES>
++{to_prompt_json(context['edge_types'])}
++</FACT_TYPES>
++"""
++
++    lane_intent_section = ''
++    if context.get('custom_extraction_instructions', '').strip():
++        lane_intent_section = f"""
++<LANE_INTENT>
++{context['custom_extraction_instructions']}
++</LANE_INTENT>
++"""
++
++    return [
++        Message(
++            role='system',
++            content=(
++                'You are an expert knowledge-graph extractor operating in ontology-conformant mode. '
++                'Your primary goal is to extract fact triples that conform to the defined FACT_TYPES '
++                'for this lane. '
++                '1. Strongly prefer relationship types from FACT_TYPES over generic labels. '
++                '2. Only extract relationships that are semantically meaningful for the lane described in LANE_INTENT. '
++                '3. Omit generic connector relations (e.g., RELATES_TO, MENTIONS, IS_RELATED_TO) that have no specific ontology match. '
++                '4. Extracted fact triples should include relevant date information. '
++                '5. Treat the CURRENT TIME as the time the CURRENT MESSAGE was sent.'
++            ),
++        ),
++        Message(
++            role='user',
++            content=f"""
++<PREVIOUS_MESSAGES>
++{to_prompt_json([ep for ep in context['previous_episodes']])}
++</PREVIOUS_MESSAGES>
++
++<CURRENT_MESSAGE>
++{context['episode_content']}
++</CURRENT_MESSAGE>
++
++<ENTITIES>
++{to_prompt_json(context['nodes'])}
++</ENTITIES>
++
++<REFERENCE_TIME>
++{context['reference_time']}  # ISO 8601 (UTC); used to resolve relative time mentions
++</REFERENCE_TIME>
++{edge_types_section}{lane_intent_section}
++# TASK
++Extract factual relationships between the given ENTITIES that are relevant to the LANE_INTENT above.
++Focus on relationships that align with the FACT_TYPES. Do NOT extract generic or off-topic relationships.
++
++Only extract facts that:
++- involve two DISTINCT ENTITIES from the ENTITIES list,
++- are clearly stated or unambiguously implied in the CURRENT MESSAGE,
++- align with the lane's FACT_TYPES or are clearly central to the LANE_INTENT,
++- can be represented as edges in a knowledge graph.
++
++You may use PREVIOUS MESSAGES only to disambiguate references or support continuity.
++
++# EXTRACTION RULES
++
++1. **Entity Name Validation**: `source_entity_name` and `target_entity_name` must use only the `name` values from the ENTITIES list.
++   - **CRITICAL**: Using names not in the list will cause the edge to be rejected.
++2. Each fact must involve two **distinct** entities.
++3. Do not emit duplicate or semantically redundant facts.
++4. The `fact` should closely paraphrase the original source sentence(s).
++5. Use `REFERENCE_TIME` to resolve relative temporal expressions.
++6. Do **not** hallucinate or infer temporal bounds from unrelated events.
++
++# RELATION TYPE RULES (STRICT — CONSTRAINED MODE)
++
++- **STRONGLY PREFER** types from FACT_TYPES. If the relationship matches a FACT_TYPE, use that `fact_type_name` exactly.
++- If the relationship is semantically central to LANE_INTENT but has no exact FACT_TYPE match, derive a specific `relation_type` in SCREAMING_SNAKE_CASE.
++- **DO NOT** emit generic connector types: RELATES_TO, IS_RELATED_TO, IS_RELATED, MENTIONS, CONNECTED_TO, ASSOCIATED_WITH, HAS, CONTAINS, INCLUDES, LINKS_TO, REFERENCES.
++  These will be dropped in post-processing. Omit rather than emit.
++- If you cannot assign a specific, meaningful relation type, skip the edge entirely.
++
++# DATETIME RULES
++
++- Use ISO 8601 with "Z" suffix (UTC) (e.g., 2025-04-30T00:00:00Z).
++- If the fact is ongoing (present tense), set `valid_at` to REFERENCE_TIME.
++- If a change/termination is expressed, set `invalid_at` to the relevant timestamp.
++- Leave both fields `null` if no explicit or resolvable time is stated.
++- If only a date is mentioned (no time), assume 00:00:00.
++- If only a year is mentioned, use January 1st at 00:00:00.
++        """,
++        ),
++    ]
++
++
++def edge(context: dict[str, Any]) -> list[Message]:
++    """Dispatch to the appropriate extraction prompt based on extraction_mode."""
++    mode = context.get('extraction_mode', _EXTRACTION_MODE_PERMISSIVE)
++    if mode == _EXTRACTION_MODE_CONSTRAINED_SOFT:
++        return _edge_constrained_soft(context)
++    return _edge_permissive(context)
++
++
+ def extract_attributes(context: dict[str, Any]) -> list[Message]:
+     return [
+         Message(

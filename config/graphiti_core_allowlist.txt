@@ -5,3 +5,6 @@ graphiti_core/search/search_utils.py
 graphiti_core/edges.py
 graphiti_core/graphiti.py
 graphiti_core/utils/maintenance/edge_operations.py
+graphiti_core/utils/maintenance/node_operations.py
+graphiti_core/prompts/extract_edges.py
+graphiti_core/prompts/extract_nodes.py
