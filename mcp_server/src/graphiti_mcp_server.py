@@ -5,6 +5,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -127,21 +128,32 @@ _search_rate_limiter = _SlidingWindowRateLimiter(
 )
 
 
-def _derive_rate_limit_key(
-    group_ids: list[str] | None,
-    lane_alias: list[str] | None,
-) -> str:
-    """Return a stable per-caller rate-limit key derived from request context.
+def _derive_rate_limit_key(effective_group_ids: list[str]) -> str:
+    """Return a stable per-caller rate-limit key from *resolved* group IDs.
 
-    Priority: explicit group_ids → lane_alias → global fallback.
-    Using the caller's group scope as the key ensures that different callers
-    get independent rate-limit buckets and cannot starve one another.
+    Must be called **after** ``_resolve_effective_group_ids`` so the key is
+    derived from trusted, validated context rather than raw caller-supplied
+    input.  Using a raw (pre-resolution) value would allow an adversary to
+    spoof distinct rate-limit buckets by cycling through arbitrary group_id
+    strings.
+
+    Args:
+        effective_group_ids: Validated and resolved group IDs returned by
+            ``_resolve_effective_group_ids``.  An empty list causes the
+            conservative ``'__global__'`` fallback to be used.
     """
-    if group_ids:
-        return f'group:{group_ids[0]}'
-    if lane_alias:
-        return f'alias:{lane_alias[0]}'
+    if effective_group_ids:
+        return f'group:{effective_group_ids[0]}'
     return '__global__'
+
+
+def _hash_rate_limit_key(key: str) -> str:
+    """Return an 8-character hex prefix of the SHA-256 of *key* for safe logging.
+
+    Group IDs may contain user-controlled strings; hashing prevents sensitive
+    values from appearing in plain text in logs.
+    """
+    return hashlib.sha256(key.encode()).hexdigest()[:8]
 
 
 # Configure structured logging with timestamps
@@ -762,11 +774,6 @@ async def search_nodes(
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
-    caller_key = _derive_rate_limit_key(group_ids, lane_alias)
-    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
-        logger.warning('search_nodes rate limit exceeded (key=%s)', caller_key)
-        return ErrorResponse(error='rate limit exceeded; retry later')
-
     try:
         if max_nodes <= 0:
             return ErrorResponse(error='max_nodes must be a positive integer')
@@ -780,6 +787,9 @@ async def search_nodes(
                 )
             )
 
+        # Resolve group scope BEFORE deriving the rate-limit key so the key is
+        # based on trusted, validated IDs — not raw caller-supplied input which
+        # could be spoofed to obtain separate (unthrottled) rate-limit buckets.
         effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
             group_ids=group_ids,
             lane_alias=lane_alias,
@@ -788,6 +798,14 @@ async def search_nodes(
             return ErrorResponse(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
+
+        caller_key = _derive_rate_limit_key(effective_group_ids)
+        if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
+            logger.warning(
+                'search_nodes rate limit exceeded (key_hash=%s)',
+                _hash_rate_limit_key(caller_key),
+            )
+            return ErrorResponse(error='rate limit exceeded; retry later')
 
         scope_error = _validate_group_scope_support(effective_group_ids)
         if scope_error:
@@ -871,11 +889,6 @@ async def search_memory_facts(
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
-    caller_key = _derive_rate_limit_key(group_ids, lane_alias)
-    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
-        logger.warning('search_memory_facts rate limit exceeded (key=%s)', caller_key)
-        return ErrorResponse(error='rate limit exceeded; retry later')
-
     try:
         # Validate max_facts parameter and apply defense-in-depth cap.
         if max_facts <= 0:
@@ -891,6 +904,9 @@ async def search_memory_facts(
                 )
             )
 
+        # Resolve group scope BEFORE deriving the rate-limit key so the key is
+        # based on trusted, validated IDs — not raw caller-supplied input which
+        # could be spoofed to obtain separate (unthrottled) rate-limit buckets.
         effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
             group_ids=group_ids,
             lane_alias=lane_alias,
@@ -899,6 +915,14 @@ async def search_memory_facts(
             return ErrorResponse(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
+
+        caller_key = _derive_rate_limit_key(effective_group_ids)
+        if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
+            logger.warning(
+                'search_memory_facts rate limit exceeded (key_hash=%s)',
+                _hash_rate_limit_key(caller_key),
+            )
+            return ErrorResponse(error='rate limit exceeded; retry later')
 
         scope_error = _validate_group_scope_support(effective_group_ids)
         if scope_error:

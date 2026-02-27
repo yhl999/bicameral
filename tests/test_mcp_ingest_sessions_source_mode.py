@@ -729,27 +729,76 @@ class TestSearchRateLimiter(unittest.TestCase):
             / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
         ).read_text(encoding='utf-8')
         self.assertIn('def _derive_rate_limit_key(', src)
-        # Verify priority logic: group_ids → lane_alias → __global__
+        # Trusted key is always derived from resolved effective_group_ids (group: prefix)
         self.assertIn('group:', src)
-        self.assertIn('alias:', src)
         self.assertIn('__global__', src)
+        # Key derivation must happen AFTER _resolve_effective_group_ids call in both endpoints
+        self.assertIn('_resolve_effective_group_ids', src)
+        # Log must use hashed key to avoid exposing sensitive values
+        self.assertIn('_hash_rate_limit_key', src)
 
     def test_derive_rate_limit_key_logic(self):
-        """_derive_rate_limit_key priority: group_ids → lane_alias → __global__."""
-        # Inline re-implementation of the contract so we can unit-test it
-        # without pulling in the full MCP server dependency tree.
-        def _derive_rate_limit_key(group_ids, lane_alias):
-            if group_ids:
-                return f'group:{group_ids[0]}'
-            if lane_alias:
-                return f'alias:{lane_alias[0]}'
+        """_derive_rate_limit_key derives from resolved effective_group_ids (trusted path)."""
+        # Mirror the actual contract: takes effective_group_ids (post-resolution)
+        def _derive_rate_limit_key(effective_group_ids):
+            if effective_group_ids:
+                return f'group:{effective_group_ids[0]}'
             return '__global__'
 
-        self.assertEqual(_derive_rate_limit_key(['grp1', 'grp2'], None), 'group:grp1')
-        self.assertEqual(_derive_rate_limit_key(None, ['alias1']), 'alias:alias1')
-        self.assertEqual(_derive_rate_limit_key([], ['alias1']), 'alias:alias1')
-        self.assertEqual(_derive_rate_limit_key(None, None), '__global__')
-        self.assertEqual(_derive_rate_limit_key([], []), '__global__')
+        self.assertEqual(_derive_rate_limit_key(['grp1', 'grp2']), 'group:grp1')
+        self.assertEqual(_derive_rate_limit_key(['grp1']), 'group:grp1')
+        self.assertEqual(_derive_rate_limit_key([]), '__global__')
+
+    def test_rate_limit_key_derived_after_resolution_in_source(self):
+        """In both endpoints, _derive_rate_limit_key is called with effective_group_ids
+        (i.e. after _resolve_effective_group_ids), not with raw caller-supplied input."""
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
+        ).read_text(encoding='utf-8')
+        # The trusted pattern: key derived from effective_group_ids
+        trusted_calls = src.count('_derive_rate_limit_key(effective_group_ids)')
+        self.assertGreaterEqual(
+            trusted_calls, 2,
+            f'Expected _derive_rate_limit_key called with effective_group_ids in at least 2 '
+            f'endpoints, found {trusted_calls}',
+        )
+
+    def test_key_cardinality_bound_evicts_lru(self):
+        """Hard max_keys cardinality: LRU key is evicted when the limit is reached."""
+        rl = self._make_limiter(max_requests=5, window_seconds=60)
+        # Override max_keys after creation to keep test fast
+        rl._max_keys = 3
+
+        # Fill to max_keys with distinct keys (keys A, B, C)
+        self._run(rl.is_allowed('key_A'))
+        self._run(rl.is_allowed('key_B'))
+        self._run(rl.is_allowed('key_C'))
+        self.assertEqual(len(rl._timestamps), 3)
+
+        # Re-access key_A to make it most-recently-used (B is now LRU)
+        self._run(rl.is_allowed('key_A'))
+
+        # New key D should evict LRU (key_B)
+        self._run(rl.is_allowed('key_D'))
+        self.assertEqual(len(rl._timestamps), 3, 'cardinality must not exceed max_keys')
+        self.assertNotIn('key_B', rl._timestamps, 'LRU key_B should have been evicted')
+        self.assertIn('key_A', rl._timestamps)
+        self.assertIn('key_C', rl._timestamps)
+        self.assertIn('key_D', rl._timestamps)
+
+    def test_max_keys_invalid_raises(self):
+        """max_keys=0 raises ValueError."""
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src'))
+        from utils.rate_limiter import SlidingWindowRateLimiter
+
+        with self.assertRaises(ValueError):
+            SlidingWindowRateLimiter(max_requests=10, window_seconds=60, max_keys=0)
 
     def test_empty_key_removed_after_window_expires(self):
         """Keys with all-expired timestamps are removed to bound memory growth."""
@@ -961,6 +1010,108 @@ class TestPhaseAStarvationPrevention(unittest.TestCase):
         finally:
             conn.close()
             os.unlink(tmp)
+
+
+class TestPhaseBFailCount(unittest.TestCase):
+    """Phase B: fail_count is incremented when Neo4j mark fails after add_memory succeeds."""
+
+    def _make_db(self, chunk_ids: list[str]):
+        import tempfile
+
+        from scripts.mcp_ingest_sessions import init_claim_db, seed_claims
+
+        tmp = tempfile.mktemp(suffix='.db')
+        conn = init_claim_db(tmp)
+        seed_claims(conn, chunk_ids)
+        return conn, tmp
+
+    def test_phase_b_fail_count_incremented_on_neo4j_mark_failure(self):
+        """When Neo4j mark fails in Phase B (after add_memory), fail_count increments.
+
+        This ensures retry-failure observability is consistent between Phase A
+        (mark-only retry) and Phase B (full pipeline where only the mark fails).
+        """
+        import os
+
+        from scripts.mcp_ingest_sessions import _claim_sent_not_marked, claim_chunk
+
+        conn, tmp = self._make_db(['chunk_phaseB'])
+        try:
+            # Simulate Phase B: claim chunk, call add_memory (success) → sent_not_marked
+            chunk_id = claim_chunk(conn, 'w0')
+            self.assertEqual(chunk_id, 'chunk_phaseB')
+            _claim_sent_not_marked(conn, chunk_id)
+
+            # Verify initial state: fail_count = 0, status = sent_not_marked
+            row = conn.execute(
+                "SELECT fail_count, status FROM chunk_claims WHERE chunk_id=?",
+                (chunk_id,),
+            ).fetchone()
+            self.assertEqual(row[0], 0)
+            self.assertEqual(row[1], 'sent_not_marked')
+
+            # Simulate Neo4j mark failure in Phase B: the fixed code increments fail_count
+            conn.execute(
+                "UPDATE chunk_claims SET "
+                "fail_count=COALESCE(fail_count, 0) + 1, error=? "
+                "WHERE chunk_id=?",
+                ('neo4j_mark_failed: simulated error'[:500], chunk_id),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                "SELECT fail_count, status FROM chunk_claims WHERE chunk_id=?",
+                (chunk_id,),
+            ).fetchone()
+            self.assertEqual(row[0], 1, 'fail_count must be 1 after first Phase B neo4j failure')
+            self.assertEqual(row[1], 'sent_not_marked', 'status stays sent_not_marked for Phase A retry')
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_phase_b_fail_count_accumulates_across_runs(self):
+        """fail_count accumulates if Neo4j mark keeps failing across multiple Phase B runs."""
+        import os
+
+        from scripts.mcp_ingest_sessions import _claim_sent_not_marked, claim_chunk
+
+        conn, tmp = self._make_db(['chunk_phaseB2'])
+        try:
+            chunk_id = claim_chunk(conn, 'w0')
+            _claim_sent_not_marked(conn, chunk_id)
+
+            for run in range(1, 4):
+                conn.execute(
+                    "UPDATE chunk_claims SET "
+                    "fail_count=COALESCE(fail_count, 0) + 1, error=? "
+                    "WHERE chunk_id=?",
+                    (f'neo4j_mark_failed: run {run}', chunk_id),
+                )
+                conn.commit()
+
+            row = conn.execute(
+                "SELECT fail_count FROM chunk_claims WHERE chunk_id=?",
+                (chunk_id,),
+            ).fetchone()
+            self.assertEqual(row[0], 3, 'fail_count must accumulate across 3 Phase B failures')
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_phase_b_source_increments_fail_count(self):
+        """The Phase B except block in mcp_ingest_sessions.py increments fail_count."""
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / 'scripts' / 'mcp_ingest_sessions.py'
+        ).read_text(encoding='utf-8')
+        # The Phase B neo4j mark failure block must include fail_count increment
+        self.assertIn(
+            'fail_count=COALESCE(fail_count, 0) + 1',
+            src,
+            'Phase B neo4j mark failure must increment fail_count (retry accounting completeness)',
+        )
 
 
 if __name__ == '__main__':

@@ -1149,8 +1149,12 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 except Exception as neo4j_exc:
                     # MCP send succeeded; leave at 'sent_not_marked' so the next
                     # run retries only the Neo4j mark (Phase A), not add_memory.
+                    # Increment fail_count so persistent failures are observable
+                    # (mirrors Phase A accounting for retry completeness).
                     conn.execute(
-                        "UPDATE chunk_claims SET error=? WHERE chunk_id=?",
+                        "UPDATE chunk_claims SET "
+                        "fail_count=COALESCE(fail_count, 0) + 1, error=? "
+                        "WHERE chunk_id=?",
                         (f'neo4j_mark_failed: {neo4j_exc}'[:500], chunk_id),
                     )
                     conn.commit()
