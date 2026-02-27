@@ -753,7 +753,9 @@ async def search_nodes(
             search_filter=search_filters,
         )
 
-        # Extract nodes from results
+        # Validate max_nodes parameter and apply defense-in-depth cap.
+        if max_nodes <= 0:
+            return ErrorResponse(error='max_nodes must be a positive integer')
         effective_max_nodes = min(max_nodes, _MAX_NODES_CAP)
         nodes = results.nodes[:effective_max_nodes] if results.nodes else []
 

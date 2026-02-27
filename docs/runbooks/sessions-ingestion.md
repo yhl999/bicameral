@@ -95,6 +95,40 @@ The ontology resolver is called **per-episode** at extraction time (not per-shar
 
 ---
 
+## Historical Transcript Bootstrap (FR-1)
+
+Before running Graphiti extraction on live data you must first import your historical session
+transcripts into Neo4j as `Episode`/`Message` nodes.  This populates the graph with the raw
+conversation data that Smart Cutter + the ingest worker will later extract from.
+
+```bash
+# Dry-run first (no Neo4j writes, no --confirm needed):
+python3 scripts/import_transcripts_to_neo4j.py \
+    --sessions-dir ~/.clawdbot/agents/main/sessions \
+    --dry-run
+
+# Live write — requires --confirm (safety gate):
+python3 scripts/import_transcripts_to_neo4j.py \
+    --sessions-dir ~/.clawdbot/agents/main/sessions \
+    --confirm
+```
+
+> **`--confirm` is required for live writes.**  Omitting it exits with an error.
+> Use `--dry-run` to preview counts and validate session files without writing anything.
+
+Optional flags:
+- `--max-files N` — limit files processed (useful for testing)
+- `--max-messages N` — stop after N total messages
+- `--stats-out path.json` — write structured stats JSON to a file
+
+After importing, verify with:
+```cypher
+MATCH (e:Episode) RETURN count(e) AS episodes
+MATCH (m:Message) RETURN count(m) AS messages
+```
+
+---
+
 ## Batch Ingestion
 
 Use batch mode for initial extraction, re-extraction after provider/embedding model changes, or disaster recovery.
@@ -104,16 +138,17 @@ Use batch mode for initial extraction, re-extraction after provider/embedding mo
 - Switching embedding models (dimension change makes old vectors incompatible → full re-extract)
 - Switching LLM providers (different extraction quality → may want fresh graph)
 - Neo4j database wipe/recovery
-- First-time setup
+- First-time setup (run Historical Transcript Bootstrap first — see above)
 
 ### Pre-Flight Checklist
 
-1. **Wipe Neo4j** (if re-extracting): `MATCH (n) DETACH DELETE n`
-2. **Reset ingest registry**: `DELETE FROM extraction_tracking WHERE group_id = '<group>'`
-3. **Reset cursors** (for cursor-based scripts) in your registry DB
-4. **Verify evidence files exist** for all groups
-5. **Verify LLM provider** has sufficient credits/quota
-6. **Verify embedding service** is running with the correct model loaded
+1. **Bootstrap Neo4j** with historical transcripts: `import_transcripts_to_neo4j.py --confirm`
+2. **Wipe Neo4j** (if re-extracting): `MATCH (n) DETACH DELETE n`
+3. **Reset ingest registry**: `DELETE FROM extraction_tracking WHERE group_id = '<group>'`
+4. **Reset cursors** (for cursor-based scripts) in your registry DB
+5. **Verify evidence files exist** for all groups
+6. **Verify LLM provider** has sufficient credits/quota
+7. **Verify embedding service** is running with the correct model loaded
 
 ### Batch Configuration: Maximize Throughput
 

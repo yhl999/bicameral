@@ -71,8 +71,10 @@ class BenchmarkMCPClient:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 ct = resp.headers.get('content-type', '')
                 # Bounded read: guard against unexpectedly large server responses.
-                raw = resp.read(_MAX_RESPONSE_BYTES)
-                if len(raw) == _MAX_RESPONSE_BYTES:
+                # Read cap+1 bytes so we can distinguish "exactly cap" (ok) from "over cap"
+                # (overflow). A response of exactly _MAX_RESPONSE_BYTES is valid.
+                raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > _MAX_RESPONSE_BYTES:
                     return {'error': {'code': -1, 'message': 'response exceeded max size'}}
                 body = raw.decode('utf-8', errors='replace')
                 sid = resp.headers.get('mcp-session-id')

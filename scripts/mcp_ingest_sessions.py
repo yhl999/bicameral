@@ -523,7 +523,13 @@ def _query_neo4j_message_count(args: argparse.Namespace) -> int:
         database = os.environ.get('NEO4J_DATABASE', 'neo4j')
 
         if not password:
-            return 0
+            # Missing credential is inconclusive — treat as unknown, not as zero messages,
+            # to avoid false BOOTSTRAP_REQUIRED triggers.
+            print(
+                'WARNING: NEO4J_PASSWORD not set; cannot verify Neo4j message count.',
+                file=sys.stderr,
+            )
+            return -1
 
         with GraphDatabase.driver(
             uri,
@@ -871,7 +877,72 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
         print(f'  {len(manifest)} chunk(s) available in manifest')
 
         claim_db_path = str(manifest_path) + '.claims.db'
+
+        # ------------------------------------------------------------------
+        # Dry-run: read-only scan — do NOT touch claim DB or call claim_chunk.
+        # Just report what would be processed without mutating any state.
+        # ------------------------------------------------------------------
+        if args.dry_run:
+            conn_ro = init_claim_db(claim_db_path)
+            try:
+                pending_rows = conn_ro.execute(
+                    "SELECT chunk_id FROM chunk_claims WHERE status='pending'"
+                ).fetchall()
+                pending_ids = [row[0] for row in pending_rows]
+                total_rows = conn_ro.execute(
+                    'SELECT COUNT(*) FROM chunk_claims'
+                ).fetchone()[0]
+            finally:
+                conn_ro.close()
+
+            print(f'DRY RUN: claim DB has {total_rows} total row(s), '
+                  f'{len(pending_ids)} pending')
+            preview = pending_ids[:10]
+            for chunk_id in preview:
+                chunk_data = manifest.get(chunk_id) or {}
+                message_ids_preview: list[str] = chunk_data.get('message_ids') or []
+                print(f'  would send chunk {chunk_id} ({len(message_ids_preview)} msg(s)) to MCP')
+            if len(pending_ids) > 10:
+                print(f'  … and {len(pending_ids) - 10} more pending chunk(s)')
+            print(f'DRY RUN: no claim state was modified.')
+            return
+
         conn = init_claim_db(claim_db_path)
+
+        # ------------------------------------------------------------------
+        # Manifest/claim handoff robustness: if claim DB has no pending chunks
+        # but the manifest is non-empty, auto-seed missing chunk IDs.
+        # This handles: fresh DB, DB loss, or first worker after --build-manifest
+        # without --claim-mode.  Already in-progress/done chunks are NOT re-seeded.
+        # ------------------------------------------------------------------
+        try:
+            pending_count = conn.execute(
+                "SELECT COUNT(*) FROM chunk_claims WHERE status='pending'"
+            ).fetchone()[0]
+
+            if pending_count == 0 and manifest:
+                existing_ids = {
+                    row[0]
+                    for row in conn.execute('SELECT chunk_id FROM chunk_claims').fetchall()
+                }
+                missing_ids = [cid for cid in manifest if cid not in existing_ids]
+                if missing_ids:
+                    seed_claims(conn, missing_ids)
+                    print(
+                        f'  Auto-seeded {len(missing_ids)} missing chunk(s) into claim DB '
+                        f'(skipped {len(existing_ids)} already-tracked chunk(s))'
+                    )
+                elif existing_ids:
+                    print(
+                        f'  All {len(existing_ids)} manifest chunk(s) already tracked in claim DB '
+                        f'(none pending — possibly all done/in-progress).'
+                    )
+        except Exception as seed_exc:
+            print(
+                f'WARNING: claim DB auto-seed check failed: {seed_exc}',
+                file=sys.stderr,
+            )
+
         client = MCPClient(args.mcp_url)
 
         ok = errors = 0
@@ -892,12 +963,8 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 message_ids: list[str] = chunk_data.get('message_ids') or []
                 content: str = chunk_data.get('content') or ''
 
-                if args.dry_run:
-                    print(f'DRY RUN: would send chunk {chunk_id} '
-                          f'({len(message_ids)} msg(s)) to MCP')
-                    _claim_done(conn, chunk_id)
-                    ok += 1
-                    continue
+                # Note: dry-run is handled above (read-only path). If we reach here,
+                # we are always in live mode.
 
                 # --- Send chunk to MCP add_memory ---
                 ep_name = f'neo4j:{chunk_data.get("chunk_index", 0)}:{chunk_id[:8]}'

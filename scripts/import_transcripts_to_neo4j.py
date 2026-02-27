@@ -660,7 +660,17 @@ def upsert_episode_and_messages(
                 and existing_model == embedding_model
                 and existing_dim == embedding_dim
             ):
-                # Content unchanged, embedding valid - skip.
+                # Content unchanged, embedding valid - skip re-embedding.
+                # Still MERGE the relationship to heal partial-failure edge gaps
+                # from prior interrupted runs.
+                session.run(
+                    """
+                    MATCH (e:Episode {episode_id: $episode_id})
+                    MATCH (m:Message {message_id: $message_id})
+                    MERGE (e)-[:HAS_MESSAGE]->(m)
+                    """,
+                    {'episode_id': episode_id, 'message_id': message_id},
+                ).consume()
                 stats.embeddings_skipped += 1
                 continue
 
@@ -697,6 +707,15 @@ def upsert_episode_and_messages(
                     'embedding_model': embedding_model,
                     'embedding_dim': embedding_dim,
                 },
+            ).consume()
+            # MERGE relationship to heal partial-failure edge gaps on reruns.
+            session.run(
+                """
+                MATCH (e:Episode {episode_id: $episode_id})
+                MATCH (m:Message {message_id: $message_id})
+                MERGE (e)-[:HAS_MESSAGE]->(m)
+                """,
+                {'episode_id': episode_id, 'message_id': message_id},
             ).consume()
             continue
 
