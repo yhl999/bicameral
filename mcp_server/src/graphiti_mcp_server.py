@@ -120,6 +120,22 @@ logger = logging.getLogger(__name__)
 SAFE_GROUP_ID_RE = re.compile(r'^[a-zA-Z0-9_]+$')
 VALID_SEARCH_MODES = {'hybrid', 'semantic', 'keyword'}
 
+_XML_TAG_RE = re.compile(r'<[^>]{0,100}>')
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+
+def _sanitize_for_error(value: str, max_len: int = 64) -> str:
+    """Sanitize user input for safe reflection in error messages.
+
+    Strips XML/HTML tags, control characters, and truncates to prevent
+    prompt injection via MCP tool output reflected into LLM context.
+    """
+    s = str(value)[:max_len]
+    s = _XML_TAG_RE.sub('', s)
+    s = _CONTROL_CHAR_RE.sub(' ', s)
+    return s.strip()
+
+
 # Create global config instance - will be properly initialized later
 config: GraphitiConfig
 
@@ -158,7 +174,7 @@ def _resolve_effective_group_ids(
 
         for alias in lane_alias:
             # Sanitize alias for safe reflection in error messages
-            sanitized = str(alias)[:64].replace('\n', ' ').replace('\r', ' ')
+            sanitized = _sanitize_for_error(alias)
             mapped = alias_map.get(alias)
             if mapped is None:
                 invalid_aliases.append(sanitized)
@@ -177,7 +193,7 @@ def _resolve_effective_group_ids(
     # Validate ALL resolved group_ids regardless of source
     for gid in effective_group_ids:
         if not SAFE_GROUP_ID_RE.match(gid):
-            raise ValueError(f'Invalid group_id: {gid!r}')
+            raise ValueError(f'Invalid group_id: {_sanitize_for_error(gid)!r}')
     return effective_group_ids, invalid_aliases
 
 
@@ -339,7 +355,7 @@ class GraphitiService:
     def _validate_group_id(self, group_id: str) -> str:
         """Validate group_id for safe use as FalkorDB graph/database name."""
         if not SAFE_GROUP_ID_RE.match(group_id):
-            raise ValueError(f'Invalid group_id for FalkorDB routing: {group_id!r}')
+            raise ValueError(f'Invalid group_id for FalkorDB routing: {_sanitize_for_error(group_id)!r}')
         return group_id
 
     async def _build_client(self, *, database_override: str | None = None) -> Graphiti:
@@ -695,7 +711,7 @@ async def search_nodes(
         if normalized_mode not in VALID_SEARCH_MODES:
             return ErrorResponse(
                 error=(
-                    f'Invalid search_mode: {search_mode!r}. '
+                    f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
                     f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
                 )
             )
@@ -798,7 +814,7 @@ async def search_memory_facts(
         if normalized_mode not in VALID_SEARCH_MODES:
             return ErrorResponse(
                 error=(
-                    f'Invalid search_mode: {search_mode!r}. '
+                    f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
                     f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
                 )
             )
