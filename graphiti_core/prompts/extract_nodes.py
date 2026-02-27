@@ -129,7 +129,7 @@ reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don
    - Assign the appropriate `entity_type_id` for each one.
 
 4. **Exclusions**:
-   - Do NOT extract entities representing relationships or actions.
+   - Do NOT extract generic verb/action phrases or relationship concepts unless they are explicitly represented by a defined ENTITY TYPE.
    - Do NOT extract dates, times, or other temporal information—these will be handled separately.
 
 5. **Formatting**:
@@ -321,7 +321,7 @@ Indicate the classified entity type by providing its entity_type_id.
 
 Guidelines:
 1. Extract significant entities, concepts, or actors mentioned in the conversation.
-2. Avoid creating nodes for relationships or actions.
+2. Do not extract generic verb/action phrases or relationship concepts unless they are explicitly represented by a defined ENTITY TYPE.
 3. Avoid creating nodes for temporal information like dates, times or years (these will be added to edges later).
 4. Be as explicit as possible in your node names, using full names and avoiding abbreviations.
 """
