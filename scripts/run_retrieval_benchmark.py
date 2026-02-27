@@ -34,6 +34,11 @@ MCP_URL_DEFAULT = 'http://localhost:8000/mcp'
 SEARCH_MODES = ['hybrid', 'semantic', 'keyword']
 MODE_TIEBREAK_ORDER = {'hybrid': 0, 'semantic': 1, 'keyword': 2}
 
+# Hard cap on bytes read from a single MCP HTTP response.  Prevents the benchmark
+# from consuming unbounded memory when the server returns an unexpectedly large
+# payload (e.g. returning thousands of facts without a server-side limit).
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MiB
+
 # Minimum fixture quotas by lane category
 FIXTURE_QUOTAS = {
     'sessions_main': 6,
@@ -65,7 +70,11 @@ class BenchmarkMCPClient:
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 ct = resp.headers.get('content-type', '')
-                body = resp.read().decode('utf-8', errors='replace')
+                # Bounded read: guard against unexpectedly large server responses.
+                raw = resp.read(_MAX_RESPONSE_BYTES)
+                if len(raw) == _MAX_RESPONSE_BYTES:
+                    return {'error': {'code': -1, 'message': 'response exceeded max size'}}
+                body = raw.decode('utf-8', errors='replace')
                 sid = resp.headers.get('mcp-session-id')
                 if sid and not self.session_id:
                     self.session_id = sid
@@ -78,7 +87,8 @@ class BenchmarkMCPClient:
                     return json.loads(lines[-1]) if lines else {}
                 return json.loads(body) if body.strip() else {}
         except urllib.error.HTTPError as e:
-            body = e.read().decode('utf-8', errors='replace')
+            raw_err = e.read(_MAX_RESPONSE_BYTES)
+            body = raw_err.decode('utf-8', errors='replace')
             sid = e.headers.get('mcp-session-id') if e.headers else None
             if sid and not self.session_id:
                 self.session_id = sid

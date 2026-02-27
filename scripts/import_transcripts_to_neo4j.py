@@ -67,6 +67,7 @@ class ImportStats:
     messages_updated: int = 0
     embeddings_computed: int = 0
     embeddings_skipped: int = 0
+    quarantined_count: int = 0  # messages rejected at ingest boundary (malformed timestamps)
     errors: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +78,7 @@ class ImportStats:
             'messages_updated': self.messages_updated,
             'embeddings_computed': self.embeddings_computed,
             'embeddings_skipped': self.embeddings_skipped,
+            'quarantined_count': self.quarantined_count,
             'errors': self.errors,
         }
 
@@ -105,6 +107,12 @@ def now_iso() -> str:
 
 
 def parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 string to a UTC-aware datetime.
+
+    Returns None when value is absent/empty; also returns None for malformed
+    strings (lenient parser for internal use).  The ingest boundary uses
+    ``validate_ingest_timestamp`` for strict validation.
+    """
     if not value:
         return None
     txt = str(value).strip()
@@ -119,6 +127,59 @@ def parse_iso(value: str | None) -> datetime | None:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def validate_ingest_timestamp(raw: str | None) -> tuple[str, str | None]:
+    """Strict timestamp validation at the ingest boundary.
+
+    Accepts ISO-8601 strings (with or without timezone) and common epoch
+    integers / floats.  Absent or empty values are treated as "no timestamp"
+    (valid; returns empty string).
+
+    Args:
+        raw: Raw timestamp value from the JSONL file.
+
+    Returns:
+        A ``(normalized_iso, error)`` tuple where:
+        - ``normalized_iso`` is the UTC ISO string (``"YYYY-MM-DDTHH:MM:SSZ"``)
+          or ``""`` when the timestamp is absent.
+        - ``error`` is ``None`` when valid, or a human-readable description of
+          the problem for malformed values.
+
+    This function is intentionally strict: any timestamp that is present but
+    not parseable is returned with a non-None error so the caller can quarantine
+    the affected record rather than silently swallowing the problem.
+    """
+    if raw is None:
+        return ('', None)
+
+    txt: str
+    if isinstance(raw, (int, float)):
+        # Unix epoch seconds — convert to ISO.
+        try:
+            dt = datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            return (dt.replace(microsecond=0).isoformat().replace('+00:00', 'Z'), None)
+        except (ValueError, OverflowError, OSError) as exc:
+            return ('', f'epoch timestamp out of range {raw!r}: {exc}')
+
+    txt = str(raw).strip()
+    if not txt:
+        return ('', None)  # absent — allowed
+
+    # Try ISO-8601 parsing (covers YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]).
+    try:
+        if txt.endswith('Z'):
+            dt = datetime.fromisoformat(txt[:-1]).replace(tzinfo=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        normalized = dt.astimezone(timezone.utc).replace(microsecond=0)
+        return (normalized.isoformat().replace('+00:00', 'Z'), None)
+    except (ValueError, TypeError):
+        pass  # fall through to rejection
+
+    return ('', f'malformed timestamp {txt!r}: not parseable as ISO-8601')
 
 
 def iso_or_none(dt: datetime | None) -> str | None:
@@ -165,8 +226,8 @@ def extract_text_content(
 
 def parse_session_messages(
     file_path: Path,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Parse a session JSONL file, returning (session_id, messages).
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse a session JSONL file, returning (session_id, messages, quarantined).
 
     Applies the same filtering as ingest/parse_sessions_v1.py:
     - type == "message" entries only
@@ -174,7 +235,16 @@ def parse_session_messages(
     - Exclude assistant when provider == "clawdbot" or model == "delivery-mirror"
     - Exclude empty content and thinking blocks
 
-    Each message dict has keys: role, content, created_at, line_index.
+    **Boundary strictness (ingest boundary):** timestamps that are *present* but
+    *malformed* are rejected at this boundary.  The affected message is added to
+    the ``quarantined`` list (not included in ``messages``) with a clear error
+    description.  Absent/empty timestamps are allowed and stored as ``""`` so
+    downstream components can handle them gracefully.
+
+    Returns:
+        session_id: Session identifier.
+        messages: Valid message dicts with keys: role, content, created_at, line_index.
+        quarantined: Dicts with keys: line_index, role, error — one per rejected msg.
     """
     entries = list(read_jsonl(file_path))
 
@@ -183,6 +253,8 @@ def parse_session_messages(
     session_id = str(session_meta.get('id') or file_path.stem)
 
     messages: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
+
     for line_index, entry in enumerate(entries):
         if entry.get('type') != 'message':
             continue
@@ -202,15 +274,27 @@ def parse_session_messages(
         if not txt.strip():
             continue
 
-        ts = entry.get('timestamp') or ''
+        # Strict timestamp validation at the ingest boundary.
+        raw_ts = entry.get('timestamp')
+        normalized_ts, ts_error = validate_ingest_timestamp(raw_ts)
+        if ts_error:
+            # Present but malformed — quarantine this message with a clear error path.
+            quarantined.append({
+                'line_index': line_index,
+                'role': role,
+                'error': ts_error,
+                'raw_timestamp': str(raw_ts),
+            })
+            continue
+
         messages.append({
             'role': role,
             'content': txt.strip(),
-            'created_at': str(ts),
+            'created_at': normalized_ts,  # UTC ISO or '' (absent)
             'line_index': line_index,
         })
 
-    return session_id, messages
+    return session_id, messages, quarantined
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +788,14 @@ def run_import(args: argparse.Namespace) -> ImportStats:
         for file_path in files:
             stats.files_seen += 1
             try:
-                session_id, messages = parse_session_messages(file_path)
+                session_id, messages, quarantined = parse_session_messages(file_path)
+                # Record quarantined messages in stats so operators can see them.
+                for q in quarantined:
+                    stats.quarantined_count += 1
+                    stats.errors.append({
+                        'file': str(file_path),
+                        'error': f'quarantined line {q["line_index"]}: {q["error"]}',
+                    })
                 for msg in messages:
                     if args.max_messages and stats.messages_seen >= args.max_messages:
                         break
@@ -737,7 +828,16 @@ def run_import(args: argparse.Namespace) -> ImportStats:
 
                 stats.files_seen += 1
                 try:
-                    session_id, messages = parse_session_messages(file_path)
+                    session_id, messages, quarantined = parse_session_messages(file_path)
+
+                    # Record quarantined messages (malformed timestamps at ingest boundary).
+                    for q in quarantined:
+                        stats.quarantined_count += 1
+                        stats.errors.append({
+                            'file': str(file_path),
+                            'error': f'quarantined line {q["line_index"]}: {q["error"]}',
+                        })
+
                     if not messages:
                         continue
 

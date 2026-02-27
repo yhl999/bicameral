@@ -162,11 +162,12 @@ class TestJSONLParsing(unittest.TestCase):
             tmp_path = f.name
 
         try:
-            session_id, messages = parse_session_messages(Path(tmp_path))
+            session_id, messages, quarantined = parse_session_messages(Path(tmp_path))
             self.assertEqual(session_id, 'test-session')
             self.assertEqual(len(messages), 2)
             self.assertEqual(messages[0]['role'], 'user')
             self.assertEqual(messages[1]['role'], 'assistant')
+            self.assertEqual(quarantined, [])
         finally:
             os.unlink(tmp_path)
 
@@ -200,9 +201,10 @@ class TestJSONLParsing(unittest.TestCase):
             tmp_path = f.name
 
         try:
-            _, messages = parse_session_messages(Path(tmp_path))
+            _, messages, quarantined = parse_session_messages(Path(tmp_path))
             self.assertEqual(len(messages), 1)
             self.assertEqual(messages[0]['content'], 'Here is my answer.')
+            self.assertEqual(quarantined, [])
         finally:
             os.unlink(tmp_path)
 
@@ -272,6 +274,131 @@ class TestNormalization(unittest.TestCase):
         # NFKC normalization
         self.assertEqual(normalize_text(''), '')
         self.assertEqual(normalize_text('  '), '')
+
+
+class TestIngestTimestampValidation(unittest.TestCase):
+    """Boundary strictness: validate_ingest_timestamp rejects malformed values."""
+
+    def setUp(self):
+        from scripts.import_transcripts_to_neo4j import validate_ingest_timestamp
+        self.validate = validate_ingest_timestamp
+
+    def test_absent_returns_empty_no_error(self):
+        ts, err = self.validate(None)
+        self.assertEqual(ts, '')
+        self.assertIsNone(err)
+
+    def test_empty_string_returns_empty_no_error(self):
+        ts, err = self.validate('')
+        self.assertEqual(ts, '')
+        self.assertIsNone(err)
+
+    def test_valid_iso_utc(self):
+        ts, err = self.validate('2026-01-15T12:30:00Z')
+        self.assertIsNone(err)
+        self.assertEqual(ts, '2026-01-15T12:30:00Z')
+
+    def test_valid_iso_with_offset(self):
+        ts, err = self.validate('2026-01-15T12:30:00+05:00')
+        self.assertIsNone(err)
+        self.assertIn('2026-01-15', ts)
+        self.assertTrue(ts.endswith('Z'))
+
+    def test_valid_naive_normalized_to_utc(self):
+        ts, err = self.validate('2026-01-15T12:30:00')
+        self.assertIsNone(err)
+        self.assertTrue(ts.endswith('Z'))
+
+    def test_epoch_int_accepted(self):
+        ts, err = self.validate(1700000000)
+        self.assertIsNone(err)
+        self.assertIn('2023', ts)  # epoch ~2023
+
+    def test_epoch_float_accepted(self):
+        ts, err = self.validate(1700000000.5)
+        self.assertIsNone(err)
+
+    def test_malformed_returns_error(self):
+        ts, err = self.validate('not-a-date')
+        self.assertEqual(ts, '')
+        self.assertIsNotNone(err)
+        self.assertIn('malformed', err)
+
+    def test_partial_date_rejected(self):
+        ts, err = self.validate('2026-01')
+        self.assertEqual(ts, '')
+        self.assertIsNotNone(err)
+
+    def test_garbage_string_rejected(self):
+        ts, err = self.validate('hello world')
+        self.assertEqual(ts, '')
+        self.assertIsNotNone(err)
+
+
+class TestQuarantineOnMalformedTimestamp(unittest.TestCase):
+    """parse_session_messages quarantines messages with malformed timestamps."""
+
+    def test_malformed_timestamp_quarantined(self):
+        import tempfile
+        import os
+        from scripts.import_transcripts_to_neo4j import parse_session_messages
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            json.dump({'type': 'session', 'id': 'sess-1'}, f)
+            f.write('\n')
+            # Good message
+            json.dump({
+                'type': 'message',
+                'timestamp': '2026-01-15T12:00:00Z',
+                'message': {'role': 'user', 'content': 'Good message'},
+            }, f)
+            f.write('\n')
+            # Malformed timestamp — should be quarantined
+            json.dump({
+                'type': 'message',
+                'timestamp': 'INVALID-TIMESTAMP',
+                'message': {'role': 'assistant', 'content': 'Bad timestamp message'},
+            }, f)
+            f.write('\n')
+            tmp_path = f.name
+
+        try:
+            session_id, messages, quarantined = parse_session_messages(Path(tmp_path))
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]['content'], 'Good message')
+            self.assertEqual(len(quarantined), 1)
+            self.assertIn('malformed', quarantined[0]['error'])
+        finally:
+            os.unlink(tmp_path)
+
+    def test_absent_timestamp_allowed(self):
+        import tempfile
+        import os
+        from scripts.import_transcripts_to_neo4j import parse_session_messages
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            json.dump({'type': 'session', 'id': 'sess-2'}, f)
+            f.write('\n')
+            # Message with no timestamp field — allowed (absent, not malformed)
+            json.dump({
+                'type': 'message',
+                'message': {'role': 'user', 'content': 'No timestamp'},
+            }, f)
+            f.write('\n')
+            tmp_path = f.name
+
+        try:
+            session_id, messages, quarantined = parse_session_messages(Path(tmp_path))
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]['created_at'], '')
+            self.assertEqual(quarantined, [])
+        finally:
+            os.unlink(tmp_path)
+
+    def test_quarantined_count_in_stats(self):
+        from scripts.import_transcripts_to_neo4j import ImportStats
+        stats = ImportStats()
+        self.assertIn('quarantined_count', stats.to_dict())
 
 
 class TestContentHash(unittest.TestCase):

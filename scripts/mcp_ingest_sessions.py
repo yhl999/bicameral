@@ -321,6 +321,192 @@ def apply_shard(evidences: list[dict], shards: int, shard_index: int) -> list[di
     return [ev for i, ev in enumerate(evidences) if (i % shards) == shard_index]
 
 
+# ---------------------------------------------------------------------------
+# Neo4j helpers for FR-4 source mode
+# ---------------------------------------------------------------------------
+
+# Upper bound on unextracted messages fetched per neo4j run.  Prevents runaway
+# queries when the graph contains hundreds of thousands of unprocessed messages.
+_NEO4J_FETCH_CEILING = 50_000
+
+# Margin factor: fetch this many messages per requested chunk so Smart Cutter
+# has enough context to assemble output chunks.
+_MESSAGES_PER_CHUNK_ESTIMATE = 40
+
+
+def _neo4j_conn_params() -> dict:
+    """Return Neo4j connection params from environment."""
+    return {
+        'uri': os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
+        'user': os.environ.get('NEO4J_USER', 'neo4j'),
+        'password': os.environ.get('NEO4J_PASSWORD', ''),
+        'database': os.environ.get('NEO4J_DATABASE', 'neo4j'),
+    }
+
+
+def _neo4j_driver_or_raise():
+    """Return a Neo4j driver or raise RuntimeError if config is missing."""
+    try:
+        from neo4j import GraphDatabase  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            'neo4j Python driver is required for neo4j source mode. '
+            'Install with: pip install neo4j'
+        ) from exc
+
+    p = _neo4j_conn_params()
+    if not p['password']:
+        raise RuntimeError(
+            'NEO4J_PASSWORD environment variable is required for neo4j source mode.'
+        )
+
+    return GraphDatabase.driver(
+        p['uri'],
+        auth=(p['user'], p['password']),
+        connection_timeout=10,
+        max_connection_lifetime=60,
+    )
+
+
+def _fetch_neo4j_messages(limit: int) -> list[dict]:
+    """Fetch up to *limit* unextracted Message nodes from Neo4j.
+
+    Returns dicts with: message_id, content, created_at, content_embedding,
+    source_session_id, role.  Ordered by created_at ASC for chronological
+    Smart Cutter input.
+    """
+    p = _neo4j_conn_params()
+    effective_limit = min(limit, _NEO4J_FETCH_CEILING)
+
+    driver = _neo4j_driver_or_raise()
+    with driver:
+        with driver.session(database=p['database']) as session:
+            rows = session.run(
+                """
+                MATCH (m:Message)
+                WHERE m.graphiti_extracted_at IS NULL
+                RETURN m.message_id AS message_id,
+                       coalesce(m.content, '') AS content,
+                       coalesce(m.created_at, '') AS created_at,
+                       coalesce(m.content_embedding, []) AS content_embedding,
+                       coalesce(m.source_session_id, '') AS source_session_id,
+                       coalesce(m.role, 'message') AS role
+                ORDER BY m.created_at ASC, m.message_id ASC
+                LIMIT $n
+                """,
+                {'n': effective_limit},
+            ).data()
+
+    return [
+        {
+            'message_id': str(r['message_id']),
+            'content': str(r['content']),
+            'created_at': str(r['created_at']),
+            'content_embedding': [float(v) for v in (r.get('content_embedding') or [])],
+            'source_session_id': str(r.get('source_session_id') or ''),
+            'role': str(r.get('role') or 'message'),
+        }
+        for r in rows
+    ]
+
+
+def _mark_neo4j_extracted(message_ids: list[str]) -> None:
+    """Set graphiti_extracted_at = now() on the given Message nodes in Neo4j."""
+    if not message_ids:
+        return
+
+    p = _neo4j_conn_params()
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+    driver = _neo4j_driver_or_raise()
+    with driver:
+        with driver.session(database=p['database']) as session:
+            session.run(
+                'MATCH (m:Message) WHERE m.message_id IN $ids '
+                'SET m.graphiti_extracted_at = $ts',
+                {'ids': list(message_ids), 'ts': now},
+            ).consume()
+
+
+def _build_episode_body(message_ids: list[str], messages_by_id: dict[str, dict]) -> str:
+    """Build a text episode body from a Smart Cutter chunk.
+
+    Each message is formatted as ``[ISO-timestamp] role: content``.
+    Messages are joined with double newlines to preserve paragraph boundaries.
+    Missing messages are silently skipped (defensive; should not occur in normal flow).
+    """
+    parts: list[str] = []
+    for mid in message_ids:
+        msg = messages_by_id.get(mid)
+        if not msg:
+            continue
+        ts = (msg.get('created_at') or '')[:19]  # trim to second precision
+        role = msg.get('role') or 'message'
+        content = msg.get('content') or ''
+        if ts:
+            parts.append(f'[{ts}] {role}: {content}')
+        else:
+            parts.append(f'{role}: {content}')
+    return '\n\n'.join(parts)
+
+
+def _apply_smart_cutter(messages: list[dict]) -> list[Any]:
+    """Apply Smart Cutter + Graphiti lane merge to a message list.
+
+    Messages that lack a valid embedding vector are excluded from the cutter
+    input (they cannot influence cosine similarity) but are still covered:
+    the cutter may include them in adjacent chunks based on time ordering.
+
+    Returns a list of ChunkBoundary objects (graphiti_lane_merge output).
+    """
+    from graphiti_core.utils.content_chunking import (  # type: ignore
+        SmartCutterConfig,
+        chunk_conversation_semantic,
+        graphiti_lane_merge,
+    )
+
+    # Partition messages into those with a usable embedding and those without.
+    cuttable: list[dict] = []
+    dim: int = 0
+
+    for msg in messages:
+        emb = msg.get('content_embedding') or []
+        if emb and len(emb) > 0 and all(isinstance(v, (int, float)) for v in emb):
+            if dim == 0:
+                dim = len(emb)
+            if len(emb) == dim:
+                cuttable.append(msg)
+
+    if not cuttable:
+        # No messages with valid embeddings — cannot run Smart Cutter.
+        return []
+
+    chunks = chunk_conversation_semantic(cuttable, SmartCutterConfig())
+    return graphiti_lane_merge(chunks, cuttable)
+
+
+def _load_manifest(manifest_path: Path) -> dict[str, dict]:
+    """Load a JSONL manifest into a dict keyed by chunk_id.
+
+    Each line is a JSON object with at least: chunk_id, message_ids, content.
+    Lines that are blank or fail JSON parsing are silently skipped.
+    """
+    result: dict[str, dict] = {}
+    with manifest_path.open('r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cid = obj.get('chunk_id')
+            if cid:
+                result[str(cid)] = obj
+    return result
+
+
 def _query_neo4j_message_count(args: argparse.Namespace) -> int:
     """Query Neo4j for the total Message node count.
 
@@ -433,6 +619,28 @@ def claim_chunk(conn: sqlite3.Connection, worker_id: str) -> str | None:
         )
         conn.commit()
         return chunk_id
+
+
+def _claim_done(conn: sqlite3.Connection, chunk_id: str) -> None:
+    """Mark a claimed chunk as successfully done."""
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    conn.execute(
+        "UPDATE chunk_claims SET status='done', completed_at=? WHERE chunk_id=?",
+        (now, chunk_id),
+    )
+    conn.commit()
+
+
+def _claim_fail(conn: sqlite3.Connection, chunk_id: str, error: str) -> None:
+    """Mark a claimed chunk as failed with an error message."""
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    conn.execute(
+        "UPDATE chunk_claims SET status='failed', "
+        "fail_count=COALESCE(fail_count, 0) + 1, error=?, completed_at=? "
+        'WHERE chunk_id=?',
+        (error[:500], now, chunk_id),
+    )
+    conn.commit()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -563,107 +771,269 @@ def main():
 
 
 def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
-    """Neo4j source mode: read candidate chunks from the graph DB."""
+    """Neo4j source mode: read unextracted Message nodes from the graph DB.
+
+    Dispatch order:
+    1. --build-manifest  → FR-10 build path: query Neo4j, cut chunks, write JSONL + seed claim DB.
+    2. --claim-mode      → FR-10 worker path: claim chunks from manifest, send to MCP, mark Neo4j.
+    3. default           → FR-4 inline path: fetch → Smart Cutter → MCP send → mark Neo4j.
+    """
     evidence_path = Path(args.evidence)
     evidence_files_exist = evidence_path.exists()
 
     # BOOTSTRAP_REQUIRED guard: if Neo4j has 0 messages but evidence files exist,
-    # the graph hasn't been bootstrapped yet.
+    # the graph hasn't been bootstrapped yet — run evidence mode first.
     neo4j_message_count = _query_neo4j_message_count(args)
     if check_bootstrap_guard(neo4j_message_count, evidence_files_exist):
         print(
             'BOOTSTRAP_REQUIRED: Neo4j has no messages but evidence files exist.\n'
             'Run with --source-mode evidence first to bootstrap the graph,\n'
-            'or populate Neo4j before using neo4j source mode.'
+            'or populate Neo4j before using neo4j source mode.',
+            file=sys.stderr,
         )
         sys.exit(1)
 
-    # --- build-manifest mode ---
+    # ------------------------------------------------------------------
+    # FR-10 build-manifest path
+    # ------------------------------------------------------------------
     if args.build_manifest:
         manifest_path = Path(args.build_manifest)
-        # Placeholder: in a full implementation, chunk IDs would come from Neo4j query.
-        chunk_ids: list[str] = []
-        print(
-            f'Neo4j source mode: would query graph for candidate chunks '
-            f'(group_id={args.group_id})'
-        )
-        if args.dry_run:
-            print(f'DRY RUN: would write {len(chunk_ids)} chunk IDs to {manifest_path}')
-            return
-        manifest_path.write_text(json.dumps(chunk_ids), encoding='utf-8')
-        print(f'Wrote manifest with {len(chunk_ids)} chunk IDs to {manifest_path}')
+        print(f'Building manifest from Neo4j (group_id={args.group_id}) …')
 
+        fetch_limit = _NEO4J_FETCH_CEILING  # fetch all unextracted messages
+        messages = _fetch_neo4j_messages(fetch_limit)
+        print(f'  Fetched {len(messages)} unextracted message(s) from Neo4j')
+
+        if not messages:
+            print('  Nothing to manifest. Exiting.')
+            if not args.dry_run:
+                manifest_path.write_text('', encoding='utf-8')
+            return
+
+        messages_by_id: dict[str, dict] = {m['message_id']: m for m in messages}
+        chunks = _apply_smart_cutter(messages)
+        print(f'  Smart Cutter produced {len(chunks)} chunk(s)')
+
+        if args.dry_run:
+            print(f'DRY RUN: would write {len(chunks)} chunk(s) to {manifest_path}')
+            for c in chunks[:5]:
+                print(f'  chunk {c.chunk_index}: {len(c.message_ids)} msg(s), '
+                      f'{c.token_count} tokens, reason={c.boundary_reason}')
+            if len(chunks) > 5:
+                print(f'  … and {len(chunks) - 5} more')
+            return
+
+        # Write JSONL manifest — one line per chunk, self-contained for workers.
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        chunk_ids: list[str] = []
+        with manifest_path.open('w', encoding='utf-8') as fh:
+            for chunk in chunks:
+                content = _build_episode_body(chunk.message_ids, messages_by_id)
+                record = {
+                    'chunk_id': chunk.chunk_id,
+                    'chunk_index': chunk.chunk_index,
+                    'message_ids': chunk.message_ids,
+                    'content': content,
+                    'token_count': chunk.token_count,
+                    'time_range_start': chunk.time_range_start,
+                    'time_range_end': chunk.time_range_end,
+                    'boundary_reason': chunk.boundary_reason,
+                    'boundary_score': chunk.boundary_score,
+                }
+                fh.write(json.dumps(record, ensure_ascii=True) + '\n')
+                chunk_ids.append(chunk.chunk_id)
+
+        print(f'Wrote manifest with {len(chunk_ids)} chunk(s) to {manifest_path}')
+
+        # Seed claim DB if worker-based processing is requested.
         if args.claim_mode:
             claim_db_path = str(manifest_path) + '.claims.db'
             conn = init_claim_db(claim_db_path)
             try:
                 seed_claims(conn, chunk_ids)
-                print(f'Seeded claim DB at {claim_db_path} with {len(chunk_ids)} chunks')
+                print(f'Seeded claim DB at {claim_db_path} with {len(chunk_ids)} chunk(s)')
             finally:
                 conn.close()
         return
 
-    # --- claim mode with existing manifest ---
+    # ------------------------------------------------------------------
+    # FR-10 claim-mode worker path
+    # ------------------------------------------------------------------
     if args.claim_mode:
         if not args.manifest:
             ap.error('--claim-mode requires --manifest (or --build-manifest to create one)')
         manifest_path = Path(args.manifest)
         if not manifest_path.exists():
             raise SystemExit(f'Manifest not found: {manifest_path}')
+
+        print(f'Loading manifest from {manifest_path} …')
+        manifest = _load_manifest(manifest_path)
+        print(f'  {len(manifest)} chunk(s) available in manifest')
+
         claim_db_path = str(manifest_path) + '.claims.db'
         conn = init_claim_db(claim_db_path)
+        client = MCPClient(args.mcp_url)
+
+        ok = errors = 0
+        worker_id = f'w{args.shard_index}'
+
         try:
-            worker_id = f'w{args.shard_index}'
-            claimed = 0
             while True:
                 chunk_id = claim_chunk(conn, worker_id)
                 if chunk_id is None:
-                    break
-                claimed += 1
-                if args.dry_run:
-                    print(f'DRY RUN: would process chunk {chunk_id}')
-                    continue
-                print(f'Processing claimed chunk: {chunk_id}')
-                try:
-                    # TODO: Actual chunk processing (read chunk content from manifest,
-                    # send to MCP add_memory, mark graphiti_extracted_at in Neo4j)
-                    # will be wired when the full pipeline is integrated.
-                    # For now, mark as failed to avoid false completion.
-                    conn.execute(
-                        "UPDATE chunk_claims SET status='failed', error=?, completed_at=? "
-                        'WHERE chunk_id=?',
-                        (
-                            'not yet implemented: chunk processing stub',
-                            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                            chunk_id,
-                        ),
-                    )
-                    conn.commit()
-                except Exception as exc:
-                    conn.execute(
-                        "UPDATE chunk_claims SET status='failed', "
-                        "fail_count=COALESCE(fail_count,0)+1, error=?, completed_at=? "
-                        'WHERE chunk_id=?',
-                        (
-                            str(exc),
-                            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                            chunk_id,
-                        ),
-                    )
-                    conn.commit()
+                    break  # no more pending chunks for this worker
 
-            print(f'Worker {worker_id} processed {claimed} chunks')
+                chunk_data = manifest.get(chunk_id)
+                if not chunk_data:
+                    _claim_fail(conn, chunk_id, 'chunk_id not found in manifest')
+                    errors += 1
+                    continue
+
+                message_ids: list[str] = chunk_data.get('message_ids') or []
+                content: str = chunk_data.get('content') or ''
+
+                if args.dry_run:
+                    print(f'DRY RUN: would send chunk {chunk_id} '
+                          f'({len(message_ids)} msg(s)) to MCP')
+                    _claim_done(conn, chunk_id)
+                    ok += 1
+                    continue
+
+                # --- Send chunk to MCP add_memory ---
+                ep_name = f'neo4j:{chunk_data.get("chunk_index", 0)}:{chunk_id[:8]}'
+                src_desc = (
+                    f'neo4j chunk {chunk_id[:12]} '
+                    f'({chunk_data.get("time_range_start", "")[:10]} to '
+                    f'{chunk_data.get("time_range_end", "")[:10]})'
+                )
+                body = sanitize_for_graphiti(content)
+
+                res = client.call_tool(
+                    'add_memory',
+                    {
+                        'name': ep_name,
+                        'episode_body': body,
+                        'group_id': args.group_id,
+                        'source': 'text',
+                        'source_description': src_desc[:200],
+                    },
+                )
+
+                if 'error' in res:
+                    err_msg = str(res['error'])
+                    print(f'ERROR sending chunk {chunk_id}: {err_msg}', file=sys.stderr)
+                    _claim_fail(conn, chunk_id, f'mcp_error: {err_msg[:200]}')
+                    errors += 1
+                    continue
+
+                # --- Mark Neo4j messages as extracted ---
+                try:
+                    _mark_neo4j_extracted(message_ids)
+                except Exception as neo4j_exc:
+                    # MCP send succeeded but Neo4j mark failed.
+                    # Fail the claim so it can be retried for marking.
+                    _claim_fail(conn, chunk_id, f'neo4j_mark_failed: {neo4j_exc}')
+                    errors += 1
+                    print(
+                        f'WARNING: MCP send ok but Neo4j mark failed for chunk {chunk_id}: '
+                        f'{neo4j_exc}',
+                        file=sys.stderr,
+                    )
+                    continue
+
+                # --- Both MCP send and Neo4j mark succeeded ---
+                _claim_done(conn, chunk_id)
+                ok += 1
+                time.sleep(args.sleep)
+
         finally:
             conn.close()
+
+        print(f'\nWorker {worker_id}: ok={ok} errors={errors}')
         return
 
-    # Default neo4j mode: placeholder
-    print(
-        f'Neo4j source mode (group_id={args.group_id}): '
-        'would read candidate chunks from the graph.\n'
-        'Use --dry-run to preview candidate chunks.\n'
-        'Use --build-manifest <path> to freeze chunk IDs to a manifest file.'
+    # ------------------------------------------------------------------
+    # FR-4 inline path (default neo4j mode — no manifest, no claim DB)
+    # ------------------------------------------------------------------
+    # Fetch enough messages for Smart Cutter to produce args.limit chunks.
+    fetch_limit = min(
+        max(args.limit, 1) * _MESSAGES_PER_CHUNK_ESTIMATE + args.offset * _MESSAGES_PER_CHUNK_ESTIMATE,
+        _NEO4J_FETCH_CEILING,
     )
+    print(f'Neo4j source mode: fetching up to {fetch_limit} unextracted message(s) …')
+    messages = _fetch_neo4j_messages(fetch_limit)
+    print(f'  Fetched {len(messages)} message(s) from Neo4j')
+
+    if not messages:
+        print('  No unextracted messages found. Nothing to do.')
+        return
+
+    messages_by_id: dict[str, dict] = {m['message_id']: m for m in messages}
+    chunks = _apply_smart_cutter(messages)
+    print(f'  Smart Cutter produced {len(chunks)} chunk(s)')
+
+    # Apply --offset and --limit to the chunk list (not the message list).
+    page = chunks[args.offset : args.offset + args.limit]
+    print(f'  Processing {len(page)} chunk(s) (offset={args.offset} limit={args.limit})')
+
+    if args.dry_run:
+        for c in page:
+            print(f'  DRY RUN chunk {c.chunk_index}: {len(c.message_ids)} msg(s), '
+                  f'{c.token_count} tokens, reason={c.boundary_reason}')
+        return
+
+    client = MCPClient(args.mcp_url)
+    ok = errors = 0
+    extracted_ids: list[str] = []  # accumulated for bulk Neo4j mark
+
+    for i, chunk in enumerate(page, start=1):
+        content = _build_episode_body(chunk.message_ids, messages_by_id)
+        body = sanitize_for_graphiti(content)
+        ep_name = f'neo4j:{chunk.chunk_index}:{chunk.chunk_id[:8]}'
+        src_desc = (
+            f'neo4j chunk {chunk.chunk_id[:12]} '
+            f'({chunk.time_range_start[:10]} to {chunk.time_range_end[:10]})'
+        )
+
+        res = client.call_tool(
+            'add_memory',
+            {
+                'name': ep_name,
+                'episode_body': body,
+                'group_id': args.group_id,
+                'source': 'text',
+                'source_description': src_desc[:200],
+            },
+        )
+
+        if 'error' in res:
+            print(
+                f'[{i}/{len(page)}] ERROR chunk {chunk.chunk_id[:12]}: {res["error"]}',
+                file=sys.stderr,
+            )
+            errors += 1
+        else:
+            extracted_ids.extend(chunk.message_ids)
+            ok += 1
+            if i <= 5 or i == len(page) or i % 50 == 0:
+                print(f'[{i}/{len(page)}] queued chunk {chunk.chunk_id[:12]} '
+                      f'({len(chunk.message_ids)} msg(s))')
+            time.sleep(args.sleep)
+
+    # Bulk-mark extracted messages in Neo4j.
+    if extracted_ids:
+        try:
+            _mark_neo4j_extracted(extracted_ids)
+            print(f'Marked {len(extracted_ids)} message(s) as graphiti_extracted_at in Neo4j')
+        except Exception as exc:
+            print(
+                f'WARNING: Failed to mark {len(extracted_ids)} message(s) in Neo4j: {exc}',
+                file=sys.stderr,
+            )
+
+    print(f'\nQueued: {ok} chunk(s) into group_id={args.group_id}')
+    if errors:
+        print(f'Errors: {errors}')
 
 
 def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
@@ -682,7 +1052,11 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             '  or: python3 ingest/parse_sessions.py --agent main      (legacy)'
         )
 
-    evidences = json.loads(evidence_path.read_text(encoding='utf-8'))
+    # Use json.load(fp) instead of json.loads(read_text()) to avoid the intermediate
+    # string allocation — the JSON array is still loaded into memory but without
+    # holding both the raw bytes and the parsed result simultaneously.
+    with evidence_path.open('r', encoding='utf-8') as _efp:
+        evidences = json.load(_efp)
 
     # Sort for consistent ordering.
     evidences.sort(

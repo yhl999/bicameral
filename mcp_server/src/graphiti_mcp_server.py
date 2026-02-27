@@ -83,6 +83,12 @@ try:
 except (ValueError, TypeError):
     TRUST_WEIGHT = 0.0
 
+# Defense-in-depth caps: callers may request arbitrarily large result sets.
+# These hard ceilings prevent accidental or adversarial result-set blowup
+# regardless of what value the client passes in max_nodes / max_facts.
+_MAX_NODES_CAP = 200
+_MAX_FACTS_CAP = 200
+
 
 # Configure structured logging with timestamps
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -748,7 +754,8 @@ async def search_nodes(
         )
 
         # Extract nodes from results
-        nodes = results.nodes[:max_nodes] if results.nodes else []
+        effective_max_nodes = min(max_nodes, _MAX_NODES_CAP)
+        nodes = results.nodes[:effective_max_nodes] if results.nodes else []
 
         if not nodes:
             return NodeSearchResponse(message='No relevant nodes found', nodes=[])
@@ -805,9 +812,10 @@ async def search_memory_facts(
         return ErrorResponse(error='Graphiti service not initialized')
 
     try:
-        # Validate max_facts parameter
+        # Validate max_facts parameter and apply defense-in-depth cap.
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
+        max_facts = min(max_facts, _MAX_FACTS_CAP)
 
         normalized_mode = (search_mode or 'hybrid').strip().lower()
         if normalized_mode not in VALID_SEARCH_MODES:
@@ -849,7 +857,7 @@ async def search_memory_facts(
             center_node_uuid=center_node_uuid,
         )
 
-        relevant_edges = results.edges[:max_facts] if results.edges else []
+        relevant_edges = results.edges[:max_facts] if results.edges else []  # already capped above
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
