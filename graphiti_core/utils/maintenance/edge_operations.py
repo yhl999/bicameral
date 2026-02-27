@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import re
 from datetime import datetime
 from difflib import SequenceMatcher
 from time import time
@@ -81,16 +82,25 @@ _CANONICALIZE_THRESHOLD: float = 0.78
 def _normalize_relation_type(relation_type: str) -> str:
     """Normalize a relation type string to SCREAMING_SNAKE_CASE for comparison.
 
-    Performs three transforms:
+    Performs these transforms in order:
     1. Strip surrounding whitespace.
-    2. Convert spaces and hyphens to underscores.
-    3. Uppercase everything.
+    2. Replace ANY non-alphanumeric character (spaces, hyphens, dots, carets,
+       colons, etc.) with an underscore — closes punctuation-bypass vectors
+       like ``'RELATES^TO'`` or ``'MENTIONS.'``.
+    3. Collapse runs of consecutive underscores to a single underscore.
+    4. Trim leading/trailing underscores left by step 2.
+    5. Uppercase everything.
 
-    This ensures that LLM outputs like ``'relates_to'``, ``'Relates To'``, or
-    ``'relates-to'`` all compare equal to the canonical ``'RELATES_TO'`` entry
-    in the ontology / noise filter, without requiring an exact-case match.
+    This ensures that LLM outputs like ``'relates_to'``, ``'Relates To'``,
+    ``'relates-to'``, ``'RELATES^TO'``, or ``'MENTIONS.'`` all compare equal
+    to the canonical ``'RELATES_TO'`` / ``'MENTIONS'`` entry in the ontology /
+    noise filter, without requiring an exact-case match.
     """
-    return relation_type.strip().replace(' ', '_').replace('-', '_').upper()
+    s = relation_type.strip()
+    s = re.sub(r'[^a-zA-Z0-9]+', '_', s)   # any non-alnum → underscore
+    s = re.sub(r'_+', '_', s)               # collapse repeated underscores
+    s = s.strip('_')                         # trim leading/trailing underscores
+    return s.upper()
 
 
 def _canonicalize_edge_name(

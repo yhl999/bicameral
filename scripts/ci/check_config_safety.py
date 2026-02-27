@@ -84,17 +84,19 @@ def _iter_strings(value: Any, path: str = '') -> list[tuple[str, str]]:
 # Scan logic
 # ---------------------------------------------------------------------------
 
-def scan_file(path: Path) -> list[tuple[str, str, str]]:
+def scan_file(path: Path) -> list[tuple[str, str, str]] | None:
     """Scan a single YAML file for injection markers.
 
     Returns:
-        List of (yaml_path, matched_pattern_description, matched_text_snippet)
+        List of (yaml_path, matched_pattern_description, matched_text_snippet),
+        or None if the file could not be parsed (parse errors are treated as
+        failures, not clean — fail-closed policy).
     """
     try:
         content = yaml.safe_load(path.read_text())
     except yaml.YAMLError as exc:
-        print(f'  WARN: could not parse {path}: {exc}', file=sys.stderr)
-        return []
+        print(f'❌  PARSE ERROR: {path}: {exc}', file=sys.stderr)
+        return None
 
     if not isinstance(content, dict):
         return []
@@ -136,23 +138,35 @@ def main() -> int:
         return 0
 
     total_findings = 0
+    parse_errors = 0
     for config_path in sorted(files_to_scan):
+        rel = config_path.relative_to(repo_root)
         findings = scan_file(config_path)
-        if findings:
-            rel = config_path.relative_to(repo_root)
+        if findings is None:
+            # Parse error — fail-closed: treat as hard failure, not clean.
+            print(f'❌  PARSE ERROR: {rel} — malformed YAML treated as failure')
+            parse_errors += 1
+        elif findings:
             print(f'\n❌  SUSPICIOUS CONTENT in {rel}:')
             for yaml_path, description, snippet in findings:
                 print(f'    [{yaml_path}]  {description}')
                 print(f'        snippet: {snippet!r}')
             total_findings += len(findings)
         else:
-            rel = config_path.relative_to(repo_root)
             print(f'✅  {rel} — clean')
 
     print()
-    if total_findings:
-        print(f'check_config_safety: FAILED — {total_findings} suspicious value(s) found.')
-        print('Review the flagged YAML fields and remove prompt-injection content.')
+    if total_findings or parse_errors:
+        msg_parts = []
+        if total_findings:
+            msg_parts.append(f'{total_findings} suspicious value(s) found')
+        if parse_errors:
+            msg_parts.append(f'{parse_errors} parse error(s)')
+        print(f'check_config_safety: FAILED — {", ".join(msg_parts)}.')
+        if total_findings:
+            print('Review the flagged YAML fields and remove prompt-injection content.')
+        if parse_errors:
+            print('Fix YAML parse errors — malformed config files are treated as failures.')
         return 1
 
     print('check_config_safety: PASS — no injection markers found.')

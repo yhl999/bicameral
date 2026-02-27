@@ -438,6 +438,26 @@ class TestEdgeNormalization:
     def test_mixed_separators(self):
         assert self._normalize('uses-move here') == 'USES_MOVE_HERE'
 
+    def test_caret_converted_to_underscore(self):
+        """RELATES^TO should normalize to RELATES_TO (punctuation bypass closed)."""
+        assert self._normalize('RELATES^TO') == 'RELATES_TO'
+
+    def test_dot_trimmed(self):
+        """MENTIONS. (trailing dot) should normalize to MENTIONS."""
+        assert self._normalize('MENTIONS.') == 'MENTIONS'
+
+    def test_mixed_punctuation(self):
+        """RELATES^.TO should collapse multiple non-alnum chars to single underscore."""
+        assert self._normalize('RELATES^.TO') == 'RELATES_TO'
+
+    def test_colon_separator(self):
+        """RELATES:TO should normalize to RELATES_TO."""
+        assert self._normalize('RELATES:TO') == 'RELATES_TO'
+
+    def test_leading_punctuation_trimmed(self):
+        """Leading non-alnum chars should be stripped, not produce leading underscore."""
+        assert self._normalize('.RELATES_TO') == 'RELATES_TO'
+
 
 class TestEdgeCanonicalizationHardening:
     """Test hardened _canonicalize_edge_name: normalization + negation guard."""
