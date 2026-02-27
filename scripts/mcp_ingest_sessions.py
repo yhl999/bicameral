@@ -675,32 +675,6 @@ def _claim_sent_not_marked(conn: sqlite3.Connection, chunk_id: str) -> None:
     conn.commit()
 
 
-def _claim_neo4j_retry(conn: sqlite3.Connection, worker_id: str) -> str | None:
-    """Atomically claim one 'sent_not_marked' chunk for Neo4j-mark-only retry.
-
-    Returns chunk_id, or None when no chunks are awaiting mark retry.
-    These chunks already had add_memory called successfully, so workers must
-    NOT call add_memory again — only _mark_neo4j_extracted.
-    """
-    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-    conn.execute('BEGIN IMMEDIATE')
-    cursor = conn.execute(
-        "SELECT chunk_id FROM chunk_claims WHERE status='sent_not_marked' LIMIT 1"
-    )
-    row = cursor.fetchone()
-    if row is None:
-        conn.commit()
-        return None
-    chunk_id = row[0]
-    conn.execute(
-        "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
-        "WHERE chunk_id=? AND status='sent_not_marked'",
-        (worker_id, now, chunk_id),
-    )
-    conn.commit()
-    return chunk_id
-
-
 def _snapshot_sent_not_marked(conn: sqlite3.Connection) -> list[str]:
     """Return all chunk IDs currently in 'sent_not_marked' status.
 
@@ -1151,19 +1125,31 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     # run retries only the Neo4j mark (Phase A), not add_memory.
                     # Increment fail_count so persistent failures are observable
                     # (mirrors Phase A accounting for retry completeness).
-                    conn.execute(
+                    #
+                    # Guard: only mutate if the row is still in 'sent_not_marked'
+                    # state owned by *this* worker.  If another worker already
+                    # resolved the row, rowcount will be 0 and we skip telemetry
+                    # overwrite to avoid corrupting a resolved row.
+                    cur = conn.execute(
                         "UPDATE chunk_claims SET "
                         "fail_count=COALESCE(fail_count, 0) + 1, error=? "
-                        "WHERE chunk_id=?",
-                        (f'neo4j_mark_failed: {neo4j_exc}'[:500], chunk_id),
+                        "WHERE chunk_id=? AND status='sent_not_marked' AND worker_id=?",
+                        (f'neo4j_mark_failed: {neo4j_exc}'[:500], chunk_id, worker_id),
                     )
                     conn.commit()
                     errors += 1
-                    print(
-                        f'WARNING: MCP send ok but Neo4j mark failed for chunk {chunk_id[:12]}: '
-                        f'{neo4j_exc}',
-                        file=sys.stderr,
-                    )
+                    if cur.rowcount == 0:
+                        _logger.warning(
+                            'Phase-B fail_count update skipped for chunk %s: '
+                            'row already resolved by another worker',
+                            chunk_id[:12],
+                        )
+                    else:
+                        print(
+                            f'WARNING: MCP send ok but Neo4j mark failed for chunk {chunk_id[:12]}: '
+                            f'{neo4j_exc}',
+                            file=sys.stderr,
+                        )
                     continue
 
                 # --- Both MCP send and Neo4j mark succeeded ---

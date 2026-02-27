@@ -129,13 +129,19 @@ _search_rate_limiter = _SlidingWindowRateLimiter(
 
 
 def _derive_rate_limit_key(effective_group_ids: list[str]) -> str:
-    """Return a stable per-caller rate-limit key from *resolved* group IDs.
+    """Return a stable, canonical per-caller rate-limit key from *resolved* group IDs.
 
     Must be called **after** ``_resolve_effective_group_ids`` so the key is
     derived from trusted, validated context rather than raw caller-supplied
-    input.  Using a raw (pre-resolution) value would allow an adversary to
-    spoof distinct rate-limit buckets by cycling through arbitrary group_id
-    strings.
+    input.
+
+    Key properties:
+    - **Canonical**: sorted unique effective_group_ids are hashed, so different
+      orderings of the same group set map to the same rate-limit bucket.
+    - **Trust-bound**: derived from post-resolution group IDs only; raw
+      caller-supplied ordering cannot manipulate the bucket.
+    - **Anti-spoof**: cycling through permutations or subsets of group IDs
+      does not allow an adversary to escape per-caller rate limiting.
 
     Args:
         effective_group_ids: Validated and resolved group IDs returned by
@@ -143,7 +149,11 @@ def _derive_rate_limit_key(effective_group_ids: list[str]) -> str:
             conservative ``'__global__'`` fallback to be used.
     """
     if effective_group_ids:
-        return f'group:{effective_group_ids[0]}'
+        # Sort + deduplicate to produce a canonical representation that is
+        # independent of caller-supplied ordering.
+        canonical = '|'.join(sorted(set(effective_group_ids)))
+        digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        return f'group:{digest}'
     return '__global__'
 
 

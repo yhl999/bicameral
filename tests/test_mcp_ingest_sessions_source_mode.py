@@ -513,50 +513,6 @@ class TestSentNotMarkedIdempotency(unittest.TestCase):
             conn.close()
             os.unlink(tmp)
 
-    def test_claim_neo4j_retry_claims_sent_not_marked(self):
-        """_claim_neo4j_retry atomically claims a sent_not_marked chunk."""
-        import os
-
-        from scripts.mcp_ingest_sessions import (
-            _claim_neo4j_retry,
-            _claim_sent_not_marked,
-            claim_chunk,
-        )
-
-        conn, tmp = self._make_db(['chunk_B'])
-        try:
-            # Simulate: claim → send to MCP → set sent_not_marked (neo4j mark failed)
-            chunk_id = claim_chunk(conn, 'w0')
-            _claim_sent_not_marked(conn, chunk_id)
-
-            # Next run: retry should claim it
-            retry_id = _claim_neo4j_retry(conn, 'w0')
-            self.assertEqual(retry_id, 'chunk_B')
-
-            # After claiming for retry, status is 'claimed'
-            row = conn.execute(
-                'SELECT status FROM chunk_claims WHERE chunk_id=?', (chunk_id,)
-            ).fetchone()
-            self.assertEqual(row[0], 'claimed')
-        finally:
-            conn.close()
-            os.unlink(tmp)
-
-    def test_pending_chunks_not_claimed_by_neo4j_retry(self):
-        """_claim_neo4j_retry must not claim 'pending' chunks (those haven't been sent)."""
-        import os
-
-        from scripts.mcp_ingest_sessions import _claim_neo4j_retry
-
-        conn, tmp = self._make_db(['chunk_C', 'chunk_D'])
-        try:
-            # Both chunks are 'pending' — neo4j retry should find nothing
-            result = _claim_neo4j_retry(conn, 'w0')
-            self.assertIsNone(result)
-        finally:
-            conn.close()
-            os.unlink(tmp)
-
     def test_sent_not_marked_survives_after_neo4j_fail(self):
         """After neo4j mark failure the chunk stays sent_not_marked (not failed/pending)."""
         import os
@@ -586,35 +542,6 @@ class TestSentNotMarkedIdempotency(unittest.TestCase):
         finally:
             conn.close()
             os.unlink(tmp)
-
-    def test_done_not_claimed_by_neo4j_retry(self):
-        """Completed chunks (done) are not re-claimed by neo4j retry."""
-        import os
-
-        from scripts.mcp_ingest_sessions import (
-            _claim_done,
-            _claim_neo4j_retry,
-            _claim_sent_not_marked,
-            claim_chunk,
-        )
-
-        conn, tmp = self._make_db(['chunk_F'])
-        try:
-            chunk_id = claim_chunk(conn, 'w0')
-            _claim_sent_not_marked(conn, chunk_id)
-            # Now mark neo4j ok → done
-            conn.execute(
-                "UPDATE chunk_claims SET status='claimed' WHERE chunk_id=?", (chunk_id,)
-            )
-            conn.commit()
-            _claim_done(conn, chunk_id)
-
-            result = _claim_neo4j_retry(conn, 'w0')
-            self.assertIsNone(result)
-        finally:
-            conn.close()
-            os.unlink(tmp)
-
 
 class TestSearchRateLimiter(unittest.TestCase):
     """Item 3: sliding-window rate limiter for search endpoints."""
@@ -738,16 +665,67 @@ class TestSearchRateLimiter(unittest.TestCase):
         self.assertIn('_hash_rate_limit_key', src)
 
     def test_derive_rate_limit_key_logic(self):
-        """_derive_rate_limit_key derives from resolved effective_group_ids (trusted path)."""
-        # Mirror the actual contract: takes effective_group_ids (post-resolution)
+        """_derive_rate_limit_key produces canonical, order-independent keys (anti-spoof).
+
+        Mirrors the actual implementation contract: sorted unique effective_group_ids
+        are hashed, so permutations of the same group set map to the same bucket.
+        """
+        import hashlib
+
         def _derive_rate_limit_key(effective_group_ids):
+            """Local mirror of the production implementation for unit testing."""
             if effective_group_ids:
-                return f'group:{effective_group_ids[0]}'
+                canonical = '|'.join(sorted(set(effective_group_ids)))
+                digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+                return f'group:{digest}'
             return '__global__'
 
-        self.assertEqual(_derive_rate_limit_key(['grp1', 'grp2']), 'group:grp1')
-        self.assertEqual(_derive_rate_limit_key(['grp1']), 'group:grp1')
+        # Empty list → global fallback
         self.assertEqual(_derive_rate_limit_key([]), '__global__')
+
+        # Non-empty → key starts with 'group:' prefix
+        key = _derive_rate_limit_key(['grp1'])
+        self.assertTrue(key.startswith('group:'), f'Expected group: prefix, got {key!r}')
+
+        # Same group set, different orderings → identical key (order-independent)
+        key_ab = _derive_rate_limit_key(['grp_a', 'grp_b'])
+        key_ba = _derive_rate_limit_key(['grp_b', 'grp_a'])
+        self.assertEqual(key_ab, key_ba, 'Key must be order-independent (anti-spoof)')
+
+        # Duplicate entries collapse to the same bucket as deduplicated
+        key_dedup = _derive_rate_limit_key(['grp_a', 'grp_a'])
+        key_single = _derive_rate_limit_key(['grp_a'])
+        self.assertEqual(key_dedup, key_single, 'Duplicate group IDs must deduplicate')
+
+        # Different group sets → different keys
+        key_a = _derive_rate_limit_key(['grp_a'])
+        key_b = _derive_rate_limit_key(['grp_b'])
+        self.assertNotEqual(key_a, key_b, 'Distinct group sets must produce distinct keys')
+
+    def test_rate_limit_key_anti_order_spoof(self):
+        """Permutation of group IDs must not produce distinct rate-limit buckets.
+
+        Source-level check: verify the implementation uses sorted(set(...)) canonicalization.
+        """
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
+        ).read_text(encoding='utf-8')
+
+        # Implementation must canonicalize via sorted + set (or equivalent)
+        self.assertIn(
+            'sorted(set(effective_group_ids))',
+            src,
+            '_derive_rate_limit_key must use sorted(set(effective_group_ids)) for canonicalization',
+        )
+        # Must hash the canonical representation
+        self.assertIn(
+            'hashlib.sha256',
+            src,
+            '_derive_rate_limit_key must hash the canonical group set',
+        )
 
     def test_rate_limit_key_derived_after_resolution_in_source(self):
         """In both endpoints, _derive_rate_limit_key is called with effective_group_ids
@@ -1112,6 +1090,90 @@ class TestPhaseBFailCount(unittest.TestCase):
             src,
             'Phase B neo4j mark failure must increment fail_count (retry accounting completeness)',
         )
+
+    def test_phase_b_source_has_worker_guard(self):
+        """Phase B fail_count UPDATE must include status + worker_id guard to prevent
+        mutating rows already resolved by another worker."""
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / 'scripts' / 'mcp_ingest_sessions.py'
+        ).read_text(encoding='utf-8')
+        self.assertIn(
+            "status='sent_not_marked' AND worker_id=?",
+            src,
+            "Phase B fail_count UPDATE must guard on status='sent_not_marked' AND worker_id=?",
+        )
+
+    def test_phase_b_fail_count_guard_skips_resolved_row(self):
+        """If another worker resolves the row first, Phase B fail_count update is a no-op."""
+        import os
+
+        from scripts.mcp_ingest_sessions import _claim_done, _claim_sent_not_marked, claim_chunk
+
+        conn, tmp = self._make_db(['chunk_race'])
+        try:
+            chunk_id = claim_chunk(conn, 'w0')
+            _claim_sent_not_marked(conn, chunk_id)
+
+            # Simulate another worker resolving the row first
+            _claim_done(conn, chunk_id)
+
+            # Phase B worker now attempts the guarded fail_count update — must be a no-op
+            cur = conn.execute(
+                "UPDATE chunk_claims SET "
+                "fail_count=COALESCE(fail_count, 0) + 1, error=? "
+                "WHERE chunk_id=? AND status='sent_not_marked' AND worker_id=?",
+                ('neo4j_mark_failed: race', chunk_id, 'w0'),
+            )
+            conn.commit()
+
+            self.assertEqual(
+                cur.rowcount, 0,
+                'Guard UPDATE must affect 0 rows when row is already resolved (done)',
+            )
+            # fail_count must remain 0 on the resolved row
+            row = conn.execute(
+                'SELECT fail_count, status FROM chunk_claims WHERE chunk_id=?',
+                (chunk_id,),
+            ).fetchone()
+            self.assertEqual(row[1], 'done', 'Row status must still be done')
+            self.assertEqual(row[0], 0, 'fail_count must not have been incremented on resolved row')
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_phase_b_fail_count_guard_updates_own_row(self):
+        """Phase B fail_count UPDATE increments correctly when row is still owned by this worker."""
+        import os
+
+        from scripts.mcp_ingest_sessions import _claim_sent_not_marked, claim_chunk
+
+        conn, tmp = self._make_db(['chunk_mine'])
+        try:
+            chunk_id = claim_chunk(conn, 'w1')
+            _claim_sent_not_marked(conn, chunk_id)
+
+            # Worker w1 applies the guarded update — should match exactly 1 row
+            cur = conn.execute(
+                "UPDATE chunk_claims SET "
+                "fail_count=COALESCE(fail_count, 0) + 1, error=? "
+                "WHERE chunk_id=? AND status='sent_not_marked' AND worker_id=?",
+                ('neo4j_mark_failed: test', chunk_id, 'w1'),
+            )
+            conn.commit()
+
+            self.assertEqual(cur.rowcount, 1, 'Guard UPDATE must affect exactly 1 row for owner worker')
+            row = conn.execute(
+                'SELECT fail_count, status FROM chunk_claims WHERE chunk_id=?',
+                (chunk_id,),
+            ).fetchone()
+            self.assertEqual(row[0], 1, 'fail_count must be 1 after guarded update')
+            self.assertEqual(row[1], 'sent_not_marked', 'Status must remain sent_not_marked')
+        finally:
+            conn.close()
+            os.unlink(tmp)
 
 
 if __name__ == '__main__':
