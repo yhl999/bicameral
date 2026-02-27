@@ -90,6 +90,12 @@ graphiti:
   group_id: ${GRAPHITI_GROUP_ID:main}
   episode_id_prefix: ${EPISODE_ID_PREFIX:}
   user_id: ${USER_ID:mcp_user}
+  lane_aliases:
+    sessions_main: ["s1_sessions_main"]
+    observational_memory: ["s1_observational_memory"]
+    curated: ["s1_curated_refs"]
+    chatgpt: ["s1_chatgpt_history"]
+    all: []
   entity_types:
     - name: "Preference"
       description: "User preferences, choices, opinions, or selections (PRIORITIZE over most other types except User/Assistant)"

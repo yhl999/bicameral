@@ -95,6 +95,40 @@ The ontology resolver is called **per-episode** at extraction time (not per-shar
 
 ---
 
+## Historical Transcript Bootstrap (FR-1)
+
+Before running Graphiti extraction on live data you must first import your historical session
+transcripts into Neo4j as `Episode`/`Message` nodes.  This populates the graph with the raw
+conversation data that Smart Cutter + the ingest worker will later extract from.
+
+```bash
+# Dry-run first (no Neo4j writes, no --confirm needed):
+python3 scripts/import_transcripts_to_neo4j.py \
+    --sessions-dir ~/.clawdbot/agents/main/sessions \
+    --dry-run
+
+# Live write — requires --confirm (safety gate):
+python3 scripts/import_transcripts_to_neo4j.py \
+    --sessions-dir ~/.clawdbot/agents/main/sessions \
+    --confirm
+```
+
+> **`--confirm` is required for live writes.**  Omitting it exits with an error.
+> Use `--dry-run` to preview counts and validate session files without writing anything.
+
+Optional flags:
+- `--max-files N` — limit files processed (useful for testing)
+- `--max-messages N` — stop after N total messages
+- `--stats-out path.json` — write structured stats JSON to a file
+
+After importing, verify with:
+```cypher
+MATCH (e:Episode) RETURN count(e) AS episodes
+MATCH (m:Message) RETURN count(m) AS messages
+```
+
+---
+
 ## Batch Ingestion
 
 Use batch mode for initial extraction, re-extraction after provider/embedding model changes, or disaster recovery.
@@ -104,16 +138,17 @@ Use batch mode for initial extraction, re-extraction after provider/embedding mo
 - Switching embedding models (dimension change makes old vectors incompatible → full re-extract)
 - Switching LLM providers (different extraction quality → may want fresh graph)
 - Neo4j database wipe/recovery
-- First-time setup
+- First-time setup (run Historical Transcript Bootstrap first — see above)
 
 ### Pre-Flight Checklist
 
-1. **Wipe Neo4j** (if re-extracting): `MATCH (n) DETACH DELETE n`
-2. **Reset ingest registry**: `DELETE FROM extraction_tracking WHERE group_id = '<group>'`
-3. **Reset cursors** (for cursor-based scripts) in your registry DB
-4. **Verify evidence files exist** for all groups
-5. **Verify LLM provider** has sufficient credits/quota
-6. **Verify embedding service** is running with the correct model loaded
+1. **Bootstrap Neo4j** with historical transcripts: `import_transcripts_to_neo4j.py --confirm`
+2. **Wipe Neo4j** (if re-extracting): `MATCH (n) DETACH DELETE n`
+3. **Reset ingest registry**: `DELETE FROM extraction_tracking WHERE group_id = '<group>'`
+4. **Reset cursors** (for cursor-based scripts) in your registry DB
+5. **Verify evidence files exist** for all groups
+6. **Verify LLM provider** has sufficient credits/quota
+7. **Verify embedding service** is running with the correct model loaded
 
 ### Batch Configuration: Maximize Throughput
 
@@ -467,3 +502,78 @@ Neo4j uses a single database with `group_id` property scoping. Ingest scripts al
 ### Graph Size Impacts Throughput
 
 Entity resolution during `add_episode` performs similarity searches against existing nodes. Throughput degrades as graph size grows — this is expected. Post-extraction dedup (which merges duplicates) reduces node count and improves subsequent extraction performance.
+
+---
+
+## Dual Source Mode & Historical Bootstrap
+
+`mcp_ingest_sessions.py` supports two source modes that govern how chunks are read.
+
+### `--source-mode neo4j` (default)
+
+Reads session chunks from Neo4j `Message` nodes (bootstrapped by `import_transcripts_to_neo4j`). This is the production steady-state path. The script applies the Smart Cutter (`chunk_conversation_semantic`) to segment messages into semantically coherent episodes before enqueuing to Graphiti.
+
+```bash
+# Default — Neo4j source mode
+python3 scripts/mcp_ingest_sessions.py \
+  --group-id s1_sessions \
+  --source-mode neo4j \
+  --mcp-url http://localhost:8000/mcp
+```
+
+A **BOOTSTRAP_REQUIRED guard** fires automatically if zero `Message` nodes exist in Neo4j but evidence files are present. The guard aborts with a clear error directing you to run `import_transcripts_to_neo4j` first.
+
+### `--source-mode evidence` (rollback)
+
+Reads chunks directly from evidence JSON files on disk, bypassing Neo4j. Use this as a rollback path when Neo4j is unavailable or during disaster recovery.
+
+```bash
+# Rollback — evidence source mode (reads from disk directly)
+python3 scripts/mcp_ingest_sessions.py \
+  --group-id s1_sessions \
+  --source-mode evidence \
+  --evidence path/to/sessions_evidence/ \
+  --mcp-url http://localhost:8000/mcp
+```
+
+### Historical Bootstrap with `import_transcripts_to_neo4j`
+
+Before running `source-mode neo4j` for the first time, populate Neo4j with historical transcript data:
+
+```bash
+# Import all historical session transcripts to Neo4j
+python3 scripts/import_transcripts_to_neo4j.py \
+  --sessions-dir path/to/session_transcripts/ \
+  --dry-run   # preview first
+
+python3 scripts/import_transcripts_to_neo4j.py \
+  --sessions-dir path/to/session_transcripts/
+```
+
+This script upserts `(:Episode)-[:HAS_MESSAGE]->(:Message)` nodes with deterministic SHA-256 IDs. Re-runs are fully idempotent.
+
+### Rollback Procedure
+
+If the Neo4j source mode produces bad output and you need to roll back to evidence files:
+
+```bash
+# 1. Stop any running ingest workers
+
+# 2. Switch to evidence source mode (rollback)
+python3 scripts/mcp_ingest_sessions.py \
+  --group-id s1_sessions \
+  --source-mode evidence \
+  --evidence path/to/sessions_evidence/ \
+  --mcp-url http://localhost:8000/mcp
+
+# 3. Investigate Neo4j import issues before re-enabling neo4j mode
+```
+
+### Ingest Adapter Contract
+
+All ingest adapters must conform to **`INGEST_ADAPTER_CONTRACT_V1`** defined in `ingest/contracts.py`. The contract specifies required fields and types for `IngestRecord` and `IngestChunk` objects, and provides a `validate_determinism()` function for verifying that chunking is stable across runs.
+
+```bash
+# Verify contract compliance (exit 0 on success, 1 on violation)
+python3 scripts/ingest_adapter_contract_check.py --strict
+```
