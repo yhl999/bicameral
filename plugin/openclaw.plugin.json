@@ -141,6 +141,14 @@
       "capabilityTopN": {
         "type": "number",
         "description": "Number of Top-N capabilities to inject per turn."
+      },
+      "capabilityRequireIntent": {
+        "type": "boolean",
+        "description": "Only inject capabilities when a pack intent is detected."
+      },
+      "capabilityMinScore": {
+        "type": "number",
+        "description": "Minimum capability score threshold for inclusion."
       }
     }
   },

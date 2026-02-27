@@ -81,6 +81,10 @@ export interface PluginConfig {
   capabilitySelectorTimeoutMs: number;
   /** Number of Top-N capabilities to inject per turn. Default 8. */
   capabilityTopN: number;
+  /** Only inject capabilities when a pack intent is detected. Default false. */
+  capabilityRequireIntent: boolean;
+  /** Minimum capability score for inclusion. Default 0 (no floor). */
+  capabilityMinScore: number;
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -105,6 +109,8 @@ export const DEFAULT_CONFIG: PluginConfig = {
   enableCapabilityInjection: false,
   capabilitySelectorTimeoutMs: 2000,
   capabilityTopN: 8,
+  capabilityRequireIntent: false,
+  capabilityMinScore: 0,
 };
 
 const normalizeOptionalString = (value?: string): string | undefined => {

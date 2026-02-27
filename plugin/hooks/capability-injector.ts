@@ -208,6 +208,12 @@ export const createCapabilityInjector = (deps: CapabilityInjectorDeps) => {
       return null;
     }
 
+    // When capabilityRequireIntent is true, skip injection if no intent was detected.
+    if (config.capabilityRequireIntent && !input.intentId) {
+      logger('Capability injection skipped: no intent detected (capabilityRequireIntent=true)');
+      return null;
+    }
+
     const repoRoot = config.packRouterRepoRoot ?? process.cwd();
     const resolvedRoot = toCanonicalPath(path.resolve(repoRoot), 'capability repo root');
 
