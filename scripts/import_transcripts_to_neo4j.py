@@ -35,10 +35,11 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -193,7 +194,7 @@ def iso_or_none(dt: datetime | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 def read_jsonl(file_path: Path) -> Iterator[dict[str, Any]]:
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -538,7 +539,6 @@ def discover_session_files(sessions_dir: Path, max_files: int | None = None) -> 
         files.extend(direct)
 
     # Layout 2: agents/*/sessions/*.jsonl (look under sessions_dir)
-    agents_pattern = sessions_dir / 'agents' / '*' / 'sessions' / '*.jsonl'
     agents_files = sorted(sessions_dir.glob('agents/*/sessions/*.jsonl'))
     if agents_files:
         seen = {f.resolve() for f in files}
@@ -815,7 +815,7 @@ def run_import(args: argparse.Namespace) -> ImportStats:
                         'file': str(file_path),
                         'error': f'quarantined line {q["line_index"]}: {q["error"]}',
                     })
-                for msg in messages:
+                for _ in messages:
                     if args.max_messages and stats.messages_seen >= args.max_messages:
                         break
                     stats.messages_seen += 1
@@ -832,50 +832,49 @@ def run_import(args: argparse.Namespace) -> ImportStats:
     driver = neo4j_driver()
     database = os.environ.get('NEO4J_DATABASE', 'neo4j')
 
-    with driver:
-        with driver.session(database=database) as neo_session:
-            ensure_constraints(neo_session)
+    with driver, driver.session(database=database) as neo_session:
+        ensure_constraints(neo_session)
 
-            # Migration: backfill content_hash on pre-existing rows.
-            migrated = run_migration(neo_session)
-            if migrated > 0:
-                print(f'Migration: backfilled content_hash on {migrated} pre-existing row(s)')
+        # Migration: backfill content_hash on pre-existing rows.
+        migrated = run_migration(neo_session)
+        if migrated > 0:
+            print(f'Migration: backfilled content_hash on {migrated} pre-existing row(s)')
 
-            for file_path in files:
-                if args.max_messages and stats.messages_seen >= args.max_messages:
-                    break
+        for file_path in files:
+            if args.max_messages and stats.messages_seen >= args.max_messages:
+                break
 
-                stats.files_seen += 1
-                try:
-                    session_id, messages, quarantined = parse_session_messages(file_path)
+            stats.files_seen += 1
+            try:
+                session_id, messages, quarantined = parse_session_messages(file_path)
 
-                    # Record quarantined messages (malformed timestamps at ingest boundary).
-                    for q in quarantined:
-                        stats.quarantined_count += 1
-                        stats.errors.append({
-                            'file': str(file_path),
-                            'error': f'quarantined line {q["line_index"]}: {q["error"]}',
-                        })
-
-                    if not messages:
-                        continue
-
-                    upsert_episode_and_messages(
-                        neo_session,
-                        file_path=file_path,
-                        session_id=session_id,
-                        messages=messages,
-                        embedding_model=embedding_model,
-                        embedding_dim=embedding_dim,
-                        dry_run=False,
-                        stats=stats,
-                        max_messages=args.max_messages,
-                    )
-                except Exception as exc:
+                # Record quarantined messages (malformed timestamps at ingest boundary).
+                for q in quarantined:
+                    stats.quarantined_count += 1
                     stats.errors.append({
                         'file': str(file_path),
-                        'error': str(exc),
+                        'error': f'quarantined line {q["line_index"]}: {q["error"]}',
                     })
+
+                if not messages:
+                    continue
+
+                upsert_episode_and_messages(
+                    neo_session,
+                    file_path=file_path,
+                    session_id=session_id,
+                    messages=messages,
+                    embedding_model=embedding_model,
+                    embedding_dim=embedding_dim,
+                    dry_run=False,
+                    stats=stats,
+                    max_messages=args.max_messages,
+                )
+            except Exception as exc:
+                stats.errors.append({
+                    'file': str(file_path),
+                    'error': str(exc),
+                })
 
     return stats
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -119,7 +118,6 @@ class TestClaimStateDB(unittest.TestCase):
     """Test SQLite claim-state storage (FR-10)."""
 
     def test_claim_db_schema(self):
-        import sqlite3
         import tempfile
 
         from scripts.mcp_ingest_sessions import init_claim_db
@@ -140,7 +138,6 @@ class TestClaimStateDB(unittest.TestCase):
             conn.close()
 
     def test_claim_pending_to_claimed(self):
-        import sqlite3
         import tempfile
 
         from scripts.mcp_ingest_sessions import (
@@ -233,8 +230,9 @@ class TestLoadManifest(unittest.TestCase):
     """Test _load_manifest reads JSONL manifest correctly."""
 
     def test_load_manifest(self):
-        import tempfile
         import os
+        import tempfile
+
         from scripts.mcp_ingest_sessions import _load_manifest
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
@@ -255,9 +253,10 @@ class TestLoadManifest(unittest.TestCase):
             os.unlink(tmp)
 
     def test_empty_manifest_returns_empty_dict(self):
-        import tempfile
         import os
+        import tempfile
         from pathlib import Path
+
         from scripts.mcp_ingest_sessions import _load_manifest
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
@@ -270,10 +269,11 @@ class TestLoadManifest(unittest.TestCase):
             os.unlink(tmp)
 
     def test_malformed_lines_skipped(self):
-        import tempfile
-        import os
         import json as _json
+        import os
+        import tempfile
         from pathlib import Path
+
         from scripts.mcp_ingest_sessions import _load_manifest
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
@@ -295,6 +295,7 @@ class TestClaimHelpers(unittest.TestCase):
 
     def _make_db(self):
         import tempfile
+
         from scripts.mcp_ingest_sessions import init_claim_db, seed_claims
         tmp = tempfile.mktemp(suffix='.db')
         conn = init_claim_db(tmp)
@@ -303,7 +304,8 @@ class TestClaimHelpers(unittest.TestCase):
 
     def test_claim_done_marks_status(self):
         import os
-        from scripts.mcp_ingest_sessions import claim_chunk, _claim_done
+
+        from scripts.mcp_ingest_sessions import _claim_done, claim_chunk
 
         conn, tmp = self._make_db()
         try:
@@ -319,7 +321,8 @@ class TestClaimHelpers(unittest.TestCase):
 
     def test_claim_fail_increments_fail_count(self):
         import os
-        from scripts.mcp_ingest_sessions import claim_chunk, _claim_fail
+
+        from scripts.mcp_ingest_sessions import _claim_fail, claim_chunk
 
         conn, tmp = self._make_db()
         try:
@@ -338,9 +341,9 @@ class TestClaimHelpers(unittest.TestCase):
 
     def test_claim_fail_twice_increments_twice(self):
         import os
-        from scripts.mcp_ingest_sessions import init_claim_db, seed_claims, claim_chunk, _claim_fail
-
         import tempfile
+
+        from scripts.mcp_ingest_sessions import _claim_fail, claim_chunk, init_claim_db, seed_claims
         tmp = tempfile.mktemp(suffix='.db')
         conn = init_claim_db(tmp)
         seed_claims(conn, ['chunk_x'])

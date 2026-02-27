@@ -22,8 +22,6 @@ import argparse
 import json
 import shlex
 import subprocess
-import sys
-import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -82,9 +80,9 @@ class BenchmarkMCPClient:
                     self.session_id = sid
                 if 'text/event-stream' in ct:
                     lines = [
-                        l[len('data:'):].strip()
-                        for l in body.splitlines()
-                        if l.startswith('data:')
+                        line[len('data:'):].strip()
+                        for line in body.splitlines()
+                        if line.startswith('data:')
                     ]
                     return json.loads(lines[-1]) if lines else {}
                 return json.loads(body) if body.strip() else {}

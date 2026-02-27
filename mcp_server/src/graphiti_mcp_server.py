@@ -168,8 +168,8 @@ def _resolve_effective_group_ids(
     effective_group_ids: list[str] = []
     invalid_aliases: list[str] = []
 
-    # 1) Explicit group_ids has highest precedence
-    if group_ids:
+    # 1) Explicit group_ids has highest precedence (including explicit empty list)
+    if group_ids is not None:
         effective_group_ids = _unique_preserve_order(group_ids)
 
     # 2) Resolve lane aliases (if provided)
@@ -743,8 +743,11 @@ async def search_nodes(
             node_labels=entity_types,
         )
 
+        # Apply defense-in-depth cap before building backend search config.
+        effective_max_nodes = min(max_nodes, _MAX_NODES_CAP)
+
         # Build mode-specific search config (trust-aware)
-        search_config = _build_node_search_config(normalized_mode, max_nodes)
+        search_config = _build_node_search_config(normalized_mode, effective_max_nodes)
 
         results = await client.search_(
             query=query,
@@ -753,10 +756,6 @@ async def search_nodes(
             search_filter=search_filters,
         )
 
-        # Validate max_nodes parameter and apply defense-in-depth cap.
-        if max_nodes <= 0:
-            return ErrorResponse(error='max_nodes must be a positive integer')
-        effective_max_nodes = min(max_nodes, _MAX_NODES_CAP)
         nodes = results.nodes[:effective_max_nodes] if results.nodes else []
 
         if not nodes:

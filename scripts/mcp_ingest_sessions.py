@@ -379,10 +379,9 @@ def _fetch_neo4j_messages(limit: int) -> list[dict]:
     effective_limit = min(limit, _NEO4J_FETCH_CEILING)
 
     driver = _neo4j_driver_or_raise()
-    with driver:
-        with driver.session(database=p['database']) as session:
-            rows = session.run(
-                """
+    with driver, driver.session(database=p['database']) as session:
+        rows = session.run(
+            """
                 MATCH (m:Message)
                 WHERE m.graphiti_extracted_at IS NULL
                 RETURN m.message_id AS message_id,
@@ -394,8 +393,8 @@ def _fetch_neo4j_messages(limit: int) -> list[dict]:
                 ORDER BY m.created_at ASC, m.message_id ASC
                 LIMIT $n
                 """,
-                {'n': effective_limit},
-            ).data()
+            {'n': effective_limit},
+        ).data()
 
     return [
         {
@@ -419,13 +418,12 @@ def _mark_neo4j_extracted(message_ids: list[str]) -> None:
     now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     driver = _neo4j_driver_or_raise()
-    with driver:
-        with driver.session(database=p['database']) as session:
-            session.run(
-                'MATCH (m:Message) WHERE m.message_id IN $ids '
-                'SET m.graphiti_extracted_at = $ts',
-                {'ids': list(message_ids), 'ts': now},
-            ).consume()
+    with driver, driver.session(database=p['database']) as session:
+        session.run(
+            'MATCH (m:Message) WHERE m.message_id IN $ids '
+            'SET m.graphiti_extracted_at = $ts',
+            {'ids': list(message_ids), 'ts': now},
+        ).consume()
 
 
 def _build_episode_body(message_ids: list[str], messages_by_id: dict[str, dict]) -> str:
@@ -536,12 +534,11 @@ def _query_neo4j_message_count(args: argparse.Namespace) -> int:
             auth=(user, password),
             connection_timeout=10,
             max_connection_lifetime=30,
-        ) as driver:
-            with driver.session(database=database) as session:
-                rec = session.run('MATCH (m:Message) RETURN count(m) AS cnt').single()
-                if rec is None:
-                    return 0
-                return int(rec.get('cnt', 0) or 0)
+        ) as driver, driver.session(database=database) as session:
+            rec = session.run('MATCH (m:Message) RETURN count(m) AS cnt').single()
+            if rec is None:
+                return 0
+            return int(rec.get('cnt', 0) or 0)
     except Exception as exc:
         print(f'WARNING: Could not query Neo4j message count ({type(exc).__name__})', file=sys.stderr)
         return -1
@@ -904,7 +901,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 print(f'  would send chunk {chunk_id} ({len(message_ids_preview)} msg(s)) to MCP')
             if len(pending_ids) > 10:
                 print(f'  … and {len(pending_ids) - 10} more pending chunk(s)')
-            print(f'DRY RUN: no claim state was modified.')
+            print('DRY RUN: no claim state was modified.')
             return
 
         conn = init_claim_db(claim_db_path)

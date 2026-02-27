@@ -8,9 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 # Ensure repo root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -339,8 +337,9 @@ class TestQuarantineOnMalformedTimestamp(unittest.TestCase):
     """parse_session_messages quarantines messages with malformed timestamps."""
 
     def test_malformed_timestamp_quarantined(self):
-        import tempfile
         import os
+        import tempfile
+
         from scripts.import_transcripts_to_neo4j import parse_session_messages
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
@@ -372,8 +371,9 @@ class TestQuarantineOnMalformedTimestamp(unittest.TestCase):
             os.unlink(tmp_path)
 
     def test_absent_timestamp_allowed(self):
-        import tempfile
         import os
+        import tempfile
+
         from scripts.import_transcripts_to_neo4j import parse_session_messages
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
