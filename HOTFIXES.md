@@ -31,15 +31,24 @@ Because the velocity of upstream `getzep/graphiti` is high, we track explicit pa
   - **constrained_soft**: ontology-conformant mode using dedicated prompt branches
     (not appended to permissive prompt — avoids conflicting directives) plus
     code-level enforcement after LLM extraction:
+    - `_normalize_relation_type()`: normalize LLM relation type output to
+      SCREAMING_SNAKE_CASE (trim whitespace, spaces/hyphens → underscores, uppercase)
+      before any ontology comparison — catches mixed-case/spaced LLM variants.
     - `_canonicalize_edge_name()`: snap near-miss relation types to ontology names
-      using difflib SequenceMatcher (threshold ≥ 0.78).
+      using difflib SequenceMatcher (threshold ≥ 0.78) on normalized form.
+      Negation polarity guard prevents canonicalization from flipping NOT_* to
+      non-NOT_* names (and vice versa) to avoid semantic inversions.
     - `_should_filter_constrained_edge()`: drop generic off-ontology edges
-      (RELATES_TO, MENTIONS, IS_RELATED_TO, etc.).
+      (RELATES_TO, MENTIONS, IS_RELATED_TO, etc.) using case-insensitive
+      normalized comparison.
+    - Node strictness: in constrained_soft mode with custom ontology types present,
+      entities whose type resolves to the generic Entity fallback (type_id=0 or
+      invalid) are dropped post-extraction. Logged with dropped count.
 - Files:
-  - `graphiti_core/prompts/extract_edges.py` — mode-specific prompt dispatch (`_edge_permissive`, `_edge_constrained_soft`)
-  - `graphiti_core/prompts/extract_nodes.py` — mode-specific prompt dispatch for all episode types
+  - `graphiti_core/prompts/extract_edges.py` — mode-specific prompt dispatch (`_edge_permissive`, `_edge_constrained_soft`); LANE_INTENT references marked "if provided"
+  - `graphiti_core/prompts/extract_nodes.py` — mode-specific prompt dispatch for all episode types; LANE_INTENT references marked "if provided"
   - `graphiti_core/utils/maintenance/edge_operations.py` — enforcement helpers + extraction_mode param
-  - `graphiti_core/utils/maintenance/node_operations.py` — extraction_mode param thread
+  - `graphiti_core/utils/maintenance/node_operations.py` — extraction_mode param thread + node strictness filter
   - `graphiti_core/graphiti.py` — extraction_mode param in add_episode + _extract_and_resolve_edges
 - Rationale: Permissive extraction creates noise in ontology lanes (RELATES_TO edges, near-miss
   edge names). Code enforcement is more reliable than prompt-only guidance, which is subject to

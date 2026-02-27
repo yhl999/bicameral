@@ -55,6 +55,8 @@ logger = logging.getLogger(__name__)
 # Generic connector relation types that carry no domain-specific signal.
 # In constrained_soft mode, edges with these relation_types that have no
 # ontology match are dropped after LLM extraction.
+# All names are stored in SCREAMING_SNAKE_CASE; comparison uses normalized form
+# so mixed-case / spaced variants from the LLM (e.g. 'relates to') are caught.
 _GENERIC_EDGE_NAMES: frozenset[str] = frozenset({
     'RELATES_TO',
     'IS_RELATED_TO',
@@ -76,6 +78,21 @@ _GENERIC_EDGE_NAMES: frozenset[str] = frozenset({
 _CANONICALIZE_THRESHOLD: float = 0.78
 
 
+def _normalize_relation_type(relation_type: str) -> str:
+    """Normalize a relation type string to SCREAMING_SNAKE_CASE for comparison.
+
+    Performs three transforms:
+    1. Strip surrounding whitespace.
+    2. Convert spaces and hyphens to underscores.
+    3. Uppercase everything.
+
+    This ensures that LLM outputs like ``'relates_to'``, ``'Relates To'``, or
+    ``'relates-to'`` all compare equal to the canonical ``'RELATES_TO'`` entry
+    in the ontology / noise filter, without requiring an exact-case match.
+    """
+    return relation_type.strip().replace(' ', '_').replace('-', '_').upper()
+
+
 def _canonicalize_edge_name(
     relation_type: str,
     ontology_names: frozenset[str],
@@ -83,9 +100,15 @@ def _canonicalize_edge_name(
 ) -> str:
     """Snap a near-miss relation_type to the closest ontology name.
 
-    If the best similarity ratio is below *threshold*, returns *relation_type*
-    unchanged.  Only exact-match or high-similarity (≥ threshold) names are
-    canonicalised so we don't over-correct specific domain relations.
+    Normalizes the input to SCREAMING_SNAKE_CASE before comparison so that
+    LLM variants with different casing or separators are handled consistently.
+    If the best similarity ratio is below *threshold*, returns the *normalized*
+    form of the original (not an ontology name).  Only exact-match or
+    high-similarity (≥ threshold) names are canonicalised.
+
+    A negation polarity guard prevents canonicalization from flipping the
+    semantic polarity: a ``NOT_*`` relation will never be snapped to a non-
+    ``NOT_*`` ontology name (and vice versa).
 
     Parameters
     ----------
@@ -99,20 +122,43 @@ def _canonicalize_edge_name(
     Returns
     -------
     str
-        Canonical name if a close match exists, otherwise the original.
+        Canonical ontology name if a close match exists; otherwise the
+        normalized (SCREAMING_SNAKE_CASE) form of the original input.
     """
-    if not ontology_names or relation_type in ontology_names:
-        return relation_type
+    # Normalize first — ensures consistent casing for all subsequent comparisons.
+    normalized = _normalize_relation_type(relation_type)
 
-    best_name = relation_type
+    if not ontology_names or normalized in ontology_names:
+        # Exact match after normalization (or no ontology to check).
+        if normalized != relation_type:
+            logger.info(
+                'constrained_soft: canonicalized edge %r → %r (normalization)',
+                relation_type,
+                normalized,
+            )
+        return normalized
+
+    best_name = normalized
     best_ratio = 0.0
     for canonical in ontology_names:
-        ratio = SequenceMatcher(None, relation_type, canonical).ratio()
+        ratio = SequenceMatcher(None, normalized, canonical).ratio()
         if ratio > best_ratio:
             best_ratio = ratio
             best_name = canonical
 
     if best_ratio >= threshold:
+        # Negation polarity guard: never snap across the NOT_ boundary.
+        # e.g., NOT_RELATED_TO must not be canonicalized to RELATED_TO.
+        original_is_negated = normalized.startswith('NOT_')
+        candidate_is_negated = best_name.startswith('NOT_')
+        if original_is_negated != candidate_is_negated:
+            logger.debug(
+                'constrained_soft: polarity guard blocked %r → %r (NOT_ boundary mismatch)',
+                normalized,
+                best_name,
+            )
+            return normalized  # keep normalized form; do not flip polarity
+
         if best_name != relation_type:
             logger.info(
                 'constrained_soft: canonicalized edge %r → %r (ratio=%.2f)',
@@ -122,7 +168,8 @@ def _canonicalize_edge_name(
             )
         return best_name
 
-    return relation_type
+    # No close ontology match — return the normalized form so casing is consistent.
+    return normalized
 
 
 def _should_filter_constrained_edge(
@@ -133,20 +180,27 @@ def _should_filter_constrained_edge(
 
     Drops edges only when ALL of the following hold:
     - The relation_type is NOT in the ontology (no exact/near-miss match was applied).
-    - The relation_type is a known generic/connector type that adds no signal.
+    - The normalized relation_type is a known generic/connector type with no signal.
+
+    Comparison is performed on the normalized (SCREAMING_SNAKE_CASE) form so
+    that mixed-case LLM outputs like ``'relates to'`` or ``'Mentions'`` are
+    caught by the filter even if the caller did not pre-normalize.
 
     Keeps domain-specific off-ontology edges (they may still carry value).
 
     Parameters
     ----------
     relation_type:
-        Post-canonicalization relation type string.
+        Post-canonicalization relation type string (may already be normalized).
     ontology_names:
         Set of canonical relation type names from the lane ontology.
     """
-    if relation_type in ontology_names:
+    # Normalize defensively — callers may pass already-normalized strings, no-op then.
+    normalized = _normalize_relation_type(relation_type)
+
+    if normalized in ontology_names:
         return False  # ontology match → keep
-    if relation_type in _GENERIC_EDGE_NAMES:
+    if normalized in _GENERIC_EDGE_NAMES:
         logger.debug(
             'constrained_soft: dropping generic off-ontology edge %r',
             relation_type,

@@ -171,7 +171,7 @@ def _extract_message_constrained_soft(context: dict[str, Any]) -> list[Message]:
 Instructions:
 
 Extract entity nodes from the CURRENT MESSAGE that match the ENTITY TYPES above.
-Focus on entities relevant to the LANE_INTENT.
+Focus on entities relevant to the LANE_INTENT (if provided).
 
 1. **Speaker Extraction**: Extract the speaker (before the colon) as an entity if it matches a defined type.
 2. **Entity Identification**: Only extract entities that clearly match one of the ENTITY TYPES.
@@ -256,7 +256,7 @@ def _extract_json_constrained_soft(context: dict[str, Any]) -> list[Message]:
 </JSON>
 {lane_intent_section}
 Extract entities from the JSON that match the ENTITY TYPES above.
-Focus on entities relevant to the LANE_INTENT.
+Focus on entities relevant to the LANE_INTENT (if provided).
 
 Guidelines:
 1. Only extract entities that clearly match one of the defined ENTITY TYPES.
@@ -333,7 +333,7 @@ def _extract_text_constrained_soft(context: dict[str, Any]) -> list[Message]:
 {context['episode_content']}
 </TEXT>
 {lane_intent_section}
-Extract entities from the TEXT that match the ENTITY TYPES above and are relevant to the LANE_INTENT.
+Extract entities from the TEXT that match the ENTITY TYPES above and are relevant to the LANE_INTENT (if provided).
 
 Guidelines:
 1. Only extract entities that clearly match one of the defined ENTITY TYPES.

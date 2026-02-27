@@ -401,3 +401,211 @@ class TestResolveOntologyFourTuple:
         profile = registry.get('unknown_lane')
         assert profile is None
         # resolve_ontology would return 'permissive' as the default
+
+
+# ---------------------------------------------------------------------------
+# New hardening tests (normalization, negation guard, node strictness)
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeNormalization:
+    """Test _normalize_relation_type helper."""
+
+    def setup_method(self):
+        from graphiti_core.utils.maintenance.edge_operations import _normalize_relation_type
+        self._normalize = _normalize_relation_type
+
+    def test_uppercase_unchanged(self):
+        assert self._normalize('RELATES_TO') == 'RELATES_TO'
+
+    def test_lowercase_uppercased(self):
+        assert self._normalize('relates_to') == 'RELATES_TO'
+
+    def test_mixed_case_uppercased(self):
+        assert self._normalize('Relates_To') == 'RELATES_TO'
+
+    def test_spaces_converted_to_underscores(self):
+        assert self._normalize('relates to') == 'RELATES_TO'
+
+    def test_hyphens_converted_to_underscores(self):
+        assert self._normalize('relates-to') == 'RELATES_TO'
+
+    def test_leading_trailing_whitespace_stripped(self):
+        assert self._normalize('  RELATES_TO  ') == 'RELATES_TO'
+
+    def test_mixed_separators(self):
+        assert self._normalize('uses-move here') == 'USES_MOVE_HERE'
+
+
+class TestEdgeCanonicalizationHardening:
+    """Test hardened _canonicalize_edge_name: normalization + negation guard."""
+
+    def setup_method(self):
+        from graphiti_core.utils.maintenance.edge_operations import _canonicalize_edge_name
+        self._canonicalize = _canonicalize_edge_name
+
+    def test_lowercase_input_normalized_and_matched(self):
+        """Lowercase 'uses_move' should normalize and exact-match USES_MOVE."""
+        names = frozenset({'USES_MOVE', 'OPENS_WITH'})
+        result = self._canonicalize('uses_move', names)
+        assert result == 'USES_MOVE'
+
+    def test_hyphenated_input_normalized_and_matched(self):
+        """'uses-move' should normalize to USES_MOVE and exact-match."""
+        names = frozenset({'USES_MOVE', 'OPENS_WITH'})
+        result = self._canonicalize('uses-move', names)
+        assert result == 'USES_MOVE'
+
+    def test_spaced_input_normalized_and_matched(self):
+        """'opens with' should normalize and match OPENS_WITH."""
+        names = frozenset({'USES_MOVE', 'OPENS_WITH'})
+        result = self._canonicalize('opens with', names)
+        assert result == 'OPENS_WITH'
+
+    def test_negation_guard_blocks_not_to_non_not(self):
+        """NOT_RELATED should NOT be snapped to RELATED (polarity flip blocked)."""
+        names = frozenset({'RELATED', 'CONNECTED'})
+        result = self._canonicalize('NOT_RELATED', names)
+        # Should return normalized form (NOT_RELATED), not RELATED
+        assert result == 'NOT_RELATED'
+
+    def test_negation_guard_blocks_non_not_to_not(self):
+        """RELATED should NOT be snapped to NOT_RELATED (polarity flip blocked)."""
+        names = frozenset({'NOT_RELATED', 'NOT_CONNECTED'})
+        result = self._canonicalize('RELATED', names)
+        # Should return normalized form (RELATED), not NOT_RELATED
+        assert result == 'RELATED'
+
+    def test_not_to_not_allowed(self):
+        """NOT_USES_MOVE close to NOT_USES_MOVES should be permitted (same polarity)."""
+        names = frozenset({'NOT_USES_MOVES', 'USES_MOVE'})
+        result = self._canonicalize('NOT_USES_MOVE', names)
+        # Both NOT_ → snap is allowed
+        assert result == 'NOT_USES_MOVES'
+
+
+class TestNoiseFilterHardening:
+    """Test case-insensitive noise filter via normalized comparison."""
+
+    def setup_method(self):
+        from graphiti_core.utils.maintenance.edge_operations import _should_filter_constrained_edge
+        self._filter = _should_filter_constrained_edge
+
+    def test_lowercase_generic_filtered(self):
+        """'relates_to' (lowercase) should still be caught as generic noise."""
+        names = frozenset({'USES_MOVE'})
+        assert self._filter('relates_to', names) is True
+
+    def test_mixed_case_generic_filtered(self):
+        """'Mentions' should normalize to MENTIONS and be filtered."""
+        names = frozenset({'USES_MOVE'})
+        assert self._filter('Mentions', names) is True
+
+    def test_spaced_generic_filtered(self):
+        """'relates to' should normalize to RELATES_TO and be filtered."""
+        names = frozenset({'USES_MOVE'})
+        assert self._filter('relates to', names) is True
+
+    def test_hyphenated_generic_filtered(self):
+        """'is-related-to' should normalize to IS_RELATED_TO and be filtered."""
+        names = frozenset({'USES_MOVE'})
+        assert self._filter('is-related-to', names) is True
+
+    def test_specific_lowercase_off_ontology_allowed(self):
+        """Specific domain edge not in generic list should be kept even if lowercase."""
+        names = frozenset({'USES_MOVE'})
+        assert self._filter('wrote_in_response_to', names) is False
+
+
+class TestConstrainedSoftNodeStrictness:
+    """Test that constrained_soft mode drops generic Entity nodes."""
+
+    def _make_entity_types_context(self, with_custom: bool):
+        base = [{'entity_type_id': 0, 'entity_type_name': 'Entity', 'entity_type_description': 'Default.'}]
+        if with_custom:
+            base.append({'entity_type_id': 1, 'entity_type_name': 'RhetoricalMove', 'entity_type_description': 'A technique.'})
+        return base
+
+    def test_constrained_soft_drops_generic_entity_nodes(self):
+        """In constrained_soft mode with custom ontology, generic Entity nodes should be dropped."""
+        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
+        from graphiti_core.prompts.extract_nodes import ExtractedEntity
+        from graphiti_core.nodes import EpisodicNode, EpisodeType
+        from datetime import datetime, timezone
+
+        entity_types_context = self._make_entity_types_context(with_custom=True)
+
+        # Simulate two extracted entities: one generic (type_id=0), one custom (type_id=1)
+        generic = ExtractedEntity(name='SomeEntity', entity_type_id=0)
+        custom = ExtractedEntity(name='ColdOpen', entity_type_id=1)
+
+        episode = EpisodicNode(
+            name='test',
+            group_id='test_group',
+            source=EpisodeType.message,
+            content='test',
+            source_description='test',
+            created_at=datetime.now(timezone.utc),
+            valid_at=datetime.now(timezone.utc),
+        )
+
+        nodes = _create_entity_nodes([generic, custom], entity_types_context, None, episode)
+        # Both are created by _create_entity_nodes (no filtering there)
+        assert len(nodes) == 2
+
+        # Now simulate the post-filter in extract_nodes (constrained_soft mode)
+        filtered = [n for n in nodes if any(label != 'Entity' for label in n.labels)]
+        assert len(filtered) == 1
+        assert any('RhetoricalMove' in n.labels for n in filtered)
+
+    def test_permissive_keeps_all_nodes(self):
+        """In permissive mode, generic Entity nodes should be kept."""
+        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
+        from graphiti_core.prompts.extract_nodes import ExtractedEntity
+        from graphiti_core.nodes import EpisodicNode, EpisodeType
+        from datetime import datetime, timezone
+
+        entity_types_context = self._make_entity_types_context(with_custom=True)
+
+        generic = ExtractedEntity(name='SomeEntity', entity_type_id=0)
+        custom = ExtractedEntity(name='ColdOpen', entity_type_id=1)
+
+        episode = EpisodicNode(
+            name='test',
+            group_id='test_group',
+            source=EpisodeType.message,
+            content='test',
+            source_description='test',
+            created_at=datetime.now(timezone.utc),
+            valid_at=datetime.now(timezone.utc),
+        )
+
+        nodes = _create_entity_nodes([generic, custom], entity_types_context, None, episode)
+        # In permissive mode, no post-filter applied — all nodes kept
+        assert len(nodes) == 2
+
+    def test_constrained_soft_no_custom_types_keeps_all(self):
+        """When no custom ontology types, constrained_soft should not drop nodes."""
+        from graphiti_core.utils.maintenance.node_operations import _create_entity_nodes
+        from graphiti_core.prompts.extract_nodes import ExtractedEntity
+        from graphiti_core.nodes import EpisodicNode, EpisodeType
+        from datetime import datetime, timezone
+
+        # Only the base Entity type — len(entity_types_context) == 1
+        entity_types_context = self._make_entity_types_context(with_custom=False)
+
+        generic = ExtractedEntity(name='SomeEntity', entity_type_id=0)
+
+        episode = EpisodicNode(
+            name='test',
+            group_id='test_group',
+            source=EpisodeType.message,
+            content='test',
+            source_description='test',
+            created_at=datetime.now(timezone.utc),
+            valid_at=datetime.now(timezone.utc),
+        )
+
+        nodes = _create_entity_nodes([generic], entity_types_context, None, episode)
+        # No custom types → constrained_soft guard condition (len > 1) is False → keep all
+        assert len(nodes) == 1

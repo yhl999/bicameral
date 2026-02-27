@@ -109,6 +109,23 @@ async def extract_nodes(
         filtered_entities, entity_types_context, excluded_entity_types, episode
     )
 
+    # constrained_soft node strictness: when custom ontology types are present, drop any
+    # node whose type resolved to the generic 'Entity' fallback (type_id=0 or invalid).
+    # This enforces ontology conformance in code rather than relying solely on prompt guidance.
+    # Permissive mode is completely unaffected — no filtering applied there.
+    if extraction_mode == 'constrained_soft' and len(entity_types_context) > 1:
+        strict_nodes = [
+            n for n in extracted_nodes if any(label != 'Entity' for label in n.labels)
+        ]
+        dropped = len(extracted_nodes) - len(strict_nodes)
+        if dropped:
+            logger.info(
+                'constrained_soft: dropped %d generic Entity node(s) '
+                '(type resolved to Entity — no custom ontology type assigned)',
+                dropped,
+            )
+        extracted_nodes = strict_nodes
+
     logger.debug(f'Extracted nodes: {[n.uuid for n in extracted_nodes]}')
     return extracted_nodes
 

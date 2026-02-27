@@ -179,7 +179,7 @@ def _edge_constrained_soft(context: dict[str, Any]) -> list[Message]:
                 'Your primary goal is to extract fact triples that conform to the defined FACT_TYPES '
                 'for this lane. '
                 '1. Strongly prefer relationship types from FACT_TYPES over generic labels. '
-                '2. Only extract relationships that are semantically meaningful for the lane described in LANE_INTENT. '
+                '2. Only extract relationships that are semantically meaningful for the lane described in LANE_INTENT (if provided). '
                 '3. Omit generic connector relations (e.g., RELATES_TO, MENTIONS, IS_RELATED_TO) that have no specific ontology match. '
                 '4. Extracted fact triples should include relevant date information. '
                 '5. Treat the CURRENT TIME as the time the CURRENT MESSAGE was sent.'
@@ -205,7 +205,7 @@ def _edge_constrained_soft(context: dict[str, Any]) -> list[Message]:
 </REFERENCE_TIME>
 {edge_types_section}{lane_intent_section}
 # TASK
-Extract factual relationships between the given ENTITIES that are relevant to the LANE_INTENT above.
+Extract factual relationships between the given ENTITIES that are relevant to the LANE_INTENT above (if provided).
 Focus on relationships that align with the FACT_TYPES. Do NOT extract generic or off-topic relationships.
 
 Only extract facts that:

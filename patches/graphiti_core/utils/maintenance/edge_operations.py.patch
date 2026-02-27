@@ -1,16 +1,18 @@
 diff --git a/graphiti_core/utils/maintenance/edge_operations.py b/graphiti_core/utils/maintenance/edge_operations.py
-index 9b7186c..67754d9 100644
+index 18e384e..67754d9 100644
 --- a/graphiti_core/utils/maintenance/edge_operations.py
 +++ b/graphiti_core/utils/maintenance/edge_operations.py
-@@ -16,6 +16,7 @@ limitations under the License.
+@@ -16,7 +16,9 @@ limitations under the License.
  
  import logging
  from datetime import datetime
 +from difflib import SequenceMatcher
  from time import time
- from typing import Literal
++from typing import Literal
  
-@@ -47,6 +48,112 @@ from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exac
+ from pydantic import BaseModel
+ from typing_extensions import LiteralString
+@@ -46,6 +48,112 @@ from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exac
  
  logger = logging.getLogger(__name__)
  
@@ -123,7 +125,7 @@ index 9b7186c..67754d9 100644
  
  def build_episodic_edges(
      entity_nodes: list[EntityNode],
-@@ -95,7 +202,18 @@ async def extract_edges(
+@@ -94,7 +202,18 @@ async def extract_edges(
      group_id: str = '',
      edge_types: dict[str, type[BaseModel]] | None = None,
      custom_extraction_instructions: str | None = None,
@@ -142,7 +144,7 @@ index 9b7186c..67754d9 100644
      start = time()
  
      extract_edges_max_tokens = 16384
-@@ -135,6 +253,7 @@ async def extract_edges(
+@@ -134,6 +253,7 @@ async def extract_edges(
          'reference_time': episode.valid_at,
          'edge_types': edge_types_context,
          'custom_extraction_instructions': custom_extraction_instructions or '',
@@ -150,7 +152,7 @@ index 9b7186c..67754d9 100644
      }
  
      llm_response = await llm_client.generate_response(
-@@ -169,6 +288,39 @@ async def extract_edges(
+@@ -168,6 +288,39 @@ async def extract_edges(
  
          edges_data.append(edge_data)
  
@@ -190,3 +192,132 @@ index 9b7186c..67754d9 100644
      end = time()
      logger.debug(f'Extracted {len(edges_data)} new edges in {(end - start) * 1000:.0f} ms')
  
+@@ -241,6 +394,7 @@ async def resolve_extracted_edges(
+     entities: list[EntityNode],
+     edge_types: dict[str, type[BaseModel]],
+     edge_type_map: dict[tuple[str, str], list[str]],
++    dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
+ ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
+     """Resolve extracted edges against existing graph context.
+ 
+@@ -373,26 +527,47 @@ async def resolve_extracted_edges(
+         edge_types_lst.append(extracted_edge_types)
+ 
+     # resolve edges with related edges in the graph and find invalidation candidates
++    # Keep semantic mode call signature backward-compatible for test monkeypatches.
++    if dedupe_mode == 'semantic':
++        resolve_coros = [
++            resolve_extracted_edge(
++                llm_client,
++                extracted_edge,
++                related_edges,
++                existing_edges,
++                episode,
++                extracted_edge_types,
++            )
++            for extracted_edge, related_edges, existing_edges, extracted_edge_types in zip(
++                extracted_edges,
++                related_edges_lists,
++                edge_invalidation_candidates,
++                edge_types_lst,
++                strict=True,
++            )
++        ]
++    else:
++        resolve_coros = [
++            resolve_extracted_edge(
++                llm_client,
++                extracted_edge,
++                related_edges,
++                existing_edges,
++                episode,
++                extracted_edge_types,
++                dedupe_mode=dedupe_mode,
++            )
++            for extracted_edge, related_edges, existing_edges, extracted_edge_types in zip(
++                extracted_edges,
++                related_edges_lists,
++                edge_invalidation_candidates,
++                edge_types_lst,
++                strict=True,
++            )
++        ]
++
+     results: list[tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]] = list(
+-        await semaphore_gather(
+-            *[
+-                resolve_extracted_edge(
+-                    llm_client,
+-                    extracted_edge,
+-                    related_edges,
+-                    existing_edges,
+-                    episode,
+-                    extracted_edge_types,
+-                )
+-                for extracted_edge, related_edges, existing_edges, extracted_edge_types in zip(
+-                    extracted_edges,
+-                    related_edges_lists,
+-                    edge_invalidation_candidates,
+-                    edge_types_lst,
+-                    strict=True,
+-                )
+-            ]
+-        )
++        await semaphore_gather(*resolve_coros)
+     )
+ 
+     resolved_edges: list[EntityEdge] = []
+@@ -467,6 +642,7 @@ async def resolve_extracted_edge(
+     existing_edges: list[EntityEdge],
+     episode: EpisodicNode,
+     edge_type_candidates: dict[str, type[BaseModel]] | None = None,
++    dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
+ ) -> tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]:
+     """Resolve an extracted edge against existing graph context.
+ 
+@@ -524,6 +700,36 @@ async def resolve_extracted_edge(
+                 resolved.episodes.append(episode.uuid)
+             return resolved, [], []
+ 
++    # Migration-only deterministic dedupe mode:
++    # Skip LLM duplicate/contradiction resolution and keep exact-match-only behavior.
++    # This mode is intended for controlled backfills where semantic dedupe may be unstable.
++    if dedupe_mode == 'deterministic':
++        resolved_edge = extracted_edge
++
++        # Preserve optional structured attribute extraction for allowed edge types.
++        edge_model = edge_type_candidates.get(resolved_edge.name) if edge_type_candidates else None
++        if edge_model is not None and len(edge_model.model_fields) != 0 and episode is not None:
++            edge_attributes_context = {
++                'episode_content': episode.content,
++                'reference_time': episode.valid_at,
++                'fact': resolved_edge.fact,
++            }
++            edge_attributes_response = await llm_client.generate_response(
++                prompt_library.extract_edges.extract_attributes(edge_attributes_context),
++                response_model=edge_model,  # type: ignore
++                model_size=ModelSize.small,
++                prompt_name='extract_edges.extract_attributes',
++            )
++            resolved_edge.attributes = edge_attributes_response
++        else:
++            resolved_edge.attributes = {}
++
++        logger.info(
++            'resolve_extracted_edge: dedupe_mode=deterministic, skipping semantic dedupe for edge %s',
++            resolved_edge.name,
++        )
++        return resolved_edge, [], []
++
+     start = time()
+ 
+     # Prepare context for LLM with continuous indexing
+@@ -628,7 +834,7 @@ async def resolve_extracted_edge(
+ 
+     end = time()
+     logger.debug(
+-        f'Resolved Edge: {extracted_edge.uuid} -> {resolved_edge.uuid}, in {(end - start) * 1000} ms'
++        f'Resolved Edge: {extracted_edge.name} is {resolved_edge.name}, in {(end - start) * 1000} ms'
+     )
+ 
+     now = utc_now()
