@@ -2,9 +2,17 @@
 #
 # Maps group_id → lane-specific extraction ontology.
 # Each lane defines:
-#   entity_types  — what kinds of entities to extract
+#   entity_types      — what kinds of entities to extract
 #   relationship_types — what edges connect those entities
-#   extraction_emphasis — free-text prompt guidance for the LLM extractor
+#   intent_guidance   — per-lane LLM focus instructions (canonical field)
+#   extraction_mode   — 'permissive' (default) or 'constrained_soft'
+#   extraction_emphasis — legacy alias for intent_guidance (still works)
+#
+# Extraction modes:
+#   permissive (default): extract broadly; all relation types allowed.
+#   constrained_soft: ontology-conformant mode — uses dedicated prompt
+#     branches and code-level edge canonicalization + noise filtering.
+#     Use for high-fidelity domain extraction where generic edges add noise.
 #
 # group_ids not listed here fall back to the default entity types
 # configured in your GraphitiConfig (graphiti.entity_types).
@@ -15,10 +23,11 @@
 schema_version: 1
 
 # ─────────────────────────────────────────────────────────────────────
-# Lane 1: Customer Support Tickets
+# Lane 1: Customer Support Tickets  [permissive — default]
 # ─────────────────────────────────────────────────────────────────────
 customer_support_tickets:
-  extraction_emphasis: >
+  # extraction_mode: permissive  # this is the default; omit if permissive
+  intent_guidance: >
     Focus on extracting the customer's core problem, the product
     features involved, resolution steps taken, and whether the issue
     was resolved or escalated. Prioritize actionable patterns over
@@ -143,3 +152,56 @@ engineering_incidents:
 
     - name: CONTRIBUTED_TO
       description: "ToolApiBehavior → IncidentReport"
+
+# ─────────────────────────────────────────────────────────────────────
+# Lane 4: Content Inspiration  [constrained_soft — ontology-conformant]
+#
+# Use constrained_soft when:
+# - The graph should closely mirror a defined domain model
+# - Generic edges (RELATES_TO, MENTIONS, etc.) would add noise
+# - Near-miss edge names need snapping to canonical names
+# ─────────────────────────────────────────────────────────────────────
+content_inspiration:
+  extraction_mode: constrained_soft
+
+  intent_guidance: >
+    Focus on rhetorical techniques, structural patterns, and voice qualities.
+    Extract what makes content distinctive — specific moves, patterns, and
+    characteristics. Do NOT extract generic topic nodes or off-topic relationships.
+    Conform strictly to the defined FACT_TYPES: USES_MOVE, OPENS_WITH, EXHIBITS.
+    Do not emit RELATES_TO, MENTIONS, IS_RELATED_TO, or other generic connectors.
+
+  entity_types:
+    - name: RhetoricalMove
+      description: >
+        A specific writing or presentation technique (e.g. cold open with
+        absurd analogy, one-liner callback, dialectical pivot). Extract the
+        technique name and a short description of how it's used.
+
+    - name: HookPattern
+      description: >
+        A first-line or opening strategy (e.g. provocative question, contrarian
+        statement, unexpected juxtaposition). Focus on the structural opening
+        technique, not the topic.
+
+    - name: VoiceQuality
+      description: >
+        A tone or register characteristic (e.g. irreverent-casual,
+        deadpan-authoritative, erudite-compressed). Extract only when
+        clearly evident from the writing style.
+
+  relationship_types:
+    - name: USES_MOVE
+      description: "Content piece → RhetoricalMove it employs"
+
+    - name: OPENS_WITH
+      description: "Content piece → HookPattern used as the opening"
+
+    - name: EXHIBITS
+      description: "Content piece → VoiceQuality it demonstrates"
+
+# Note on constrained_soft code enforcement:
+# After LLM extraction, two passes run automatically:
+# 1. Near-miss canonicalization: "USE_MOVE" → "USES_MOVE" (difflib ≥ 0.78)
+# 2. Generic noise filter: RELATES_TO, MENTIONS, etc. → dropped
+# Domain-specific off-ontology edges (e.g. WRITTEN_IN_RESPONSE_TO) are kept.

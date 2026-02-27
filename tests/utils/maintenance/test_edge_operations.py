@@ -557,3 +557,52 @@ def test_edge_type_signatures_map_single_signature_still_works():
         assert 'fact_type_signatures' in ctx
         assert isinstance(ctx['fact_type_signatures'], list)
         assert len(ctx['fact_type_signatures']) == 1
+
+
+# ---------------------------------------------------------------------------
+# Punctuation-bypass hardening tests (normalize + filter with non-alnum chars)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_caret_separator():
+    """RELATES^TO must normalize to RELATES_TO (caret bypass closed)."""
+    from graphiti_core.utils.maintenance.edge_operations import _normalize_relation_type
+    assert _normalize_relation_type('RELATES^TO') == 'RELATES_TO'
+
+
+def test_normalize_trailing_dot():
+    """MENTIONS. (trailing dot) must normalize to MENTIONS."""
+    from graphiti_core.utils.maintenance.edge_operations import _normalize_relation_type
+    assert _normalize_relation_type('MENTIONS.') == 'MENTIONS'
+
+
+def test_normalize_mixed_punctuation():
+    """RELATES^.TO with consecutive non-alnum chars collapses to RELATES_TO."""
+    from graphiti_core.utils.maintenance.edge_operations import _normalize_relation_type
+    assert _normalize_relation_type('RELATES^.TO') == 'RELATES_TO'
+
+
+def test_noise_filter_caret_variant():
+    """'RELATES^TO' should be caught by the noise filter (normalizes to RELATES_TO)."""
+    from graphiti_core.utils.maintenance.edge_operations import _should_filter_constrained_edge
+    assert _should_filter_constrained_edge('RELATES^TO', frozenset({'USES_MOVE'})) is True
+
+
+def test_noise_filter_trailing_dot_variant():
+    """'MENTIONS.' should be caught by the noise filter (normalizes to MENTIONS)."""
+    from graphiti_core.utils.maintenance.edge_operations import _should_filter_constrained_edge
+    assert _should_filter_constrained_edge('MENTIONS.', frozenset({'USES_MOVE'})) is True
+
+
+def test_noise_filter_mixed_punctuation_variant():
+    """'IS^RELATED.TO' should be caught by the noise filter."""
+    from graphiti_core.utils.maintenance.edge_operations import _should_filter_constrained_edge
+    assert _should_filter_constrained_edge('IS^RELATED.TO', frozenset({'USES_MOVE'})) is True
+
+
+def test_canonicalize_caret_variant_snaps_to_ontology():
+    """'USES^MOVE' should normalize and snap to USES_MOVE in the ontology."""
+    from graphiti_core.utils.maintenance.edge_operations import _canonicalize_edge_name
+    names = frozenset({'USES_MOVE', 'OPENS_WITH'})
+    result = _canonicalize_edge_name('USES^MOVE', names)
+    assert result == 'USES_MOVE'

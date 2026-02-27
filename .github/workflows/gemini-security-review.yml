@@ -22,18 +22,25 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          if [ -z "$GEMINI_API_KEY" ]; then
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "GEMINI_API_KEY not found. Skipping."
-            exit 0
-          fi
-          # Check if fork PR (secrets are generally not available)
+          # Check fork status FIRST — fork PRs don't have access to repo secrets,
+          # so the API key will always be empty for forks regardless of repo config.
+          # Detect early and emit a clear, informative skip message.
           if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.event.pull_request.base.repo.full_name }}" ]; then
             echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "Fork PR detected. Skipping security review securely."
+            echo "skip_reason=fork_pr" >> $GITHUB_OUTPUT
+            echo "ℹ️  Fork PR detected — Gemini security review skipped (secrets not available for fork context)."
+            exit 0
+          fi
+          # Non-fork: check that GEMINI_API_KEY is actually configured for this repo.
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "skip_reason=missing_key" >> $GITHUB_OUTPUT
+            echo "⚠️  GEMINI_API_KEY secret not configured — Gemini security review skipped."
+            echo "    To enable: add GEMINI_API_KEY to repository secrets."
             exit 0
           fi
           echo "should_run=true" >> $GITHUB_OUTPUT
+          echo "skip_reason=" >> $GITHUB_OUTPUT
 
       - name: Checkout code
         if: steps.gate.outputs.should_run == 'true'
@@ -134,4 +141,17 @@ jobs:
             gh pr comment $PR_NUMBER -F gemini-security.md || echo "Failed to post comment"
           else
             echo "Gemini output was empty."
+          fi
+
+      - name: Report skip (fork or missing key)
+        if: steps.gate.outputs.should_run == 'false'
+        run: |
+          reason="${{ steps.gate.outputs.skip_reason }}"
+          if [ "$reason" = "fork_pr" ]; then
+            echo "✅ Gemini security review skipped: fork PR (secrets unavailable). No action needed."
+          elif [ "$reason" = "missing_key" ]; then
+            echo "✅ Gemini security review skipped: GEMINI_API_KEY not configured."
+            echo "   Add GEMINI_API_KEY to repository secrets to enable automated security scanning."
+          else
+            echo "✅ Gemini security review skipped."
           fi

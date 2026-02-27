@@ -1,0 +1,55 @@
+diff --git a/graphiti_core/utils/maintenance/node_operations.py b/graphiti_core/utils/maintenance/node_operations.py
+index 10f18d2..17d4c00 100644
+--- a/graphiti_core/utils/maintenance/node_operations.py
++++ b/graphiti_core/utils/maintenance/node_operations.py
+@@ -67,8 +67,17 @@ async def extract_nodes(
+     entity_types: dict[str, type[BaseModel]] | None = None,
+     excluded_entity_types: list[str] | None = None,
+     custom_extraction_instructions: str | None = None,
++    extraction_mode: str = 'permissive',
+ ) -> list[EntityNode]:
+-    """Extract entity nodes from an episode."""
++    """Extract entity nodes from an episode.
++
++    Parameters
++    ----------
++    extraction_mode : str
++        Extraction behaviour: ``'permissive'`` (default — extract broadly) or
++        ``'constrained_soft'`` (ontology-conformant — only extract entity types
++        defined for the lane; omit unclassifiable entities).
++    """
+     start = time()
+     llm_client = clients.llm_client
+ 
+@@ -83,6 +92,7 @@ async def extract_nodes(
+         'custom_extraction_instructions': custom_extraction_instructions or '',
+         'entity_types': entity_types_context,
+         'source_description': episode.source_description,
++        'extraction_mode': extraction_mode,
+     }
+ 
+     # Extract entities
+@@ -99,6 +109,23 @@ async def extract_nodes(
+         filtered_entities, entity_types_context, excluded_entity_types, episode
+     )
+ 
++    # constrained_soft node strictness: when custom ontology types are present, drop any
++    # node whose type resolved to the generic 'Entity' fallback (type_id=0 or invalid).
++    # This enforces ontology conformance in code rather than relying solely on prompt guidance.
++    # Permissive mode is completely unaffected — no filtering applied there.
++    if extraction_mode == 'constrained_soft' and len(entity_types_context) > 1:
++        strict_nodes = [
++            n for n in extracted_nodes if any(label != 'Entity' for label in n.labels)
++        ]
++        dropped = len(extracted_nodes) - len(strict_nodes)
++        if dropped:
++            logger.info(
++                'constrained_soft: dropped %d generic Entity node(s) '
++                '(type resolved to Entity — no custom ontology type assigned)',
++                dropped,
++            )
++        extracted_nodes = strict_nodes
++
+     logger.debug(f'Extracted nodes: {[n.uuid for n in extracted_nodes]}')
+     return extracted_nodes
+ 

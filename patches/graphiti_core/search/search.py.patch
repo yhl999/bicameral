@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/search/search.py b/graphiti_core/search/search.py
-index af98f56..c89dea5 100644
+index 973ab51..c89dea5 100644
 --- a/graphiti_core/search/search.py
 +++ b/graphiti_core/search/search.py
 @@ -54,12 +54,14 @@ from graphiti_core.search.search_utils import (
@@ -33,6 +33,15 @@ index af98f56..c89dea5 100644
          ),
          episode_search(
              driver,
+@@ -178,7 +182,7 @@ async def search(
+ 
+     latency = (time() - start) * 1000
+ 
+-    logger.debug(f'search returned context in {latency} ms')
++    logger.debug(f'search returned context for query {query} in {latency} ms')
+ 
+     return results
+ 
 @@ -195,6 +199,7 @@ async def edge_search(
      bfs_origin_node_uuids: list[str] | None = None,
      limit=DEFAULT_SEARCH_LIMIT,

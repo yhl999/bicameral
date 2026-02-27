@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/graphiti.py b/graphiti_core/graphiti.py
-index 619607a..1598850 100644
+index 619607a..dad8007 100644
 --- a/graphiti_core/graphiti.py
 +++ b/graphiti_core/graphiti.py
 @@ -17,6 +17,7 @@ limitations under the License.
@@ -10,11 +10,32 @@ index 619607a..1598850 100644
  from uuid import uuid4
  
  from dotenv import load_dotenv
-@@ -457,16 +458,14 @@ class Graphiti:
+@@ -430,10 +431,18 @@ class Graphiti:
+         previous_episodes: list[EpisodicNode],
+         entity_types: dict[str, type[BaseModel]] | None,
+         excluded_entity_types: list[str] | None,
++        custom_extraction_instructions: str | None = None,
++        extraction_mode: str = 'permissive',
+     ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
+         """Extract nodes from episode and resolve against existing graph."""
+         extracted_nodes = await extract_nodes(
+-            self.clients, episode, previous_episodes, entity_types, excluded_entity_types
++            self.clients,
++            episode,
++            previous_episodes,
++            entity_types,
++            excluded_entity_types,
++            custom_extraction_instructions,
++            extraction_mode,
+         )
+ 
+         nodes, uuid_map, duplicates = await resolve_extracted_nodes(
+@@ -457,16 +466,15 @@ class Graphiti:
          nodes: list[EntityNode],
          uuid_map: dict[str, str],
          custom_extraction_instructions: str | None = None,
 +        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
++        extraction_mode: str = 'permissive',
      ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
          """Extract edges from episode and resolve against existing graph.
  
@@ -29,7 +50,15 @@ index 619607a..1598850 100644
          """
          extracted_edges = await extract_edges(
              self.clients,
-@@ -488,6 +487,7 @@ class Graphiti:
+@@ -477,6 +485,7 @@ class Graphiti:
+             group_id,
+             edge_types,
+             custom_extraction_instructions,
++            extraction_mode=extraction_mode,
+         )
+ 
+         edges = resolve_edge_pointers(extracted_edges, uuid_map)
+@@ -488,6 +497,7 @@ class Graphiti:
              nodes,
              edge_types or {},
              edge_type_map,
@@ -37,15 +66,16 @@ index 619607a..1598850 100644
          )
  
          return resolved_edges, invalidated_edges, new_edges
-@@ -803,6 +803,7 @@ class Graphiti:
+@@ -803,6 +813,8 @@ class Graphiti:
          custom_extraction_instructions: str | None = None,
          saga: str | SagaNode | None = None,
          saga_previous_episode_uuid: str | None = None,
 +        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
++        extraction_mode: str = 'permissive',
      ) -> AddEpisodeResults:
          """
          Process an episode and update the graph.
-@@ -850,6 +851,11 @@ class Graphiti:
+@@ -850,6 +862,21 @@ class Graphiti:
              query to find the most recent episode. Useful for efficiently adding multiple episodes
              to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
              as this parameter for the next episode.
@@ -54,14 +84,33 @@ index 619607a..1598850 100644
 +            - 'semantic' (default): uses LLM duplicate + contradiction resolution.
 +            - 'deterministic': migration-safe mode that skips semantic duplicate/contradiction
 +              resolution (exact-match dedupe still runs). Intended for controlled backfills.
++        extraction_mode : str
++            Extraction behaviour for this episode.
++            - 'permissive' (default): extract broadly; all relationship types allowed.
++            - 'constrained_soft': ontology-conformant mode. Uses dedicated prompt branches
++              that avoid conflicting directives. After LLM extraction, near-miss relation
++              types are canonicalized to ontology names and generic off-ontology noise
++              (RELATES_TO, MENTIONS, etc.) is dropped in code.  Entity extraction is also
++              tightened to prefer defined entity types.  Set via the lane ontology config
++              (``extraction_mode`` key) — callers should not set this manually unless
++              overriding per-call.
  
          Returns
          -------
-@@ -959,6 +965,7 @@ class Graphiti:
+@@ -934,6 +961,7 @@ class Graphiti:
+                     entity_types,
+                     excluded_entity_types,
+                     custom_extraction_instructions,
++                    extraction_mode=extraction_mode,
+                 )
+ 
+                 nodes, uuid_map, _ = await resolve_extracted_nodes(
+@@ -959,6 +987,8 @@ class Graphiti:
                      nodes,
                      uuid_map,
                      custom_extraction_instructions,
 +                    dedupe_mode=dedupe_mode,
++                    extraction_mode=extraction_mode,
                  )
  
                  entity_edges = resolved_edges + invalidated_edges
