@@ -1,7 +1,16 @@
 diff --git a/graphiti_core/edges.py b/graphiti_core/edges.py
-index 2a212ab..648c341 100644
+index d1360d0..648c341 100644
 --- a/graphiti_core/edges.py
 +++ b/graphiti_core/edges.py
+@@ -288,7 +288,7 @@ class EntityEdge(Edge):
+         self.fact_embedding = await embedder.create(input_data=[text])
+ 
+         end = time()
+-        logger.debug(f'embedded edge {self.uuid} fact ({len(text)} chars) in {(end - start) * 1000} ms')
++        logger.debug(f'embedded {text} in {end - start} ms')
+ 
+         return self.fact_embedding
+ 
 @@ -412,12 +412,14 @@ class EntityEdge(Edge):
  
          match_query = """

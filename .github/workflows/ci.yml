@@ -24,6 +24,16 @@ jobs:
       - name: Enforce graphiti_core patch allowlist
         run: bash scripts/ci/check_graphiti_core_allowlist.sh
 
+  patch_integrity:
+    name: Graphiti core patch integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify all patches apply cleanly to upstream/main
+        run: bash scripts/ci/check_patch_integrity.sh
+
   lint:
     name: Ruff lint
     runs-on: ubuntu-latest

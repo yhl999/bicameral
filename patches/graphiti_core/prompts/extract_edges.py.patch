@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/prompts/extract_edges.py b/graphiti_core/prompts/extract_edges.py
-index 80534ca..c2bfdef 100644
+index 80534ca..56a0c88 100644
 --- a/graphiti_core/prompts/extract_edges.py
 +++ b/graphiti_core/prompts/extract_edges.py
 @@ -21,6 +21,10 @@ from pydantic import BaseModel, Field
@@ -64,7 +64,7 @@ index 80534ca..c2bfdef 100644
 +                'Your primary goal is to extract fact triples that conform to the defined FACT_TYPES '
 +                'for this lane. '
 +                '1. Strongly prefer relationship types from FACT_TYPES over generic labels. '
-+                '2. Only extract relationships that are semantically meaningful for the lane described in LANE_INTENT. '
++                '2. Only extract relationships that are semantically meaningful for the lane described in LANE_INTENT (if provided). '
 +                '3. Omit generic connector relations (e.g., RELATES_TO, MENTIONS, IS_RELATED_TO) that have no specific ontology match. '
 +                '4. Extracted fact triples should include relevant date information. '
 +                '5. Treat the CURRENT TIME as the time the CURRENT MESSAGE was sent.'
@@ -90,7 +90,7 @@ index 80534ca..c2bfdef 100644
 +</REFERENCE_TIME>
 +{edge_types_section}{lane_intent_section}
 +# TASK
-+Extract factual relationships between the given ENTITIES that are relevant to the LANE_INTENT above.
++Extract factual relationships between the given ENTITIES that are relevant to the LANE_INTENT above (if provided).
 +Focus on relationships that align with the FACT_TYPES. Do NOT extract generic or off-topic relationships.
 +
 +Only extract facts that:

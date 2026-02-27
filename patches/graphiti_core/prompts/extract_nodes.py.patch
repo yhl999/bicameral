@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/prompts/extract_nodes.py b/graphiti_core/prompts/extract_nodes.py
-index 39ca211..839b1ac 100644
+index 39ca211..b4a4941 100644
 --- a/graphiti_core/prompts/extract_nodes.py
 +++ b/graphiti_core/prompts/extract_nodes.py
 @@ -24,6 +24,10 @@ from .models import Message, PromptFunction, PromptVersion
@@ -69,7 +69,7 @@ index 39ca211..839b1ac 100644
 +Instructions:
 +
 +Extract entity nodes from the CURRENT MESSAGE that match the ENTITY TYPES above.
-+Focus on entities relevant to the LANE_INTENT.
++Focus on entities relevant to the LANE_INTENT (if provided).
 +
 +1. **Speaker Extraction**: Extract the speaker (before the colon) as an entity if it matches a defined type.
 +2. **Entity Identification**: Only extract entities that clearly match one of the ENTITY TYPES.
@@ -129,7 +129,7 @@ index 39ca211..839b1ac 100644
 +</JSON>
 +{lane_intent_section}
 +Extract entities from the JSON that match the ENTITY TYPES above.
-+Focus on entities relevant to the LANE_INTENT.
++Focus on entities relevant to the LANE_INTENT (if provided).
 +
 +Guidelines:
 +1. Only extract entities that clearly match one of the defined ENTITY TYPES.
@@ -183,7 +183,7 @@ index 39ca211..839b1ac 100644
 +{context['episode_content']}
 +</TEXT>
 +{lane_intent_section}
-+Extract entities from the TEXT that match the ENTITY TYPES above and are relevant to the LANE_INTENT.
++Extract entities from the TEXT that match the ENTITY TYPES above and are relevant to the LANE_INTENT (if provided).
 +
 +Guidelines:
 +1. Only extract entities that clearly match one of the defined ENTITY TYPES.
