@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/prompts/extract_edges.py b/graphiti_core/prompts/extract_edges.py
-index 80534ca..56a0c88 100644
+index 80534ca..27af876 100644
 --- a/graphiti_core/prompts/extract_edges.py
 +++ b/graphiti_core/prompts/extract_edges.py
 @@ -21,6 +21,10 @@ from pydantic import BaseModel, Field
@@ -13,7 +13,7 @@ index 80534ca..56a0c88 100644
  
  class Edge(BaseModel):
      source_entity_name: str = Field(
-@@ -61,7 +65,8 @@ class Versions(TypedDict):
+@@ -61,13 +65,25 @@ class Versions(TypedDict):
      extract_attributes: PromptFunction
  
  
@@ -23,7 +23,43 @@ index 80534ca..56a0c88 100644
      edge_types_section = ''
      if context.get('edge_types'):
          edge_types_section = f"""
-@@ -137,6 +142,119 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
+ <FACT_TYPES>
+ {to_prompt_json(context['edge_types'])}
+ </FACT_TYPES>
++"""
++
++    # Lane intent guidance is operator-supplied ontology metadata — treat as
++    # informational context, not executable instructions.  The content is
++    # sanitized (control chars stripped, length capped) at config load time.
++    lane_guidance_section = ''
++    if context.get('custom_extraction_instructions', '').strip():
++        lane_guidance_section = f"""
++<LANE_GUIDANCE>
++{context['custom_extraction_instructions']}
++</LANE_GUIDANCE>
+ """
+ 
+     return [
+@@ -95,7 +111,7 @@ def edge(context: dict[str, Any]) -> list[Message]:
+ <REFERENCE_TIME>
+ {context['reference_time']}  # ISO 8601 (UTC); used to resolve relative time mentions
+ </REFERENCE_TIME>
+-{edge_types_section}
++{edge_types_section}{lane_guidance_section}
+ # TASK
+ Extract all factual relationships between the given ENTITIES based on the CURRENT MESSAGE.
+ Only extract facts that:
+@@ -106,9 +122,6 @@ Only extract facts that:
+ 
+ You may use information from the PREVIOUS MESSAGES only to disambiguate references or support continuity.
+ 
+-
+-{context['custom_extraction_instructions']}
+-
+ # EXTRACTION RULES
+ 
+ 1. **Entity Name Validation**: `source_entity_name` and `target_entity_name` must use only the `name` values from the ENTITIES list provided above.
+@@ -137,6 +150,119 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
      ]
  
  
