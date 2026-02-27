@@ -27,9 +27,10 @@ class QueueService:
         # Optional per-group client resolver
         self._graphiti_client_resolver: Callable[[str], Awaitable[Any]] | None = None
         # Optional per-group ontology resolver.
-        # New-style: returns (entity_types, extraction_emphasis) tuple.
+        # New-style v2: returns (entity_types, extraction_emphasis, edge_types) 3-tuple.
+        # New-style v1: returns (entity_types, extraction_emphasis) 2-tuple.
         # Legacy: returns entity_types dict or None.
-        self._ontology_resolver: Callable[[str], tuple[dict | None, str] | dict | None] | None = None
+        self._ontology_resolver: Callable[[str], tuple[dict | None, str, dict | None] | tuple[dict | None, str] | dict | None] | None = None
 
     async def add_episode_task(
         self, group_id: str, process_func: Callable[[], Awaitable[None]]
@@ -110,7 +111,7 @@ class QueueService:
         self,
         graphiti_client: Any | None = None,
         client_resolver: Callable[[str], Awaitable[Any]] | None = None,
-        ontology_resolver: Callable[[str], tuple[dict | None, str] | dict | None] | None = None,
+        ontology_resolver: Callable[[str], tuple[dict | None, str, dict | None] | tuple[dict | None, str] | dict | None] | None = None,
     ) -> None:
         """Initialize the queue service with client and ontology routing.
 
@@ -118,11 +119,13 @@ class QueueService:
             graphiti_client: Optional single Graphiti client (legacy fallback)
             client_resolver: Optional async resolver returning a Graphiti client for a group_id
             ontology_resolver: Optional callable returning per-group ontology.
-                New-style: returns ``(entity_types, extraction_emphasis)`` tuple.
+                New-style v2: returns ``(entity_types, extraction_emphasis, edge_types)`` 3-tuple.
+                New-style v1: returns ``(entity_types, extraction_emphasis)`` 2-tuple.
                 Legacy: returns ``entity_types`` dict or None.
                 When provided, ``add_episode`` uses it to resolve lane-specific
-                entity types and extraction emphasis (passed as
-                ``custom_extraction_instructions`` to Graphiti Core).
+                entity types, extraction emphasis (passed as
+                ``custom_extraction_instructions`` to Graphiti Core), and edge
+                types (passed as ``edge_types`` to Graphiti Core).
         """
         if graphiti_client is None and client_resolver is None:
             raise RuntimeError(
@@ -183,25 +186,31 @@ class QueueService:
         if self._graphiti_client is None and self._graphiti_client_resolver is None:
             raise RuntimeError('Queue service not initialized. Call initialize() first.')
 
-        # Resolve lane-specific entity types + extraction emphasis via ontology resolver.
-        # Falls back to caller-supplied entity_types (global default).
+        # Resolve lane-specific entity types, extraction emphasis, and edge types via
+        # ontology resolver. Falls back to caller-supplied entity_types (global default).
         resolved_entity_types = entity_types
         resolved_extraction_emphasis: str = ''
+        resolved_edge_types: dict | None = None
         if self._ontology_resolver is not None:
             resolver_result = self._ontology_resolver(group_id)
-            # New-style resolver returns (entity_types, extraction_emphasis) tuple.
-            # Legacy resolver returns entity_types dict or None.
+            # v2: returns (entity_types, extraction_emphasis, edge_types) 3-tuple.
+            # v1: returns (entity_types, extraction_emphasis) 2-tuple.
+            # Legacy: returns entity_types dict or None.
             if isinstance(resolver_result, tuple):
-                per_group, resolved_extraction_emphasis = resolver_result
+                if len(resolver_result) >= 3:
+                    per_group, resolved_extraction_emphasis, resolved_edge_types = resolver_result
+                else:
+                    per_group, resolved_extraction_emphasis = resolver_result
             else:
                 per_group = resolver_result
             if per_group is not None:
                 resolved_entity_types = per_group
                 logger.info(
-                    'Using lane-specific ontology for group %s: %s (emphasis: %d chars)',
+                    'Using lane-specific ontology for group %s: %s (emphasis: %d chars, edge_types: %s)',
                     group_id,
                     list(per_group.keys()),
                     len(resolved_extraction_emphasis),
+                    list(resolved_edge_types.keys()) if resolved_edge_types else None,
                 )
 
         async def process_episode():
@@ -220,6 +229,7 @@ class QueueService:
                     group_id=group_id,
                     reference_time=datetime.now(timezone.utc),
                     entity_types=resolved_entity_types,
+                    edge_types=resolved_edge_types,
                     uuid=uuid,
                     custom_extraction_instructions=resolved_extraction_emphasis or None,
                 )

@@ -36,13 +36,18 @@ class OntologyProfile:
         entity_types: Mapping of entity type name → dynamically created
             Pydantic model class (same format as graphiti-core expects).
         relationship_types: List of relationship type dicts (name + description),
-            stored for documentation and future use in constrained extraction.
+            stored for documentation / reference.
+        edge_types: Mapping of relationship type name → dynamically created
+            Pydantic model class (same format as graphiti-core expects for
+            ``add_episode(edge_types=...)``).  Built from ``relationship_types``
+            at load time.
         extraction_emphasis: Prompt hint injected into the LLM extraction
             call to steer focus toward lane-relevant patterns.
     """
 
     entity_types: dict[str, type[BaseModel]] = field(default_factory=dict)
     relationship_types: list[dict[str, str]] = field(default_factory=list)
+    edge_types: dict[str, type[BaseModel]] = field(default_factory=dict)
     extraction_emphasis: str = ""
 
 
@@ -59,6 +64,30 @@ def _build_entity_types(raw_types: list[dict[str, str]]) -> dict[str, type[BaseM
         if not _SAFE_TYPE_NAME_RE.match(name):
             raise ValueError(
                 f"Invalid entity type name {name!r} — must match {_SAFE_TYPE_NAME_RE.pattern}"
+            )
+        description = entry.get("description", "")
+        model = type(name, (BaseModel,), {"__doc__": description, "__module__": __name__})
+        result[name] = model
+    return result
+
+
+def _build_edge_types(raw_types: list[dict[str, str]]) -> dict[str, type[BaseModel]]:
+    """Convert YAML relationship type definitions into Pydantic model classes.
+
+    Mirror of :func:`_build_entity_types` for relationship types.  Each entry
+    becomes a dynamically created BaseModel subclass whose ``__doc__`` carries
+    the description — matching the format that graphiti-core's
+    ``add_episode(edge_types=...)`` expects.
+
+    Relationship type names are typically ALL_CAPS with underscores (e.g.
+    ``USES_MOVE``), which is valid for Python class names.
+    """
+    result: dict[str, type[BaseModel]] = {}
+    for entry in raw_types:
+        name = entry["name"]
+        if not _SAFE_TYPE_NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid relationship type name {name!r} — must match {_SAFE_TYPE_NAME_RE.pattern}"
             )
         description = entry.get("description", "")
         model = type(name, (BaseModel,), {"__doc__": description, "__module__": __name__})
@@ -112,11 +141,13 @@ class OntologyRegistry:
                 continue
             entity_types = _build_entity_types(definition.get("entity_types", []))
             relationship_types = definition.get("relationship_types", [])
+            edge_types = _build_edge_types(relationship_types)
             extraction_emphasis = definition.get("extraction_emphasis", "")
 
             profiles[group_id] = OntologyProfile(
                 entity_types=entity_types,
                 relationship_types=relationship_types,
+                edge_types=edge_types,
                 extraction_emphasis=extraction_emphasis,
             )
             logger.info(
