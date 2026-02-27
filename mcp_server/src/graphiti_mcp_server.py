@@ -118,9 +118,172 @@ def configure_uvicorn_logging():
 
 logger = logging.getLogger(__name__)
 SAFE_GROUP_ID_RE = re.compile(r'^[a-zA-Z0-9_]+$')
+VALID_SEARCH_MODES = {'hybrid', 'semantic', 'keyword'}
+
+_UNSAFE_CHAR_RE = re.compile(r'[<>&\x00-\x1f\x7f-\x9f]')
+
+
+def _sanitize_for_error(value: str, max_len: int = 64) -> str:
+    """Sanitize user input for safe reflection in error messages.
+
+    Uses allowlist approach: replaces all angle brackets, ampersands,
+    and control characters with empty string. Then truncates.
+    This prevents XML/HTML tag injection, entity encoding bypasses,
+    and control character attacks in MCP tool output.
+    """
+    s = _UNSAFE_CHAR_RE.sub('', str(value))
+    return s[:max_len].strip()
+
 
 # Create global config instance - will be properly initialized later
 config: GraphitiConfig
+
+
+def _unique_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _resolve_effective_group_ids(
+    *,
+    group_ids: list[str] | None,
+    lane_alias: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Resolve effective group IDs with deterministic precedence.
+
+    Returns:
+        (effective_group_ids, invalid_aliases)
+    """
+    effective_group_ids: list[str] = []
+    invalid_aliases: list[str] = []
+
+    # 1) Explicit group_ids has highest precedence
+    if group_ids:
+        effective_group_ids = _unique_preserve_order(group_ids)
+
+    # 2) Resolve lane aliases (if provided)
+    elif lane_alias is not None:
+        alias_map = config.graphiti.lane_aliases or {}
+        resolved: list[str] = []
+
+        for alias in lane_alias:
+            # Sanitize alias for safe reflection in error messages
+            sanitized = _sanitize_for_error(alias)
+            mapped = alias_map.get(alias)
+            if mapped is None:
+                invalid_aliases.append(sanitized)
+                continue
+            resolved.extend(mapped)
+
+        # explicit empty alias list or alias mapping to [] means all lanes
+        if invalid_aliases:
+            return [], invalid_aliases
+        effective_group_ids = _unique_preserve_order(resolved)
+
+    # 3) Fallback behavior: default configured group if present, else all lanes ([])
+    elif config.graphiti.group_id:
+        effective_group_ids = [config.graphiti.group_id]
+
+    # Validate ALL resolved group_ids regardless of source
+    for gid in effective_group_ids:
+        if not SAFE_GROUP_ID_RE.match(gid):
+            raise ValueError(f'Invalid group_id: {_sanitize_for_error(gid)!r}')
+    return effective_group_ids, invalid_aliases
+
+
+def _validate_group_scope_support(effective_group_ids: list[str]) -> str | None:
+    """Validate backend-specific group scope support.
+
+    FalkorDB currently supports routed single-group searches only.
+    """
+    provider = config.database.provider.lower()
+    if provider != 'falkordb':
+        return None
+
+    if len(effective_group_ids) > 1:
+        return (
+            'Multi-group searches are not supported in FalkorDB mode yet. '
+            'Provide a single group_id/lane_alias.'
+        )
+
+    if len(effective_group_ids) == 0 and not config.graphiti.group_id:
+        return (
+            'All-lanes search is not supported in FalkorDB mode without a default group. '
+            'Provide group_ids or lane_alias.'
+        )
+
+    return None
+
+
+def _build_node_search_config(search_mode: str, max_nodes: int):
+    from graphiti_core.search.search_config import (
+        NodeReranker,
+        NodeSearchConfig,
+        NodeSearchMethod,
+        SearchConfig,
+    )
+    from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
+
+    if search_mode == 'hybrid':
+        base = NODE_HYBRID_SEARCH_RRF
+    elif search_mode == 'semantic':
+        base = SearchConfig(
+            node_config=NodeSearchConfig(
+                search_methods=[NodeSearchMethod.cosine_similarity],
+                reranker=NodeReranker.rrf,
+            )
+        )
+    elif search_mode == 'keyword':
+        base = SearchConfig(
+            node_config=NodeSearchConfig(
+                search_methods=[NodeSearchMethod.bm25],
+                reranker=NodeReranker.rrf,
+            )
+        )
+    else:
+        raise ValueError(f'Unsupported search_mode: {search_mode}')
+
+    return base.model_copy(update={'limit': max_nodes, 'trust_weight': TRUST_WEIGHT})
+
+
+def _build_edge_search_config(search_mode: str, max_facts: int, center_node_uuid: str | None):
+    from graphiti_core.search.search_config import (
+        EdgeReranker,
+        EdgeSearchConfig,
+        EdgeSearchMethod,
+        SearchConfig,
+    )
+    from graphiti_core.search.search_config_recipes import (
+        EDGE_HYBRID_SEARCH_NODE_DISTANCE,
+        EDGE_HYBRID_SEARCH_RRF,
+    )
+
+    if search_mode == 'hybrid':
+        base = (
+            EDGE_HYBRID_SEARCH_RRF
+            if center_node_uuid is None
+            else EDGE_HYBRID_SEARCH_NODE_DISTANCE
+        )
+    else:
+        methods = (
+            [EdgeSearchMethod.cosine_similarity]
+            if search_mode == 'semantic'
+            else [EdgeSearchMethod.bm25]
+        )
+        reranker = EdgeReranker.node_distance if center_node_uuid else EdgeReranker.rrf
+        base = SearchConfig(
+            edge_config=EdgeSearchConfig(
+                search_methods=methods,
+                reranker=reranker,
+            )
+        )
+
+    return base.model_copy(update={'limit': max_facts, 'trust_weight': TRUST_WEIGHT})
 
 # MCP server instructions
 GRAPHITI_MCP_INSTRUCTIONS = """
@@ -191,7 +354,7 @@ class GraphitiService:
     def _validate_group_id(self, group_id: str) -> str:
         """Validate group_id for safe use as FalkorDB graph/database name."""
         if not SAFE_GROUP_ID_RE.match(group_id):
-            raise ValueError(f'Invalid group_id for FalkorDB routing: {group_id!r}')
+            raise ValueError(f'Invalid group_id for FalkorDB routing: {_sanitize_for_error(group_id)!r}')
         return group_id
 
     async def _build_client(self, *, database_override: str | None = None) -> Graphiti:
@@ -297,6 +460,24 @@ class GraphitiService:
             # Store entity types for later use
             self.entity_types = custom_types
 
+            # Load optional per-lane extraction ontology registry
+            try:
+                from services.ontology_registry import OntologyRegistry
+
+                ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
+                if ontology_path.exists():
+                    self.ontology_registry = OntologyRegistry.load(ontology_path)
+                    logger.info(
+                        'Loaded ontology profiles for %d lanes',
+                        len(self.ontology_registry.configured_groups),
+                    )
+                else:
+                    self.ontology_registry = None
+                    logger.info('No extraction ontology file found; using default entity types only')
+            except Exception as ontology_error:
+                self.ontology_registry = None
+                logger.warning(f'Failed to load ontology registry: {ontology_error}')
+
             # Initialize default Graphiti client for configured database
             try:
                 self.client = await self._build_client()
@@ -344,14 +525,6 @@ class GraphitiService:
             if self.config.database.provider.lower() == 'falkordb' and self.config.graphiti.group_id:
                 default_group = self._validate_group_id(self.config.graphiti.group_id)
                 self._clients_by_group[default_group] = self.client
-
-            # Load lane-specific extraction ontologies if config file exists.
-            ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
-            if ontology_path.exists():
-                try:
-                    self.ontology_registry = OntologyRegistry.load(ontology_path)
-                except Exception as e:
-                    logger.warning('Failed to load extraction ontologies from %s: %s', ontology_path, e)
 
             logger.info('Successfully initialized Graphiti client')
 
@@ -509,6 +682,8 @@ async def add_memory(
 async def search_nodes(
     query: str,
     group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    search_mode: str = 'hybrid',
     max_nodes: int = 10,
     entity_types: list[str] | None = None,
 ) -> NodeSearchResponse | ErrorResponse:
@@ -516,7 +691,9 @@ async def search_nodes(
 
     Args:
         query: The search query
-        group_ids: Optional list of group IDs to filter results
+        group_ids: Optional explicit list of group IDs to filter results (highest precedence)
+        lane_alias: Optional lane aliases resolved via config.graphiti.lane_aliases
+        search_mode: Retrieval mode: hybrid|semantic|keyword
         max_nodes: Maximum number of nodes to return (default: 10)
         entity_types: Optional list of entity type names to filter by
     """
@@ -526,14 +703,30 @@ async def search_nodes(
         return ErrorResponse(error='Graphiti service not initialized')
 
     try:
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids
-            if group_ids is not None
-            else [config.graphiti.group_id]
-            if config.graphiti.group_id
-            else []
+        if max_nodes <= 0:
+            return ErrorResponse(error='max_nodes must be a positive integer')
+
+        normalized_mode = (search_mode or 'hybrid').strip().lower()
+        if normalized_mode not in VALID_SEARCH_MODES:
+            return ErrorResponse(
+                error=(
+                    f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
+                    f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
+                )
+            )
+
+        effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
         )
+        if invalid_aliases:
+            return ErrorResponse(
+                error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
+            )
+
+        scope_error = _validate_group_scope_support(effective_group_ids)
+        if scope_error:
+            return ErrorResponse(error=scope_error)
 
         # Route to the correct FalkorDB graph for the target group
         primary_group = effective_group_ids[0] if effective_group_ids else config.graphiti.group_id
@@ -544,10 +737,9 @@ async def search_nodes(
             node_labels=entity_types,
         )
 
-        # Use the search_ method with node search config (trust-aware)
-        from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
+        # Build mode-specific search config (trust-aware)
+        search_config = _build_node_search_config(normalized_mode, max_nodes)
 
-        search_config = NODE_HYBRID_SEARCH_RRF.model_copy(update={'trust_weight': TRUST_WEIGHT})
         results = await client.search_(
             query=query,
             config=search_config,
@@ -592,6 +784,8 @@ async def search_nodes(
 async def search_memory_facts(
     query: str,
     group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    search_mode: str = 'hybrid',
     max_facts: int = 10,
     center_node_uuid: str | None = None,
 ) -> FactSearchResponse | ErrorResponse:
@@ -599,7 +793,9 @@ async def search_memory_facts(
 
     Args:
         query: The search query
-        group_ids: Optional list of group IDs to filter results
+        group_ids: Optional explicit list of group IDs to filter results (highest precedence)
+        lane_alias: Optional lane aliases resolved via config.graphiti.lane_aliases
+        search_mode: Retrieval mode: hybrid|semantic|keyword
         max_facts: Maximum number of facts to return (default: 10)
         center_node_uuid: Optional UUID of a node to center the search around
     """
@@ -613,32 +809,37 @@ async def search_memory_facts(
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids
-            if group_ids is not None
-            else [config.graphiti.group_id]
-            if config.graphiti.group_id
-            else []
+        normalized_mode = (search_mode or 'hybrid').strip().lower()
+        if normalized_mode not in VALID_SEARCH_MODES:
+            return ErrorResponse(
+                error=(
+                    f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
+                    f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
+                )
+            )
+
+        effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
         )
+        if invalid_aliases:
+            return ErrorResponse(
+                error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
+            )
+
+        scope_error = _validate_group_scope_support(effective_group_ids)
+        if scope_error:
+            return ErrorResponse(error=scope_error)
 
         # Route to the correct FalkorDB graph for the target group
         primary_group = effective_group_ids[0] if effective_group_ids else config.graphiti.group_id
         client = await graphiti_service.get_client_for_group(primary_group)
 
-        # Use search_ with trust-aware config for trust-boosted retrieval
-        from graphiti_core.search.search_config_recipes import (
-            EDGE_HYBRID_SEARCH_NODE_DISTANCE,
-            EDGE_HYBRID_SEARCH_RRF,
-        )
-
-        base_config = (
-            EDGE_HYBRID_SEARCH_RRF
-            if center_node_uuid is None
-            else EDGE_HYBRID_SEARCH_NODE_DISTANCE
-        )
-        search_config = base_config.model_copy(
-            update={'limit': max_facts, 'trust_weight': TRUST_WEIGHT}
+        # Build mode-specific search config (trust-aware)
+        search_config = _build_edge_search_config(
+            normalized_mode,
+            max_facts,
+            center_node_uuid,
         )
 
         results = await client.search_(
