@@ -177,7 +177,10 @@ def run_bicameral_query(
 
 
 def run_qmd_query(qmd_command: str, query: str) -> dict:
-    """Run a QMD query via subprocess."""
+    """Run a QMD query via subprocess.
+
+    Raises RuntimeError when QMD fails or returns invalid JSON output.
+    """
     cmd_parts = shlex.split(qmd_command) + [query]
     try:
         result = subprocess.run(
@@ -186,18 +189,26 @@ def run_qmd_query(qmd_command: str, query: str) -> dict:
             capture_output=True,
             text=True,
             timeout=30,
+            check=True,
         )
-        if result.returncode != 0:
-            return {'error': result.stderr, 'text': ''}
-        try:
-            parsed = json.loads(result.stdout)
-            return {'parsed': parsed, 'text': result.stdout}
-        except json.JSONDecodeError:
-            return {'text': result.stdout}
-    except subprocess.TimeoutExpired:
-        return {'error': 'timeout', 'text': ''}
-    except FileNotFoundError:
-        return {'error': f'command not found: {cmd_parts[0]}', 'text': ''}
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or '').strip()
+        raise RuntimeError(
+            f'QMD query failed with exit code {exc.returncode}: {stderr or "<no stderr>"}'
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('QMD query timed out after 30 seconds') from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError(f'QMD command not found: {cmd_parts[0]}') from exc
+
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f'QMD query returned invalid JSON: {exc.msg} (pos {exc.pos})'
+        ) from exc
+
+    return {'parsed': parsed, 'text': result.stdout}
 
 
 def validate_fixture(queries: list[dict]) -> list[str]:

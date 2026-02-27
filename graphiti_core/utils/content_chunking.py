@@ -1061,11 +1061,13 @@ def chunk_conversation_semantic(
 
     hard_gap_seconds = config.hard_gap_hours * 3600.0
 
+    expected_embedding_dim = len(sorted_messages[0]['content_embedding'])
+
     # Accumulator state for the current chunk.
     chunk_start = 0
     chunk_token_count = 0
-    centroid: list[float] = list(sorted_messages[0]['content_embedding'])
-    centroid_n = 1
+    centroid: list[float] = [0.0] * expected_embedding_dim
+    centroid_n = 0
     chunks: list[ChunkBoundary] = []
 
     def _emit(end_exclusive: int, reason: str, score: float) -> None:
@@ -1091,16 +1093,21 @@ def chunk_conversation_semantic(
         # Reset accumulator for the next chunk.
         chunk_start = end_exclusive
         if end_exclusive < len(sorted_messages):
-            centroid = list(sorted_messages[end_exclusive]['content_embedding'])
-            centroid_n = 1
+            centroid = [0.0] * expected_embedding_dim
+            centroid_n = 0
             chunk_token_count = 0
         else:
+            centroid = [0.0] * expected_embedding_dim
             centroid_n = 0
             chunk_token_count = 0
 
     for i, msg in enumerate(sorted_messages):
         msg_tokens = estimate_tokens(msg['content'])
         emb: list[float] = msg['content_embedding']
+        if len(emb) != expected_embedding_dim:
+            raise ValueError(
+                f'Embedding dimension mismatch: expected {expected_embedding_dim}, got {len(emb)}'
+            )
 
         # ----- Rule 1: hard gap -------------------------------------------
         if i > chunk_start:
@@ -1109,9 +1116,10 @@ def chunk_conversation_semantic(
             gap_seconds = (curr_time - prev_time).total_seconds()
             if gap_seconds > hard_gap_seconds:
                 _emit(i, 'hard_gap', gap_seconds / 3600.0)
-                # After emit, centroid is already set to this message.
+                # Current message starts the new chunk.
                 chunk_token_count = msg_tokens
-                # Update centroid (already initialised by _emit).
+                centroid = list(emb)
+                centroid_n = 1
                 continue
 
         # ----- Rule 3 check (pre): token overflow -------------------------
@@ -1136,6 +1144,8 @@ def chunk_conversation_semantic(
                 # No valid lookback candidate – cut right before this msg.
                 _emit(i, 'token_overflow', 1.0)
                 chunk_token_count = msg_tokens
+                centroid = list(emb)
+                centroid_n = 1
                 continue
 
         # ----- Rule 2: semantic drift -------------------------------------
@@ -1144,19 +1154,21 @@ def chunk_conversation_semantic(
             if sim < config.semantic_drift_threshold and _is_substantive(msg['content'], config):
                 _emit(i, 'semantic_drift', sim)
                 chunk_token_count = msg_tokens
+                centroid = list(emb)
+                centroid_n = 1
                 continue
 
         # ----- Update running state ---------------------------------------
         chunk_token_count += msg_tokens
-        centroid_n += 1
-        # Incremental centroid: new_mean = old_mean + (x - old_mean) / n
-        centroid = _vec_add(
-            centroid,
-            _vec_scale(
-                [x - c for x, c in zip(emb, centroid, strict=True)],
-                1.0 / centroid_n,
+        new_centroid = _vec_scale(
+            _vec_add(
+                _vec_scale(centroid, float(centroid_n)),
+                emb,
             ),
+            1.0 / float(centroid_n + 1),
         )
+        centroid = new_centroid
+        centroid_n += 1
 
     # Emit the final chunk.
     if chunk_start < len(sorted_messages):

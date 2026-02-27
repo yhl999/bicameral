@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -322,24 +323,25 @@ def _query_neo4j_message_count(args: argparse.Namespace) -> int:
     """Query Neo4j for the total Message node count.
 
     Returns 0 if Neo4j is not reachable or has no messages.
-    Uses the MCP server's /status endpoint or a direct Cypher query.
     """
-    import urllib.request
-
-    mcp_url = getattr(args, 'mcp_url', MCP_URL_DEFAULT)
     try:
-        # Try the MCP health endpoint to check if Neo4j has messages
-        req = urllib.request.Request(
-            f'{mcp_url}/status',
-            headers={'Content-Type': 'application/json'},
-            method='GET',
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            # If status endpoint returns message count, use it
-            return data.get('message_count', 0)
+        from neo4j import GraphDatabase  # type: ignore
+
+        uri = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+        user = os.environ.get('NEO4J_USER', 'neo4j')
+        password = os.environ.get('NEO4J_PASSWORD')
+        database = os.environ.get('NEO4J_DATABASE', 'neo4j')
+
+        if not password:
+            return 0
+
+        with GraphDatabase.driver(uri, auth=(user, password)) as driver:
+            with driver.session(database=database) as session:
+                rec = session.run('MATCH (m:Message) RETURN count(m) AS cnt').single()
+                if rec is None:
+                    return 0
+                return int(rec.get('cnt', 0) or 0)
     except Exception:
-        # If MCP server is unreachable, assume no messages (guard will fire)
         return 0
 
 
@@ -382,6 +384,7 @@ def seed_claims(conn: sqlite3.Connection, chunk_ids: list[str]) -> None:
 
 def claim_chunk(conn: sqlite3.Connection, worker_id: str) -> str | None:
     """Atomically claim one pending chunk. Returns chunk_id or None."""
+    conn.execute('BEGIN IMMEDIATE')
     cursor = conn.execute(
         "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
         "WHERE chunk_id = (SELECT chunk_id FROM chunk_claims WHERE status='pending' LIMIT 1) "
