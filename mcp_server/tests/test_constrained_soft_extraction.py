@@ -12,10 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import io
-from dataclasses import fields
-from unittest.mock import MagicMock, patch
-
 import pytest
 import yaml
 from pydantic import BaseModel
@@ -262,8 +258,11 @@ class TestOntologyRegistryLoad:
         return yaml.dump({'test_lane': lane})
 
     def _load_registry(self, content: str):
-        import tempfile, os
+        import os
+        import tempfile
+
         from mcp_server.src.services.ontology_registry import OntologyRegistry
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             f.write(content)
             path = f.name
@@ -379,7 +378,6 @@ class TestResolveOntologyFourTuple:
         registry = OntologyRegistry({'test_lane': profile})
 
         # Simulate GraphitiService.resolve_ontology logic directly
-        entity_types = registry.get('test_lane').entity_types
         p = registry.get('test_lane')
         return (
             p.entity_types,
