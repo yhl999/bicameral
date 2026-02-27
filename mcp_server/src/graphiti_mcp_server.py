@@ -33,6 +33,7 @@ from models.response_types import (
     SuccessResponse,
 )
 from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+from services.ontology_registry import OntologyRegistry
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result
 
@@ -176,6 +177,7 @@ class GraphitiService:
         self.semaphore = asyncio.Semaphore(semaphore_limit)
         self.client: Graphiti | None = None
         self.entity_types = None
+        self.ontology_registry: OntologyRegistry | None = None
 
         # Shared client dependencies (used for per-group FalkorDB routing)
         self._llm_client: Any = None
@@ -342,6 +344,14 @@ class GraphitiService:
             if self.config.database.provider.lower() == 'falkordb' and self.config.graphiti.group_id:
                 default_group = self._validate_group_id(self.config.graphiti.group_id)
                 self._clients_by_group[default_group] = self.client
+
+            # Load lane-specific extraction ontologies if config file exists.
+            ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
+            if ontology_path.exists():
+                try:
+                    self.ontology_registry = OntologyRegistry.load(ontology_path)
+                except Exception as e:
+                    logger.warning('Failed to load extraction ontologies from %s: %s', ontology_path, e)
 
             logger.info('Successfully initialized Graphiti client')
 
