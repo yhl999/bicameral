@@ -320,9 +320,7 @@ class QueueService:
             if 'query timed out' in msg or 'timed out' in msg or 'timeout' in msg:
                 return True
             # Detect FalkorDB / redis-py error classes without a hard import.
-            if exc.__class__.__name__ in {'ResponseError', 'TimeoutError'}:
-                return True
-            return False
+            return exc.__class__.__name__ in {'ResponseError', 'TimeoutError'}
 
         def _is_context_overflow(exc: Exception) -> bool:
             """Return True if the exception indicates an LLM context window overflow."""
