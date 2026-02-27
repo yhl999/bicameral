@@ -17,9 +17,50 @@ limitations under the License.
 import os
 from unittest.mock import Mock
 
-import numpy as np
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    import random as _random_mod
+
+    _HAS_NUMPY = False
+
+    class _ListWithToList(list):
+        """List subclass that exposes a ``.tolist()`` method for numpy compat."""
+        def tolist(self):
+            return list(self)
+
+    class _NumpyFallback:
+        """Minimal numpy shim providing only the methods used in helpers_test.py."""
+
+        class random:  # noqa: N801
+            @staticmethod
+            def uniform(low: float, high: float, size: int) -> '_ListWithToList':
+                return _ListWithToList(
+                    _random_mod.random() * (high - low) + low for _ in range(size)
+                )
+
+        @staticmethod
+        def allclose(
+            a, b, rtol: float = 1e-5, atol: float = 1e-8
+        ) -> bool:
+            """Equivalent to ``np.allclose`` for 1-D sequences."""
+            if len(a) != len(b):
+                return False
+            return all(
+                abs(float(x) - float(y)) <= atol + rtol * abs(float(y))
+                for x, y in zip(a, b, strict=False)
+            )
+
+    np = _NumpyFallback()  # type: ignore[assignment]
+
 import pytest
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs) -> None:  # type: ignore[misc]
+        """No-op shim when python-dotenv is not installed."""
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.edges import EntityEdge, EpisodicEdge
