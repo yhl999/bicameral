@@ -157,9 +157,11 @@ def _resolve_effective_group_ids(
         resolved: list[str] = []
 
         for alias in lane_alias:
+            # Sanitize alias for safe reflection in error messages
+            sanitized = str(alias)[:64].replace('\n', ' ').replace('\r', ' ')
             mapped = alias_map.get(alias)
             if mapped is None:
-                invalid_aliases.append(alias)
+                invalid_aliases.append(sanitized)
                 continue
             resolved.extend(mapped)
 
