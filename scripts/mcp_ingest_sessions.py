@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -89,9 +91,11 @@ def strip_untrusted_metadata(content: str) -> str:
             # We found a header followed by ```json
             # Find the true closing ``` which is unindented and on its own line.
             # Real JSON doesn't contain unescaped newlines, so any "```" on its own line is the end.
+            # Cap at 1000 iterations to prevent O(N²) DoS on malicious input.
             k = i + 2
             found_end = False
-            while k < n:
+            max_scan = min(n, i + 2 + 1000)
+            while k < max_scan:
                 if lines[k].strip() == "```":
                     found_end = True
                     break
@@ -317,7 +321,122 @@ def apply_shard(evidences: list[dict], shards: int, shard_index: int) -> list[di
     return [ev for i, ev in enumerate(evidences) if (i % shards) == shard_index]
 
 
-def main():
+def _query_neo4j_message_count(args: argparse.Namespace) -> int:
+    """Query Neo4j for the total Message node count.
+
+    Returns:
+        >= 0: actual message count from Neo4j.
+        -1:   could not connect or authenticate (error, not zero messages).
+    """
+    try:
+        from neo4j import GraphDatabase  # type: ignore
+
+        uri = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+        user = os.environ.get('NEO4J_USER', 'neo4j')
+        password = os.environ.get('NEO4J_PASSWORD')
+        database = os.environ.get('NEO4J_DATABASE', 'neo4j')
+
+        if not password:
+            return 0
+
+        with GraphDatabase.driver(
+            uri,
+            auth=(user, password),
+            connection_timeout=10,
+            max_connection_lifetime=30,
+        ) as driver:
+            with driver.session(database=database) as session:
+                rec = session.run('MATCH (m:Message) RETURN count(m) AS cnt').single()
+                if rec is None:
+                    return 0
+                return int(rec.get('cnt', 0) or 0)
+    except Exception as exc:
+        print(f'WARNING: Could not query Neo4j message count ({type(exc).__name__})', file=sys.stderr)
+        return -1
+
+
+def check_bootstrap_guard(neo4j_message_count: int, evidence_files_exist: bool) -> bool:
+    """Return True if BOOTSTRAP_REQUIRED guard should fire.
+
+    The guard fires when Neo4j has zero messages but evidence files exist,
+    indicating the graph has not been bootstrapped yet.
+
+    Returns False (don't block) when neo4j_message_count is -1 (connection error),
+    printing a warning so the operator knows the check was inconclusive.
+    """
+    if neo4j_message_count < 0:
+        print(
+            'WARNING: Could not verify Neo4j state. Proceeding with caution.',
+            file=sys.stderr,
+        )
+        return False
+    return neo4j_message_count == 0 and evidence_files_exist
+
+
+def init_claim_db(path: str) -> sqlite3.Connection:
+    """Initialize SQLite claim-state DB."""
+    conn = sqlite3.connect(path)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS chunk_claims (
+            chunk_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'pending',
+            worker_id TEXT,
+            claimed_at TEXT,
+            completed_at TEXT,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        )
+    ''')
+    conn.commit()
+    return conn
+
+
+def seed_claims(conn: sqlite3.Connection, chunk_ids: list[str]) -> None:
+    """Seed claim DB with pending chunks."""
+    for cid in chunk_ids:
+        conn.execute(
+            'INSERT OR IGNORE INTO chunk_claims (chunk_id, status) VALUES (?, ?)',
+            (cid, 'pending'),
+        )
+    conn.commit()
+
+
+def claim_chunk(conn: sqlite3.Connection, worker_id: str) -> str | None:
+    """Atomically claim one pending chunk. Returns chunk_id or None."""
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    conn.execute('BEGIN IMMEDIATE')
+
+    if sqlite3.sqlite_version_info >= (3, 35, 0):
+        cursor = conn.execute(
+            "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
+            "WHERE chunk_id = (SELECT chunk_id FROM chunk_claims WHERE status='pending' LIMIT 1) "
+            'RETURNING chunk_id',
+            (worker_id, now),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    else:
+        # Fallback for SQLite < 3.35.0: SELECT then UPDATE
+        cursor = conn.execute(
+            "SELECT chunk_id FROM chunk_claims WHERE status='pending' LIMIT 1"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        chunk_id = row[0]
+        conn.execute(
+            "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
+            "WHERE chunk_id=? AND status='pending'",
+            (worker_id, now, chunk_id),
+        )
+        conn.commit()
+        return chunk_id
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for mcp_ingest_sessions."""
     ap = argparse.ArgumentParser()
     ap.add_argument('--mcp-url', default=MCP_URL_DEFAULT)
     ap.add_argument(
@@ -352,7 +471,10 @@ def main():
         '--overlap',
         type=int,
         default=DEFAULT_OVERLAP_CHUNKS,
-        help=f'Number of evidence chunks to overlap for incremental mode (default: {DEFAULT_OVERLAP_CHUNKS})',
+        help=(
+            'Number of evidence chunks to overlap for incremental mode'
+            f' (default: {DEFAULT_OVERLAP_CHUNKS})'
+        ),
     )
     ap.add_argument(
         '--dry-run',
@@ -366,12 +488,190 @@ def main():
         '--subchunk-size',
         type=int,
         default=DEFAULT_SUBCHUNK_SIZE,
-        help=f'Max chars per sub-chunk for large evidence (default: {DEFAULT_SUBCHUNK_SIZE}). '
-        'Only applies to group IDs in _SUBCHUNK_GROUP_IDS (e.g. s1_sessions_main).',
+        help=(
+            f'Max chars per sub-chunk for large evidence (default: {DEFAULT_SUBCHUNK_SIZE}). '
+            'Only applies to group IDs in _SUBCHUNK_GROUP_IDS (e.g. s1_sessions_main).'
+        ),
     )
+
+    # FR-4: source mode
+    ap.add_argument(
+        '--source-mode',
+        choices=['neo4j', 'evidence'],
+        default='neo4j',
+        help='Source mode: neo4j (default) reads from graph DB; evidence reads from JSON files',
+    )
+
+    # FR-10: manifest and claim-based processing
+    ap.add_argument(
+        '--build-manifest',
+        default=None,
+        help='Build frozen chunk manifest and write to this path',
+    )
+    ap.add_argument(
+        '--manifest',
+        default=None,
+        help='Use pre-built manifest file for chunk IDs',
+    )
+    ap.add_argument(
+        '--claim-mode',
+        action='store_true',
+        help='Enable SQLite claim-based processing for high-throughput batch extraction',
+    )
+    ap.add_argument(
+        '--claim-state-check',
+        action='store_true',
+        help='Check integrity of claim-state DB and report status',
+    )
+
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
 
     if args.subchunk_size <= 0:
+        ap.error('--subchunk-size must be a positive integer')
+
+    # --- FR-10: claim-state-check mode ---
+    if args.claim_state_check:
+        if not args.manifest and not args.build_manifest:
+            ap.error('--claim-state-check requires --manifest or --build-manifest')
+        claim_db_path = (args.manifest or args.build_manifest) + '.claims.db'
+        if not Path(claim_db_path).exists():
+            print(f'Claim DB not found: {claim_db_path}')
+            return
+        conn = init_claim_db(claim_db_path)
+        try:
+            cursor = conn.execute(
+                'SELECT status, COUNT(*) FROM chunk_claims GROUP BY status'
+            )
+            rows = cursor.fetchall()
+            print('Claim state summary:')
+            for status, count in rows:
+                print(f'  {status}: {count}')
+        finally:
+            conn.close()
+        return
+
+    # --- FR-4: source mode routing ---
+    if args.source_mode == 'neo4j':
+        _run_neo4j_mode(args, ap)
+    else:
+        _run_evidence_mode(args, ap)
+
+
+def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
+    """Neo4j source mode: read candidate chunks from the graph DB."""
+    evidence_path = Path(args.evidence)
+    evidence_files_exist = evidence_path.exists()
+
+    # BOOTSTRAP_REQUIRED guard: if Neo4j has 0 messages but evidence files exist,
+    # the graph hasn't been bootstrapped yet.
+    neo4j_message_count = _query_neo4j_message_count(args)
+    if check_bootstrap_guard(neo4j_message_count, evidence_files_exist):
+        print(
+            'BOOTSTRAP_REQUIRED: Neo4j has no messages but evidence files exist.\n'
+            'Run with --source-mode evidence first to bootstrap the graph,\n'
+            'or populate Neo4j before using neo4j source mode.'
+        )
+        sys.exit(1)
+
+    # --- build-manifest mode ---
+    if args.build_manifest:
+        manifest_path = Path(args.build_manifest)
+        # Placeholder: in a full implementation, chunk IDs would come from Neo4j query.
+        chunk_ids: list[str] = []
+        print(
+            f'Neo4j source mode: would query graph for candidate chunks '
+            f'(group_id={args.group_id})'
+        )
+        if args.dry_run:
+            print(f'DRY RUN: would write {len(chunk_ids)} chunk IDs to {manifest_path}')
+            return
+        manifest_path.write_text(json.dumps(chunk_ids), encoding='utf-8')
+        print(f'Wrote manifest with {len(chunk_ids)} chunk IDs to {manifest_path}')
+
+        if args.claim_mode:
+            claim_db_path = str(manifest_path) + '.claims.db'
+            conn = init_claim_db(claim_db_path)
+            try:
+                seed_claims(conn, chunk_ids)
+                print(f'Seeded claim DB at {claim_db_path} with {len(chunk_ids)} chunks')
+            finally:
+                conn.close()
+        return
+
+    # --- claim mode with existing manifest ---
+    if args.claim_mode:
+        if not args.manifest:
+            ap.error('--claim-mode requires --manifest (or --build-manifest to create one)')
+        manifest_path = Path(args.manifest)
+        if not manifest_path.exists():
+            raise SystemExit(f'Manifest not found: {manifest_path}')
+        claim_db_path = str(manifest_path) + '.claims.db'
+        conn = init_claim_db(claim_db_path)
+        try:
+            worker_id = f'w{args.shard_index}'
+            claimed = 0
+            while True:
+                chunk_id = claim_chunk(conn, worker_id)
+                if chunk_id is None:
+                    break
+                claimed += 1
+                if args.dry_run:
+                    print(f'DRY RUN: would process chunk {chunk_id}')
+                    continue
+                print(f'Processing claimed chunk: {chunk_id}')
+                try:
+                    # TODO: Actual chunk processing (read chunk content from manifest,
+                    # send to MCP add_memory, mark graphiti_extracted_at in Neo4j)
+                    # will be wired when the full pipeline is integrated.
+                    # For now, mark as failed to avoid false completion.
+                    conn.execute(
+                        "UPDATE chunk_claims SET status='failed', error=?, completed_at=? "
+                        'WHERE chunk_id=?',
+                        (
+                            'not yet implemented: chunk processing stub',
+                            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                            chunk_id,
+                        ),
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    conn.execute(
+                        "UPDATE chunk_claims SET status='failed', "
+                        "fail_count=COALESCE(fail_count,0)+1, error=?, completed_at=? "
+                        'WHERE chunk_id=?',
+                        (
+                            str(exc),
+                            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                            chunk_id,
+                        ),
+                    )
+                    conn.commit()
+
+            print(f'Worker {worker_id} processed {claimed} chunks')
+        finally:
+            conn.close()
+        return
+
+    # Default neo4j mode: placeholder
+    print(
+        f'Neo4j source mode (group_id={args.group_id}): '
+        'would read candidate chunks from the graph.\n'
+        'Use --dry-run to preview candidate chunks.\n'
+        'Use --build-manifest <path> to freeze chunk IDs to a manifest file.'
+    )
+
+
+def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
+    """Evidence source mode: the original JSON-file-based ingestion path.
+
+    Uses the already-parsed args from main() — does NOT re-parse sys.argv.
+    """
+    if getattr(args, 'subchunk_size', 0) <= 0:
         ap.error('--subchunk-size must be a positive integer')
 
     evidence_path = Path(args.evidence)
