@@ -24,6 +24,10 @@ from .models import Message, PromptFunction, PromptVersion
 from .prompt_helpers import to_prompt_json
 from .snippets import summary_instructions
 
+# Extraction modes for constrained_soft routing.
+_EXTRACTION_MODE_PERMISSIVE = 'permissive'
+_EXTRACTION_MODE_CONSTRAINED_SOFT = 'constrained_soft'
+
 
 class ExtractedEntity(BaseModel):
     name: str = Field(..., description='Name of the extracted entity')
@@ -74,6 +78,13 @@ class Versions(TypedDict):
 
 
 def extract_message(context: dict[str, Any]) -> list[Message]:
+    mode = context.get('extraction_mode', _EXTRACTION_MODE_PERMISSIVE)
+    if mode == _EXTRACTION_MODE_CONSTRAINED_SOFT:
+        return _extract_message_constrained_soft(context)
+    return _extract_message_permissive(context)
+
+
+def _extract_message_permissive(context: dict[str, Any]) -> list[Message]:
     sys_prompt = """You are an AI assistant that extracts entity nodes from conversational messages. 
     Your primary task is to extract and classify the speaker and other significant entities mentioned in the conversation."""
 
@@ -122,7 +133,68 @@ reference entities. Only extract distinct entities from the CURRENT MESSAGE. Don
     ]
 
 
+def _extract_message_constrained_soft(context: dict[str, Any]) -> list[Message]:
+    """Constrained-soft node extraction for conversational messages.
+
+    Only extracts entity types defined in ENTITY TYPES.  Avoids generic
+    catch-all entities not aligned with the lane ontology.
+    """
+    lane_intent_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_intent_section = f"""
+<LANE_INTENT>
+{context['custom_extraction_instructions']}
+</LANE_INTENT>
+"""
+
+    sys_prompt = (
+        'You are an AI assistant that extracts entity nodes from conversational messages, '
+        'operating in ontology-conformant mode. '
+        'Extract ONLY entities that match the defined ENTITY TYPES for this lane. '
+        'Do not create generic or uncategorised entity nodes — if an entity does not '
+        'fit a defined type, omit it.'
+    )
+
+    user_prompt = f"""
+<ENTITY TYPES>
+{context['entity_types']}
+</ENTITY TYPES>
+
+<PREVIOUS MESSAGES>
+{to_prompt_json([ep for ep in context['previous_episodes']])}
+</PREVIOUS MESSAGES>
+
+<CURRENT MESSAGE>
+{context['episode_content']}
+</CURRENT MESSAGE>
+{lane_intent_section}
+Instructions:
+
+Extract entity nodes from the CURRENT MESSAGE that match the ENTITY TYPES above.
+Focus on entities relevant to the LANE_INTENT.
+
+1. **Speaker Extraction**: Extract the speaker (before the colon) as an entity if it matches a defined type.
+2. **Entity Identification**: Only extract entities that clearly match one of the ENTITY TYPES.
+   - Do NOT extract generic entities that don't fit any defined type.
+   - Focus on entities relevant to the lane intent.
+3. **Entity Classification**: Assign the appropriate `entity_type_id`. If no type fits, do not extract.
+4. **Exclusions**: No relationships, actions, or temporal information.
+5. **Formatting**: Use full, unambiguous names.
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
 def extract_json(context: dict[str, Any]) -> list[Message]:
+    mode = context.get('extraction_mode', _EXTRACTION_MODE_PERMISSIVE)
+    if mode == _EXTRACTION_MODE_CONSTRAINED_SOFT:
+        return _extract_json_constrained_soft(context)
+    return _extract_json_permissive(context)
+
+
+def _extract_json_permissive(context: dict[str, Any]) -> list[Message]:
     sys_prompt = """You are an AI assistant that extracts entity nodes from JSON. 
     Your primary task is to extract and classify relevant entities from JSON files"""
 
@@ -155,7 +227,56 @@ Guidelines:
     ]
 
 
+def _extract_json_constrained_soft(context: dict[str, Any]) -> list[Message]:
+    """Constrained-soft node extraction from JSON — only ontology-matching entities."""
+    lane_intent_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_intent_section = f"""
+<LANE_INTENT>
+{context['custom_extraction_instructions']}
+</LANE_INTENT>
+"""
+
+    sys_prompt = (
+        'You are an AI assistant that extracts entity nodes from JSON, '
+        'operating in ontology-conformant mode. '
+        'Extract ONLY entities that match the defined ENTITY TYPES for this lane.'
+    )
+
+    user_prompt = f"""
+<ENTITY TYPES>
+{context['entity_types']}
+</ENTITY TYPES>
+
+<SOURCE DESCRIPTION>:
+{context['source_description']}
+</SOURCE DESCRIPTION>
+<JSON>
+{context['episode_content']}
+</JSON>
+{lane_intent_section}
+Extract entities from the JSON that match the ENTITY TYPES above.
+Focus on entities relevant to the LANE_INTENT.
+
+Guidelines:
+1. Only extract entities that clearly match one of the defined ENTITY TYPES.
+2. Do NOT create generic entities that don't fit a defined type.
+3. Do NOT extract any properties that contain dates.
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
 def extract_text(context: dict[str, Any]) -> list[Message]:
+    mode = context.get('extraction_mode', _EXTRACTION_MODE_PERMISSIVE)
+    if mode == _EXTRACTION_MODE_CONSTRAINED_SOFT:
+        return _extract_text_constrained_soft(context)
+    return _extract_text_permissive(context)
+
+
+def _extract_text_permissive(context: dict[str, Any]) -> list[Message]:
     sys_prompt = """You are an AI assistant that extracts entity nodes from text. 
     Your primary task is to extract and classify the speaker and other significant entities mentioned in the provided text."""
 
@@ -179,6 +300,46 @@ Guidelines:
 2. Avoid creating nodes for relationships or actions.
 3. Avoid creating nodes for temporal information like dates, times or years (these will be added to edges later).
 4. Be as explicit as possible in your node names, using full names and avoiding abbreviations.
+"""
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_prompt),
+    ]
+
+
+def _extract_text_constrained_soft(context: dict[str, Any]) -> list[Message]:
+    """Constrained-soft node extraction from plain text — ontology-conformant."""
+    lane_intent_section = ''
+    if context.get('custom_extraction_instructions', '').strip():
+        lane_intent_section = f"""
+<LANE_INTENT>
+{context['custom_extraction_instructions']}
+</LANE_INTENT>
+"""
+
+    sys_prompt = (
+        'You are an AI assistant that extracts entity nodes from text, '
+        'operating in ontology-conformant mode. '
+        'Extract ONLY entities that match the defined ENTITY TYPES for this lane. '
+        'Do not create generic or uncategorised entity nodes.'
+    )
+
+    user_prompt = f"""
+<ENTITY TYPES>
+{context['entity_types']}
+</ENTITY TYPES>
+
+<TEXT>
+{context['episode_content']}
+</TEXT>
+{lane_intent_section}
+Extract entities from the TEXT that match the ENTITY TYPES above and are relevant to the LANE_INTENT.
+
+Guidelines:
+1. Only extract entities that clearly match one of the defined ENTITY TYPES.
+2. Do NOT extract generic entities that don't fit any defined type.
+3. Avoid nodes for relationships, actions, or temporal information.
+4. Be explicit and unambiguous in entity names.
 """
     return [
         Message(role='system', content=sys_prompt),

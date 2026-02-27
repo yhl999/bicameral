@@ -43,12 +43,25 @@ class OntologyProfile:
             at load time.
         extraction_emphasis: Prompt hint injected into the LLM extraction
             call to steer focus toward lane-relevant patterns.
+            Deprecated alias: use ``intent_guidance`` in new YAML configs.
+        intent_guidance: Per-lane natural-language description of what the
+            extraction should focus on.  Passed as
+            ``custom_extraction_instructions`` to Graphiti Core.  If not set,
+            falls back to ``extraction_emphasis`` for backward compatibility.
+        extraction_mode: Controls extraction strictness for this lane.
+            - ``'permissive'`` (default): extract broadly; all relationship
+              types and entity types are allowed.
+            - ``'constrained_soft'``: ontology-conformant mode.  Uses
+              dedicated prompt branches and code-level enforcement to reduce
+              noise and increase conformance to the defined ontology.
     """
 
     entity_types: dict[str, type[BaseModel]] = field(default_factory=dict)
     relationship_types: list[dict[str, str]] = field(default_factory=list)
     edge_types: dict[str, type[BaseModel]] = field(default_factory=dict)
     extraction_emphasis: str = ""
+    intent_guidance: str = ""
+    extraction_mode: str = "permissive"
 
 
 def _build_entity_types(raw_types: list[dict[str, str]]) -> dict[str, type[BaseModel]]:
@@ -143,18 +156,37 @@ class OntologyRegistry:
             relationship_types = definition.get("relationship_types", [])
             edge_types = _build_edge_types(relationship_types)
             extraction_emphasis = definition.get("extraction_emphasis", "")
+            # intent_guidance is the canonical key for new configs.
+            # Falls back to extraction_emphasis for backward compatibility.
+            intent_guidance = definition.get(
+                "intent_guidance", extraction_emphasis
+            )
+            extraction_mode = definition.get("extraction_mode", "permissive")
+            _VALID_EXTRACTION_MODES = {"permissive", "constrained_soft"}
+            if extraction_mode not in _VALID_EXTRACTION_MODES:
+                logger.warning(
+                    "Invalid extraction_mode %r for %s — falling back to 'permissive'. "
+                    "Valid values: %s",
+                    extraction_mode,
+                    group_id,
+                    _VALID_EXTRACTION_MODES,
+                )
+                extraction_mode = "permissive"
 
             profiles[group_id] = OntologyProfile(
                 entity_types=entity_types,
                 relationship_types=relationship_types,
                 edge_types=edge_types,
                 extraction_emphasis=extraction_emphasis,
+                intent_guidance=intent_guidance,
+                extraction_mode=extraction_mode,
             )
             logger.info(
-                "  Loaded ontology for %s: %d entity types, %d relationship types",
+                "  Loaded ontology for %s: %d entity types, %d relationship types, mode=%s",
                 group_id,
                 len(entity_types),
                 len(relationship_types),
+                extraction_mode,
             )
 
         logger.info("Ontology registry loaded: %d lanes configured", len(profiles))

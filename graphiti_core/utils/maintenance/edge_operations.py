@@ -16,6 +16,7 @@ limitations under the License.
 
 import logging
 from datetime import datetime
+from difflib import SequenceMatcher
 from time import time
 from typing import Literal
 
@@ -46,6 +47,112 @@ from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# constrained_soft enforcement helpers
+# ---------------------------------------------------------------------------
+
+# Generic connector relation types that carry no domain-specific signal.
+# In constrained_soft mode, edges with these relation_types that have no
+# ontology match are dropped after LLM extraction.
+_GENERIC_EDGE_NAMES: frozenset[str] = frozenset({
+    'RELATES_TO',
+    'IS_RELATED_TO',
+    'IS_RELATED',
+    'MENTIONS',
+    'CONNECTED_TO',
+    'ASSOCIATED_WITH',
+    'HAS',
+    'CONTAINS',
+    'INCLUDES',
+    'LINKS_TO',
+    'REFERENCES',
+    'IS_CONNECTED_TO',
+    'IS_ASSOCIATED_WITH',
+})
+
+# Similarity threshold for near-miss canonicalization.
+# A relation_type that scores ≥ this against any ontology name is snapped to that name.
+_CANONICALIZE_THRESHOLD: float = 0.78
+
+
+def _canonicalize_edge_name(
+    relation_type: str,
+    ontology_names: frozenset[str],
+    threshold: float = _CANONICALIZE_THRESHOLD,
+) -> str:
+    """Snap a near-miss relation_type to the closest ontology name.
+
+    If the best similarity ratio is below *threshold*, returns *relation_type*
+    unchanged.  Only exact-match or high-similarity (≥ threshold) names are
+    canonicalised so we don't over-correct specific domain relations.
+
+    Parameters
+    ----------
+    relation_type:
+        The relation type string returned by the LLM.
+    ontology_names:
+        Set of canonical relation type names from the lane ontology.
+    threshold:
+        Minimum SequenceMatcher ratio to accept a canonicalisation.
+
+    Returns
+    -------
+    str
+        Canonical name if a close match exists, otherwise the original.
+    """
+    if not ontology_names or relation_type in ontology_names:
+        return relation_type
+
+    best_name = relation_type
+    best_ratio = 0.0
+    for canonical in ontology_names:
+        ratio = SequenceMatcher(None, relation_type, canonical).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_name = canonical
+
+    if best_ratio >= threshold:
+        if best_name != relation_type:
+            logger.info(
+                'constrained_soft: canonicalized edge %r → %r (ratio=%.2f)',
+                relation_type,
+                best_name,
+                best_ratio,
+            )
+        return best_name
+
+    return relation_type
+
+
+def _should_filter_constrained_edge(
+    relation_type: str,
+    ontology_names: frozenset[str],
+) -> bool:
+    """Return True if an edge should be dropped in constrained_soft mode.
+
+    Drops edges only when ALL of the following hold:
+    - The relation_type is NOT in the ontology (no exact/near-miss match was applied).
+    - The relation_type is a known generic/connector type that adds no signal.
+
+    Keeps domain-specific off-ontology edges (they may still carry value).
+
+    Parameters
+    ----------
+    relation_type:
+        Post-canonicalization relation type string.
+    ontology_names:
+        Set of canonical relation type names from the lane ontology.
+    """
+    if relation_type in ontology_names:
+        return False  # ontology match → keep
+    if relation_type in _GENERIC_EDGE_NAMES:
+        logger.debug(
+            'constrained_soft: dropping generic off-ontology edge %r',
+            relation_type,
+        )
+        return True  # generic noise → drop
+    return False  # specific off-ontology → allow (limited)
 
 
 def build_episodic_edges(
@@ -95,7 +202,18 @@ async def extract_edges(
     group_id: str = '',
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
+    extraction_mode: str = 'permissive',
 ) -> list[EntityEdge]:
+    """Extract relationship edges from an episode.
+
+    Parameters
+    ----------
+    extraction_mode : str
+        Extraction behaviour: ``'permissive'`` (default — extract broadly) or
+        ``'constrained_soft'`` (ontology-conformant — after LLM extraction,
+        near-miss relation types are canonicalized to ontology names and
+        generic off-ontology noise is dropped).
+    """
     start = time()
 
     extract_edges_max_tokens = 16384
@@ -135,6 +253,7 @@ async def extract_edges(
         'reference_time': episode.valid_at,
         'edge_types': edge_types_context,
         'custom_extraction_instructions': custom_extraction_instructions or '',
+        'extraction_mode': extraction_mode,
     }
 
     llm_response = await llm_client.generate_response(
@@ -168,6 +287,39 @@ async def extract_edges(
             continue
 
         edges_data.append(edge_data)
+
+    # -----------------------------------------------------------------------
+    # constrained_soft post-extraction enforcement
+    # -----------------------------------------------------------------------
+    # After entity-name validation, apply two enforcement passes:
+    #   1. Canonicalize near-miss relation types to ontology names.
+    #   2. Filter generic off-ontology noise.
+    # This is intentionally done in code (not prompt) to avoid conflicting
+    # directives and ensure deterministic enforcement regardless of LLM drift.
+    if extraction_mode == 'constrained_soft' and edge_types is not None:
+        ontology_names: frozenset[str] = frozenset(edge_types.keys())
+        enforced: list[ExtractedEdge] = []
+        for edge_data in edges_data:
+            canonical = _canonicalize_edge_name(edge_data.relation_type, ontology_names)
+            edge_data.relation_type = canonical
+            if _should_filter_constrained_edge(canonical, ontology_names):
+                logger.info(
+                    'constrained_soft: dropped generic edge %r between %r → %r',
+                    canonical,
+                    edge_data.source_entity_name,
+                    edge_data.target_entity_name,
+                )
+                continue
+            enforced.append(edge_data)
+        dropped = len(edges_data) - len(enforced)
+        if dropped:
+            logger.info(
+                'constrained_soft enforcement: kept %d/%d edges (dropped %d generic/noise)',
+                len(enforced),
+                len(edges_data),
+                dropped,
+            )
+        edges_data = enforced
 
     end = time()
     logger.debug(f'Extracted {len(edges_data)} new edges in {(end - start) * 1000:.0f} ms')

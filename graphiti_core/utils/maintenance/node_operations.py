@@ -67,8 +67,17 @@ async def extract_nodes(
     entity_types: dict[str, type[BaseModel]] | None = None,
     excluded_entity_types: list[str] | None = None,
     custom_extraction_instructions: str | None = None,
+    extraction_mode: str = 'permissive',
 ) -> list[EntityNode]:
-    """Extract entity nodes from an episode."""
+    """Extract entity nodes from an episode.
+
+    Parameters
+    ----------
+    extraction_mode : str
+        Extraction behaviour: ``'permissive'`` (default — extract broadly) or
+        ``'constrained_soft'`` (ontology-conformant — only extract entity types
+        defined for the lane; omit unclassifiable entities).
+    """
     start = time()
     llm_client = clients.llm_client
 
@@ -83,6 +92,7 @@ async def extract_nodes(
         'custom_extraction_instructions': custom_extraction_instructions or '',
         'entity_types': entity_types_context,
         'source_description': episode.source_description,
+        'extraction_mode': extraction_mode,
     }
 
     # Extract entities

@@ -393,20 +393,29 @@ class GraphitiService:
                 return profile.entity_types
         return self.entity_types
 
-    def resolve_ontology(self, group_id: str) -> tuple[dict | None, str, dict | None]:
-        """Resolve entity types, extraction emphasis, and edge types for a group.
+    def resolve_ontology(
+        self, group_id: str
+    ) -> tuple[dict | None, str, dict | None, str]:
+        """Resolve entity types, intent guidance, edge types, and extraction mode for a group.
 
         Returns:
-            A 3-tuple of (entity_types, extraction_emphasis, edge_types).
-            entity_types falls back to the global default when the group has
-            no explicit ontology profile. extraction_emphasis defaults to ''
-            and edge_types defaults to None when no profile is configured.
+            A 4-tuple of (entity_types, intent_guidance, edge_types, extraction_mode).
+            - entity_types falls back to the global default when the group has no profile.
+            - intent_guidance is the per-lane LLM focus hint (passed as
+              custom_extraction_instructions to Graphiti Core). Defaults to ''.
+            - edge_types defaults to None when no profile is configured.
+            - extraction_mode defaults to 'permissive' when no profile is configured.
         """
         if self.ontology_registry is not None:
             profile = self.ontology_registry.get(group_id)
             if profile is not None:
-                return profile.entity_types, profile.extraction_emphasis, profile.edge_types
-        return self.entity_types, '', None
+                return (
+                    profile.entity_types,
+                    profile.intent_guidance or profile.extraction_emphasis,
+                    profile.edge_types,
+                    profile.extraction_mode,
+                )
+        return self.entity_types, '', None, 'permissive'
 
     async def get_client(self) -> Graphiti:
         """Get the Graphiti client, initializing if necessary."""
