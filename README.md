@@ -324,6 +324,8 @@ python3 scripts/import_transcripts_to_neo4j.py \
   --sessions-dir path/to/session_transcripts/
 
 # 2. Ingest sessions — Neo4j source mode (default, production path)
+# NOTE: If Neo4j has no Message nodes (empty graph), a BOOTSTRAP_REQUIRED guard
+# fires and the script exits non-zero. Run step 1 first to populate Neo4j.
 python3 scripts/mcp_ingest_sessions.py \
   --group-id s1_sessions_main \
   --source-mode neo4j \

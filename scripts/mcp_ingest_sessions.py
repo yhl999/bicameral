@@ -351,7 +351,7 @@ def _query_neo4j_message_count(args: argparse.Namespace) -> int:
                     return 0
                 return int(rec.get('cnt', 0) or 0)
     except Exception as exc:
-        print(f'WARNING: Could not query Neo4j message count: {exc}', file=sys.stderr)
+        print(f'WARNING: Could not query Neo4j message count ({type(exc).__name__})', file=sys.stderr)
         return -1
 
 
@@ -543,14 +543,16 @@ def main():
             print(f'Claim DB not found: {claim_db_path}')
             return
         conn = init_claim_db(claim_db_path)
-        cursor = conn.execute(
-            'SELECT status, COUNT(*) FROM chunk_claims GROUP BY status'
-        )
-        rows = cursor.fetchall()
-        print('Claim state summary:')
-        for status, count in rows:
-            print(f'  {status}: {count}')
-        conn.close()
+        try:
+            cursor = conn.execute(
+                'SELECT status, COUNT(*) FROM chunk_claims GROUP BY status'
+            )
+            rows = cursor.fetchall()
+            print('Claim state summary:')
+            for status, count in rows:
+                print(f'  {status}: {count}')
+        finally:
+            conn.close()
         return
 
     # --- FR-4: source mode routing ---
@@ -594,9 +596,11 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
         if args.claim_mode:
             claim_db_path = str(manifest_path) + '.claims.db'
             conn = init_claim_db(claim_db_path)
-            seed_claims(conn, chunk_ids)
-            print(f'Seeded claim DB at {claim_db_path} with {len(chunk_ids)} chunks')
-            conn.close()
+            try:
+                seed_claims(conn, chunk_ids)
+                print(f'Seeded claim DB at {claim_db_path} with {len(chunk_ids)} chunks')
+            finally:
+                conn.close()
         return
 
     # --- claim mode with existing manifest ---
@@ -608,48 +612,49 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
             raise SystemExit(f'Manifest not found: {manifest_path}')
         claim_db_path = str(manifest_path) + '.claims.db'
         conn = init_claim_db(claim_db_path)
+        try:
+            worker_id = f'w{args.shard_index}'
+            claimed = 0
+            while True:
+                chunk_id = claim_chunk(conn, worker_id)
+                if chunk_id is None:
+                    break
+                claimed += 1
+                if args.dry_run:
+                    print(f'DRY RUN: would process chunk {chunk_id}')
+                    continue
+                print(f'Processing claimed chunk: {chunk_id}')
+                try:
+                    # TODO: Actual chunk processing (read chunk content from manifest,
+                    # send to MCP add_memory, mark graphiti_extracted_at in Neo4j)
+                    # will be wired when the full pipeline is integrated.
+                    # For now, mark as failed to avoid false completion.
+                    conn.execute(
+                        "UPDATE chunk_claims SET status='failed', error=?, completed_at=? "
+                        'WHERE chunk_id=?',
+                        (
+                            'not yet implemented: chunk processing stub',
+                            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                            chunk_id,
+                        ),
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    conn.execute(
+                        "UPDATE chunk_claims SET status='failed', "
+                        "fail_count=COALESCE(fail_count,0)+1, error=?, completed_at=? "
+                        'WHERE chunk_id=?',
+                        (
+                            str(exc),
+                            datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                            chunk_id,
+                        ),
+                    )
+                    conn.commit()
 
-        worker_id = f'w{args.shard_index}'
-        claimed = 0
-        while True:
-            chunk_id = claim_chunk(conn, worker_id)
-            if chunk_id is None:
-                break
-            claimed += 1
-            if args.dry_run:
-                print(f'DRY RUN: would process chunk {chunk_id}')
-                continue
-            print(f'Processing claimed chunk: {chunk_id}')
-            try:
-                # TODO: Actual chunk processing (read chunk content from manifest,
-                # send to MCP add_memory, mark graphiti_extracted_at in Neo4j)
-                # will be wired when the full pipeline is integrated.
-                # For now, mark as failed to avoid false completion.
-                conn.execute(
-                    "UPDATE chunk_claims SET status='failed', error=?, completed_at=? "
-                    'WHERE chunk_id=?',
-                    (
-                        'not yet implemented: chunk processing stub',
-                        datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                        chunk_id,
-                    ),
-                )
-                conn.commit()
-            except Exception as exc:
-                conn.execute(
-                    "UPDATE chunk_claims SET status='failed', "
-                    "fail_count=COALESCE(fail_count,0)+1, error=?, completed_at=? "
-                    'WHERE chunk_id=?',
-                    (
-                        str(exc),
-                        datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                        chunk_id,
-                    ),
-                )
-                conn.commit()
-
-        print(f'Worker {worker_id} processed {claimed} chunks')
-        conn.close()
+            print(f'Worker {worker_id} processed {claimed} chunks')
+        finally:
+            conn.close()
         return
 
     # Default neo4j mode: placeholder

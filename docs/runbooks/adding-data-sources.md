@@ -338,7 +338,7 @@ python3 scripts/ingest_adapter_contract_check.py --strict
 
 | Check | Requirement |
 |-------|-------------|
-| `source_type` | One of `conversation`, `document`, `note`, `task`, `artifact` |
+| `source_type` | One of `conversation`, `document`, `structured_rows` (see `ingest/contracts.py`) |
 | `record_id` | Deterministic — derived from source data, not randomly generated |
 | `chunk_id` | SHA-256 based, stable across re-runs |
 | `content_hash` | `sha256(content.encode()).hexdigest()` |
