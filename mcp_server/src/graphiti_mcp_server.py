@@ -19,7 +19,8 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
-from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
@@ -96,72 +97,154 @@ _MAX_FACTS_CAP = 200
 # ---------------------------------------------------------------------------
 # Configurable via environment variables:
 #   SEARCH_RATE_LIMIT_ENABLED   "true" (default) | "false"
-#   SEARCH_RATE_LIMIT_REQUESTS  max requests per window (default: 60)
-#   SEARCH_RATE_LIMIT_WINDOW    window duration in seconds (default: 60)
+#   SEARCH_RATE_LIMIT_REQUESTS  max requests per window (default: 60, min: 1, max: 10000)
+#   SEARCH_RATE_LIMIT_WINDOW    window duration in seconds (default: 60, min: 1, max: 86400)
 #
-# The limiter is in-process and per-window (sliding).  It falls back to a
-# global bucket when no caller key is available; if a session/caller key is
-# injected by the transport layer it will be used for per-caller isolation.
+# The limiter enforces a per-(caller, scope) bucket so that rotating group IDs
+# cannot inflate the key space and escape throttling.  When no trusted caller
+# principal is available (anonymous) a parallel global bucket is also checked,
+# providing a conservative fallback that prevents key-space spraying via
+# group-ID rotation even without auth.
 
+_ANON_PRINCIPAL = '__anon__'
 
 _SEARCH_RATE_LIMIT_ENABLED: bool = (
     os.environ.get('SEARCH_RATE_LIMIT_ENABLED', 'true').strip().lower() != 'false'
 )
 
-try:
-    _SEARCH_RATE_LIMIT_REQUESTS = int(os.environ.get('SEARCH_RATE_LIMIT_REQUESTS', '60'))
-    if _SEARCH_RATE_LIMIT_REQUESTS <= 0:
-        raise ValueError
-except (ValueError, TypeError):
-    _SEARCH_RATE_LIMIT_REQUESTS = 60
+_SEARCH_RATE_LIMIT_REQUESTS_DEFAULT = 60
+_SEARCH_RATE_LIMIT_REQUESTS_MIN = 1
+_SEARCH_RATE_LIMIT_REQUESTS_MAX = 10_000
+_SEARCH_RATE_LIMIT_WINDOW_DEFAULT = 60.0
+_SEARCH_RATE_LIMIT_WINDOW_MIN = 1.0
+_SEARCH_RATE_LIMIT_WINDOW_MAX = 86_400.0
 
 try:
-    _SEARCH_RATE_LIMIT_WINDOW = float(os.environ.get('SEARCH_RATE_LIMIT_WINDOW', '60'))
-    if _SEARCH_RATE_LIMIT_WINDOW <= 0:
-        raise ValueError
-except (ValueError, TypeError):
-    _SEARCH_RATE_LIMIT_WINDOW = 60.0
+    _raw_requests = int(os.environ.get('SEARCH_RATE_LIMIT_REQUESTS', str(_SEARCH_RATE_LIMIT_REQUESTS_DEFAULT)))
+    if not (_SEARCH_RATE_LIMIT_REQUESTS_MIN <= _raw_requests <= _SEARCH_RATE_LIMIT_REQUESTS_MAX):
+        raise ValueError(
+            f'SEARCH_RATE_LIMIT_REQUESTS={_raw_requests} out of range '
+            f'[{_SEARCH_RATE_LIMIT_REQUESTS_MIN}, {_SEARCH_RATE_LIMIT_REQUESTS_MAX}]; '
+            f'using default {_SEARCH_RATE_LIMIT_REQUESTS_DEFAULT}'
+        )
+    _SEARCH_RATE_LIMIT_REQUESTS = _raw_requests
+except (ValueError, TypeError) as _rl_exc:
+    _SEARCH_RATE_LIMIT_REQUESTS = _SEARCH_RATE_LIMIT_REQUESTS_DEFAULT
+    # Emit warning at module load time so operators see it in startup logs.
+    import warnings as _warnings
+    _warnings.warn(str(_rl_exc), stacklevel=1)
 
+try:
+    _raw_window = float(os.environ.get('SEARCH_RATE_LIMIT_WINDOW', str(_SEARCH_RATE_LIMIT_WINDOW_DEFAULT)))
+    if not (_SEARCH_RATE_LIMIT_WINDOW_MIN <= _raw_window <= _SEARCH_RATE_LIMIT_WINDOW_MAX):
+        raise ValueError(
+            f'SEARCH_RATE_LIMIT_WINDOW={_raw_window} out of range '
+            f'[{_SEARCH_RATE_LIMIT_WINDOW_MIN}, {_SEARCH_RATE_LIMIT_WINDOW_MAX}]; '
+            f'using default {_SEARCH_RATE_LIMIT_WINDOW_DEFAULT}'
+        )
+    _SEARCH_RATE_LIMIT_WINDOW = _raw_window
+except (ValueError, TypeError) as _rl_exc:
+    _SEARCH_RATE_LIMIT_WINDOW = _SEARCH_RATE_LIMIT_WINDOW_DEFAULT
+    import warnings as _warnings
+    _warnings.warn(str(_rl_exc), stacklevel=1)
+
+# Per-(caller, scope) sliding-window limiter — primary enforcement.
 _search_rate_limiter = _SlidingWindowRateLimiter(
     max_requests=_SEARCH_RATE_LIMIT_REQUESTS,
     window_seconds=_SEARCH_RATE_LIMIT_WINDOW,
 )
 
+# Global fallback limiter enforced *in addition to* the per-caller limiter
+# whenever the caller principal is unavailable (anonymous).  This prevents
+# key-space spraying via group-ID rotation even in unauthenticated deployments.
+_search_global_fallback_limiter = _SlidingWindowRateLimiter(
+    max_requests=_SEARCH_RATE_LIMIT_REQUESTS,
+    window_seconds=_SEARCH_RATE_LIMIT_WINDOW,
+)
 
-def _derive_rate_limit_key(effective_group_ids: list[str]) -> str:
-    """Return a stable, canonical per-caller rate-limit key from *resolved* group IDs.
 
-    Must be called **after** ``_resolve_effective_group_ids`` so the key is
-    derived from trusted, validated context rather than raw caller-supplied
-    input.
+def _extract_trusted_caller_principal(ctx: 'Context | None') -> str:
+    """Return a trusted caller principal string (best-effort, never from raw payload).
+
+    Resolution order (most-trusted → least-trusted):
+    1. OAuth ``AccessToken.client_id`` from the MCP auth middleware contextvar —
+       set by ``AuthContextMiddleware`` from a verified bearer token.
+    2. ``Context.client_id`` from the MCP request context meta field.
+    3. ``'__anon__'`` sentinel — no authenticated identity is available.
+
+    The returned value is used as the caller component of the rate-limit key.
+    It is **never** sourced from the raw MCP request payload so a caller cannot
+    self-assign an arbitrary principal to share another caller's bucket.
+
+    Args:
+        ctx: The FastMCP ``Context`` for the current request, or ``None`` when
+            called outside a live request (e.g. unit tests without a request).
+
+    Returns:
+        A non-empty string that identifies the caller, or ``'__anon__'``.
+    """
+    # 1. Try the auth-middleware contextvar (set from a verified bearer token).
+    try:
+        access_token = get_access_token()
+        if access_token is not None and access_token.client_id:
+            return access_token.client_id
+    except Exception:  # pragma: no cover — guard against unexpected import edge-cases
+        pass
+
+    # 2. Try the MCP request-context meta field (transport-injected, not payload).
+    if ctx is not None:
+        try:
+            client_id = ctx.client_id
+            if client_id:
+                return client_id
+        except Exception:  # pragma: no cover — ctx may not be inside a request
+            pass
+
+    return _ANON_PRINCIPAL
+
+
+def _derive_rate_limit_key(effective_group_ids: list[str], caller_principal: str) -> str:
+    """Return a stable, canonical per-(caller, scope) rate-limit key.
+
+    Must be called **after** ``_resolve_effective_group_ids`` and
+    ``_extract_trusted_caller_principal`` so both components are derived from
+    trusted, validated context rather than raw caller-supplied input.
 
     Key properties:
-    - **Canonical**: sorted unique effective_group_ids are hashed, so different
-      orderings of the same group set map to the same rate-limit bucket.
-    - **Trust-bound**: derived from post-resolution group IDs only; raw
-      caller-supplied ordering cannot manipulate the bucket.
-    - **Anti-spoof**: cycling through permutations or subsets of group IDs
-      does not allow an adversary to escape per-caller rate limiting.
+    - **Caller-bound**: the ``caller_principal`` component ensures different
+      callers with identical group scopes do not share a bucket.
+    - **Canonical scope**: sorted unique effective_group_ids are hashed, so
+      permutations of the same group set map to the same key.
+    - **Anti-spray**: cycling through group-ID subsets/permutations cannot
+      generate a fresh unthrottled bucket — the caller component pins the key.
 
     Args:
         effective_group_ids: Validated and resolved group IDs returned by
-            ``_resolve_effective_group_ids``.  An empty list causes the
-            conservative ``'__global__'`` fallback to be used.
+            ``_resolve_effective_group_ids``.  An empty list uses the
+            ``'__global__'`` scope component.
+        caller_principal: Trusted caller identity from
+            ``_extract_trusted_caller_principal``.  Must not be empty.
+
+    Returns:
+        A composite key string of the form
+        ``caller:<principal>|scope:<digest_or_global>``.
     """
     if effective_group_ids:
-        # Sort + deduplicate to produce a canonical representation that is
-        # independent of caller-supplied ordering.
+        # Sort + deduplicate to produce a canonical, order-insensitive scope digest.
         canonical = '|'.join(sorted(set(effective_group_ids)))
-        digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
-        return f'group:{digest}'
-    return '__global__'
+        scope_digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        scope_component = f'scope:{scope_digest}'
+    else:
+        scope_component = 'scope:__global__'
+
+    return f'caller:{caller_principal}|{scope_component}'
 
 
 def _hash_rate_limit_key(key: str) -> str:
     """Return an 8-character hex prefix of the SHA-256 of *key* for safe logging.
 
-    Group IDs may contain user-controlled strings; hashing prevents sensitive
-    values from appearing in plain text in logs.
+    The key may contain the caller principal and group IDs; hashing prevents
+    sensitive values from appearing in plain text in logs.
     """
     return hashlib.sha256(key.encode()).hexdigest()[:8]
 
@@ -768,6 +851,7 @@ async def search_nodes(
     search_mode: str = 'hybrid',
     max_nodes: int = 10,
     entity_types: list[str] | None = None,
+    ctx: Context | None = None,
 ) -> NodeSearchResponse | ErrorResponse:
     """Search for nodes in the graph memory.
 
@@ -809,13 +893,23 @@ async def search_nodes(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
 
-        caller_key = _derive_rate_limit_key(effective_group_ids)
-        if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
-            logger.warning(
-                'search_nodes rate limit exceeded (key_hash=%s)',
-                _hash_rate_limit_key(caller_key),
-            )
-            return ErrorResponse(error='rate limit exceeded; retry later')
+        # Extract the trusted caller principal (never from raw request payload).
+        caller_principal = _extract_trusted_caller_principal(ctx)
+        caller_key = _derive_rate_limit_key(effective_group_ids, caller_principal)
+        if _SEARCH_RATE_LIMIT_ENABLED:
+            if not await _search_rate_limiter.is_allowed(caller_key):
+                logger.warning(
+                    'search_nodes rate limit exceeded (key_hash=%s)',
+                    _hash_rate_limit_key(caller_key),
+                )
+                return ErrorResponse(error='rate limit exceeded; retry later')
+            # Global fallback: enforce an additional shared bucket for anonymous
+            # callers so rotating group IDs cannot bypass per-caller throttling.
+            if caller_principal == _ANON_PRINCIPAL and not await _search_global_fallback_limiter.is_allowed('__global__'):
+                logger.warning(
+                    'search_nodes global fallback rate limit exceeded (anon caller)',
+                )
+                return ErrorResponse(error='rate limit exceeded; retry later')
 
         scope_error = _validate_group_scope_support(effective_group_ids)
         if scope_error:
@@ -883,6 +977,7 @@ async def search_memory_facts(
     search_mode: str = 'hybrid',
     max_facts: int = 10,
     center_node_uuid: str | None = None,
+    ctx: Context | None = None,
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts.
 
@@ -926,13 +1021,23 @@ async def search_memory_facts(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
 
-        caller_key = _derive_rate_limit_key(effective_group_ids)
-        if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed(caller_key):
-            logger.warning(
-                'search_memory_facts rate limit exceeded (key_hash=%s)',
-                _hash_rate_limit_key(caller_key),
-            )
-            return ErrorResponse(error='rate limit exceeded; retry later')
+        # Extract the trusted caller principal (never from raw request payload).
+        caller_principal = _extract_trusted_caller_principal(ctx)
+        caller_key = _derive_rate_limit_key(effective_group_ids, caller_principal)
+        if _SEARCH_RATE_LIMIT_ENABLED:
+            if not await _search_rate_limiter.is_allowed(caller_key):
+                logger.warning(
+                    'search_memory_facts rate limit exceeded (key_hash=%s)',
+                    _hash_rate_limit_key(caller_key),
+                )
+                return ErrorResponse(error='rate limit exceeded; retry later')
+            # Global fallback: enforce an additional shared bucket for anonymous
+            # callers so rotating group IDs cannot bypass per-caller throttling.
+            if caller_principal == _ANON_PRINCIPAL and not await _search_global_fallback_limiter.is_allowed('__global__'):
+                logger.warning(
+                    'search_memory_facts global fallback rate limit exceeded (anon caller)',
+                )
+                return ErrorResponse(error='rate limit exceeded; retry later')
 
         scope_error = _validate_group_scope_support(effective_group_ids)
         if scope_error:

@@ -179,11 +179,14 @@ def _load_single_extension(
     try:
         payload = _read_json_object(manifest_path)
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        # Avoid logging raw exc.msg which may contain user-controlled content
+        # from the manifest file (e.g. malicious strings in the JSON body).
+        exc_type = type(exc).__name__
         report.diagnostics.append(
             ExtensionDiagnostic(
                 level='error',
                 location=str(manifest_path),
-                message=str(exc),
+                message=f'Failed to read or parse manifest ({exc_type}); check JSON syntax and object shape.',
                 hint='Fix manifest JSON syntax and object shape.',
             ),
         )
