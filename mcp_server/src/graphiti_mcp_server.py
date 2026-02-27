@@ -120,20 +120,19 @@ logger = logging.getLogger(__name__)
 SAFE_GROUP_ID_RE = re.compile(r'^[a-zA-Z0-9_]+$')
 VALID_SEARCH_MODES = {'hybrid', 'semantic', 'keyword'}
 
-_XML_TAG_RE = re.compile(r'<[^>]{0,100}>')
-_CONTROL_CHAR_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+_UNSAFE_CHAR_RE = re.compile(r'[<>&\x00-\x1f\x7f-\x9f]')
 
 
 def _sanitize_for_error(value: str, max_len: int = 64) -> str:
     """Sanitize user input for safe reflection in error messages.
 
-    Strips XML/HTML tags, control characters, and truncates to prevent
-    prompt injection via MCP tool output reflected into LLM context.
+    Uses allowlist approach: replaces all angle brackets, ampersands,
+    and control characters with empty string. Then truncates.
+    This prevents XML/HTML tag injection, entity encoding bypasses,
+    and control character attacks in MCP tool output.
     """
-    s = str(value)[:max_len]
-    s = _XML_TAG_RE.sub('', s)
-    s = _CONTROL_CHAR_RE.sub(' ', s)
-    return s.strip()
+    s = _UNSAFE_CHAR_RE.sub('', str(value))
+    return s[:max_len].strip()
 
 
 # Create global config instance - will be properly initialized later
