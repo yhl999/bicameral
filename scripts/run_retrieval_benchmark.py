@@ -160,6 +160,17 @@ def run_bicameral_query(
         args['search_mode'] = search_mode
 
     facts_resp = client.call_tool('search_memory_facts', args)
+    # Fail hard if MCP returned an error — do not silently score garbage.
+    if isinstance(facts_resp, dict) and 'error' in facts_resp:
+        raise RuntimeError(
+            f'MCP returned error for query {query!r} (search_memory_facts): '
+            f'{str(facts_resp["error"])[:200]}'
+        )
+    if not isinstance(facts_resp, (list, dict)):
+        raise RuntimeError(
+            f'MCP returned unexpected type {type(facts_resp).__name__} '
+            f'for query {query!r} (search_memory_facts)'
+        )
 
     node_args: dict[str, Any] = {'query': query, 'max_nodes': top_k}
     if lane_alias:
@@ -167,6 +178,17 @@ def run_bicameral_query(
     if search_mode != 'hybrid':
         node_args['search_mode'] = search_mode
     nodes_resp = client.call_tool('search_nodes', node_args)
+    # Fail hard if MCP returned an error — do not silently score garbage.
+    if isinstance(nodes_resp, dict) and 'error' in nodes_resp:
+        raise RuntimeError(
+            f'MCP returned error for query {query!r} (search_nodes): '
+            f'{str(nodes_resp["error"])[:200]}'
+        )
+    if not isinstance(nodes_resp, (list, dict)):
+        raise RuntimeError(
+            f'MCP returned unexpected type {type(nodes_resp).__name__} '
+            f'for query {query!r} (search_nodes)'
+        )
 
     return {
         'facts_response': facts_resp,

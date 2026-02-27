@@ -21,7 +21,7 @@ import math
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import combinations
 from math import comb
 from typing import TypeVar
@@ -892,10 +892,18 @@ def _is_substantive(content: str, config: SmartCutterConfig) -> bool:
 def _parse_iso_datetime(value: str) -> datetime:
     """Parse an ISO-8601 string to a timezone-aware datetime.
 
-    Handles the common ``Z`` suffix and bare offsets.
+    Handles the common ``Z`` suffix, bare offsets, and naive datetimes
+    (assumed UTC).  Returns ``datetime.min`` (UTC) on parse failure so
+    this function is safe to use as a sort key.
     """
-    text = value.replace('Z', '+00:00')
-    return datetime.fromisoformat(text)
+    try:
+        text = value.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError, AttributeError):
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _make_chunk_id(
@@ -1057,7 +1065,7 @@ def chunk_conversation_semantic(
     _validate_messages(messages)
 
     # Ensure chronological order.
-    sorted_messages = sorted(messages, key=lambda m: m['created_at'])
+    sorted_messages = sorted(messages, key=lambda m: _parse_iso_datetime(m['created_at']))
 
     hard_gap_seconds = config.hard_gap_hours * 3600.0
 
