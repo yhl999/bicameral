@@ -171,6 +171,22 @@ def run_bicameral_query(
             f'MCP returned unexpected type {type(facts_resp).__name__} '
             f'for query {query!r} (search_memory_facts)'
         )
+    # Check for tool-level errors in content (ErrorResponse nested in result.content[].text)
+    if isinstance(facts_resp, dict) and 'content' in facts_resp.get('result', facts_resp):
+        _content_check = facts_resp.get('result', facts_resp)
+        for _item in _content_check.get('content', []):
+            if isinstance(_item, dict):
+                _text = _item.get('text', '')
+                if isinstance(_text, str) and '"error"' in _text:
+                    try:
+                        _parsed = json.loads(_text)
+                        if isinstance(_parsed, dict) and 'error' in _parsed:
+                            raise RuntimeError(
+                                f'MCP tool returned ErrorResponse for query {query!r} '
+                                f'(search_memory_facts): {str(_parsed["error"])[:200]}'
+                            )
+                    except json.JSONDecodeError:
+                        pass
 
     node_args: dict[str, Any] = {'query': query, 'max_nodes': top_k}
     if lane_alias:
@@ -189,6 +205,22 @@ def run_bicameral_query(
             f'MCP returned unexpected type {type(nodes_resp).__name__} '
             f'for query {query!r} (search_nodes)'
         )
+    # Check for tool-level errors in content (ErrorResponse nested in result.content[].text)
+    if isinstance(nodes_resp, dict) and 'content' in nodes_resp.get('result', nodes_resp):
+        _content_check = nodes_resp.get('result', nodes_resp)
+        for _item in _content_check.get('content', []):
+            if isinstance(_item, dict):
+                _text = _item.get('text', '')
+                if isinstance(_text, str) and '"error"' in _text:
+                    try:
+                        _parsed = json.loads(_text)
+                        if isinstance(_parsed, dict) and 'error' in _parsed:
+                            raise RuntimeError(
+                                f'MCP tool returned ErrorResponse for query {query!r} '
+                                f'(search_nodes): {str(_parsed["error"])[:200]}'
+                            )
+                    except json.JSONDecodeError:
+                        pass
 
     return {
         'facts_response': facts_resp,
@@ -203,7 +235,7 @@ def run_qmd_query(qmd_command: str, query: str) -> dict:
 
     Raises RuntimeError when QMD fails or returns invalid JSON output.
     """
-    cmd_parts = shlex.split(qmd_command) + [query]
+    cmd_parts = shlex.split(qmd_command) + ['--', query]
     try:
         result = subprocess.run(
             cmd_parts,

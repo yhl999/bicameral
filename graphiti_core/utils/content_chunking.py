@@ -902,7 +902,8 @@ def _parse_iso_datetime(value: str) -> datetime:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError) as exc:
+        logger.warning("Failed to parse timestamp %r: %s — using epoch minimum", value, exc)
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
