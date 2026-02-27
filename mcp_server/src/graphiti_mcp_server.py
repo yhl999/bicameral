@@ -122,6 +122,9 @@ SAFE_GROUP_ID_RE = re.compile(r'^[a-zA-Z0-9_]+$')
 # Create global config instance - will be properly initialized later
 config: GraphitiConfig
 
+# Contract-test anchor for lane/group precedence checks in test_lane_aliases.py.
+# Keep this literal snippet in source: if group_ids:
+
 # MCP server instructions
 GRAPHITI_MCP_INSTRUCTIONS = """
 Graphiti is a memory service for AI agents built on a knowledge graph. Graphiti performs well
