@@ -36,6 +36,7 @@ from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClient
 from services.ontology_registry import OntologyRegistry
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result
+from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -88,6 +89,42 @@ except (ValueError, TypeError):
 # regardless of what value the client passes in max_nodes / max_facts.
 _MAX_NODES_CAP = 200
 _MAX_FACTS_CAP = 200
+
+# ---------------------------------------------------------------------------
+# Search endpoint rate limiter
+# ---------------------------------------------------------------------------
+# Configurable via environment variables:
+#   SEARCH_RATE_LIMIT_ENABLED   "true" (default) | "false"
+#   SEARCH_RATE_LIMIT_REQUESTS  max requests per window (default: 60)
+#   SEARCH_RATE_LIMIT_WINDOW    window duration in seconds (default: 60)
+#
+# The limiter is in-process and per-window (sliding).  It falls back to a
+# global bucket when no caller key is available; if a session/caller key is
+# injected by the transport layer it will be used for per-caller isolation.
+
+
+_SEARCH_RATE_LIMIT_ENABLED: bool = (
+    os.environ.get('SEARCH_RATE_LIMIT_ENABLED', 'true').strip().lower() != 'false'
+)
+
+try:
+    _SEARCH_RATE_LIMIT_REQUESTS = int(os.environ.get('SEARCH_RATE_LIMIT_REQUESTS', '60'))
+    if _SEARCH_RATE_LIMIT_REQUESTS <= 0:
+        raise ValueError
+except (ValueError, TypeError):
+    _SEARCH_RATE_LIMIT_REQUESTS = 60
+
+try:
+    _SEARCH_RATE_LIMIT_WINDOW = float(os.environ.get('SEARCH_RATE_LIMIT_WINDOW', '60'))
+    if _SEARCH_RATE_LIMIT_WINDOW <= 0:
+        raise ValueError
+except (ValueError, TypeError):
+    _SEARCH_RATE_LIMIT_WINDOW = 60.0
+
+_search_rate_limiter = _SlidingWindowRateLimiter(
+    max_requests=_SEARCH_RATE_LIMIT_REQUESTS,
+    window_seconds=_SEARCH_RATE_LIMIT_WINDOW,
+)
 
 
 # Configure structured logging with timestamps
@@ -708,6 +745,10 @@ async def search_nodes(
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
+    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed():
+        logger.warning('search_nodes rate limit exceeded')
+        return ErrorResponse(error='rate limit exceeded; retry later')
+
     try:
         if max_nodes <= 0:
             return ErrorResponse(error='max_nodes must be a positive integer')
@@ -811,6 +852,10 @@ async def search_memory_facts(
 
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
+
+    if _SEARCH_RATE_LIMIT_ENABLED and not await _search_rate_limiter.is_allowed():
+        logger.warning('search_memory_facts rate limit exceeded')
+        return ErrorResponse(error='rate limit exceeded; retry later')
 
     try:
         # Validate max_facts parameter and apply defense-in-depth cap.

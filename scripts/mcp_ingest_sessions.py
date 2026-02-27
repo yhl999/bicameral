@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -44,6 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ingest.common import sanitize_for_graphiti
 from ingest.registry import get_registry
+
+_logger = logging.getLogger(__name__)
 
 MCP_URL_DEFAULT = 'http://localhost:8000/mcp'
 DEFAULT_OVERLAP_CHUNKS = 10  # for incremental mode
@@ -487,17 +490,25 @@ def _load_manifest(manifest_path: Path) -> dict[str, dict]:
     """Load a JSONL manifest into a dict keyed by chunk_id.
 
     Each line is a JSON object with at least: chunk_id, message_ids, content.
-    Lines that are blank or fail JSON parsing are silently skipped.
+    Blank lines are silently skipped.  Lines that fail JSON parsing are skipped
+    and logged as WARNING (line number + parse error message only; raw payload
+    is NOT logged to avoid leaking sensitive session content).
     """
     result: dict[str, dict] = {}
     with manifest_path.open('r', encoding='utf-8') as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                _logger.warning(
+                    'manifest %s line %d: skipping malformed JSONL (%s)',
+                    manifest_path.name,
+                    lineno,
+                    exc.msg,
+                )
                 continue
             cid = obj.get('chunk_id')
             if cid:
@@ -644,6 +655,50 @@ def _claim_fail(conn: sqlite3.Connection, chunk_id: str, error: str) -> None:
         (error[:500], now, chunk_id),
     )
     conn.commit()
+
+
+def _claim_sent_not_marked(conn: sqlite3.Connection, chunk_id: str) -> None:
+    """Transition a claimed chunk to 'sent_not_marked'.
+
+    Called after add_memory succeeds but before _mark_neo4j_extracted is called.
+    This intermediate state lets retry workers skip re-sending to add_memory
+    and only retry the Neo4j mark — preventing duplicate memory extraction when
+    the Neo4j mark fails transiently.
+
+    Claim-ordering guarantee preserved: the chunk stays in a pending-like state
+    until _claim_done() is called after a successful Neo4j mark.
+    """
+    conn.execute(
+        "UPDATE chunk_claims SET status='sent_not_marked', error=NULL WHERE chunk_id=?",
+        (chunk_id,),
+    )
+    conn.commit()
+
+
+def _claim_neo4j_retry(conn: sqlite3.Connection, worker_id: str) -> str | None:
+    """Atomically claim one 'sent_not_marked' chunk for Neo4j-mark-only retry.
+
+    Returns chunk_id, or None when no chunks are awaiting mark retry.
+    These chunks already had add_memory called successfully, so workers must
+    NOT call add_memory again — only _mark_neo4j_extracted.
+    """
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    conn.execute('BEGIN IMMEDIATE')
+    cursor = conn.execute(
+        "SELECT chunk_id FROM chunk_claims WHERE status='sent_not_marked' LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if row is None:
+        conn.commit()
+        return None
+    chunk_id = row[0]
+    conn.execute(
+        "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
+        "WHERE chunk_id=? AND status='sent_not_marked'",
+        (worker_id, now, chunk_id),
+    )
+    conn.commit()
+    return chunk_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -946,6 +1001,56 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
         worker_id = f'w{args.shard_index}'
 
         try:
+            # ------------------------------------------------------------------
+            # Two-phase loop for idempotent retry safety:
+            #
+            # Phase A — drain 'sent_not_marked' chunks first.
+            #   These chunks already had add_memory called successfully on a
+            #   prior attempt; only the Neo4j mark failed.  We must NOT call
+            #   add_memory again (would duplicate extraction).  Just retry the
+            #   Neo4j mark.
+            #
+            # Phase B — process fresh 'pending' chunks.
+            #   Full pipeline: add_memory → sent_not_marked → mark → done.
+            #   Transitioning to 'sent_not_marked' before the Neo4j mark
+            #   ensures that if the mark fails the chunk lands in Phase A on
+            #   the next run (skip re-send).
+            # ------------------------------------------------------------------
+
+            # --- Phase A: Neo4j-mark-only retries ---
+            while True:
+                chunk_id = _claim_neo4j_retry(conn, worker_id)
+                if chunk_id is None:
+                    break
+
+                chunk_data = manifest.get(chunk_id)
+                if not chunk_data:
+                    _claim_fail(conn, chunk_id, 'chunk_id not found in manifest (neo4j-retry)')
+                    errors += 1
+                    continue
+
+                message_ids_retry: list[str] = chunk_data.get('message_ids') or []
+                try:
+                    _mark_neo4j_extracted(message_ids_retry)
+                    _claim_done(conn, chunk_id)
+                    ok += 1
+                    _logger.info('neo4j-retry ok: chunk %s', chunk_id[:12])
+                except Exception as neo4j_exc:
+                    # Put back to sent_not_marked so the next run retries again.
+                    conn.execute(
+                        "UPDATE chunk_claims SET status='sent_not_marked', error=? "
+                        'WHERE chunk_id=?',
+                        (str(neo4j_exc)[:500], chunk_id),
+                    )
+                    conn.commit()
+                    errors += 1
+                    _logger.warning(
+                        'neo4j-retry still failing for chunk %s: %s',
+                        chunk_id[:12],
+                        neo4j_exc,
+                    )
+
+            # --- Phase B: fresh pending chunks ---
             while True:
                 chunk_id = claim_chunk(conn, worker_id)
                 if chunk_id is None:
@@ -990,16 +1095,25 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     errors += 1
                     continue
 
+                # --- Transition to sent_not_marked before Neo4j mark ---
+                # If the process dies between here and _claim_done, the next
+                # run will find this chunk in Phase A and only retry the mark.
+                _claim_sent_not_marked(conn, chunk_id)
+
                 # --- Mark Neo4j messages as extracted ---
                 try:
                     _mark_neo4j_extracted(message_ids)
                 except Exception as neo4j_exc:
-                    # MCP send succeeded but Neo4j mark failed.
-                    # Fail the claim so it can be retried for marking.
-                    _claim_fail(conn, chunk_id, f'neo4j_mark_failed: {neo4j_exc}')
+                    # MCP send succeeded; leave at 'sent_not_marked' so the next
+                    # run retries only the Neo4j mark (Phase A), not add_memory.
+                    conn.execute(
+                        "UPDATE chunk_claims SET error=? WHERE chunk_id=?",
+                        (f'neo4j_mark_failed: {neo4j_exc}'[:500], chunk_id),
+                    )
+                    conn.commit()
                     errors += 1
                     print(
-                        f'WARNING: MCP send ok but Neo4j mark failed for chunk {chunk_id}: '
+                        f'WARNING: MCP send ok but Neo4j mark failed for chunk {chunk_id[:12]}: '
                         f'{neo4j_exc}',
                         file=sys.stderr,
                     )

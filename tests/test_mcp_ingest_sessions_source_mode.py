@@ -392,5 +392,321 @@ class TestHardeningCaps(unittest.TestCase):
         self.assertIn('_MAX_FACTS_CAP', source)
 
 
+class TestManifestMalformedLineWarning(unittest.TestCase):
+    """Item 1: _load_manifest emits WARNING for malformed JSONL lines (not silent skip)."""
+
+    def test_malformed_line_triggers_warning(self):
+        """A malformed JSONL line should produce a logger.warning, not be silently dropped."""
+        import json as _json
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts.mcp_ingest_sessions import _load_manifest
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            f.write('not json at all\n')
+            _json.dump({'chunk_id': 'good', 'message_ids': [], 'content': 'c'}, f)
+            f.write('\n')
+            tmp = f.name
+
+        try:
+            with patch('scripts.mcp_ingest_sessions._logger') as mock_log:
+                result = _load_manifest(Path(tmp))
+            # Valid line still loaded
+            self.assertIn('good', result)
+            # Warning was emitted for the bad line
+            self.assertTrue(
+                mock_log.warning.called,
+                'Expected _logger.warning to be called for malformed JSONL line',
+            )
+            # Warning includes line number (first positional arg is format string; check args)
+            call_args = mock_log.warning.call_args
+            # Line number 1 should appear in the arguments
+            self.assertIn(1, call_args[0], 'Expected line number 1 in warning args')
+        finally:
+            os.unlink(tmp)
+
+    def test_warning_does_not_include_raw_payload(self):
+        """Sensitive payload content must NOT appear verbatim in the warning args."""
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts.mcp_ingest_sessions import _load_manifest
+
+        sensitive = 'SENSITIVE_TOKEN_XYZ'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            # Write something that looks malformed but contains sensitive text
+            f.write(f'{sensitive} {{bad json\n')
+            tmp = f.name
+
+        try:
+            with patch('scripts.mcp_ingest_sessions._logger') as mock_log:
+                _load_manifest(Path(tmp))
+            # Flatten all warning call args to a string for inspection
+            call_args_str = str(mock_log.warning.call_args_list)
+            self.assertNotIn(
+                sensitive,
+                call_args_str,
+                'Raw payload content must not appear in warning message',
+            )
+        finally:
+            os.unlink(tmp)
+
+    def test_blank_lines_not_warned(self):
+        """Blank lines are silently skipped — no warning should fire."""
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts.mcp_ingest_sessions import _load_manifest
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            f.write('\n\n   \n')
+            tmp = f.name
+
+        try:
+            with patch('scripts.mcp_ingest_sessions._logger') as mock_log:
+                result = _load_manifest(Path(tmp))
+            self.assertEqual(result, {})
+            mock_log.warning.assert_not_called()
+        finally:
+            os.unlink(tmp)
+
+
+class TestSentNotMarkedIdempotency(unittest.TestCase):
+    """Item 2: sent_not_marked status prevents duplicate add_memory on retry."""
+
+    def _make_db(self, chunk_ids: list[str]):
+        import tempfile
+
+        from scripts.mcp_ingest_sessions import init_claim_db, seed_claims
+
+        tmp = tempfile.mktemp(suffix='.db')
+        conn = init_claim_db(tmp)
+        seed_claims(conn, chunk_ids)
+        return conn, tmp
+
+    def test_claim_sent_not_marked_helper(self):
+        """_claim_sent_not_marked transitions a claimed chunk to sent_not_marked."""
+        import os
+
+        from scripts.mcp_ingest_sessions import (
+            _claim_sent_not_marked,
+            claim_chunk,
+        )
+
+        conn, tmp = self._make_db(['chunk_A'])
+        try:
+            chunk_id = claim_chunk(conn, 'w0')
+            self.assertEqual(chunk_id, 'chunk_A')
+            _claim_sent_not_marked(conn, chunk_id)
+            row = conn.execute(
+                'SELECT status FROM chunk_claims WHERE chunk_id=?', (chunk_id,)
+            ).fetchone()
+            self.assertEqual(row[0], 'sent_not_marked')
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_claim_neo4j_retry_claims_sent_not_marked(self):
+        """_claim_neo4j_retry atomically claims a sent_not_marked chunk."""
+        import os
+
+        from scripts.mcp_ingest_sessions import (
+            _claim_neo4j_retry,
+            _claim_sent_not_marked,
+            claim_chunk,
+        )
+
+        conn, tmp = self._make_db(['chunk_B'])
+        try:
+            # Simulate: claim → send to MCP → set sent_not_marked (neo4j mark failed)
+            chunk_id = claim_chunk(conn, 'w0')
+            _claim_sent_not_marked(conn, chunk_id)
+
+            # Next run: retry should claim it
+            retry_id = _claim_neo4j_retry(conn, 'w0')
+            self.assertEqual(retry_id, 'chunk_B')
+
+            # After claiming for retry, status is 'claimed'
+            row = conn.execute(
+                'SELECT status FROM chunk_claims WHERE chunk_id=?', (chunk_id,)
+            ).fetchone()
+            self.assertEqual(row[0], 'claimed')
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_pending_chunks_not_claimed_by_neo4j_retry(self):
+        """_claim_neo4j_retry must not claim 'pending' chunks (those haven't been sent)."""
+        import os
+
+        from scripts.mcp_ingest_sessions import _claim_neo4j_retry
+
+        conn, tmp = self._make_db(['chunk_C', 'chunk_D'])
+        try:
+            # Both chunks are 'pending' — neo4j retry should find nothing
+            result = _claim_neo4j_retry(conn, 'w0')
+            self.assertIsNone(result)
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_sent_not_marked_survives_after_neo4j_fail(self):
+        """After neo4j mark failure the chunk stays sent_not_marked (not failed/pending)."""
+        import os
+
+        from scripts.mcp_ingest_sessions import (
+            _claim_sent_not_marked,
+            claim_chunk,
+        )
+
+        conn, tmp = self._make_db(['chunk_E'])
+        try:
+            chunk_id = claim_chunk(conn, 'w0')
+            _claim_sent_not_marked(conn, chunk_id)
+
+            # Simulate neo4j mark failure: update error field but keep status
+            conn.execute(
+                "UPDATE chunk_claims SET error='neo4j timeout' WHERE chunk_id=?",
+                (chunk_id,),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                'SELECT status, error FROM chunk_claims WHERE chunk_id=?', (chunk_id,)
+            ).fetchone()
+            self.assertEqual(row[0], 'sent_not_marked')
+            self.assertIn('neo4j', row[1])
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_done_not_claimed_by_neo4j_retry(self):
+        """Completed chunks (done) are not re-claimed by neo4j retry."""
+        import os
+
+        from scripts.mcp_ingest_sessions import (
+            _claim_done,
+            _claim_neo4j_retry,
+            _claim_sent_not_marked,
+            claim_chunk,
+        )
+
+        conn, tmp = self._make_db(['chunk_F'])
+        try:
+            chunk_id = claim_chunk(conn, 'w0')
+            _claim_sent_not_marked(conn, chunk_id)
+            # Now mark neo4j ok → done
+            conn.execute(
+                "UPDATE chunk_claims SET status='claimed' WHERE chunk_id=?", (chunk_id,)
+            )
+            conn.commit()
+            _claim_done(conn, chunk_id)
+
+            result = _claim_neo4j_retry(conn, 'w0')
+            self.assertIsNone(result)
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+
+class TestSearchRateLimiter(unittest.TestCase):
+    """Item 3: sliding-window rate limiter for search endpoints."""
+
+    def _make_limiter(self, max_requests: int = 5, window_seconds: float = 10.0):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src'))
+        from utils.rate_limiter import SlidingWindowRateLimiter
+
+        return SlidingWindowRateLimiter(max_requests=max_requests, window_seconds=window_seconds)
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_allows_requests_within_limit(self):
+        rl = self._make_limiter(max_requests=3, window_seconds=60)
+        for _ in range(3):
+            self.assertTrue(self._run(rl.is_allowed()))
+
+    def test_blocks_request_over_limit(self):
+        rl = self._make_limiter(max_requests=3, window_seconds=60)
+        for _ in range(3):
+            self._run(rl.is_allowed())
+        # 4th request should be blocked
+        self.assertFalse(self._run(rl.is_allowed()))
+
+    def test_different_keys_independent(self):
+        rl = self._make_limiter(max_requests=2, window_seconds=60)
+        for _ in range(2):
+            self._run(rl.is_allowed('key_a'))
+        # key_a is exhausted; key_b should still be allowed
+        self.assertFalse(self._run(rl.is_allowed('key_a')))
+        self.assertTrue(self._run(rl.is_allowed('key_b')))
+
+    def test_window_expiry_allows_new_requests(self):
+        """Requests outside the window no longer count against the limit."""
+        import time
+
+        rl = self._make_limiter(max_requests=2, window_seconds=0.05)
+        self._run(rl.is_allowed())
+        self._run(rl.is_allowed())
+        self.assertFalse(self._run(rl.is_allowed()))
+
+        # Wait for window to expire
+        time.sleep(0.1)
+        self.assertTrue(self._run(rl.is_allowed()))
+
+    def test_invalid_config_raises(self):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src'))
+        from utils.rate_limiter import SlidingWindowRateLimiter
+
+        with self.assertRaises(ValueError):
+            SlidingWindowRateLimiter(max_requests=0, window_seconds=60)
+        with self.assertRaises(ValueError):
+            SlidingWindowRateLimiter(max_requests=10, window_seconds=0)
+
+    def test_rate_limiter_constants_in_mcp_server(self):
+        """Verify rate limiter env-var constants and instance appear in MCP server source."""
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
+        ).read_text(encoding='utf-8')
+        self.assertIn('_SEARCH_RATE_LIMIT_ENABLED', src)
+        self.assertIn('_SEARCH_RATE_LIMIT_REQUESTS', src)
+        self.assertIn('_SEARCH_RATE_LIMIT_WINDOW', src)
+        self.assertIn('_search_rate_limiter', src)
+        self.assertIn('rate limit exceeded', src)
+
+    def test_rate_limiter_applied_to_both_search_endpoints(self):
+        """Both search_nodes and search_memory_facts check the rate limiter."""
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
+        ).read_text(encoding='utf-8')
+        # Count occurrences of the rate limit guard pattern
+        occurrences = src.count('_search_rate_limiter.is_allowed()')
+        self.assertGreaterEqual(
+            occurrences, 2,
+            f'Expected rate limiter applied to at least 2 endpoints, found {occurrences}',
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
