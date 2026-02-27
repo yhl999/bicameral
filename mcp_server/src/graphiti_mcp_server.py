@@ -146,6 +146,9 @@ def _resolve_effective_group_ids(
     """
     # 1) Explicit group_ids has highest precedence
     if group_ids:
+        for gid in group_ids:
+            if not SAFE_GROUP_ID_RE.match(gid):
+                raise ValueError(f'Invalid group_id: {gid!r}')
         return _unique_preserve_order(group_ids), []
 
     # 2) Resolve lane aliases (if provided)
