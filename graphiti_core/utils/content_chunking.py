@@ -1104,10 +1104,14 @@ def chunk_conversation_semantic(
     for i, msg in enumerate(sorted_messages):
         msg_tokens = estimate_tokens(msg['content'])
         emb: list[float] = msg['content_embedding']
+        if emb is None or len(emb) == 0:
+            raise ValueError(f'Empty or None embedding for message at index {i}')
         if len(emb) != expected_embedding_dim:
             raise ValueError(
                 f'Embedding dimension mismatch: expected {expected_embedding_dim}, got {len(emb)}'
             )
+        if not all(isinstance(v, (int, float)) for v in emb):
+            raise ValueError(f'Embedding contains non-numeric values for message at index {i}')
 
         # ----- Rule 1: hard gap -------------------------------------------
         if i > chunk_start:

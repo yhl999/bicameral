@@ -91,9 +91,11 @@ def strip_untrusted_metadata(content: str) -> str:
             # We found a header followed by ```json
             # Find the true closing ``` which is unindented and on its own line.
             # Real JSON doesn't contain unescaped newlines, so any "```" on its own line is the end.
+            # Cap at 1000 iterations to prevent O(N²) DoS on malicious input.
             k = i + 2
             found_end = False
-            while k < n:
+            max_scan = min(n, i + 2 + 1000)
+            while k < max_scan:
                 if lines[k].strip() == "```":
                     found_end = True
                     break
@@ -322,7 +324,9 @@ def apply_shard(evidences: list[dict], shards: int, shard_index: int) -> list[di
 def _query_neo4j_message_count(args: argparse.Namespace) -> int:
     """Query Neo4j for the total Message node count.
 
-    Returns 0 if Neo4j is not reachable or has no messages.
+    Returns:
+        >= 0: actual message count from Neo4j.
+        -1:   could not connect or authenticate (error, not zero messages).
     """
     try:
         from neo4j import GraphDatabase  # type: ignore
@@ -335,14 +339,20 @@ def _query_neo4j_message_count(args: argparse.Namespace) -> int:
         if not password:
             return 0
 
-        with GraphDatabase.driver(uri, auth=(user, password)) as driver:
+        with GraphDatabase.driver(
+            uri,
+            auth=(user, password),
+            connection_timeout=10,
+            max_connection_lifetime=30,
+        ) as driver:
             with driver.session(database=database) as session:
                 rec = session.run('MATCH (m:Message) RETURN count(m) AS cnt').single()
                 if rec is None:
                     return 0
                 return int(rec.get('cnt', 0) or 0)
-    except Exception:
-        return 0
+    except Exception as exc:
+        print(f'WARNING: Could not query Neo4j message count: {exc}', file=sys.stderr)
+        return -1
 
 
 def check_bootstrap_guard(neo4j_message_count: int, evidence_files_exist: bool) -> bool:
@@ -350,7 +360,16 @@ def check_bootstrap_guard(neo4j_message_count: int, evidence_files_exist: bool) 
 
     The guard fires when Neo4j has zero messages but evidence files exist,
     indicating the graph has not been bootstrapped yet.
+
+    Returns False (don't block) when neo4j_message_count is -1 (connection error),
+    printing a warning so the operator knows the check was inconclusive.
     """
+    if neo4j_message_count < 0:
+        print(
+            'WARNING: Could not verify Neo4j state. Proceeding with caution.',
+            file=sys.stderr,
+        )
+        return False
     return neo4j_message_count == 0 and evidence_files_exist
 
 
@@ -384,16 +403,36 @@ def seed_claims(conn: sqlite3.Connection, chunk_ids: list[str]) -> None:
 
 def claim_chunk(conn: sqlite3.Connection, worker_id: str) -> str | None:
     """Atomically claim one pending chunk. Returns chunk_id or None."""
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     conn.execute('BEGIN IMMEDIATE')
-    cursor = conn.execute(
-        "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
-        "WHERE chunk_id = (SELECT chunk_id FROM chunk_claims WHERE status='pending' LIMIT 1) "
-        'RETURNING chunk_id',
-        (worker_id, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')),
-    )
-    row = cursor.fetchone()
-    conn.commit()
-    return row[0] if row else None
+
+    if sqlite3.sqlite_version_info >= (3, 35, 0):
+        cursor = conn.execute(
+            "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
+            "WHERE chunk_id = (SELECT chunk_id FROM chunk_claims WHERE status='pending' LIMIT 1) "
+            'RETURNING chunk_id',
+            (worker_id, now),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    else:
+        # Fallback for SQLite < 3.35.0: SELECT then UPDATE
+        cursor = conn.execute(
+            "SELECT chunk_id FROM chunk_claims WHERE status='pending' LIMIT 1"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        chunk_id = row[0]
+        conn.execute(
+            "UPDATE chunk_claims SET status='claimed', worker_id=?, claimed_at=? "
+            "WHERE chunk_id=? AND status='pending'",
+            (worker_id, now, chunk_id),
+        )
+        conn.commit()
+        return chunk_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -535,7 +574,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
             'Run with --source-mode evidence first to bootstrap the graph,\n'
             'or populate Neo4j before using neo4j source mode.'
         )
-        return
+        sys.exit(1)
 
     # --- build-manifest mode ---
     if args.build_manifest:
