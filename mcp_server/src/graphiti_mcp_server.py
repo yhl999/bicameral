@@ -144,35 +144,39 @@ def _resolve_effective_group_ids(
     Returns:
         (effective_group_ids, invalid_aliases)
     """
+    effective_group_ids: list[str] = []
+    invalid_aliases: list[str] = []
+
     # 1) Explicit group_ids has highest precedence
     if group_ids:
-        for gid in group_ids:
-            if not SAFE_GROUP_ID_RE.match(gid):
-                raise ValueError(f'Invalid group_id: {gid!r}')
-        return _unique_preserve_order(group_ids), []
+        effective_group_ids = _unique_preserve_order(group_ids)
 
     # 2) Resolve lane aliases (if provided)
-    if lane_alias is not None:
+    elif lane_alias is not None:
         alias_map = config.graphiti.lane_aliases or {}
         resolved: list[str] = []
-        invalid: list[str] = []
 
         for alias in lane_alias:
             mapped = alias_map.get(alias)
             if mapped is None:
-                invalid.append(alias)
+                invalid_aliases.append(alias)
                 continue
             resolved.extend(mapped)
 
         # explicit empty alias list or alias mapping to [] means all lanes
-        if invalid:
-            return [], invalid
-        return _unique_preserve_order(resolved), []
+        if invalid_aliases:
+            return [], invalid_aliases
+        effective_group_ids = _unique_preserve_order(resolved)
 
     # 3) Fallback behavior: default configured group if present, else all lanes ([])
-    if config.graphiti.group_id:
-        return [config.graphiti.group_id], []
-    return [], []
+    elif config.graphiti.group_id:
+        effective_group_ids = [config.graphiti.group_id]
+
+    # Validate ALL resolved group_ids regardless of source
+    for gid in effective_group_ids:
+        if not SAFE_GROUP_ID_RE.match(gid):
+            raise ValueError(f'Invalid group_id: {gid!r}')
+    return effective_group_ids, invalid_aliases
 
 
 def _validate_group_scope_support(effective_group_ids: list[str]) -> str | None:
