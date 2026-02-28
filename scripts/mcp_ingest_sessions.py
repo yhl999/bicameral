@@ -36,6 +36,7 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,11 +168,57 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     return [(f'{chunk_key}:p{i}', part) for i, part in enumerate(parts)]
 
 
+def _validate_mcp_url(url: str) -> str:
+    """Validate and return the MCP server URL with basic SSRF hardening.
+
+    Reuses the same validation pattern as om_compressor._llm_chat_base_url().
+
+    Rules:
+      - Must be an absolute http(s) URL with a non-empty netloc.
+      - Must not embed credentials (user:pass@host).
+      - Must not include a query string or fragment (structurally invalid for
+        an MCP base URL; would indicate mis-configuration or injection).
+      - Cloud metadata IP ranges (169.254.x.x / link-local) are always blocked.
+        Loopback (localhost / 127.x.x.x / ::1) and private RFC-1918 ranges are
+        allowed because the Graphiti MCP server is expected to run locally or
+        on the same private network.
+
+    Raises:
+        ValueError: on any validation failure.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            f"MCP URL must be an absolute http(s) URL with a host, got: {url!r}"
+        )
+    if parsed.username or parsed.password:
+        raise ValueError(
+            f"MCP URL must not include embedded credentials: {url!r}"
+        )
+
+    # Block cloud metadata / link-local addresses (169.254.x.x).
+    # We intentionally allow loopback and RFC-1918 (MCP server is typically local).
+    host = parsed.netloc.split(":")[0].strip("[]")
+    try:
+        import ipaddress as _ipaddress
+        addr = _ipaddress.ip_address(host)
+        if addr.is_link_local:
+            raise ValueError(
+                f"MCP URL targets a link-local address (cloud metadata risk): {url!r}"
+            )
+    except ValueError as exc:
+        if "cloud metadata" in str(exc) or "link-local" in str(exc):
+            raise
+        # Not a numeric IP address — hostname, allowed.
+
+    return url
+
+
 class MCPClient:
     """Minimal MCP (streamable HTTP) client for Graphiti (stdlib only)."""
 
     def __init__(self, url: str = MCP_URL_DEFAULT):
-        self.url = url
+        self.url = _validate_mcp_url(url)
         self.session_id: str | None = None
         self.initialized = False
 

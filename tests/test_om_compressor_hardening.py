@@ -558,7 +558,8 @@ def test_call_llm_extract_parses_nodes_and_edges(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
 
     msgs = _make_messages(2)
-    cfg = _make_cfg()
+    # Use a chat-compatible model so the mock chat-completions response is parsed correctly.
+    cfg = _make_cfg(model_id="gpt-4o")
 
     llm_payload = {
         "nodes": [
@@ -600,7 +601,7 @@ def test_call_llm_extract_drops_illegal_relation_type(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
 
     msgs = _make_messages(2)
-    cfg = _make_cfg()
+    cfg = _make_cfg(model_id="gpt-4o")  # chat-compatible model → chat API mock response
 
     llm_payload = {
         "nodes": [
@@ -638,7 +639,7 @@ def test_call_llm_extract_raises_on_no_api_key(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
 
     with pytest.raises(om_compressor.OMCompressorError, match="no API key"):
-        om_compressor._call_llm_extract(_make_messages(), _make_cfg())
+        om_compressor._call_llm_extract(_make_messages(), _make_cfg(model_id="gpt-4o"))
 
 
 def test_call_llm_extract_raises_on_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -652,4 +653,258 @@ def test_call_llm_extract_raises_on_invalid_json(monkeypatch: pytest.MonkeyPatch
         patch("urllib.request.urlopen", return_value=bad_resp),
         pytest.raises(om_compressor.OMCompressorError, match="not valid JSON"),
     ):
-        om_compressor._call_llm_extract(_make_messages(), _make_cfg())
+        # Use chat-compatible model so the mock chat response envelope is parsed correctly.
+        om_compressor._call_llm_extract(_make_messages(), _make_cfg(model_id="gpt-4o"))
+
+
+# ---------------------------------------------------------------------------
+# NEW: BLOCKER #1 — responses API auto-style selection + fail-fast validation
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_llm_api_style_auto_selects_responses_for_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_llm_api_style auto-selects 'responses' for gpt-5.1-codex-mini."""
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+    assert om_compressor._resolve_llm_api_style("gpt-5.1-codex-mini") == "responses"
+
+
+def test_resolve_llm_api_style_auto_selects_responses_for_o_series(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_llm_api_style auto-selects 'responses' for o1, o3, o4-mini etc."""
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+    for model in ("o1", "o3", "o4-mini", "o1-mini", "openai/o3", "openrouter/openai/o4-mini"):
+        assert om_compressor._resolve_llm_api_style(model) == "responses", (
+            f"Expected 'responses' for {model!r}"
+        )
+
+
+def test_resolve_llm_api_style_auto_selects_chat_for_gpt4o(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_llm_api_style defaults to 'chat' for non-codex/o-series models."""
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+    for model in ("gpt-4o", "gpt-4.1", "claude-3-opus", "anthropic/claude-3-opus"):
+        assert om_compressor._resolve_llm_api_style(model) == "chat", (
+            f"Expected 'chat' for {model!r}"
+        )
+
+
+def test_resolve_llm_api_style_explicit_env_honored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit OM_COMPRESSOR_LLM_API_STYLE=responses is honoured for any model."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_API_STYLE", "responses")
+    assert om_compressor._resolve_llm_api_style("gpt-4o") == "responses"
+
+
+def test_resolve_llm_api_style_explicit_chat_with_codex_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit 'chat' style + codex/o-series model → OMCompressorError (fail-fast)."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_API_STYLE", "chat")
+    with pytest.raises(om_compressor.OMCompressorError, match="requires the 'responses' API"):
+        om_compressor._resolve_llm_api_style("gpt-5.1-codex-mini")
+
+
+def test_resolve_llm_api_style_explicit_chat_with_o4_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit 'chat' style + o4-mini → OMCompressorError (fail-fast)."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_API_STYLE", "chat")
+    with pytest.raises(om_compressor.OMCompressorError, match="requires the 'responses' API"):
+        om_compressor._resolve_llm_api_style("o4-mini")
+
+
+def test_resolve_llm_api_style_no_model_defaults_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no model_id and no env var, default style is 'chat'."""
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+    assert om_compressor._resolve_llm_api_style(None) == "chat"
+    assert om_compressor._resolve_llm_api_style("") == "chat"
+
+
+# ---------------------------------------------------------------------------
+# NEW: BLOCKER #1 — responses API response path parsing in _call_llm_extract
+# ---------------------------------------------------------------------------
+
+
+def _responses_api_response_wrapping(content_str: str) -> dict:
+    """Wrap a content string in a minimal /v1/responses API response shape."""
+    return {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": content_str},
+                ],
+            }
+        ]
+    }
+
+
+def test_call_llm_extract_responses_api_path_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract correctly parses a /v1/responses format response for codex models."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+
+    msgs = _make_messages(2)
+    cfg = _make_cfg(model_id="gpt-5.1-codex-mini")  # auto-detects → responses style
+
+    llm_payload = {
+        "nodes": [
+            {
+                "node_type": "OperationalRule",
+                "semantic_domain": "sessions_main",
+                "content": "Always use responses API for codex models",
+                "urgency_score": 4,
+                "source_message_ids": [msgs[0].message_id],
+            },
+        ],
+        "edges": [],
+    }
+    fake_resp = _make_fake_http_response(
+        _responses_api_response_wrapping(json.dumps(llm_payload))
+    )
+
+    with patch("urllib.request.urlopen", return_value=fake_resp):
+        result = om_compressor._call_llm_extract(msgs, cfg)
+
+    assert len(result.nodes) == 1
+    assert result.nodes[0].node_type == "OperationalRule"
+    assert len(result.edges) == 0
+
+
+def test_call_llm_extract_responses_api_empty_output_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract raises on responses API shape with no output_text."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+
+    msgs = _make_messages(1)
+    cfg = _make_cfg(model_id="o4-mini")  # auto-detects → responses style
+
+    # Return a /v1/responses response with no output_text content item
+    bad_payload = {"output": [{"type": "function_call", "content": []}]}
+    fake_resp = _make_fake_http_response(bad_payload)
+
+    with (
+        patch("urllib.request.urlopen", return_value=fake_resp),
+        pytest.raises(om_compressor.OMCompressorError, match="no output_text"),
+    ):
+        om_compressor._call_llm_extract(msgs, cfg)
+
+
+# ---------------------------------------------------------------------------
+# NEW: HIGH — duplicate-key detection in JSON parsing
+# ---------------------------------------------------------------------------
+
+
+def test_detect_duplicate_keys_raises_on_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_detect_duplicate_keys raises OMCompressorError on a duplicate JSON key."""
+    dup_json = '{"a": 1, "b": 2, "a": 3}'  # "a" appears twice
+    with pytest.raises(om_compressor.OMCompressorError, match="Duplicate JSON key"):
+        import json as _json
+        _json.loads(dup_json, object_pairs_hook=om_compressor._detect_duplicate_keys)
+
+
+def test_detect_duplicate_keys_allows_unique_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_detect_duplicate_keys passes through JSON with unique keys unchanged."""
+    import json as _json
+    result = _json.loads('{"a": 1, "b": 2}', object_pairs_hook=om_compressor._detect_duplicate_keys)
+    assert result == {"a": 1, "b": 2}
+
+
+def test_call_llm_extract_rejects_duplicate_key_in_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract raises OMCompressorError when the LLM API envelope has duplicate keys."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    msgs = _make_messages(1)
+    cfg = _make_cfg(model_id="gpt-4o")
+
+    # HTTP response body has duplicate "id" key in the envelope JSON
+    dup_envelope = b'{"id": "1", "id": "2", "choices": [{"message": {"content": "{}"}}]}'
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = dup_envelope
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with (
+        patch("urllib.request.urlopen", return_value=mock_resp),
+        pytest.raises(om_compressor.OMCompressorError, match="Duplicate JSON key"),
+    ):
+        om_compressor._call_llm_extract(msgs, cfg)
+
+
+def test_call_llm_extract_rejects_duplicate_key_in_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract raises OMCompressorError when the extracted JSON payload has duplicate keys."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    msgs = _make_messages(1)
+    cfg = _make_cfg(model_id="gpt-4o")
+
+    # Model output JSON has duplicate "nodes" key
+    dup_payload_str = '{"nodes": [], "nodes": [], "edges": []}'
+    fake_resp = _make_fake_http_response(_openai_response_wrapping(dup_payload_str))
+
+    with (
+        patch("urllib.request.urlopen", return_value=fake_resp),
+        pytest.raises(om_compressor.OMCompressorError, match="Duplicate JSON key"),
+    ):
+        om_compressor._call_llm_extract(msgs, cfg)
+
+
+# ---------------------------------------------------------------------------
+# NEW: SSRF hardening — _is_ssrf_blocked_host and _llm_chat_base_url
+# ---------------------------------------------------------------------------
+
+
+def test_is_ssrf_blocked_host_blocks_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert om_compressor._is_ssrf_blocked_host("localhost") is True
+    assert om_compressor._is_ssrf_blocked_host("localhost:8080") is True
+
+
+def test_is_ssrf_blocked_host_blocks_loopback_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert om_compressor._is_ssrf_blocked_host("127.0.0.1") is True
+    assert om_compressor._is_ssrf_blocked_host("127.0.0.1:11434") is True
+
+
+def test_is_ssrf_blocked_host_blocks_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert om_compressor._is_ssrf_blocked_host("10.0.0.1") is True
+    assert om_compressor._is_ssrf_blocked_host("192.168.1.1") is True
+    assert om_compressor._is_ssrf_blocked_host("172.16.0.1") is True
+
+
+def test_is_ssrf_blocked_host_blocks_link_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert om_compressor._is_ssrf_blocked_host("169.254.169.254") is True
+
+
+def test_is_ssrf_blocked_host_allows_external_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert om_compressor._is_ssrf_blocked_host("api.openai.com") is False
+    assert om_compressor._is_ssrf_blocked_host("openrouter.ai") is False
+
+
+def test_llm_chat_base_url_blocks_localhost_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_llm_chat_base_url raises for local LLM URLs when OM_ALLOW_LOCAL_LLM is unset."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.delenv("OM_ALLOW_LOCAL_LLM", raising=False)
+    with pytest.raises(om_compressor.OMCompressorError, match="loopback or private"):
+        om_compressor._llm_chat_base_url()
+
+
+def test_llm_chat_base_url_allows_localhost_with_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OM_ALLOW_LOCAL_LLM=1 bypasses the SSRF block for local LLM endpoints."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("OM_ALLOW_LOCAL_LLM", "1")
+    url = om_compressor._llm_chat_base_url()
+    assert url == "http://localhost:11434/v1"
+
+
+def test_llm_chat_base_url_allows_external_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_llm_chat_base_url accepts standard external provider URLs without bypass."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("OM_ALLOW_LOCAL_LLM", raising=False)
+    url = om_compressor._llm_chat_base_url()
+    assert url == "https://openrouter.ai/api/v1"
