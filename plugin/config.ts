@@ -48,6 +48,23 @@ export interface PluginConfig {
    */
   memoryGroupId?: string;
   /**
+   * Explicit multi-lane override for singleTenant deployments.
+   *
+   * When non-empty and `singleTenant: true`, recall searches ALL listed group
+   * IDs simultaneously (fan-out across sessions, OM, self-audit, etc.).
+   * This takes precedence over `memoryGroupId` when both are set.
+   *
+   * Lane ordering is stable (insertion-order preserved, duplicates removed).
+   * Empty-string entries are silently stripped during normalization.
+   *
+   * SAFETY: same tenant-isolation constraint as `memoryGroupId` — only
+   * effective when `singleTenant: true` is explicitly declared.
+   *
+   * Example deployment target:
+   *   ["s1_sessions_main", "s1_observational_memory", "learning_self_audit"]
+   */
+  memoryGroupIds?: string[];
+  /**
    * Declare that this plugin instance serves a single tenant.
    *
    * Required to unlock `memoryGroupId` overrides.  When `false` (the safe
@@ -121,11 +138,34 @@ const normalizeOptionalString = (value?: string): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
+/**
+ * Normalize a multi-lane group-ID list:
+ *  - Trim whitespace from each entry.
+ *  - Strip empty strings (after trim).
+ *  - Deduplicate while preserving insertion order (first occurrence wins).
+ *  - Returns undefined when the result would be empty (so callers can fall
+ *    through to the single-lane memoryGroupId or session-key paths).
+ */
+const normalizeGroupIds = (ids?: string[]): string[] | undefined => {
+  if (!ids || ids.length === 0) return undefined;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of ids) {
+    const trimmed = raw.trim();
+    if (trimmed.length > 0 && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+  }
+  return out.length > 0 ? out : undefined;
+};
+
 export const normalizeConfig = (config?: Partial<PluginConfig>): PluginConfig => {
   return {
     ...DEFAULT_CONFIG,
     ...config,
     memoryGroupId: normalizeOptionalString(config?.memoryGroupId),
+    memoryGroupIds: normalizeGroupIds(config?.memoryGroupIds),
     stickySignals: config?.stickySignals ?? DEFAULT_CONFIG.stickySignals,
     allowedProviderOverrides:
       config?.allowedProviderOverrides ?? DEFAULT_CONFIG.allowedProviderOverrides,

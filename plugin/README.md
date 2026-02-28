@@ -53,6 +53,32 @@ Notes:
   - `"packRouterCommand": ["python3", "scripts/pack router.py"]`
 - `configPathRoots` is an allowlist. Config files outside these roots are rejected. Defaults to the current working directory.
 
+### Single-tenant multi-lane recall (`memoryGroupIds`)
+
+For deployments with a single logical tenant (e.g. a personal assistant), recall can fan out across multiple named Graphiti group lanes simultaneously — sessions history, observational memory, self-audit learnings, etc.
+
+```json
+{
+  "singleTenant": true,
+  "memoryGroupIds": [
+    "s1_sessions_main",
+    "s1_observational_memory",
+    "learning_self_audit"
+  ]
+}
+```
+
+Precedence (highest to lowest):
+1. `memoryGroupIds` (non-empty, `singleTenant: true`) — multi-lane fan-out
+2. `memoryGroupId` (non-empty, `singleTenant: true`) — single-lane pin
+3. `messageProvider.groupId` — per-provider lane
+4. `sessionKey` (hashed) — per-session derived lane
+
+Safety rules:
+- **Both `memoryGroupIds` and `memoryGroupId` require `singleTenant: true`.** Without it, multi-tenant isolation applies and these fields are silently ignored.
+- Duplicate entries and blank strings are stripped during normalization; insertion order is preserved.
+- `memoryGroupIds` takes precedence over `memoryGroupId` when both are set.
+
 ## Intent Rules
 
 Intent rules map prompts to workflow packs using deterministic keyword routing plus entity boosts.

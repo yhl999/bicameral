@@ -91,10 +91,16 @@ const resolveGroupIds = (
   ctx: PackInjectorContext,
   config: PluginConfig,
 ): string[] | undefined => {
-  // SAFETY: memoryGroupId is a single-tenant override that pins all requests
-  // to one group lane. Only allow it when the operator has explicitly declared
-  // singleTenant: true. In multi-tenant mode (the safe default), fall through
-  // to per-session lanes so different users cannot read each other's memories.
+  // SAFETY: multi-lane override — only active when the operator has explicitly
+  // declared singleTenant: true. memoryGroupIds takes precedence over the
+  // scalar memoryGroupId when both are set, enabling fan-out recall across
+  // sessions, observational memory, self-audit, and any other named lanes.
+  // In multi-tenant mode (the safe default) this block is skipped entirely so
+  // different users cannot read each other's memories.
+  if (config.singleTenant && config.memoryGroupIds && config.memoryGroupIds.length > 0) {
+    return config.memoryGroupIds;
+  }
+  // SAFETY: scalar single-lane override — same singleTenant guard applies.
   if (config.singleTenant && config.memoryGroupId) {
     return [config.memoryGroupId];
   }
