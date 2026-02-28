@@ -469,8 +469,14 @@ def _load_extractor_config(path: Path) -> ExtractorConfig:
     model_id = str(om_cfg.get("model_id") or "").strip()
     if not prompt_template:
         prompt_template = "OM_PROMPT_TEMPLATE_V1"
-    if not model_id:
-        model_id = os.environ.get("OM_COMPRESSOR_MODEL", "gpt-5.1-codex-mini")
+    # OM_COMPRESSOR_MODEL env var always takes precedence over the YAML value.
+    # This allows provider-comparison pilots and one-off overrides without
+    # editing the shared config file.
+    env_model = (os.environ.get("OM_COMPRESSOR_MODEL") or "").strip()
+    if env_model:
+        model_id = env_model
+    elif not model_id:
+        model_id = "gpt-5.1-codex-mini"
 
     extractor_version = sha256_hex(f"{prompt_template}|{model_id}|{schema_version}")
     return ExtractorConfig(
@@ -755,7 +761,11 @@ def _call_llm_extract(messages: list[MessageRow], cfg: ExtractorConfig) -> Extra
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
-            "max_tokens": 2048,
+            # OM_LLM_MAX_TOKENS controls the token budget for chat/completions calls.
+            # Default is 16384 to accommodate reasoning models (e.g. gpt-5.3-codex via
+            # OpenRouter) where reasoning tokens consume part of the max_tokens budget.
+            # 2048 is too low for 50-message chunks when ~400-1800 tokens go to reasoning.
+            "max_tokens": int(os.environ.get("OM_LLM_MAX_TOKENS", "16384")),
         }
 
     body = json.dumps(payload).encode("utf-8")
