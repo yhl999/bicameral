@@ -197,6 +197,14 @@ _UNTRUSTED_METADATA_PREFIXES = (
     "Conversation info (untrusted metadata):",
 )
 
+# XML-style wrapper blocks injected by the Graphiti memory layer.
+# These are stripped as complete tag-delimited blocks (opening tag → closing tag inclusive).
+# Bounded scan of 1 000 lines (same DoS cap as the backtick-fence scanner above).
+_UNTRUSTED_XML_WRAPPERS: dict[str, str] = {
+    "<graphiti-context>": "</graphiti-context>",
+    "<graphiti-fallback>": "</graphiti-fallback>",
+}
+
 
 def strip_untrusted_metadata(content: str) -> str:
     """Remove untrusted metadata blocks from raw message content.
@@ -235,6 +243,23 @@ def strip_untrusted_metadata(content: str) -> str:
 
             if found_end:
                 i = k + 1  # skip header + ```json … ``` block
+                continue
+
+        # XML-style wrapper blocks: <graphiti-context>…</graphiti-context>
+        # and <graphiti-fallback>…</graphiti-fallback>.  Strip the entire
+        # block including the opening and closing tags (bounded scan).
+        xml_close = _UNTRUSTED_XML_WRAPPERS.get(stripped_line)
+        if xml_close is not None:
+            k = i + 1
+            found_end = False
+            max_scan = min(n, i + 1 + 1000)
+            while k < max_scan:
+                if lines[k].strip() == xml_close:
+                    found_end = True
+                    break
+                k += 1
+            if found_end:
+                i = k + 1  # skip opening tag + content + closing tag
                 continue
 
         out.append(line)
@@ -687,6 +712,21 @@ EXTRACTION RULES:
 - source_index and target_index must be valid 0-based indices into the nodes array.
 - Return valid JSON only. No markdown fences, no explanation, no text outside the JSON object.
 - If no meaningful nodes can be extracted, return {"nodes": [], "edges": []}.
+
+TEMPORAL SEQUENCING — SUPERSEDES (critical for memory accuracy):
+- Messages are provided in strict chronological order (oldest first).
+- When a later message updates, corrects, or replaces an earlier state, commitment, or rule,
+  emit a SUPERSEDES edge: source_index = newer node, target_index = older node.
+- Prefer SUPERSEDES over duplication: do NOT emit two separate nodes for the same fact
+  at different points in time; instead emit the current (newer) node and link it via
+  SUPERSEDES to the outdated one if the outdated node was already mentioned earlier in
+  this chunk.
+- Examples that warrant SUPERSEDES:
+    • A preference is updated ("I now prefer X" after "I prefer Y").
+    • A commitment is revised or cancelled.
+    • A rule is tightened or relaxed.
+    • A status changes from open → resolved.
+- When in doubt, prefer explicit SUPERSEDES over omitting the edge.
 """
 
 
@@ -1250,7 +1290,10 @@ def _fetch_messages_by_ids(session: Any, message_ids: list[str]) -> list[Message
         )
         for r in rows
     }
-    return [by_id[mid] for mid in message_ids if mid in by_id]
+    # FM3: return in the order rows were fetched (ORDER BY created_at ASC) to preserve
+    # strict chronological sequencing for the extractor.  The original message_ids input
+    # order is intentionally discarded here to guarantee temporal fidelity.
+    return [by_id[str(r["message_id"])] for r in rows if str(r["message_id"]) in by_id]
 
 
 def _fetch_parent_messages(session: Any, limit: int = MAX_PARENT_CHUNK_SIZE) -> list[MessageRow]:

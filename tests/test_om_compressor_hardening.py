@@ -908,3 +908,179 @@ def test_llm_chat_base_url_allows_external_provider(monkeypatch: pytest.MonkeyPa
     monkeypatch.delenv("OM_ALLOW_LOCAL_LLM", raising=False)
     url = om_compressor._llm_chat_base_url()
     assert url == "https://openrouter.ai/api/v1"
+
+
+# ---------------------------------------------------------------------------
+# FM1: graphiti-context and graphiti-fallback XML wrapper stripping
+# ---------------------------------------------------------------------------
+
+
+def test_strip_graphiti_context_wrapper_removed() -> None:
+    """<graphiti-context>…</graphiti-context> block is fully stripped."""
+    content = (
+        "Pre-context message text.\n\n"
+        "<graphiti-context>\n"
+        "## Graphiti Recall\n"
+        "- Some injected context line 1\n"
+        "- Some injected context line 2\n"
+        "</graphiti-context>\n\n"
+        "Post-context message text."
+    )
+    result = om_compressor.strip_untrusted_metadata(content)
+    assert "<graphiti-context>" not in result
+    assert "</graphiti-context>" not in result
+    assert "Graphiti Recall" not in result
+    assert "injected context" not in result
+    assert "Pre-context message text." in result
+    assert "Post-context message text." in result
+
+
+def test_strip_graphiti_fallback_wrapper_removed() -> None:
+    """<graphiti-fallback>…</graphiti-fallback> block is fully stripped."""
+    content = (
+        "Before fallback.\n"
+        "<graphiti-fallback>\n"
+        "Fallback memory content injected here.\n"
+        "More fallback lines.\n"
+        "</graphiti-fallback>\n"
+        "After fallback."
+    )
+    result = om_compressor.strip_untrusted_metadata(content)
+    assert "<graphiti-fallback>" not in result
+    assert "</graphiti-fallback>" not in result
+    assert "Fallback memory content" not in result
+    assert "Before fallback." in result
+    assert "After fallback." in result
+
+
+def test_strip_graphiti_context_nested_content_fully_removed() -> None:
+    """Nested multi-line content inside <graphiti-context> is entirely stripped."""
+    inner_lines = "\n".join(f"- nested line {i}" for i in range(50))
+    content = (
+        "Header.\n"
+        f"<graphiti-context>\n"
+        f"{inner_lines}\n"
+        "</graphiti-context>\n"
+        "Footer."
+    )
+    result = om_compressor.strip_untrusted_metadata(content)
+    assert "<graphiti-context>" not in result
+    assert "nested line" not in result
+    assert "Header." in result
+    assert "Footer." in result
+
+
+def test_strip_graphiti_both_wrappers_in_one_message() -> None:
+    """Both graphiti wrapper types in one message are both stripped."""
+    content = (
+        "Start.\n"
+        "<graphiti-context>\n"
+        "Context block content.\n"
+        "</graphiti-context>\n"
+        "Middle.\n"
+        "<graphiti-fallback>\n"
+        "Fallback block content.\n"
+        "</graphiti-fallback>\n"
+        "End."
+    )
+    result = om_compressor.strip_untrusted_metadata(content)
+    assert "Context block content." not in result
+    assert "Fallback block content." not in result
+    assert "Start." in result
+    assert "Middle." in result
+    assert "End." in result
+
+
+def test_strip_graphiti_context_unclosed_tag_is_preserved() -> None:
+    """An unclosed <graphiti-context> tag (no closing tag within 1000 lines) is NOT stripped."""
+    content = (
+        "<graphiti-context>\n"
+        "Orphaned content with no closing tag.\n"
+    )
+    # Without a closing tag, the bounded scanner gives up and leaves the block intact.
+    result = om_compressor.strip_untrusted_metadata(content)
+    assert "<graphiti-context>" in result
+    assert "Orphaned content" in result
+
+
+def test_strip_graphiti_wrappers_exported_from_module() -> None:
+    """_UNTRUSTED_XML_WRAPPERS dict is accessible and contains both graphiti keys."""
+    wrappers = om_compressor._UNTRUSTED_XML_WRAPPERS
+    assert "<graphiti-context>" in wrappers
+    assert "<graphiti-fallback>" in wrappers
+    assert wrappers["<graphiti-context>"] == "</graphiti-context>"
+    assert wrappers["<graphiti-fallback>"] == "</graphiti-fallback>"
+
+
+# ---------------------------------------------------------------------------
+# FM3: SUPERSEDES prompt guidance present + chronological ordering contract
+# ---------------------------------------------------------------------------
+
+
+def test_om_extract_system_prompt_contains_supersedes_guidance() -> None:
+    """_OM_EXTRACT_SYSTEM_PROMPT instructs model to use SUPERSEDES for temporal updates."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    # Must mention SUPERSEDES in the temporal sequencing context
+    assert "SUPERSEDES" in prompt, "SUPERSEDES must appear in extraction system prompt"
+    # Must explain the semantic: newer → older direction
+    assert "newer" in prompt.lower() or "chronolog" in prompt.lower(), (
+        "Prompt must explain chronological/newer-to-older SUPERSEDES semantics"
+    )
+    # Must mention chronological ordering of messages
+    assert "chronolog" in prompt.lower() or "oldest first" in prompt.lower(), (
+        "Prompt must state messages are in chronological order"
+    )
+
+
+def test_fetch_messages_by_ids_returns_chronological_order() -> None:
+    """_fetch_messages_by_ids returns rows in created_at ASC order (DB fetch order), not
+    input message_ids order — ensuring temporal sequencing for the extractor."""
+    # Simulate rows returned by the DB already sorted by created_at ASC
+    # (msg3 earliest, msg1 latest — opposite of the input order)
+    fake_rows = [
+        {
+            "message_id": "msg3",
+            "source_session_id": "sess1",
+            "content": "earliest message",
+            "created_at": "2026-01-01T10:00:00Z",
+            "content_embedding": [],
+            "om_extract_attempts": 0,
+        },
+        {
+            "message_id": "msg1",
+            "source_session_id": "sess1",
+            "content": "middle message",
+            "created_at": "2026-01-01T11:00:00Z",
+            "content_embedding": [],
+            "om_extract_attempts": 0,
+        },
+        {
+            "message_id": "msg2",
+            "source_session_id": "sess1",
+            "content": "latest message",
+            "created_at": "2026-01-01T12:00:00Z",
+            "content_embedding": [],
+            "om_extract_attempts": 0,
+        },
+    ]
+
+    # Mock session.run().data() to return chronologically sorted rows
+    mock_result = MagicMock()
+    mock_result.data.return_value = fake_rows
+    mock_session = MagicMock()
+    mock_session.run.return_value = mock_result
+
+    # Input order is deliberately reverse-chronological (msg2, msg1, msg3)
+    # The function must return in DB row order (msg3, msg1, msg2 = created_at ASC)
+    result = om_compressor._fetch_messages_by_ids(mock_session, ["msg2", "msg1", "msg3"])
+
+    assert len(result) == 3
+    assert result[0].message_id == "msg3", (
+        f"First message should be earliest (msg3), got {result[0].message_id}"
+    )
+    assert result[1].message_id == "msg1", (
+        f"Second message should be msg1, got {result[1].message_id}"
+    )
+    assert result[2].message_id == "msg2", (
+        f"Third message should be latest (msg2), got {result[2].message_id}"
+    )
