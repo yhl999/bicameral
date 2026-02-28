@@ -567,3 +567,129 @@ def test_claim_mode_limit_zero_means_unlimited(tmp_path):
     conn.close()
 
     assert len(claimed) == n_total, "limit=0 should allow all chunks to be claimed"
+
+
+# ── NEW: Part B — OM path guard ───────────────────────────────────────────────
+
+
+def test_om_path_guard_warning_printed_for_om_namespace(capsys, monkeypatch):
+    """Part B: targeting s1_observational_memory must print a warning to stderr."""
+    import argparse
+
+    from scripts.mcp_ingest_sessions import _check_om_path_guard
+
+    # Remove OM_PATH_GUARD=strict so we only get warning, not abort
+    monkeypatch.delenv("OM_PATH_GUARD", raising=False)
+
+    args = argparse.Namespace(group_id="s1_observational_memory")
+    _check_om_path_guard(args)
+
+    captured = capsys.readouterr()
+    assert "OM PATH GUARD" in captured.err
+    assert "om_compressor" in captured.err
+    assert "s1_observational_memory" in captured.err
+
+
+def test_om_path_guard_no_warning_for_sessions_namespace(capsys, monkeypatch):
+    """Part B: sessions namespace must NOT trigger the OM guard."""
+    import argparse
+
+    from scripts.mcp_ingest_sessions import _check_om_path_guard
+
+    monkeypatch.delenv("OM_PATH_GUARD", raising=False)
+
+    args = argparse.Namespace(group_id="s1_sessions_main")
+    _check_om_path_guard(args)
+
+    captured = capsys.readouterr()
+    assert "OM PATH GUARD" not in captured.err
+
+
+def test_om_path_guard_strict_raises_systemexit(monkeypatch):
+    """Part B: OM_PATH_GUARD=strict must cause sys.exit(2) for OM namespace."""
+    import argparse
+
+    import pytest
+
+    from scripts.mcp_ingest_sessions import _check_om_path_guard
+
+    monkeypatch.setenv("OM_PATH_GUARD", "strict")
+
+    args = argparse.Namespace(group_id="s1_observational_memory")
+    with pytest.raises(SystemExit) as exc_info:
+        _check_om_path_guard(args)
+
+    assert exc_info.value.code == 2
+
+
+def test_om_path_guard_no_abort_for_pilot_namespace(monkeypatch):
+    """Part B: pilot namespace (not OM) must not trigger guard even in strict mode."""
+    import argparse
+
+    from scripts.mcp_ingest_sessions import _check_om_path_guard
+
+    monkeypatch.setenv("OM_PATH_GUARD", "strict")
+
+    # Pilot namespace does not start with s1_observational_memory → no guard
+    args = argparse.Namespace(group_id="s1_pilot_om_path_20260228_v3")
+    # Must not raise
+    _check_om_path_guard(args)
+
+
+# ── NEW: s1_pilot_om_path_20260228_v3 ontology profile ───────────────────────
+
+
+def test_om_pilot_v3_namespace_loads():
+    """s1_pilot_om_path_20260228_v3 must load from the ontology registry."""
+    import importlib
+
+    ontology_registry = importlib.import_module("mcp_server.src.services.ontology_registry")
+    OntologyRegistry = ontology_registry.OntologyRegistry
+
+    config_path = _get_ontology_path()
+    registry = OntologyRegistry.load(config_path)
+
+    profile = registry.get("s1_pilot_om_path_20260228_v3")
+    assert profile is not None, "s1_pilot_om_path_20260228_v3 profile must exist in ontology config"
+
+
+def test_om_pilot_v3_has_om_relation_types():
+    """s1_pilot_om_path_20260228_v3 must include the OM ontology relation types."""
+    import importlib
+
+    ontology_registry = importlib.import_module("mcp_server.src.services.ontology_registry")
+    OntologyRegistry = ontology_registry.OntologyRegistry
+
+    config_path = _get_ontology_path()
+    registry = OntologyRegistry.load(config_path)
+
+    profile = registry.get("s1_pilot_om_path_20260228_v3")
+    assert profile is not None
+
+    expected_om_relations = {"MOTIVATES", "GENERATES", "SUPERSEDES", "ADDRESSES", "RESOLVES"}
+    actual = set(profile.edge_types)
+    missing = expected_om_relations - actual
+    assert not missing, (
+        f"s1_pilot_om_path_20260228_v3 missing OM relation types: {missing}"
+    )
+
+
+def test_om_pilot_v3_has_om_entity_types():
+    """s1_pilot_om_path_20260228_v3 must include OM-specific entity types."""
+    import importlib
+
+    ontology_registry = importlib.import_module("mcp_server.src.services.ontology_registry")
+    OntologyRegistry = ontology_registry.OntologyRegistry
+
+    config_path = _get_ontology_path()
+    registry = OntologyRegistry.load(config_path)
+
+    profile = registry.get("s1_pilot_om_path_20260228_v3")
+    assert profile is not None
+
+    expected_om_entities = {"Insight", "Pattern", "Requirement", "Decision", "Problem"}
+    actual = set(profile.entity_types.keys())
+    missing = expected_om_entities - actual
+    assert not missing, (
+        f"s1_pilot_om_path_20260228_v3 missing OM entity types: {missing}"
+    )

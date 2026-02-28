@@ -801,12 +801,61 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+_OM_GROUP_ID_PREFIX = "s1_observational_memory"
+
+
+def _check_om_path_guard(args: argparse.Namespace) -> None:
+    """Part B guardrail: warn (or refuse) when --group-id targets the OM namespace.
+
+    Observational Memory extraction in production MUST go through om_compressor
+    (scripts/om_compressor.py), NOT through this script's add_memory MCP path.
+    Using add_memory for OM would bypass:
+      - OM ontology constraints (MOTIVATES/GENERATES/SUPERSEDES/ADDRESSES/RESOLVES)
+      - OM node deduplication + provenance writes
+      - om_extractor schema-version pinning
+      - Dead-letter isolation for failed OM chunks
+
+    This function prints a prominent warning. Set OM_PATH_GUARD=strict to
+    abort instead of warn (production hardening option).
+
+    See docs/runbooks/om-operations.md for the authoritative OM path runbook.
+    """
+    if not args.group_id.startswith(_OM_GROUP_ID_PREFIX):
+        return
+
+    msg = (
+        f"\n{'='*70}\n"
+        f"⚠  OM PATH GUARD: --group-id '{args.group_id}' looks like an OM namespace.\n"
+        f"\n"
+        f"   Observational Memory extraction MUST use om_compressor, NOT add_memory:\n"
+        f"   uv run python scripts/om_compressor.py --force --max-chunks-per-run 10\n"
+        f"\n"
+        f"   This script (mcp_ingest_sessions.py) uses Graphiti MCP's add_memory,\n"
+        f"   which bypasses OM ontology constraints and provenance tracking.\n"
+        f"\n"
+        f"   Runbook: docs/runbooks/om-operations.md\n"
+        f"{'='*70}\n"
+    )
+    print(msg, file=sys.stderr)
+
+    strict = os.environ.get("OM_PATH_GUARD", "").strip().lower() == "strict"
+    if strict:
+        print(
+            "OM_PATH_GUARD=strict: refusing to ingest into OM namespace via add_memory path.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def main():
     ap = build_parser()
     args = ap.parse_args()
 
     if args.subchunk_size <= 0:
         ap.error('--subchunk-size must be a positive integer')
+
+    # Part B: OM path guard — warn when targeting the OM namespace
+    _check_om_path_guard(args)
 
     # --- FR-10: claim-state-check mode ---
     if args.claim_state_check:

@@ -6,6 +6,48 @@ deterministic state machine, and promotes high-confidence nodes to `CoreMemory`.
 
 ---
 
+## ⚠️ CRITICAL: OM Extraction Path
+
+**OM extraction in production MUST use `om_compressor`, NOT `mcp_ingest_sessions.py`.**
+
+Using `mcp_ingest_sessions.py --group-id s1_observational_memory ...` routes through
+Graphiti MCP's `add_memory` tool, which:
+- Creates `Entity` nodes (not `OMNode`) — wrong schema
+- Bypasses OM ontology constraints (MOTIVATES/GENERATES/SUPERSEDES/ADDRESSES/RESOLVES)
+- Skips OM node deduplication and provenance tracking
+- Ignores `om_extractor` schema version pinning
+- Does not integrate with the dead-letter isolation flow
+
+The `mcp_ingest_sessions.py` script includes a runtime guardrail (`_check_om_path_guard`)
+that prints a prominent warning when targeting OM namespaces (group-id starts with
+`s1_observational_memory`). Set `OM_PATH_GUARD=strict` in the environment to make this
+an abort instead of a warning.
+
+### Correct OM extraction command:
+
+```bash
+# Standard OM extraction run
+uv run python scripts/om_compressor.py --force --max-chunks-per-run 10
+
+# Dry run (preview only — no writes)
+uv run python scripts/om_compressor.py --dry-run --max-chunks-per-run 10
+
+# Pilot with bounded sample (FR-11 style)
+uv run python scripts/om_compressor.py --force --max-chunks-per-run 50 --mode backfill
+
+# Pin model explicitly (model also set via OM_COMPRESSOR_MODEL env var)
+OM_COMPRESSOR_MODEL=gpt-5.1-codex-mini uv run python scripts/om_compressor.py --force
+```
+
+### Wrong command (do NOT use for OM):
+
+```bash
+# ❌ WRONG — routes through add_memory, creates Entity nodes, bypasses OM
+uv run python scripts/mcp_ingest_sessions.py --group-id s1_observational_memory ...
+```
+
+---
+
 ## Components
 
 | Script | Purpose |

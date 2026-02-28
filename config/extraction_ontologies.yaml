@@ -348,3 +348,137 @@ s1_pilot_fr11_20260227:
       description: "Entity → Document or resource"
     - name: CONCERNS
       description: "Session or episode → Topic"
+
+# ─────────────────────────────────────────────
+# Sessions Memory — Pilot Lanes (FR-11, 2026-02-28)
+# Mirrors s1_pilot_fr11_20260227. Added for v1 and v2 pilot rerun evaluations.
+# ─────────────────────────────────────────────
+s1_pilot_fr11_20260228:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    Pilot lane for FR-11 observe-only conformance validation (2026-02-28 run).
+    Same ontology as s1_pilot_fr11_20260227.
+
+  entity_types:
+    - name: Preference
+      description: "A stated or inferred preference"
+    - name: Requirement
+      description: "A hard constraint or requirement"
+    - name: Procedure
+      description: "A repeatable process or workflow"
+    - name: Location
+      description: "A place that matters"
+    - name: Event
+      description: "A scheduled or past event"
+    - name: Organization
+      description: "A company, fund, or group"
+    - name: Document
+      description: "A referenced file, doc, or resource"
+    - name: Topic
+      description: "A recurring subject or domain"
+    - name: Object
+      description: "A physical or digital artifact"
+
+  relationship_types:
+    - name: RELATES_TO
+      description: "General semantic relationship (catch-all for backwards compatibility)"
+    - name: PREFERS
+      description: "Person or entity → Preference"
+    - name: REQUIRES
+      description: "Entity or task → Requirement"
+    - name: FOLLOWS
+      description: "Agent or person → Procedure"
+    - name: LOCATED_AT
+      description: "Event or Organization → Location"
+    - name: ATTENDED
+      description: "Person → Event"
+    - name: PART_OF
+      description: "Entity → Organization"
+    - name: REFERENCES
+      description: "Entity → Document or resource"
+    - name: CONCERNS
+      description: "Session or episode → Topic"
+
+s1_pilot_fr11_20260228_v2:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    Pilot lane for FR-11 observe-only conformance validation (2026-02-28 v2 rerun,
+    with EVAL-1/2/3 fixes applied). Same ontology as s1_pilot_fr11_20260227.
+
+  entity_types:
+    - name: Preference
+      description: "A stated or inferred preference"
+    - name: Requirement
+      description: "A hard constraint or requirement"
+    - name: Procedure
+      description: "A repeatable process or workflow"
+    - name: Location
+      description: "A place that matters"
+    - name: Event
+      description: "A scheduled or past event"
+    - name: Organization
+      description: "A company, fund, or group"
+    - name: Document
+      description: "A referenced file, doc, or resource"
+    - name: Topic
+      description: "A recurring subject or domain"
+    - name: Object
+      description: "A physical or digital artifact"
+
+  relationship_types:
+    - name: RELATES_TO
+      description: "General semantic relationship (catch-all for backwards compatibility)"
+    - name: PREFERS
+      description: "Person or entity → Preference"
+    - name: REQUIRES
+      description: "Entity or task → Requirement"
+    - name: FOLLOWS
+      description: "Agent or person → Procedure"
+    - name: LOCATED_AT
+      description: "Event or Organization → Location"
+    - name: ATTENDED
+      description: "Person → Event"
+    - name: PART_OF
+      description: "Entity → Organization"
+    - name: REFERENCES
+      description: "Entity → Document or resource"
+    - name: CONCERNS
+      description: "Session or episode → Topic"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OM-path pilot — 2026-02-28 v3
+# Uses om_compressor/om_extractor path, NOT mcp_ingest_sessions add_memory.
+# Isolated namespace for FR-11 OM-path verification.
+# ─────────────────────────────────────────────────────────────────────────────
+s1_pilot_om_path_20260228_v3:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    OM-path pilot for FR-11 verification (2026-02-28 v3). Validates that
+    om_compressor extracts structured OM observations with correct typing.
+    Uses om_extractor rule-based path; model pinned to gpt-5.1-codex-mini.
+
+  entity_types:
+    - name: Insight
+      description: "A durable observational insight extracted from session transcripts"
+    - name: Pattern
+      description: "A recurring behaviour or structural pattern"
+    - name: Requirement
+      description: "A hard constraint or system requirement"
+    - name: Preference
+      description: "A stated or inferred user preference"
+    - name: Decision
+      description: "A resolved choice or architectural decision"
+    - name: Problem
+      description: "An identified problem or failure mode"
+
+  relationship_types:
+    - name: MOTIVATES
+      description: "OM node A motivates or drives OM node B"
+    - name: GENERATES
+      description: "OM node A generates or produces OM node B"
+    - name: SUPERSEDES
+      description: "OM node A supersedes or replaces OM node B"
+    - name: ADDRESSES
+      description: "OM node A addresses or resolves OM node B"
+    - name: RESOLVES
+      description: "OM node A resolves OM node B (conclusion)"
