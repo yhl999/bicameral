@@ -11,10 +11,22 @@ IMPORTANT: This script is OBSERVE-ONLY.
 - All findings are surfaced as warnings in the JSON output and human summary.
 
 Metrics computed:
-  typed_entity_rate     Fraction of Entity nodes that have a type matching the
-                        lane's allowed entity types.
-  allowed_relation_rate Fraction of relationships whose type is in the allow-list.
-  out_of_schema_count   Absolute count of relationships not in the allow-list.
+  typed_entity_rate              Fraction of Entity nodes whose semantic type
+                                 (first non-'Entity' Neo4j label) matches the
+                                 lane's allowed entity types.  Derived from
+                                 graph labels, NOT from the n.entity_type
+                                 property (which is unreliable in
+                                 constrained_soft mode).
+  allowed_relation_rate          Fraction of ALL relationships (including
+                                 Graphiti infra MENTIONS edges) whose type is
+                                 in the allow-list.  Kept for backward
+                                 compatibility; may be confounded by infra edges.
+  semantic_allowed_relation_rate Deconfounded rate: computed only over
+                                 Entity→Entity edges, excluding Graphiti
+                                 infrastructure edges (MENTIONS, etc.).
+                                 Use this metric for quality assessment.
+  out_of_schema_count            Absolute count of relationships not in the
+                                 allow-list (all-edge basis).
 
 Usage:
   uv run python scripts/evaluate_ontology_conformance.py \\
@@ -65,17 +77,41 @@ _DRY_RUN_RELATIONS: list[dict[str, Any]] = [
     {"relation_type": "PREFERS"},
     {"relation_type": "REQUIRES"},
     {"relation_type": "OFF_SCHEMA_REL"},
+    # Simulated Graphiti infra edges (Episodic→Entity)
+    {"relation_type": "MENTIONS"},
+    {"relation_type": "MENTIONS"},
+]
+
+# Semantic (Entity→Entity only) fixture — excludes MENTIONS infra edges
+_DRY_RUN_SEMANTIC_RELATIONS: list[dict[str, Any]] = [
+    {"relation_type": "RELATES_TO"},
+    {"relation_type": "PREFERS"},
+    {"relation_type": "REQUIRES"},
+    {"relation_type": "OFF_SCHEMA_REL"},
 ]
 
 
 # ── DB query helpers ──────────────────────────────────────────────────────────
 
 
-def _query_neo4j(group_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _query_neo4j(
+    group_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Query Neo4j for entity and relationship data for the given group.
 
+    EVAL-1 fix: entity types are derived from Neo4j graph labels (the first
+    non-'Entity' label), NOT from the ``n.entity_type`` property.  The property
+    is unreliable in constrained_soft mode — Graphiti writes the semantic type
+    exclusively as a label.
+
+    EVAL-2 fix: returns two relation lists:
+      - ``relations``: all edges (includes Graphiti infra MENTIONS/Episodic edges)
+        — kept for backward-compatible ``allowed_relation_rate``.
+      - ``semantic_relations``: Entity→Entity edges only (excludes infra edges)
+        — used for ``semantic_allowed_relation_rate`` (deconfounded metric).
+
     Returns:
-        (entities, relations) — lists of dicts with 'entity_type'/'relation_type' keys.
+        (entities, relations, semantic_relations)
 
     Raises:
         RuntimeError: If the Neo4j driver is unavailable or query fails.
@@ -100,16 +136,22 @@ def _query_neo4j(group_id: str) -> tuple[list[dict[str, Any]], list[dict[str, An
     driver = neo4j.GraphDatabase.driver(uri, auth=(user, password))
     entities: list[dict[str, Any]] = []
     relations: list[dict[str, Any]] = []
+    semantic_relations: list[dict[str, Any]] = []
 
     try:
         with driver.session(database=database) as session:
-            # Entity nodes — prefer the 'name' label property; fall back to labels.
+            # EVAL-1: Entity nodes — derive semantic type from graph labels.
+            # The first non-'Entity' label is the semantic type; fall back to 'UNKNOWN'
+            # if the node has no additional labels (pure Entity-only node).
             entity_result = session.run(
                 """
                 MATCH (n:Entity)
                 WHERE n.group_id = $group_id
                 RETURN
-                    coalesce(n.entity_type, 'UNKNOWN') AS entity_type,
+                    coalesce(
+                        [label IN labels(n) WHERE label <> 'Entity' | label][0],
+                        'UNKNOWN'
+                    ) AS entity_type,
                     coalesce(n.name, '') AS name
                 """,
                 group_id=group_id,
@@ -120,7 +162,7 @@ def _query_neo4j(group_id: str) -> tuple[list[dict[str, Any]], list[dict[str, An
                     "name": record["name"],
                 })
 
-            # Relationships — type comes from the Neo4j relationship type.
+            # Legacy: all relationships (includes Graphiti infra MENTIONS edges).
             relation_result = session.run(
                 """
                 MATCH (a)-[r]->(b)
@@ -131,14 +173,33 @@ def _query_neo4j(group_id: str) -> tuple[list[dict[str, Any]], list[dict[str, An
             )
             for record in relation_result:
                 relations.append({"relation_type": record["relation_type"]})
+
+            # EVAL-2: Semantic relationships only — Entity→Entity edges.
+            # Excludes Graphiti infra edges (Episodic→Entity MENTIONS) which are
+            # not part of the ontology and would confound allowed_relation_rate.
+            semantic_result = session.run(
+                """
+                MATCH (a:Entity)-[r]->(b:Entity)
+                WHERE r.group_id = $group_id
+                RETURN type(r) AS relation_type
+                """,
+                group_id=group_id,
+            )
+            for record in semantic_result:
+                semantic_relations.append({"relation_type": record["relation_type"]})
     finally:
         driver.close()
 
-    return entities, relations
+    return entities, relations, semantic_relations
 
 
-def _query_falkordb(group_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _query_falkordb(
+    group_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Query FalkorDB for entity and relationship data.
+
+    EVAL-1 fix: uses label-based entity type extraction (labels() function).
+    EVAL-2 fix: returns semantic (Entity→Entity) relations separately.
 
     Raises:
         RuntimeError: If the FalkorDB client is unavailable or query fails.
@@ -158,24 +219,35 @@ def _query_falkordb(group_id: str) -> tuple[list[dict[str, Any]], list[dict[str,
 
     entities: list[dict[str, Any]] = []
     relations: list[dict[str, Any]] = []
+    semantic_relations: list[dict[str, Any]] = []
 
     try:
+        # EVAL-1: label-based entity type (FalkorDB supports labels() function)
         entity_result = graph.query(
-            "MATCH (n:Entity) RETURN coalesce(n.entity_type, 'UNKNOWN') AS entity_type, "
-            "coalesce(n.name, '') AS name"
+            "MATCH (n:Entity) "
+            "RETURN coalesce([label IN labels(n) WHERE label <> 'Entity' | label][0], 'UNKNOWN') "
+            "AS entity_type, coalesce(n.name, '') AS name"
         )
         for row in entity_result.result_set:
             entities.append({"entity_type": row[0], "name": row[1]})
 
+        # Legacy: all edges
         relation_result = graph.query(
             "MATCH (a)-[r]->(b) RETURN type(r) AS relation_type"
         )
         for row in relation_result.result_set:
             relations.append({"relation_type": row[0]})
+
+        # EVAL-2: Entity→Entity edges only (deconfounded)
+        semantic_result = graph.query(
+            "MATCH (a:Entity)-[r]->(b:Entity) RETURN type(r) AS relation_type"
+        )
+        for row in semantic_result.result_set:
+            semantic_relations.append({"relation_type": row[0]})
     finally:
         pass  # FalkorDB client has no explicit close method
 
-    return entities, relations
+    return entities, relations, semantic_relations
 
 
 # ── Metric computation ────────────────────────────────────────────────────────
@@ -186,6 +258,7 @@ def compute_conformance_metrics(
     relations: list[dict[str, Any]],
     allowed_entity_types: set[str],
     allowed_relation_types: set[str],
+    semantic_relations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compute conformance metrics from raw entity/relation lists.
 
@@ -193,22 +266,34 @@ def compute_conformance_metrics(
     unit testing with fixture data.
 
     Args:
-        entities:             List of dicts with 'entity_type' key.
-        relations:            List of dicts with 'relation_type' key.
+        entities:             List of dicts with 'entity_type' key.  In live mode
+                              the type is derived from Neo4j graph labels (first
+                              non-'Entity' label), not from the entity_type property.
+        relations:            List of dicts with 'relation_type' key.  Includes ALL
+                              edges (legacy, may include Graphiti infra MENTIONS edges).
         allowed_entity_types: Set of entity type names from the lane ontology.
         allowed_relation_types: Set of relationship type names from the lane ontology.
+        semantic_relations:   Optional list of Entity→Entity-only edges (EVAL-2
+                              deconfounded metric).  When provided, computes
+                              ``semantic_allowed_relation_rate`` over this subset,
+                              excluding infra edges.  When None, falls back to the
+                              same value as ``allowed_relation_rate``.
 
     Returns:
         Dict with keys:
-            total_entities          int
-            typed_entities          int
-            typed_entity_rate       float   (0.0–1.0; 1.0 if no entities)
-            total_relations         int
-            allowed_relations       int
-            allowed_relation_rate   float   (0.0–1.0; 1.0 if no relations)
-            out_of_schema_count     int
-            out_of_schema_types     list[str]  (unique off-schema relation types)
-            off_schema_entity_types list[str]  (unique off-schema entity types)
+            total_entities                 int
+            typed_entities                 int
+            typed_entity_rate              float  (0.0–1.0; 1.0 if no entities)
+            total_relations                int    (all edges, including infra)
+            allowed_relations              int
+            allowed_relation_rate          float  (legacy; may include infra edges)
+            semantic_total_relations       int    (Entity→Entity only)
+            semantic_allowed_relations     int
+            semantic_allowed_relation_rate float  (deconfounded; preferred metric)
+            out_of_schema_count            int    (all-edge basis)
+            out_of_schema_types            list[str]
+            semantic_out_of_schema_types   list[str]
+            off_schema_entity_types        list[str]
     """
     total_entities = len(entities)
     typed_count = sum(
@@ -216,12 +301,35 @@ def compute_conformance_metrics(
     )
     typed_entity_rate = typed_count / total_entities if total_entities > 0 else 1.0
 
+    # Legacy metric — all edges including Graphiti infra MENTIONS edges
     total_relations = len(relations)
     allowed_count = sum(
         1 for r in relations if r.get("relation_type", "") in allowed_relation_types
     )
     out_of_schema_count = total_relations - allowed_count
     allowed_relation_rate = allowed_count / total_relations if total_relations > 0 else 1.0
+
+    # EVAL-2: Deconfounded metric — Entity→Entity edges only
+    if semantic_relations is not None:
+        sem_total = len(semantic_relations)
+        sem_allowed = sum(
+            1 for r in semantic_relations
+            if r.get("relation_type", "") in allowed_relation_types
+        )
+        semantic_allowed_relation_rate = sem_allowed / sem_total if sem_total > 0 else 1.0
+        sem_out_of_schema_types = sorted(
+            {
+                r["relation_type"]
+                for r in semantic_relations
+                if r.get("relation_type", "") not in allowed_relation_types
+            }
+        )
+    else:
+        # Fallback: no semantic relation data; mirror legacy metric
+        sem_total = total_relations
+        sem_allowed = allowed_count
+        semantic_allowed_relation_rate = allowed_relation_rate
+        sem_out_of_schema_types = []
 
     # Collect unique off-schema types for diagnostics
     out_of_schema_types = sorted(
@@ -238,8 +346,12 @@ def compute_conformance_metrics(
         "total_relations": total_relations,
         "allowed_relations": allowed_count,
         "allowed_relation_rate": allowed_relation_rate,
+        "semantic_total_relations": sem_total,
+        "semantic_allowed_relations": sem_allowed,
+        "semantic_allowed_relation_rate": semantic_allowed_relation_rate,
         "out_of_schema_count": out_of_schema_count,
         "out_of_schema_types": out_of_schema_types,
+        "semantic_out_of_schema_types": sem_out_of_schema_types,
         "off_schema_entity_types": off_schema_entity_types,
     }
 
@@ -301,14 +413,19 @@ def build_report(
     dry_run: bool,
     warnings: list[str],
 ) -> dict[str, Any]:
-    """Build the full JSON report dict."""
+    """Build the full JSON report dict.
+
+    ``conformance_passed`` uses ``semantic_allowed_relation_rate`` (EVAL-2
+    deconfounded metric) rather than the legacy ``allowed_relation_rate`` to
+    avoid false WARN from Graphiti infra MENTIONS edges.
+    """
     passed = (
         metrics["typed_entity_rate"] >= typed_entity_threshold
-        and metrics["allowed_relation_rate"] >= allowed_relation_threshold
+        and metrics["semantic_allowed_relation_rate"] >= allowed_relation_threshold
     )
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "group_id": group_id,
         "observe_only": observe_only,
@@ -341,23 +458,34 @@ def print_human_summary(report: dict[str, Any]) -> None:
         f"  Generated at : {report['generated_at']}",
         f"  Mode         : {'DRY-RUN' if report['dry_run'] else 'LIVE'} | OBSERVE-ONLY={report['observe_only']}",
         "",
-        f"  Entities     : {m['typed_entities']}/{m['total_entities']} typed"
+        f"  Entities     : {m['typed_entities']}/{m['total_entities']} typed (label-based)"
         f" → rate={m['typed_entity_rate']:.3f}"
         f" (threshold {report['thresholds']['typed_entity_rate']:.2f})",
-        f"  Relations    : {m['allowed_relations']}/{m['total_relations']} allowed"
-        f" → rate={m['allowed_relation_rate']:.3f}"
-        f" (threshold {report['thresholds']['allowed_relation_rate']:.2f})",
-        f"  Out-of-schema: {m['out_of_schema_count']} relations",
+        # Semantic (deconfounded) relation rate — primary metric
+        f"  Semantic rels: {m['semantic_allowed_relations']}/{m['semantic_total_relations']}"
+        f" allowed (Entity→Entity only)"
+        f" → rate={m['semantic_allowed_relation_rate']:.3f}"
+        f" (threshold {report['thresholds']['allowed_relation_rate']:.2f}) ◀ primary",
+        # Legacy metric — shown for reference, may include infra edges
+        f"  All rels     : {m['allowed_relations']}/{m['total_relations']}"
+        f" allowed (all edges incl. infra)"
+        f" → rate={m['allowed_relation_rate']:.3f} (legacy/reference)",
+        f"  Out-of-schema: {m['out_of_schema_count']} relations (all-edge basis)",
     ]
 
+    if m.get("semantic_out_of_schema_types"):
+        lines.append(
+            f"  Off-schema semantic rel types: {', '.join(m['semantic_out_of_schema_types'])}"
+        )
     if m["out_of_schema_types"]:
-        lines.append(f"  Off-schema relation types: {', '.join(m['out_of_schema_types'])}")
+        lines.append(f"  Off-schema all-rel types    : {', '.join(m['out_of_schema_types'])}")
     if m["off_schema_entity_types"]:
-        lines.append(f"  Off-schema entity  types : {', '.join(m['off_schema_entity_types'])}")
+        lines.append(f"  Off-schema entity types     : {', '.join(m['off_schema_entity_types'])}")
 
     lines += [
         "",
         f"  {status_symbol} Conformance: {'PASS' if passed else 'WARN (below threshold)'}",
+        "    (based on typed_entity_rate + semantic_allowed_relation_rate)",
         "",
     ]
 
@@ -500,16 +628,18 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ── Fetch data ────────────────────────────────────────────────────────────
+    semantic_relations: list[dict[str, Any]] | None
     if args.dry_run:
         logger.debug("DRY-RUN: using fixture data, skipping DB queries")
         entities = _DRY_RUN_ENTITIES
         relations = _DRY_RUN_RELATIONS
+        semantic_relations = _DRY_RUN_SEMANTIC_RELATIONS
     else:
         try:
             if args.backend == "neo4j":
-                entities, relations = _query_neo4j(args.group_id)
+                entities, relations, semantic_relations = _query_neo4j(args.group_id)
             else:
-                entities, relations = _query_falkordb(args.group_id)
+                entities, relations, semantic_relations = _query_falkordb(args.group_id)
         except RuntimeError as exc:
             # Operational failure (DB unavailable, auth error, etc.)
             # Emit to stderr and exit 1 — the only non-zero exit case.
@@ -520,15 +650,17 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     logger.debug(
-        "Fetched %d entities and %d relations for group_id=%s",
+        "Fetched %d entities, %d relations, %d semantic relations for group_id=%s",
         len(entities),
         len(relations),
+        len(semantic_relations) if semantic_relations is not None else -1,
         args.group_id,
     )
 
     # ── Compute metrics ───────────────────────────────────────────────────────
     metrics = compute_conformance_metrics(
-        entities, relations, allowed_entity_types, allowed_relation_types
+        entities, relations, allowed_entity_types, allowed_relation_types,
+        semantic_relations=semantic_relations,
     )
 
     # ── Threshold warnings (OBSERVE-ONLY — never blocks) ─────────────────────
@@ -539,11 +671,13 @@ def main(argv: list[str] | None = None) -> int:
             f"Off-schema entity types: {metrics['off_schema_entity_types']}. "
             "OBSERVE-ONLY: no data was dropped."
         )
-    if metrics["allowed_relation_rate"] < args.allowed_relation_threshold:
+    # EVAL-2: warn on deconfounded metric (semantic_allowed_relation_rate), not legacy
+    if metrics["semantic_allowed_relation_rate"] < args.allowed_relation_threshold:
         warnings.append(
-            f"allowed_relation_rate={metrics['allowed_relation_rate']:.3f} is below threshold "
-            f"{args.allowed_relation_threshold:.2f}. "
-            f"Off-schema relation types: {metrics['out_of_schema_types']}. "
+            f"semantic_allowed_relation_rate={metrics['semantic_allowed_relation_rate']:.3f} "
+            f"is below threshold {args.allowed_relation_threshold:.2f} "
+            f"(Entity→Entity only; excludes infra MENTIONS edges). "
+            f"Off-schema semantic relation types: {metrics.get('semantic_out_of_schema_types', [])}. "
             "OBSERVE-ONLY: no data was dropped."
         )
 

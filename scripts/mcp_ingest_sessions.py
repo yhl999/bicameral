@@ -1068,7 +1068,25 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     )
 
             # --- Phase B: fresh pending chunks ---
+            # EVAL-3 fix: honour --limit in claim mode so bounded pilots stay bounded.
+            # args.limit <= 0 means unlimited (consistent with evidence-mode semantics).
+            phase_b_limit = args.limit if args.limit > 0 else None
+            phase_b_count = 0
+
             while True:
+                if phase_b_limit is not None and phase_b_count >= phase_b_limit:
+                    _logger.info(
+                        "Worker %s: reached --limit %d in claim mode, stopping Phase B",
+                        worker_id,
+                        phase_b_limit,
+                    )
+                    print(
+                        f"Worker {worker_id}: --limit {phase_b_limit} reached, "
+                        f"stopping claim-mode Phase B.",
+                        file=sys.stderr,
+                    )
+                    break
+
                 chunk_id = claim_chunk(conn, worker_id)
                 if chunk_id is None:
                     break  # no more pending chunks for this worker
@@ -1077,6 +1095,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 if not chunk_data:
                     _claim_fail(conn, chunk_id, 'chunk_id not found in manifest')
                     errors += 1
+                    phase_b_count += 1
                     continue
 
                 message_ids: list[str] = chunk_data.get('message_ids') or []
@@ -1110,6 +1129,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     print(f'ERROR sending chunk {chunk_id}: {err_msg}', file=sys.stderr)
                     _claim_fail(conn, chunk_id, f'mcp_error: {err_msg[:200]}')
                     errors += 1
+                    phase_b_count += 1
                     continue
 
                 # --- Transition to sent_not_marked before Neo4j mark ---
@@ -1155,6 +1175,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 # --- Both MCP send and Neo4j mark succeeded ---
                 _claim_done(conn, chunk_id)
                 ok += 1
+                phase_b_count += 1
                 time.sleep(args.sleep)
 
         finally:
