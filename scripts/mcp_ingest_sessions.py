@@ -36,6 +36,7 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,11 +168,69 @@ def subchunk_evidence(content: str, chunk_key: str, max_chars: int) -> list[tupl
     return [(f'{chunk_key}:p{i}', part) for i, part in enumerate(parts)]
 
 
+def _validate_mcp_url(url: str) -> str:
+    """Validate and return the MCP server URL with basic SSRF hardening.
+
+    Reuses the same validation pattern as om_compressor._llm_chat_base_url().
+
+    Rules:
+      - Must be an absolute http(s) URL with a non-empty netloc.
+      - Must not embed credentials (user:pass@host).
+      - Must not include a query string or fragment (structurally invalid for
+        an MCP base URL; would indicate mis-configuration or injection).
+      - Cloud metadata IP ranges (169.254.x.x / link-local) are always blocked.
+        Loopback (localhost / 127.x.x.x / ::1) and private RFC-1918 ranges are
+        allowed because the Graphiti MCP server is expected to run locally or
+        on the same private network.
+
+    Raises:
+        ValueError: on any validation failure.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            f"MCP URL must be an absolute http(s) URL with a host, got: {url!r}"
+        )
+    if parsed.username or parsed.password:
+        raise ValueError(
+            f"MCP URL must not include embedded credentials: {url!r}"
+        )
+    # Reject query strings and fragments — structurally invalid for an MCP base URL
+    # and a potential indicator of mis-configuration or injection attempt.
+    if parsed.query:
+        raise ValueError(
+            f"MCP URL must not include a query string: {url!r}"
+        )
+    if parsed.fragment:
+        raise ValueError(
+            f"MCP URL must not include a fragment: {url!r}"
+        )
+
+    # Block cloud metadata / link-local addresses (169.254.x.x, fe80::, …).
+    # We intentionally allow loopback and RFC-1918 (MCP server is typically local).
+    # IPv6-safe: use parsed.hostname which correctly strips brackets from IPv6
+    # literals (e.g. "[::1]:8000" → "::1") rather than naive split(":")[0].
+    host = (parsed.hostname or "").strip()
+    try:
+        import ipaddress as _ipaddress
+        addr = _ipaddress.ip_address(host)
+        if addr.is_link_local:
+            raise ValueError(
+                f"MCP URL targets a link-local address (cloud metadata risk): {url!r}"
+            )
+    except ValueError as exc:
+        if "cloud metadata" in str(exc) or "link-local" in str(exc):
+            raise
+        # Not a numeric IP address — hostname, allowed.
+
+    return url
+
+
 class MCPClient:
     """Minimal MCP (streamable HTTP) client for Graphiti (stdlib only)."""
 
     def __init__(self, url: str = MCP_URL_DEFAULT):
-        self.url = url
+        self.url = _validate_mcp_url(url)
         self.session_id: str | None = None
         self.initialized = False
 
@@ -801,12 +860,61 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+_OM_GROUP_ID_PREFIX = "s1_observational_memory"
+
+
+def _check_om_path_guard(args: argparse.Namespace) -> None:
+    """Part B guardrail: warn (or refuse) when --group-id targets the OM namespace.
+
+    Observational Memory extraction in production MUST go through om_compressor
+    (scripts/om_compressor.py), NOT through this script's add_memory MCP path.
+    Using add_memory for OM would bypass:
+      - OM ontology constraints (MOTIVATES/GENERATES/SUPERSEDES/ADDRESSES/RESOLVES)
+      - OM node deduplication + provenance writes
+      - om_extractor schema-version pinning
+      - Dead-letter isolation for failed OM chunks
+
+    This function prints a prominent warning. Set OM_PATH_GUARD=strict to
+    abort instead of warn (production hardening option).
+
+    See docs/runbooks/om-operations.md for the authoritative OM path runbook.
+    """
+    if not args.group_id.startswith(_OM_GROUP_ID_PREFIX):
+        return
+
+    msg = (
+        f"\n{'='*70}\n"
+        f"⚠  OM PATH GUARD: --group-id '{args.group_id}' looks like an OM namespace.\n"
+        f"\n"
+        f"   Observational Memory extraction MUST use om_compressor, NOT add_memory:\n"
+        f"   uv run python scripts/om_compressor.py --force --max-chunks-per-run 10\n"
+        f"\n"
+        f"   This script (mcp_ingest_sessions.py) uses Graphiti MCP's add_memory,\n"
+        f"   which bypasses OM ontology constraints and provenance tracking.\n"
+        f"\n"
+        f"   Runbook: docs/runbooks/om-operations.md\n"
+        f"{'='*70}\n"
+    )
+    print(msg, file=sys.stderr)
+
+    strict = os.environ.get("OM_PATH_GUARD", "").strip().lower() == "strict"
+    if strict:
+        print(
+            "OM_PATH_GUARD=strict: refusing to ingest into OM namespace via add_memory path.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def main():
     ap = build_parser()
     args = ap.parse_args()
 
     if args.subchunk_size <= 0:
         ap.error('--subchunk-size must be a positive integer')
+
+    # Part B: OM path guard — warn when targeting the OM namespace
+    _check_om_path_guard(args)
 
     # --- FR-10: claim-state-check mode ---
     if args.claim_state_check:
@@ -1068,7 +1176,25 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     )
 
             # --- Phase B: fresh pending chunks ---
+            # EVAL-3 fix: honour --limit in claim mode so bounded pilots stay bounded.
+            # args.limit <= 0 means unlimited (consistent with evidence-mode semantics).
+            phase_b_limit = args.limit if args.limit > 0 else None
+            phase_b_count = 0
+
             while True:
+                if phase_b_limit is not None and phase_b_count >= phase_b_limit:
+                    _logger.info(
+                        "Worker %s: reached --limit %d in claim mode, stopping Phase B",
+                        worker_id,
+                        phase_b_limit,
+                    )
+                    print(
+                        f"Worker {worker_id}: --limit {phase_b_limit} reached, "
+                        f"stopping claim-mode Phase B.",
+                        file=sys.stderr,
+                    )
+                    break
+
                 chunk_id = claim_chunk(conn, worker_id)
                 if chunk_id is None:
                     break  # no more pending chunks for this worker
@@ -1077,6 +1203,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 if not chunk_data:
                     _claim_fail(conn, chunk_id, 'chunk_id not found in manifest')
                     errors += 1
+                    phase_b_count += 1
                     continue
 
                 message_ids: list[str] = chunk_data.get('message_ids') or []
@@ -1110,6 +1237,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                     print(f'ERROR sending chunk {chunk_id}: {err_msg}', file=sys.stderr)
                     _claim_fail(conn, chunk_id, f'mcp_error: {err_msg[:200]}')
                     errors += 1
+                    phase_b_count += 1
                     continue
 
                 # --- Transition to sent_not_marked before Neo4j mark ---
@@ -1155,6 +1283,7 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
                 # --- Both MCP send and Neo4j mark succeeded ---
                 _claim_done(conn, chunk_id)
                 ok += 1
+                phase_b_count += 1
                 time.sleep(args.sleep)
 
         finally:
