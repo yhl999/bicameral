@@ -82,7 +82,8 @@ Example groups for a typical deployment:
 
 | Group ID | Source | Ontology | Ingest Script |
 |----------|--------|----------|---------------|
-| `s1_sessions` | Agent session transcripts | Custom | `mcp_ingest_sessions.py` |
+| `s1_sessions_main` | Agent session transcripts | Custom (constrained_soft) | `mcp_ingest_sessions.py` |
+| `s1_pilot_fr11_20260227` | FR-11 pilot extraction | Custom (constrained_soft) | `mcp_ingest_sessions.py` |
 | `s1_documents` | Document corpus | Custom | `ingest_content_groups.py` |
 | `s1_notes` | Markdown notes | Default | `mcp_ingest_sessions.py` |
 | `engineering_learnings` | Engineering compound notes | Custom | `ingest_compound_notes.py` |
@@ -92,6 +93,43 @@ Example groups for a typical deployment:
 Custom entity types are defined in `mcp_server/config/extraction_ontologies.yaml`. Groups without an explicit ontology entry fall back to the global default entity types from `config.yaml`.
 
 The ontology resolver is called **per-episode** at extraction time (not per-shard), so a single MCP instance correctly handles all groups with their respective ontologies.
+
+### Sessions Lanes: constrained_soft Mode
+
+`s1_sessions_main` and `s1_pilot_fr11_20260227` use `extraction_mode: constrained_soft`. This tells the
+extractor to prefer ontology-conformant types (Preference, Requirement, Procedure, Event, Organization,
+etc.) and relationship types (RELATES_TO, PREFERS, REQUIRES, FOLLOWS, etc.) defined in the YAML profile.
+
+`constrained_soft` is a **soft constraint** — it steers extraction toward the defined ontology but does
+not hard-reject off-schema results. **No episodes are ever dropped.**
+
+### Observe-Only Conformance Gate (FR-11)
+
+The conformance gate (`scripts/evaluate_ontology_conformance.py`) is **OBSERVE-ONLY**.
+
+It computes three metrics against a live (or dry-run fixture) graph:
+- `typed_entity_rate` — fraction of Entity nodes whose type matches the lane ontology
+- `allowed_relation_rate` — fraction of relationships in the allow-list
+- `out_of_schema_count` — absolute count of off-schema relationships
+
+**Critical invariant: the conformance script NEVER blocks ingestion, drops episodes, or interrupts
+the extraction pipeline.** It only reports warnings when metrics fall below configured thresholds.
+Exit code is 0 unless there is an operational failure (DB/connection error).
+
+Run a dry-run at any time:
+```bash
+uv run python scripts/evaluate_ontology_conformance.py \
+    --group-id s1_sessions_main \
+    --dry-run
+
+# Live run (requires NEO4J_PASSWORD):
+uv run python scripts/evaluate_ontology_conformance.py \
+    --group-id s1_sessions_main \
+    --typed-entity-threshold 0.5 \
+    --allowed-relation-threshold 0.5
+```
+
+See `scripts/evaluate_ontology_conformance.py --help` for full options.
 
 ---
 

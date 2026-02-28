@@ -245,3 +245,106 @@ learning_self_audit:
       description: "ToolBehavior → specific tool or service"
     - name: SUPERSEDES
       description: "New learning → old stale learning"
+
+# ─────────────────────────────────────────────
+# Sessions Memory — Main Lane
+# ─────────────────────────────────────────────
+s1_sessions_main:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    Focus on durable facts about the user: preferences, requirements, procedures,
+    people, places, events, and decisions. Extract concrete operational knowledge
+    that will remain useful across future sessions. Avoid ephemeral conversation
+    scaffolding — prioritize signal over noise.
+
+  entity_types:
+    - name: Preference
+      description: "A stated or inferred preference (e.g. prefers email summaries in bullet form, dislikes excessive jargon)"
+    - name: Requirement
+      description: "A hard constraint or requirement (e.g. meetings must include Google Meet link, no calls before 10:30am)"
+    - name: Procedure
+      description: "A repeatable process or workflow (e.g. how to update OpenClaw with hotfix carry-forward)"
+    - name: Location
+      description: "A place that matters (e.g. East Village apartment, BCAP office at X address)"
+    - name: Event
+      description: "A scheduled or past event (e.g. crypto conference, quarterly LP meeting)"
+    - name: Organization
+      description: "A company, fund, or group (e.g. Blockchain Capital, FranklinDAO, Antfarm)"
+    - name: Document
+      description: "A referenced file, doc, or resource (e.g. AGENTS.md, quarterly report draft)"
+    - name: Topic
+      description: "A recurring subject or domain (e.g. crypto VC, content strategy, personal health)"
+    - name: Object
+      description: "A physical or digital artifact (e.g. wine bottle recommendation, code snippet)"
+
+  relationship_types:
+    - name: RELATES_TO
+      description: "General semantic relationship between two entities (catch-all for backwards compatibility)"
+    - name: PREFERS
+      description: "Entity or person → Preference (what is preferred)"
+    - name: REQUIRES
+      description: "Entity or task → Requirement (what is needed)"
+    - name: FOLLOWS
+      description: "Agent or person → Procedure (workflow used)"
+    - name: LOCATED_AT
+      description: "Event or Organization → Location"
+    - name: ATTENDED
+      description: "Person → Event"
+    - name: PART_OF
+      description: "Entity → Organization or group it belongs to"
+    - name: REFERENCES
+      description: "Entity or session → Document or resource"
+    - name: CONCERNS
+      description: "Session or episode → Topic (primary subject)"
+
+# ─────────────────────────────────────────────
+# Sessions Memory — Pilot Lane (FR-11, 2026-02-27)
+# ─────────────────────────────────────────────
+s1_pilot_fr11_20260227:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    Pilot lane for FR-11 observe-only conformance validation. Mirrors the
+    sessions_main ontology. Focus on the same durable facts — preferences,
+    requirements, procedures, events, and organizations — but scoped to the
+    pilot extraction window. Used for conformance metric calibration only;
+    does not gate any production ingestion.
+
+  entity_types:
+    - name: Preference
+      description: "A stated or inferred preference"
+    - name: Requirement
+      description: "A hard constraint or requirement"
+    - name: Procedure
+      description: "A repeatable process or workflow"
+    - name: Location
+      description: "A place that matters"
+    - name: Event
+      description: "A scheduled or past event"
+    - name: Organization
+      description: "A company, fund, or group"
+    - name: Document
+      description: "A referenced file, doc, or resource"
+    - name: Topic
+      description: "A recurring subject or domain"
+    - name: Object
+      description: "A physical or digital artifact"
+
+  relationship_types:
+    - name: RELATES_TO
+      description: "General semantic relationship (catch-all for backwards compatibility)"
+    - name: PREFERS
+      description: "Person or entity → Preference"
+    - name: REQUIRES
+      description: "Entity or task → Requirement"
+    - name: FOLLOWS
+      description: "Agent or person → Procedure"
+    - name: LOCATED_AT
+      description: "Event or Organization → Location"
+    - name: ATTENDED
+      description: "Person → Event"
+    - name: PART_OF
+      description: "Entity → Organization"
+    - name: REFERENCES
+      description: "Entity → Document or resource"
+    - name: CONCERNS
+      description: "Session or episode → Topic"

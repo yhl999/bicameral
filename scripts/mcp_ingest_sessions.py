@@ -443,7 +443,7 @@ def _build_episode_body(message_ids: list[str], messages_by_id: dict[str, dict])
             continue
         ts = (msg.get('created_at') or '')[:19]  # trim to second precision
         role = msg.get('role') or 'message'
-        content = msg.get('content') or ''
+        content = strip_untrusted_metadata(msg.get('content') or '')
         if ts:
             parts.append(f'[{ts}] {role}: {content}')
         else:
