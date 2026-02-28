@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -150,9 +151,30 @@ def _make_cfg(model_id: str = "gpt-5.1-codex-mini") -> om_compressor.ExtractorCo
     )
 
 
-def test_extractor_path_event_emitted(capsys: pytest.CaptureFixture) -> None:
-    """OM_EXTRACTOR_PATH event is emitted by _extract_items with required fields."""
-    om_compressor._extract_items(_make_messages(), _make_cfg())
+def test_extractor_path_event_emitted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """OM_EXTRACTOR_PATH event is emitted by _extract_items (model path, mocked LLM)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    fake_chunk = om_compressor.ExtractedChunk(
+        nodes=[
+            om_compressor.ExtractionNode(
+                node_id="n1",
+                node_type="WorldState",
+                semantic_domain="sessions_main",
+                content="test fact",
+                urgency_score=3,
+                source_session_id="sess1",
+                source_message_ids=["msg0"],
+            )
+        ],
+        edges=[],
+    )
+    with patch("scripts.om_compressor._call_llm_extract", return_value=fake_chunk):
+        om_compressor._extract_items(_make_messages(), _make_cfg())
 
     captured = capsys.readouterr()
     events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
@@ -161,17 +183,20 @@ def test_extractor_path_event_emitted(capsys: pytest.CaptureFixture) -> None:
     assert len(path_events) >= 1, "Expected at least one OM_EXTRACTOR_PATH event"
     evt = path_events[0]
     assert "extractor_mode" in evt, "extractor_mode field missing"
-    assert evt["extractor_mode"] in ("model", "fallback"), f"Invalid extractor_mode: {evt['extractor_mode']!r}"
+    assert evt["extractor_mode"] == "model", f"Expected model path, got: {evt['extractor_mode']!r}"
     assert "model_id" in evt, "model_id field missing"
     assert evt["model_id"] == "gpt-5.1-codex-mini"
+    assert "strict_mode" in evt, "strict_mode field missing"
 
 
 def test_extractor_path_event_fallback_has_reason(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """Fallback path emits OM_EXTRACTOR_PATH with a non-empty reason field."""
+    """Permissive fallback path emits OM_EXTRACTOR_PATH with a non-empty reason field."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+    # Permissive mode required — fallback is only allowed when explicitly opted in
+    monkeypatch.setenv("OM_EXTRACTOR_STRICT", "false")
 
     om_compressor._extract_items(_make_messages(), _make_cfg())
 
@@ -189,9 +214,10 @@ def test_extractor_path_event_fallback_has_reason(
 def test_extractor_path_event_model_id_propagated(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """model_id in OM_EXTRACTOR_PATH matches the ExtractorConfig.model_id."""
+    """model_id in OM_EXTRACTOR_PATH matches the ExtractorConfig.model_id (permissive, no key)."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+    monkeypatch.setenv("OM_EXTRACTOR_STRICT", "false")
 
     custom_model = "my-custom-model-xyz"
     om_compressor._extract_items(_make_messages(), _make_cfg(model_id=custom_model))
@@ -242,3 +268,388 @@ def test_relation_type_validation_and_interpolation_guard() -> None:
 
     with pytest.raises(om_compressor.OMCompressorError):
         om_compressor._assert_relation_type_safe_for_interpolation("BAD-TOKEN", edge)
+
+
+# ---------------------------------------------------------------------------
+# OM-2: Strict mode — fail-close extractor behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_is_extractor_strict_defaults_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_is_extractor_strict() returns True when no env vars are set (fail-close default)."""
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+    assert om_compressor._is_extractor_strict() is True
+
+
+def test_is_extractor_strict_false_with_env_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OM_EXTRACTOR_STRICT=false disables strict mode."""
+    monkeypatch.setenv("OM_EXTRACTOR_STRICT", "false")
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+    assert om_compressor._is_extractor_strict() is False
+
+
+def test_is_extractor_strict_false_with_env_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OM_EXTRACTOR_STRICT=0 disables strict mode."""
+    monkeypatch.setenv("OM_EXTRACTOR_STRICT", "0")
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+    assert om_compressor._is_extractor_strict() is False
+
+
+def test_is_extractor_strict_false_with_mode_permissive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OM_EXTRACTOR_MODE=permissive disables strict mode (takes priority over STRICT env)."""
+    monkeypatch.setenv("OM_EXTRACTOR_MODE", "permissive")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    assert om_compressor._is_extractor_strict() is False
+
+
+def test_is_extractor_strict_false_with_mode_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OM_EXTRACTOR_MODE=debug disables strict mode."""
+    monkeypatch.setenv("OM_EXTRACTOR_MODE", "debug")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    assert om_compressor._is_extractor_strict() is False
+
+
+def test_is_extractor_strict_true_with_mode_model_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown OM_EXTRACTOR_MODE values preserve strict mode."""
+    monkeypatch.setenv("OM_EXTRACTOR_MODE", "model_only")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    assert om_compressor._is_extractor_strict() is True
+
+
+# ---------------------------------------------------------------------------
+# OM-2: Strict mode — _extract_items blocks fallback on no API key
+# ---------------------------------------------------------------------------
+
+
+def test_strict_mode_raises_on_no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In strict mode (default), _extract_items raises when no API key is configured."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    with pytest.raises(om_compressor.OMExtractorStrictModeError):
+        om_compressor._extract_items(_make_messages(), _make_cfg())
+
+
+def test_strict_mode_raises_on_model_call_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In strict mode, _extract_items raises when _call_llm_extract raises."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    with patch(
+        "scripts.om_compressor._call_llm_extract",
+        side_effect=om_compressor.OMCompressorError("simulated LLM timeout"),
+    ), pytest.raises(om_compressor.OMExtractorStrictModeError):
+        om_compressor._extract_items(_make_messages(), _make_cfg())
+
+
+def test_strict_mode_emits_strict_block_event_on_no_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Strict mode emits OM_EXTRACTOR_STRICT_BLOCK event before raising."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    with pytest.raises(om_compressor.OMExtractorStrictModeError):
+        om_compressor._extract_items(_make_messages(), _make_cfg())
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    block_events = [e for e in events if e.get("event") == "OM_EXTRACTOR_STRICT_BLOCK"]
+
+    assert len(block_events) >= 1, "OM_EXTRACTOR_STRICT_BLOCK event must be emitted"
+    evt = block_events[0]
+    assert evt.get("strict_mode") is True
+    assert "reason" in evt
+    assert evt["reason"] == "no_model_client"
+
+
+def test_strict_mode_emits_strict_block_event_on_model_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Strict mode emits OM_EXTRACTOR_STRICT_BLOCK when model call fails."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    with patch(
+        "scripts.om_compressor._call_llm_extract",
+        side_effect=om_compressor.OMCompressorError("connection refused"),
+    ), pytest.raises(om_compressor.OMExtractorStrictModeError):
+        om_compressor._extract_items(_make_messages(), _make_cfg())
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    block_events = [e for e in events if e.get("event") == "OM_EXTRACTOR_STRICT_BLOCK"]
+
+    assert len(block_events) >= 1
+    assert "connection refused" in block_events[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# OM-2: Permissive mode — _extract_items allows fallback with warning
+# ---------------------------------------------------------------------------
+
+
+def test_permissive_mode_allows_fallback_on_no_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """In permissive mode, _extract_items falls back to rules when no API key (no raise)."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+    monkeypatch.setenv("OM_EXTRACTOR_STRICT", "false")
+
+    result = om_compressor._extract_items(_make_messages(3), _make_cfg())
+
+    # Should not raise; should return a valid (rule-based) chunk
+    assert isinstance(result, om_compressor.ExtractedChunk)
+    # Rule-based path produces nodes but no ontology edges
+    assert isinstance(result.nodes, list)
+    assert isinstance(result.edges, list)
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    path_events = [e for e in events if e.get("event") == "OM_EXTRACTOR_PATH"]
+    assert any(e.get("extractor_mode") == "fallback" for e in path_events)
+
+
+def test_permissive_mode_allows_fallback_on_model_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """In permissive mode, _extract_items falls back to rules when model call fails."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.setenv("OM_EXTRACTOR_STRICT", "false")
+
+    with patch(
+        "scripts.om_compressor._call_llm_extract",
+        side_effect=om_compressor.OMCompressorError("simulated timeout"),
+    ):
+        result = om_compressor._extract_items(_make_messages(2), _make_cfg())
+
+    assert isinstance(result, om_compressor.ExtractedChunk)
+    assert isinstance(result.nodes, list)
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    permissive_events = [e for e in events if e.get("event") == "OM_EXTRACTOR_PERMISSIVE_FALLBACK"]
+    assert len(permissive_events) >= 1, "OM_EXTRACTOR_PERMISSIVE_FALLBACK event must be emitted"
+    assert permissive_events[0].get("warning") == "PERMISSIVE_MODE_FALLBACK"
+
+
+def test_permissive_mode_via_mode_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OM_EXTRACTOR_MODE=permissive enables permissive mode (no raise on no key)."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+    monkeypatch.setenv("OM_EXTRACTOR_MODE", "permissive")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+
+    # Must not raise
+    result = om_compressor._extract_items(_make_messages(), _make_cfg())
+    assert isinstance(result, om_compressor.ExtractedChunk)
+
+
+# ---------------------------------------------------------------------------
+# OM-2: Model path — non-empty edges emitted when LLM returns edges
+# ---------------------------------------------------------------------------
+
+
+def _fake_chunk_with_edges() -> om_compressor.ExtractedChunk:
+    """Build a fake ExtractedChunk with two nodes and one MOTIVATES edge."""
+    n1 = om_compressor.ExtractionNode(
+        node_id="node-a",
+        node_type="Commitment",
+        semantic_domain="sessions_main",
+        content="Yuan prefers meetings after 11am",
+        urgency_score=4,
+        source_session_id="sess1",
+        source_message_ids=["msg0"],
+    )
+    n2 = om_compressor.ExtractionNode(
+        node_id="node-b",
+        node_type="OperationalRule",
+        semantic_domain="sessions_main",
+        content="No calls before 10:30am",
+        urgency_score=4,
+        source_session_id="sess1",
+        source_message_ids=["msg1"],
+    )
+    edge = om_compressor.ExtractionEdge(
+        source_node_id="node-a",
+        target_node_id="node-b",
+        relation_type="MOTIVATES",
+    )
+    return om_compressor.ExtractedChunk(nodes=[n1, n2], edges=[edge])
+
+
+def test_model_path_emits_non_empty_edges(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Model path can emit non-empty edges; OM_EXTRACTOR_PATH reflects edge count."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    fake_chunk = _fake_chunk_with_edges()
+    with patch("scripts.om_compressor._call_llm_extract", return_value=fake_chunk):
+        result = om_compressor._extract_items(_make_messages(2), _make_cfg())
+
+    assert len(result.edges) >= 1, "Model path must produce at least one edge"
+    assert result.edges[0].relation_type == "MOTIVATES"
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    path_events = [e for e in events if e.get("event") == "OM_EXTRACTOR_PATH"]
+    assert path_events, "OM_EXTRACTOR_PATH must be emitted"
+    evt = path_events[0]
+    assert evt["extractor_mode"] == "model"
+    assert evt["edges"] >= 1, "edges field in event must reflect edge count"
+    assert evt["nodes"] >= 1
+
+
+def test_model_path_strict_mode_field_true_in_event(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """OM_EXTRACTOR_PATH event includes strict_mode=True when in strict mode."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_EXTRACTOR_STRICT", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_MODE", raising=False)
+
+    with patch("scripts.om_compressor._call_llm_extract", return_value=_fake_chunk_with_edges()):
+        om_compressor._extract_items(_make_messages(), _make_cfg())
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    path_events = [e for e in events if e.get("event") == "OM_EXTRACTOR_PATH"]
+    assert path_events[0].get("strict_mode") is True
+
+
+# ---------------------------------------------------------------------------
+# OM-2: _call_llm_extract — parsing and allowlist enforcement (mock HTTP)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_http_response(payload: dict) -> MagicMock:
+    """Build a minimal fake urllib response returning the given JSON payload."""
+
+    body = json.dumps(payload).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = body
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    return mock_resp
+
+
+def _openai_response_wrapping(content_str: str) -> dict:
+    """Wrap a content string in a minimal OpenAI chat completion response shape."""
+    return {
+        "choices": [{"message": {"role": "assistant", "content": content_str}}]
+    }
+
+
+def test_call_llm_extract_parses_nodes_and_edges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract correctly parses nodes and edges from a valid LLM response."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    msgs = _make_messages(2)
+    cfg = _make_cfg()
+
+    llm_payload = {
+        "nodes": [
+            {
+                "node_type": "Preference",
+                "semantic_domain": "sessions_main",
+                "content": "Prefers bullet-point summaries",
+                "urgency_score": 3,
+                "source_message_ids": [msgs[0].message_id],
+            },
+            {
+                "node_type": "OperationalRule",
+                "semantic_domain": "sessions_main",
+                "content": "Always add Google Meet link to calendar events",
+                "urgency_score": 4,
+                "source_message_ids": [msgs[1].message_id],
+            },
+        ],
+        "edges": [
+            {"source_index": 0, "target_index": 1, "relation_type": "MOTIVATES"},
+        ],
+    }
+    fake_resp = _make_fake_http_response(_openai_response_wrapping(json.dumps(llm_payload)))
+
+    with patch("urllib.request.urlopen", return_value=fake_resp):
+        result = om_compressor._call_llm_extract(msgs, cfg)
+
+    assert len(result.nodes) == 2
+    assert len(result.edges) == 1
+    assert result.edges[0].relation_type == "MOTIVATES"
+    assert result.nodes[0].node_type == "Preference"
+    assert result.nodes[1].node_type == "OperationalRule"
+
+
+def test_call_llm_extract_drops_illegal_relation_type(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """_call_llm_extract silently drops edges with illegal relation types."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    msgs = _make_messages(2)
+    cfg = _make_cfg()
+
+    llm_payload = {
+        "nodes": [
+            {"node_type": "WorldState", "semantic_domain": "sessions_main",
+             "content": "Node A", "urgency_score": 3, "source_message_ids": []},
+            {"node_type": "WorldState", "semantic_domain": "sessions_main",
+             "content": "Node B", "urgency_score": 3, "source_message_ids": []},
+        ],
+        "edges": [
+            # "RELATES_TO" is not in RELATION_TYPES allowlist
+            {"source_index": 0, "target_index": 1, "relation_type": "RELATES_TO"},
+            # "MOTIVATES" is valid
+            {"source_index": 0, "target_index": 1, "relation_type": "MOTIVATES"},
+        ],
+    }
+    fake_resp = _make_fake_http_response(_openai_response_wrapping(json.dumps(llm_payload)))
+
+    with patch("urllib.request.urlopen", return_value=fake_resp):
+        result = om_compressor._call_llm_extract(msgs, cfg)
+
+    # RELATES_TO dropped, MOTIVATES kept
+    assert len(result.edges) == 1
+    assert result.edges[0].relation_type == "MOTIVATES"
+
+    captured = capsys.readouterr()
+    events = [json.loads(ln) for ln in captured.out.splitlines() if ln.strip() and '"event"' in ln]
+    blocked = [e for e in events if e.get("event") == "OM_RELATION_TYPE_INTERPOLATION_BLOCKED"]
+    assert len(blocked) >= 1
+    assert blocked[0]["relation_type"] == "RELATES_TO"
+
+
+def test_call_llm_extract_raises_on_no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract raises OMCompressorError when no API key is set."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OM_EXTRACTOR_API_KEY", raising=False)
+
+    with pytest.raises(om_compressor.OMCompressorError, match="no API key"):
+        om_compressor._call_llm_extract(_make_messages(), _make_cfg())
+
+
+def test_call_llm_extract_raises_on_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_call_llm_extract raises OMCompressorError when LLM returns non-JSON content."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    bad_resp = _make_fake_http_response(
+        _openai_response_wrapping("This is plain text, not JSON")
+    )
+    with (
+        patch("urllib.request.urlopen", return_value=bad_resp),
+        pytest.raises(om_compressor.OMCompressorError, match="not valid JSON"),
+    ):
+        om_compressor._call_llm_extract(_make_messages(), _make_cfg())

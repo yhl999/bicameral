@@ -81,6 +81,18 @@ class NodeContentMismatchError(OMCompressorError):
         super().__init__(f"OM_NODE_CONTENT_MISMATCH node_id={node_id}")
 
 
+class OMExtractorStrictModeError(OMCompressorError):
+    """Raised in strict extractor mode when model extraction is unavailable or fails.
+
+    In strict mode (default) the rule-based fallback extractor is NEVER used
+    as a silent substitute for the model path.  The chunk fails hard so the
+    caller can retry rather than pollute the graph with edge-less nodes.
+
+    Opt out of strict mode with: OM_EXTRACTOR_STRICT=false
+    (or OM_EXTRACTOR_MODE=permissive for pilot/debug use only).
+    """
+
+
 @dataclass(frozen=True)
 class ExtractorConfig:
     schema_version: str
@@ -542,41 +554,437 @@ def _is_model_client_available() -> bool:
     return bool(api_key)
 
 
+def _is_extractor_strict() -> bool:
+    """Return True when the OM extractor is in fail-close strict mode (default).
+
+    Strict mode (DEFAULT — fail-close):
+      If model extraction is unavailable (no API key) or fails at runtime,
+      the chunk raises OMExtractorStrictModeError rather than silently writing
+      edge-less nodes via the rule-based fallback.  This ensures every OM write
+      carries genuine ontology edges from the model path.
+
+    Permissive mode (explicit pilot/debug opt-in only):
+      Allows fallback to the rule-based extractor with a loud warning event.
+      Enable ONLY for debug or transitional pilot runs.
+
+    Env controls (first match wins):
+      OM_EXTRACTOR_MODE=permissive | fallback | debug  → permissive (not strict)
+      OM_EXTRACTOR_STRICT=false | 0 | no | off         → permissive (not strict)
+      (anything else)                                   → strict (default)
+    """
+    mode_env = (os.environ.get("OM_EXTRACTOR_MODE") or "").strip().lower()
+    if mode_env in {"permissive", "fallback", "debug"}:
+        return False
+    strict_env = (os.environ.get("OM_EXTRACTOR_STRICT") or "true").strip().lower()
+    return strict_env not in {"0", "false", "no", "off"}
+
+
+def _llm_chat_base_url() -> str:
+    """Resolve the LLM chat completions base URL.
+
+    Priority:
+      1. OM_COMPRESSOR_LLM_BASE_URL — explicit override for the extractor
+      2. OPENAI_BASE_URL — shared OpenAI-compatible base URL
+      3. https://api.openai.com/v1 — default OpenAI endpoint
+    """
+    base = (
+        os.environ.get("OM_COMPRESSOR_LLM_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or "https://api.openai.com/v1"
+    ).strip()
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise OMCompressorError("LLM chat base URL must be absolute http(s) URL")
+    if parsed.username or parsed.password:
+        raise OMCompressorError("LLM chat base URL must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise OMCompressorError("LLM chat base URL must not include query/fragment")
+    return base.rstrip("/")
+
+
+# OM-2: System prompt for LLM-backed OM extraction.
+# Instructs the model to emit a JSON object with "nodes" and "edges" arrays.
+# relation_type values are constrained to the RELATION_TYPES allowlist enforced
+# in code; the prompt lists them explicitly to guide the model.
+_OM_EXTRACT_SYSTEM_PROMPT = """\
+You are the Observational Memory extractor for a personal AI assistant.
+Extract structured memory nodes and ontology edges from a conversation transcript chunk.
+
+OUTPUT FORMAT: Return a single JSON object with exactly two top-level keys:
+  "nodes": array of node objects
+  "edges": array of edge objects
+
+Node object schema (all fields required):
+  {
+    "node_type": one of ["WorldState", "Judgment", "OperationalRule", "Commitment", "Friction"],
+    "semantic_domain": "sessions_main",
+    "content": "<concise durable fact or insight — normalized, no metadata noise>",
+    "urgency_score": <integer 1-5; 5=critical, 3=default>,
+    "source_message_ids": [<message_id strings this node was derived from>]
+  }
+
+Edge object schema (all fields required):
+  {
+    "source_index": <integer, 0-based index into nodes array>,
+    "target_index": <integer, 0-based index into nodes array; must differ from source_index>,
+    "relation_type": one of ["MOTIVATES", "GENERATES", "SUPERSEDES", "ADDRESSES", "RESOLVES"]
+  }
+
+EXTRACTION RULES:
+- Only extract durable, operationally useful facts. Skip ephemeral conversational filler.
+- Normalize and deduplicate: if two messages express the same fact, emit one node.
+- Only emit edges where the relationship is clearly evidenced in the transcript.
+- relation_type MUST be one of the five allowed values above — no others are valid.
+- source_index and target_index must be valid 0-based indices into the nodes array.
+- Return valid JSON only. No markdown fences, no explanation, no text outside the JSON object.
+- If no meaningful nodes can be extracted, return {"nodes": [], "edges": []}.
+"""
+
+
+def _build_extraction_user_prompt(messages: list[MessageRow], cfg: ExtractorConfig) -> str:
+    """Build the user-facing extraction prompt from a list of messages."""
+    lines = [f"Extract memory nodes and edges from the following {len(messages)} message(s):"]
+    lines.append("")
+    for msg in messages:
+        content_preview = normalize_text(msg.content)
+        lines.append(f"[message_id={msg.message_id}] {content_preview}")
+    return "\n".join(lines)
+
+
+def _resolve_llm_api_style() -> str:
+    """Return the LLM API style to use for extraction.
+
+    Supported styles:
+      "chat"      — OpenAI /v1/chat/completions (default; gpt-4o, gpt-4.1, etc.)
+      "responses" — OpenAI /v1/responses (required for Codex/o-series models
+                    such as gpt-5.1-codex-mini, o4-mini, etc.)
+
+    Control via OM_COMPRESSOR_LLM_API_STYLE env var.
+    """
+    raw = (os.environ.get("OM_COMPRESSOR_LLM_API_STYLE") or "chat").strip().lower()
+    if raw in {"responses", "response"}:
+        return "responses"
+    return "chat"
+
+
+def _extract_content_from_response(resp_data: Any, api_style: str) -> str:
+    """Extract the text content string from an LLM API response dict.
+
+    Handles both chat/completions and responses API shapes.
+    Raises OMCompressorError if the expected content cannot be found.
+    """
+    if not isinstance(resp_data, dict):
+        raise OMCompressorError("LLM response is not a JSON object")
+
+    if api_style == "responses":
+        # /v1/responses shape:
+        # {"output": [{"type": "message", "content": [{"type": "output_text", "text": "..."}]}]}
+        output = resp_data.get("output") or []
+        if not output:
+            raise OMCompressorError("LLM responses API: no output items")
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "message":
+                continue
+            content_list = item.get("content") or []
+            for c in content_list:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "output_text":
+                    text = (c.get("text") or "").strip()
+                    if text:
+                        return text
+        raise OMCompressorError("LLM responses API: no output_text content found")
+
+    # chat/completions shape:
+    # {"choices": [{"message": {"content": "..."}}]}
+    choices = resp_data.get("choices") or []
+    if not choices:
+        raise OMCompressorError("LLM response has no choices")
+    content_str = (choices[0].get("message") or {}).get("content") or ""
+    if not content_str.strip():
+        raise OMCompressorError("LLM response content is empty")
+    return content_str.strip()
+
+
+def _call_llm_extract(messages: list[MessageRow], cfg: ExtractorConfig) -> ExtractedChunk:
+    """Call the LLM API to extract OM nodes and edges.
+
+    Supports both the chat/completions API (default, gpt-4o/gpt-4.1 family)
+    and the Responses API (required for Codex/o-series models such as
+    gpt-5.1-codex-mini).  Set OM_COMPRESSOR_LLM_API_STYLE=responses to
+    route to the Responses API endpoint.
+
+    This is the OM-2 model-backed extraction path. It sends the transcript
+    chunk to the configured model and parses the structured JSON response into
+    an ExtractedChunk containing both nodes and edges.
+
+    Edges are validated against RELATION_TYPES before inclusion; invalid
+    relation types are silently dropped with an observability event emitted.
+
+    Raises OMCompressorError on any failure (API error, parse error, schema
+    violation). Caller should fall back to _extract_with_rules on error.
+    """
+    api_style = _resolve_llm_api_style()
+    base = _llm_chat_base_url()
+
+    url = base + "/responses" if api_style == "responses" else base + "/chat/completions"
+
+    api_key = (
+        os.environ.get("OPENAI_API_KEY") or os.environ.get("OM_EXTRACTOR_API_KEY") or ""
+    ).strip()
+    if not api_key:
+        raise OMCompressorError("no API key available for LLM extraction")
+
+    user_prompt = _build_extraction_user_prompt(messages, cfg)
+
+    if api_style == "responses":
+        payload: dict[str, Any] = {
+            "model": cfg.model_id,
+            "instructions": _OM_EXTRACT_SYSTEM_PROMPT,
+            "input": user_prompt,
+            "text": {"format": {"type": "json_object"}},
+        }
+    else:
+        payload = {
+            "model": cfg.model_id,
+            "messages": [
+                {"role": "system", "content": _OM_EXTRACT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+            "max_tokens": 2048,
+        }
+
+    body = json.dumps(payload).encode("utf-8")
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    timeout = int(os.environ.get("OM_LLM_TIMEOUT_SECONDS", "60"))
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise OMCompressorError(f"LLM extraction HTTP {exc.code}: {details[:500]}") from exc
+    except Exception as exc:
+        raise OMCompressorError(f"LLM extraction request failed: {exc}") from exc
+
+    resp_data: Any = json.loads(raw) if raw.strip() else {}
+    content_str = _extract_content_from_response(resp_data, api_style)
+
+    try:
+        extracted_json = json.loads(content_str)
+    except json.JSONDecodeError as exc:
+        raise OMCompressorError(f"LLM response not valid JSON: {exc}") from exc
+
+    if not isinstance(extracted_json, dict):
+        raise OMCompressorError("LLM response JSON root is not an object")
+
+    # Build a set of valid message_ids from the chunk for provenance validation.
+    message_id_set = {msg.message_id for msg in messages}
+
+    # ── Parse nodes ──────────────────────────────────────────────────────────
+    raw_nodes = extracted_json.get("nodes")
+    if not isinstance(raw_nodes, list):
+        raise OMCompressorError("LLM response 'nodes' is not a list")
+
+    parsed_nodes: list[ExtractionNode] = []
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, dict):
+            continue
+        content_text = normalize_text(str(raw_node.get("content") or ""))
+        if not content_text:
+            continue
+
+        node_type = str(raw_node.get("node_type") or "WorldState").strip()
+        semantic_domain = str(raw_node.get("semantic_domain") or "sessions_main").strip()
+        urgency_raw = raw_node.get("urgency_score")
+        try:
+            urgency_score = max(1, min(5, int(urgency_raw or 3)))
+        except (ValueError, TypeError):
+            urgency_score = 3
+
+        # Validate source_message_ids against the actual chunk message set.
+        raw_src_ids = _safe_str_list(raw_node.get("source_message_ids") or [])
+        source_ids = [mid for mid in raw_src_ids if mid in message_id_set]
+        if not source_ids:
+            # Model didn't provide valid IDs — attribute to all messages in chunk.
+            source_ids = [msg.message_id for msg in messages]
+
+        # Derive source_session_id from the first matching message.
+        source_session_id = "sessions_main"
+        for msg in messages:
+            if msg.message_id in source_ids:
+                source_session_id = msg.source_session_id
+                break
+
+        node_id = sha256_hex(f"omnode|{node_type}|{semantic_domain}|{content_text.lower()}")
+        parsed_nodes.append(
+            ExtractionNode(
+                node_id=node_id,
+                node_type=node_type,
+                semantic_domain=semantic_domain,
+                content=content_text,
+                urgency_score=urgency_score,
+                source_session_id=source_session_id,
+                source_message_ids=source_ids,
+            )
+        )
+
+    # ── Parse edges ──────────────────────────────────────────────────────────
+    raw_edges = extracted_json.get("edges")
+    if not isinstance(raw_edges, list):
+        raw_edges = []
+
+    parsed_edges: list[ExtractionEdge] = []
+    for raw_edge in raw_edges:
+        if not isinstance(raw_edge, dict):
+            continue
+        relation_raw = str(raw_edge.get("relation_type") or "").strip().upper()
+        try:
+            src_i = int(raw_edge.get("source_index"))  # type: ignore[arg-type]
+            tgt_i = int(raw_edge.get("target_index"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if src_i < 0 or src_i >= len(parsed_nodes):
+            continue
+        if tgt_i < 0 or tgt_i >= len(parsed_nodes):
+            continue
+        if src_i == tgt_i:
+            continue
+        # Enforce RELATION_TYPES allowlist — drop and emit event if invalid.
+        if relation_raw not in RELATION_TYPES:
+            emit_event(
+                "OM_RELATION_TYPE_INTERPOLATION_BLOCKED",
+                relation_type=relation_raw,
+                source_index=src_i,
+                target_index=tgt_i,
+                reason="not_allowlisted",
+            )
+            continue
+        parsed_edges.append(
+            ExtractionEdge(
+                source_node_id=parsed_nodes[src_i].node_id,
+                target_node_id=parsed_nodes[tgt_i].node_id,
+                relation_type=relation_raw,
+            )
+        )
+
+    return ExtractedChunk(nodes=parsed_nodes, edges=parsed_edges)
+
+
 def _extract_items(messages: list[MessageRow], cfg: ExtractorConfig) -> ExtractedChunk:
     """Extract OM items from messages.
 
-    Emits OM_EXTRACTOR_PATH per chunk invocation so that every pilot run
-    produces machine-parseable proof of which extraction path executed.
+    OM-2: Attempts LLM-backed extraction (model path) when an API key is
+    available.  Behaviour on failure is governed by the extractor mode:
 
-    Fields emitted:
+    STRICT MODE (default — fail-close):
+      OM_EXTRACTOR_STRICT=true (or unset)
+      If model extraction is unavailable (no API key) or fails at runtime,
+      raises OMExtractorStrictModeError.  The chunk fails hard; no rule-based
+      fallback writes are made to the graph.  Use this mode in all production
+      and staged-rollout contexts.
+
+    PERMISSIVE MODE (explicit opt-in for pilot/debug only):
+      OM_EXTRACTOR_STRICT=false  OR  OM_EXTRACTOR_MODE=permissive
+      Falls back to the deterministic rule-based extractor on model failure,
+      with a loud OM_EXTRACTOR_PERMISSIVE_FALLBACK warning event emitted.
+
+    OM_EXTRACTOR_PATH event fields:
       extractor_mode : "model" | "fallback"
-      model_id       : resolved model identifier from ExtractorConfig
-      reason         : present only in fallback mode; explains why the model
-                       path was not taken
-
-    Model-backed extraction is the target path; until the LLM client is wired
-    the deterministic rule-based fallback is used unconditionally.
+      model_id       : resolved model from ExtractorConfig
+      strict_mode    : True | False
+      nodes          : node count (model path only)
+      edges          : edge count (model path only)
+      reason         : present on fallback; explains why model path was skipped
+      warning        : "PERMISSIVE_MODE_FALLBACK" on permissive fallback
     """
     model_id = cfg.model_id
+    strict = _is_extractor_strict()
 
     if _is_model_client_available():
-        # API key present but LLM extraction wire-up is deferred to next PR.
-        # Emit fallback with explicit reason rather than silently falling through.
-        emit_event(
-            "OM_EXTRACTOR_PATH",
-            extractor_mode="fallback",
-            model_id=model_id,
-            reason="model_extraction_not_wired",
-        )
+        try:
+            chunk = _call_llm_extract(messages, cfg)
+            emit_event(
+                "OM_EXTRACTOR_PATH",
+                extractor_mode="model",
+                model_id=model_id,
+                strict_mode=strict,
+                nodes=len(chunk.nodes),
+                edges=len(chunk.edges),
+            )
+            return chunk
+        except OMExtractorStrictModeError:
+            raise
+        except Exception as exc:
+            fallback_reason = f"model_error:{type(exc).__name__}:{str(exc)[:200]}"
+            if strict:
+                emit_event(
+                    "OM_EXTRACTOR_STRICT_BLOCK",
+                    model_id=model_id,
+                    reason=fallback_reason,
+                    strict_mode=True,
+                )
+                raise OMExtractorStrictModeError(
+                    f"strict mode: model extraction failed, refusing rule-based fallback: {fallback_reason}"
+                ) from exc
+            # Permissive path — loud warning, then fall back
+            emit_event(
+                "OM_EXTRACTOR_PERMISSIVE_FALLBACK",
+                extractor_mode="fallback",
+                model_id=model_id,
+                strict_mode=False,
+                reason=fallback_reason,
+                warning="PERMISSIVE_MODE_FALLBACK",
+            )
+            emit_event(
+                "OM_EXTRACTOR_PATH",
+                extractor_mode="fallback",
+                model_id=model_id,
+                strict_mode=False,
+                reason=fallback_reason,
+                warning="PERMISSIVE_MODE_FALLBACK",
+            )
+            return _extract_with_rules(messages)
     else:
+        # No API key available at all
+        no_client_reason = "no_model_client"
+        if strict:
+            emit_event(
+                "OM_EXTRACTOR_STRICT_BLOCK",
+                model_id=model_id,
+                reason=no_client_reason,
+                strict_mode=True,
+            )
+            raise OMExtractorStrictModeError(
+                "strict mode: no model API key configured, refusing rule-based fallback"
+            )
+        # Permissive path — loud warning, then fall back
+        emit_event(
+            "OM_EXTRACTOR_PERMISSIVE_FALLBACK",
+            extractor_mode="fallback",
+            model_id=model_id,
+            strict_mode=False,
+            reason=no_client_reason,
+            warning="PERMISSIVE_MODE_FALLBACK",
+        )
         emit_event(
             "OM_EXTRACTOR_PATH",
             extractor_mode="fallback",
             model_id=model_id,
-            reason="no_model_client",
+            strict_mode=False,
+            reason=no_client_reason,
+            warning="PERMISSIVE_MODE_FALLBACK",
         )
-
-    return _extract_with_rules(messages)
+        return _extract_with_rules(messages)
 
 
 def _is_truthy_env(name: str) -> bool:

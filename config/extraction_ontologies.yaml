@@ -559,3 +559,41 @@ s1_pilot_om_path_20260228_v4_small:
       description: "OM node A addresses or resolves OM node B"
     - name: RESOLVES
       description: "OM node A resolves OM node B (conclusion)"
+
+# ─────────────────────────────────────────────
+# Sessions Memory — Pilot Lane v5-medium (FR-11, 2026-02-28)
+# OM-2: LLM extraction wire-up + strict mode (fail-close)
+# ─────────────────────────────────────────────
+s1_pilot_om_path_20260228_v5_medium:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    OM-path pilot for FR-11 v5-medium (2026-02-28). Validates OM-2 LLM
+    extraction wire-up with strict fail-close mode (OM_EXTRACTOR_STRICT=true).
+    Medium bounded run (≤20 chunks / ≤1000 messages). Model pinned to
+    gpt-5.1-codex-mini. Namespace isolated; no production data polluted.
+
+  entity_types:
+    - name: Insight
+      description: "A durable observational insight extracted from session transcripts"
+    - name: Pattern
+      description: "A recurring behaviour or structural pattern"
+    - name: Requirement
+      description: "A hard constraint or system requirement"
+    - name: Preference
+      description: "A stated or inferred user preference"
+    - name: Decision
+      description: "A resolved choice or architectural decision"
+    - name: Problem
+      description: "An identified problem or failure mode"
+
+  relationship_types:
+    - name: MOTIVATES
+      description: "OM node A motivates or drives OM node B"
+    - name: GENERATES
+      description: "OM node A generates or produces OM node B"
+    - name: SUPERSEDES
+      description: "OM node A supersedes or replaces OM node B"
+    - name: ADDRESSES
+      description: "OM node A addresses or resolves OM node B"
+    - name: RESOLVES
+      description: "OM node A resolves OM node B (conclusion)"
