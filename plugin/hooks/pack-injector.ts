@@ -689,7 +689,7 @@ export const createPackInjector = (deps: PackInjectorDeps) => {
           '--step-id',
           decision.rule.stepId ?? 'draft',
           '--task',
-          decision.rule.task ?? '',
+          input.prompt,
           '--injection-text',
           decision.rule.injectionText ?? '',
           '--repo',
