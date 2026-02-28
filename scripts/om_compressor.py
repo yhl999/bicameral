@@ -174,6 +174,64 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+# OM-1 fix: metadata contamination guard
+# Applied to every message content before it enters the extraction pipeline.
+# Mirrors the equivalent guard in mcp_ingest_sessions._build_episode_body().
+_UNTRUSTED_METADATA_PREFIXES = (
+    "Conversation info:",
+    "Sender (untrusted metadata):",
+    "Replied message (untrusted, for context):",
+    "Conversation info (untrusted metadata):",
+)
+
+
+def strip_untrusted_metadata(content: str) -> str:
+    """Remove untrusted metadata blocks from raw message content.
+
+    Parses line-by-line to correctly pair backtick fences and avoid early
+    termination if the JSON payload itself contains embedded triple backticks
+    inside strings.  Caps scan at 1 000 lines per block to prevent O(N²) DoS
+    on malicious input.  Collapses resulting multiple blank lines.
+
+    Safe for empty / None input — returns the original value untouched.
+    """
+    if not content:
+        return content
+
+    lines = content.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+        stripped_line = line.strip()
+
+        matched = any(stripped_line == p for p in _UNTRUSTED_METADATA_PREFIXES)
+
+        if matched and i + 1 < n and lines[i + 1].strip() == "```json":
+            # Locate the closing ``` (unindented, on its own line).
+            k = i + 2
+            found_end = False
+            max_scan = min(n, i + 2 + 1000)
+            while k < max_scan:
+                if lines[k].strip() == "```":
+                    found_end = True
+                    break
+                k += 1
+
+            if found_end:
+                i = k + 1  # skip header + ```json … ``` block
+                continue
+
+        out.append(line)
+        i += 1
+
+    result = "".join(out)
+    # Collapse 3+ newlines → 2 to preserve paragraph boundaries.
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
 def parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -472,9 +530,52 @@ def _extract_with_rules(messages: list[MessageRow]) -> ExtractedChunk:
     return ExtractedChunk(nodes=list(by_node.values()), edges=[])
 
 
-def _extract_items(messages: list[MessageRow], _cfg: ExtractorConfig) -> ExtractedChunk:
-    # Deterministic fallback extractor. This is deliberately stable and
-    # idempotent; model-backed extraction can be layered behind this contract.
+def _is_model_client_available() -> bool:
+    """Return True when an API key for LLM-backed extraction is configured.
+
+    Checks OPENAI_API_KEY and OM_EXTRACTOR_API_KEY (in that order).
+    Used by _extract_items to decide which extractor-mode label to emit.
+    """
+    api_key = (
+        os.environ.get("OPENAI_API_KEY") or os.environ.get("OM_EXTRACTOR_API_KEY") or ""
+    ).strip()
+    return bool(api_key)
+
+
+def _extract_items(messages: list[MessageRow], cfg: ExtractorConfig) -> ExtractedChunk:
+    """Extract OM items from messages.
+
+    Emits OM_EXTRACTOR_PATH per chunk invocation so that every pilot run
+    produces machine-parseable proof of which extraction path executed.
+
+    Fields emitted:
+      extractor_mode : "model" | "fallback"
+      model_id       : resolved model identifier from ExtractorConfig
+      reason         : present only in fallback mode; explains why the model
+                       path was not taken
+
+    Model-backed extraction is the target path; until the LLM client is wired
+    the deterministic rule-based fallback is used unconditionally.
+    """
+    model_id = cfg.model_id
+
+    if _is_model_client_available():
+        # API key present but LLM extraction wire-up is deferred to next PR.
+        # Emit fallback with explicit reason rather than silently falling through.
+        emit_event(
+            "OM_EXTRACTOR_PATH",
+            extractor_mode="fallback",
+            model_id=model_id,
+            reason="model_extraction_not_wired",
+        )
+    else:
+        emit_event(
+            "OM_EXTRACTOR_PATH",
+            extractor_mode="fallback",
+            model_id=model_id,
+            reason="no_model_client",
+        )
+
     return _extract_with_rules(messages)
 
 
@@ -595,7 +696,8 @@ def _fetch_messages_by_ids(session: Any, message_ids: list[str]) -> list[Message
         str(r["message_id"]): MessageRow(
             message_id=str(r["message_id"]),
             source_session_id=str(r["source_session_id"]),
-            content=str(r["content"]),
+            # OM-1: strip untrusted metadata before content enters extraction pipeline.
+            content=strip_untrusted_metadata(str(r["content"])),
             created_at=str(r["created_at"]),
             content_embedding=[float(v) for v in _safe_list(r.get("content_embedding"))],
             om_extract_attempts=int(r.get("om_extract_attempts") or 0),
@@ -629,7 +731,8 @@ def _fetch_parent_messages(session: Any, limit: int = MAX_PARENT_CHUNK_SIZE) -> 
             MessageRow(
                 message_id=str(row["message_id"]),
                 source_session_id=str(row["source_session_id"]),
-                content=str(row["content"]),
+                # OM-1: strip untrusted metadata before content enters extraction pipeline.
+                content=strip_untrusted_metadata(str(row["content"])),
                 created_at=str(row["created_at"]),
                 content_embedding=[float(v) for v in _safe_list(row.get("content_embedding"))],
                 om_extract_attempts=int(row.get("om_extract_attempts") or 0),
@@ -1433,7 +1536,7 @@ def run(args: argparse.Namespace) -> int:
         parent = _fetch_structured_parent(session)
         if parent is not None:
             if dry_run:
-                print(f"DRY RUN: would process structured parent chunk")
+                print("DRY RUN: would process structured parent chunk")
                 return 0
             _process_structured_parent(session, parent, cfg)
             return 0

@@ -483,3 +483,41 @@ s1_pilot_om_path_20260228_v3:
       description: "OM node A addresses or resolves OM node B"
     - name: RESOLVES
       description: "OM node A resolves OM node B (conclusion)"
+
+# ─────────────────────────────────────────────
+# v4-small: OM-1 metadata contamination fix verification pilot (2026-02-28)
+# Small bounded run (≤3 chunks / ≤150 messages) to confirm contamination→0%.
+# ─────────────────────────────────────────────
+s1_pilot_om_path_20260228_v4_small:
+  extraction_mode: constrained_soft
+  extraction_emphasis: >-
+    OM-path pilot for FR-11 v4-small (2026-02-28). Verifies OM-1 metadata
+    contamination fix in om_compressor path and extractor-path verification
+    event emission. Small bounded run (≤3 chunks / ≤150 messages). Model
+    pinned to gpt-5.1-codex-mini. Namespace isolated; no production data.
+
+  entity_types:
+    - name: Insight
+      description: "A durable observational insight extracted from session transcripts"
+    - name: Pattern
+      description: "A recurring behaviour or structural pattern"
+    - name: Requirement
+      description: "A hard constraint or system requirement"
+    - name: Preference
+      description: "A stated or inferred user preference"
+    - name: Decision
+      description: "A resolved choice or architectural decision"
+    - name: Problem
+      description: "An identified problem or failure mode"
+
+  relationship_types:
+    - name: MOTIVATES
+      description: "OM node A motivates or drives OM node B"
+    - name: GENERATES
+      description: "OM node A generates or produces OM node B"
+    - name: SUPERSEDES
+      description: "OM node A supersedes or replaces OM node B"
+    - name: ADDRESSES
+      description: "OM node A addresses or resolves OM node B"
+    - name: RESOLVES
+      description: "OM node A resolves OM node B (conclusion)"
