@@ -1576,6 +1576,187 @@ test('capture hook still uses raw provider groupId (not hashed) when available',
   assert.equal(capturedGroupId, 'telegram:-1003893734334');
 });
 
+// ── Multi-lane recall routing tests ───────────────────────────────────────
+
+test('recall hook fans out across memoryGroupIds when singleTenant=true', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      singleTenant: true,
+      memoryGroupIds: ['s1_sessions_main', 's1_observational_memory', 'learning_self_audit'],
+    },
+  });
+
+  await hook(
+    { prompt: 'multi-lane recall check' },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  assert.deepEqual(capturedGroupIds, [
+    's1_sessions_main',
+    's1_observational_memory',
+    'learning_self_audit',
+  ]);
+});
+
+test('recall hook memoryGroupIds takes precedence over memoryGroupId when singleTenant=true', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      singleTenant: true,
+      memoryGroupId: 'single-lane',
+      memoryGroupIds: ['s1_sessions_main', 's1_observational_memory', 'learning_self_audit'],
+    },
+  });
+
+  await hook(
+    { prompt: 'precedence check' },
+    { sessionKey: 'session-lane' },
+  );
+
+  // memoryGroupIds wins over the scalar memoryGroupId.
+  assert.deepEqual(capturedGroupIds, [
+    's1_sessions_main',
+    's1_observational_memory',
+    'learning_self_audit',
+  ]);
+});
+
+test('recall hook falls back to memoryGroupId when memoryGroupIds is empty after normalization', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      singleTenant: true,
+      memoryGroupId: 'single-lane',
+      // All entries are blank — normalization strips them → fall through to memoryGroupId.
+      memoryGroupIds: ['   ', ''],
+    },
+  });
+
+  await hook(
+    { prompt: 'empty multi-lane fallback' },
+    { sessionKey: 'session-lane' },
+  );
+
+  assert.deepEqual(capturedGroupIds, ['single-lane']);
+});
+
+test('recall hook ignores memoryGroupIds when singleTenant is not set', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    // memoryGroupIds without singleTenant: true — must NOT take effect.
+    config: {
+      memoryGroupIds: ['s1_sessions_main', 's1_observational_memory', 'learning_self_audit'],
+    },
+  });
+
+  await hook(
+    { prompt: 'tenant isolation for multi-lane' },
+    {
+      sessionKey: 'session-lane',
+      messageProvider: { groupId: 'provider-lane', chatType: 'group' },
+    },
+  );
+
+  // Must fall through to provider-group lane, not the pinned multi-lane override.
+  assert.deepEqual(capturedGroupIds, ['provider-lane']);
+});
+
+test('normalizeConfig deduplicates memoryGroupIds and strips empty entries', () => {
+  const normalized = normalizeConfig({
+    memoryGroupIds: [
+      's1_sessions_main',
+      '  ',
+      's1_observational_memory',
+      '',
+      's1_sessions_main', // duplicate
+      'learning_self_audit',
+    ],
+  });
+  assert.deepEqual(normalized.memoryGroupIds, [
+    's1_sessions_main',
+    's1_observational_memory',
+    'learning_self_audit',
+  ]);
+});
+
+test('normalizeConfig returns undefined memoryGroupIds when all entries are blank', () => {
+  const normalized = normalizeConfig({ memoryGroupIds: ['', '   '] });
+  assert.equal(normalized.memoryGroupIds, undefined);
+});
+
+test('normalizeConfig returns undefined memoryGroupIds when array is empty', () => {
+  const normalized = normalizeConfig({ memoryGroupIds: [] });
+  assert.equal(normalized.memoryGroupIds, undefined);
+});
+
+test('recall hook multi-lane preserves stable insertion order', async () => {
+  let capturedGroupIds: string[] | undefined;
+
+  const hook = createRecallHook({
+    client: {
+      search: async (_query, groupIds) => {
+        capturedGroupIds = groupIds;
+        return { facts: [] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      singleTenant: true,
+      // Order matters: sessions first, then OM, then audit.
+      memoryGroupIds: ['learning_self_audit', 's1_sessions_main', 's1_observational_memory'],
+    },
+  });
+
+  await hook({ prompt: 'order check' }, { sessionKey: 'session-lane' });
+
+  assert.deepEqual(capturedGroupIds, [
+    'learning_self_audit',
+    's1_sessions_main',
+    's1_observational_memory',
+  ]);
+});
+
 test('pack router resolves relative script path from packRouterRepoRoot, not process.cwd()', async (t) => {
   // Create a temp dir that is NOT process.cwd(). The relative script path
   // "./test-router.js" must be resolved against packRouterRepoRoot so that

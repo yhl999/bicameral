@@ -51,6 +51,14 @@
         "type": "string",
         "minLength": 1
       },
+      "memoryGroupIds": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": "Multi-lane group IDs for singleTenant deployments. When non-empty and singleTenant=true, recall fans out across all listed lanes (sessions, OM, self-audit, etc.). Takes precedence over memoryGroupId. Duplicates and empty entries are stripped during normalization. Example: [\"s1_sessions_main\", \"s1_observational_memory\", \"learning_self_audit\"]"
+      },
       "minPromptChars": {
         "type": "number"
       },
