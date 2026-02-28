@@ -1084,3 +1084,84 @@ def test_fetch_messages_by_ids_returns_chronological_order() -> None:
     assert result[2].message_id == "msg2", (
         f"Third message should be latest (msg2), got {result[2].message_id}"
     )
+
+
+# ---------------------------------------------------------------------------
+# NO-GO fixes: IPv6 parsing, OM_ALLOW_LOCAL_LLM scope, cloud-metadata always-blocked
+# ---------------------------------------------------------------------------
+
+
+def test_is_ssrf_blocked_host_blocks_ipv6_loopback() -> None:
+    """[::1] IPv6 loopback must be correctly parsed and blocked.
+
+    The naive netloc.split(':')[0] approach returns '[', which fails ip_address()
+    and causes the IPv6 loopback to be silently allowed.  urlparse.hostname fixes this.
+    """
+    assert om_compressor._is_ssrf_blocked_host("[::1]") is True
+    assert om_compressor._is_ssrf_blocked_host("[::1]:8080") is True
+    assert om_compressor._is_ssrf_blocked_host("[::1]:11434") is True
+
+
+def test_is_ssrf_blocked_host_blocks_ipv6_link_local() -> None:
+    """IPv6 link-local addresses (fe80::) must be blocked."""
+    assert om_compressor._is_ssrf_blocked_host("[fe80::1]") is True
+    assert om_compressor._is_ssrf_blocked_host("[fe80::1]:8080") is True
+
+
+def test_is_ssrf_blocked_host_blocks_ipv6_private() -> None:
+    """IPv6 private / ULA addresses (fc00::/7) must be blocked."""
+    assert om_compressor._is_ssrf_blocked_host("[fd00::1]") is True
+
+
+def test_llm_chat_base_url_blocks_ipv6_loopback_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IPv6 loopback [::1] is blocked by default (no OM_ALLOW_LOCAL_LLM)."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://[::1]:11434/v1")
+    monkeypatch.delenv("OM_ALLOW_LOCAL_LLM", raising=False)
+    with pytest.raises(om_compressor.OMCompressorError, match="loopback or private"):
+        om_compressor._llm_chat_base_url()
+
+
+def test_llm_chat_base_url_allows_ipv6_loopback_with_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OM_ALLOW_LOCAL_LLM=1 should permit [::1] for local Ollama/dev usage."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://[::1]:11434/v1")
+    monkeypatch.setenv("OM_ALLOW_LOCAL_LLM", "1")
+    url = om_compressor._llm_chat_base_url()
+    assert url == "http://[::1]:11434/v1"
+
+
+def test_llm_chat_base_url_always_blocks_cloud_metadata_even_with_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloud metadata 169.254.169.254 is ALWAYS blocked, even with OM_ALLOW_LOCAL_LLM=1.
+
+    This is the key NO-GO fix: OM_ALLOW_LOCAL_LLM must only widen the allowed set
+    to localhost/127.x/[::1], never to link-local/cloud-metadata endpoints.
+    """
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://169.254.169.254/latest/meta-data/")
+    monkeypatch.setenv("OM_ALLOW_LOCAL_LLM", "1")
+    with pytest.raises(om_compressor.OMCompressorError, match="link-local"):
+        om_compressor._llm_chat_base_url()
+
+
+def test_llm_chat_base_url_always_blocks_ipv6_link_local_even_with_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IPv6 link-local fe80::1 is ALWAYS blocked, even with OM_ALLOW_LOCAL_LLM=1."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://[fe80::1]/v1")
+    monkeypatch.setenv("OM_ALLOW_LOCAL_LLM", "1")
+    with pytest.raises(om_compressor.OMCompressorError, match="link-local"):
+        om_compressor._llm_chat_base_url()
+
+
+def test_llm_chat_base_url_allows_127_0_0_1_with_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OM_ALLOW_LOCAL_LLM=1 allows 127.0.0.1 (IPv4 loopback) for local dev."""
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OM_ALLOW_LOCAL_LLM", "1")
+    url = om_compressor._llm_chat_base_url()
+    assert url == "http://127.0.0.1:11434/v1"

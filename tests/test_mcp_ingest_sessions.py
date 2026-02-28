@@ -135,3 +135,60 @@ def test_mcp_client_accepts_localhost_url() -> None:
     """MCPClient accepts localhost MCP URL on init."""
     client = MCPClient("http://localhost:8000/mcp")
     assert client.url == "http://localhost:8000/mcp"
+
+
+# ---------------------------------------------------------------------------
+# NO-GO fixes: IPv6 parsing + query/fragment rejection in _validate_mcp_url
+# ---------------------------------------------------------------------------
+
+
+def test_validate_mcp_url_rejects_query_string() -> None:
+    """MCP URLs with query parameters must be rejected.
+
+    The docstring documents this requirement; this test ensures code enforces it.
+    """
+    with pytest.raises(ValueError, match="query"):
+        _validate_mcp_url("http://localhost:8000/mcp?token=abc")
+
+
+def test_validate_mcp_url_rejects_query_string_complex() -> None:
+    """Reject complex query strings that could indicate injection attempts."""
+    with pytest.raises(ValueError, match="query"):
+        _validate_mcp_url("http://localhost:8000/mcp?foo=bar&baz=1")
+
+
+def test_validate_mcp_url_rejects_fragment() -> None:
+    """MCP URLs with URL fragments must be rejected.
+
+    The docstring documents this requirement; this test ensures code enforces it.
+    """
+    with pytest.raises(ValueError, match="fragment"):
+        _validate_mcp_url("http://localhost:8000/mcp#section")
+
+
+def test_validate_mcp_url_allows_path_without_query_or_fragment() -> None:
+    """URLs with a path component (but no query/fragment) are valid."""
+    url = "http://localhost:8000/mcp/v2"
+    assert _validate_mcp_url(url) == url
+
+
+def test_validate_mcp_url_blocks_ipv6_link_local() -> None:
+    """IPv6 link-local addresses (fe80::1) are always blocked in MCP URLs.
+
+    The naive netloc.split(':')[0] approach fails to extract the IPv6 address
+    and silently allows link-local endpoints.  parsed.hostname fixes this.
+    """
+    with pytest.raises(ValueError, match="link-local"):
+        _validate_mcp_url("http://[fe80::1]:8000/mcp")
+
+
+def test_validate_mcp_url_allows_ipv6_loopback() -> None:
+    """IPv6 loopback [::1] is allowed — MCP server can legitimately run on ::1."""
+    url = "http://[::1]:8000/mcp"
+    assert _validate_mcp_url(url) == url
+
+
+def test_validate_mcp_url_allows_ipv6_loopback_no_port() -> None:
+    """IPv6 loopback [::1] without explicit port is allowed."""
+    url = "http://[::1]/mcp"
+    assert _validate_mcp_url(url) == url

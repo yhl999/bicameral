@@ -622,9 +622,15 @@ def _is_ssrf_blocked_host(netloc: str) -> bool:
     Cloud metadata endpoints (169.254.x.x link-local) are always blocked
     regardless of OM_ALLOW_LOCAL_LLM because there is no legitimate reason to
     send model traffic to them.
+
+    IPv6-safe: uses urlparse.hostname to correctly strip brackets from IPv6
+    literals (e.g. "[::1]:8080" → "::1") rather than naive split(":")[0]
+    which mis-handles bracketed IPv6 addresses.
     """
-    # Strip port and IPv6 brackets, e.g. "[::1]:8080" → "::1"
-    host = netloc.split(":")[0].strip("[]")
+    # Use urlparse to safely extract hostname, handling IPv6 brackets and port.
+    # Prepend "//" so urlparse treats the argument as a netloc component.
+    _parsed = urllib.parse.urlparse(f"//{netloc}")
+    host = (_parsed.hostname or "").strip()
 
     # Well-known loopback hostnames
     if host.lower() in {"localhost", "ip6-localhost", "ip6-loopback"}:
@@ -663,6 +669,22 @@ def _llm_chat_base_url() -> str:
         raise OMCompressorError("LLM chat base URL must not include credentials")
     if parsed.query or parsed.fragment:
         raise OMCompressorError("LLM chat base URL must not include query/fragment")
+
+    # Safely extract the hostname (IPv6-aware) for SSRF checks.
+    _host_only = (urllib.parse.urlparse(f"//{parsed.netloc}").hostname or "").strip()
+
+    # ALWAYS block link-local / cloud-metadata addresses (e.g. 169.254.169.254, fe80::1)
+    # regardless of OM_ALLOW_LOCAL_LLM.  There is no legitimate reason for the LLM
+    # extractor to reach cloud-metadata endpoints even in local-dev mode.
+    try:
+        _addr = ipaddress.ip_address(_host_only)
+        if _addr.is_link_local:
+            raise OMCompressorError(
+                f"LLM chat base URL {base!r} targets a link-local/cloud-metadata address. "
+                "This is always blocked regardless of OM_ALLOW_LOCAL_LLM."
+            )
+    except ValueError:
+        pass  # hostname (not a numeric IP) — link-local check does not apply
 
     allow_local = os.environ.get("OM_ALLOW_LOCAL_LLM", "").strip().lower() in _TRUTHY_ENV_VALUES
     if not allow_local and _is_ssrf_blocked_host(parsed.netloc):

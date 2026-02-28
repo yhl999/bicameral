@@ -195,10 +195,22 @@ def _validate_mcp_url(url: str) -> str:
         raise ValueError(
             f"MCP URL must not include embedded credentials: {url!r}"
         )
+    # Reject query strings and fragments — structurally invalid for an MCP base URL
+    # and a potential indicator of mis-configuration or injection attempt.
+    if parsed.query:
+        raise ValueError(
+            f"MCP URL must not include a query string: {url!r}"
+        )
+    if parsed.fragment:
+        raise ValueError(
+            f"MCP URL must not include a fragment: {url!r}"
+        )
 
-    # Block cloud metadata / link-local addresses (169.254.x.x).
+    # Block cloud metadata / link-local addresses (169.254.x.x, fe80::, …).
     # We intentionally allow loopback and RFC-1918 (MCP server is typically local).
-    host = parsed.netloc.split(":")[0].strip("[]")
+    # IPv6-safe: use parsed.hostname which correctly strips brackets from IPv6
+    # literals (e.g. "[::1]:8000" → "::1") rather than naive split(":")[0].
+    host = (parsed.hostname or "").strip()
     try:
         import ipaddress as _ipaddress
         addr = _ipaddress.ip_address(host)
