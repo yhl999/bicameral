@@ -1463,7 +1463,9 @@ def _claim_shard(chunk_id: str) -> int:
 
 
 def init_claim_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chunk_claims (
@@ -1527,6 +1529,24 @@ def seed_claims(conn: sqlite3.Connection, chunk_ids: list[str]) -> None:
         conn.execute(
             "UPDATE chunk_claims SET claim_shard=? WHERE chunk_id=? AND claim_shard != ?",
             (shard, chunk_id, shard),
+        )
+        # Reset previously failed chunks so they can be retried on the next run.
+        # Only resets status=failed → pending; leaves done/claimed/pending rows untouched.
+        # Clears transient fields so the chunk re-enters the queue cleanly (no stale lease,
+        # worker, or error that would confuse the next worker to claim it).
+        conn.execute(
+            """
+            UPDATE chunk_claims
+            SET status = ?,
+                worker_id = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                completed_at = NULL,
+                error = NULL
+            WHERE chunk_id = ?
+              AND status = ?
+            """,
+            (CLAIM_STATUS_PENDING, chunk_id, CLAIM_STATUS_FAILED),
         )
     conn.commit()
 
@@ -2598,6 +2618,7 @@ def _run_claim_mode(
         worker_id = f"om-{args.shards}-{args.shard_index}-{os.getpid()}"
         lease_seconds = _claim_lease_seconds()
         processed = 0
+        had_failures = False  # tracks any confirmation/ownership/processing failure in this run
         max_chunks = max(1, int(args.max_chunks_per_run))
 
         while processed < max_chunks:
@@ -2613,29 +2634,45 @@ def _run_claim_mode(
 
             manifest_row = manifest.get(chunk_id)
             if not manifest_row:
-                _claim_fail(
+                fail_ok = _claim_fail(
                     conn,
                     chunk_id=chunk_id,
                     worker_id=worker_id,
                     error="chunk missing from manifest",
                 )
+                if not fail_ok:
+                    emit_event(
+                        "OM_CLAIM_OWNERSHIP_LOST",
+                        chunk_id=chunk_id,
+                        worker_id=worker_id,
+                        phase="manifest_missing",
+                    )
                 emit_event("OM_CHUNK_FAILED", chunk_id=chunk_id, error="chunk missing from manifest")
+                had_failures = True
                 continue
 
             message_ids = [str(mid) for mid in _safe_list(manifest_row.get("message_ids")) if str(mid)]
             chunk_messages = _fetch_messages_by_ids(session, message_ids)
             if len(chunk_messages) != len(message_ids):
-                _claim_fail(
+                fail_ok = _claim_fail(
                     conn,
                     chunk_id=chunk_id,
                     worker_id=worker_id,
                     error="manifest message_ids no longer resolvable in Neo4j",
                 )
+                if not fail_ok:
+                    emit_event(
+                        "OM_CLAIM_OWNERSHIP_LOST",
+                        chunk_id=chunk_id,
+                        worker_id=worker_id,
+                        phase="message_resolve_fail",
+                    )
                 emit_event(
                     "OM_CHUNK_FAILED",
                     chunk_id=chunk_id,
                     error="manifest message_ids no longer resolvable in Neo4j",
                 )
+                had_failures = True
                 continue
 
             try:
@@ -2653,20 +2690,41 @@ def _run_claim_mode(
                     message_ids=[m.message_id for m in chunk_messages],
                     chunk_id=chunk_id,
                 ):
-                    _claim_fail(
+                    fail_ok = _claim_fail(
                         conn,
                         chunk_id=chunk_id,
                         worker_id=worker_id,
                         error="done-confirm failed (message not durably marked extracted)",
                     )
+                    if not fail_ok:
+                        # _claim_fail returned False — ownership was already lost (race).
+                        emit_event(
+                            "OM_CLAIM_OWNERSHIP_LOST",
+                            chunk_id=chunk_id,
+                            worker_id=worker_id,
+                            phase="confirm_fail",
+                        )
                     emit_event(
                         "OM_CHUNK_DONE_CONFIRM_FAILED",
                         chunk_id=chunk_id,
                         worker_id=worker_id,
                     )
+                    had_failures = True
                     continue
 
-                _claim_done(conn, chunk_id=chunk_id, worker_id=worker_id)
+                # Attempt to transition claim → done; False means another worker
+                # already modified this row (ownership-lost / race condition).
+                done_ok = _claim_done(conn, chunk_id=chunk_id, worker_id=worker_id)
+                if not done_ok:
+                    emit_event(
+                        "OM_CLAIM_OWNERSHIP_LOST",
+                        chunk_id=chunk_id,
+                        worker_id=worker_id,
+                        phase="done",
+                    )
+                    had_failures = True
+                    continue  # do not count as success, do not emit OM_CHUNK_PROCESSED
+
                 emit_event(
                     "OM_CHUNK_PROCESSED",
                     **result,
@@ -2676,22 +2734,38 @@ def _run_claim_mode(
                 )
                 processed += 1
             except NodeContentMismatchError as exc:
-                _claim_fail(conn, chunk_id=chunk_id, worker_id=worker_id, error=str(exc))
+                fail_ok = _claim_fail(conn, chunk_id=chunk_id, worker_id=worker_id, error=str(exc))
+                if not fail_ok:
+                    emit_event(
+                        "OM_CLAIM_OWNERSHIP_LOST",
+                        chunk_id=chunk_id,
+                        worker_id=worker_id,
+                        phase="node_mismatch_fail",
+                    )
                 emit_event(
                     "OM_NODE_CONTENT_MISMATCH",
                     node_id=exc.node_id,
                     existing_content_hash=exc.existing_hash,
                     incoming_content_hash=exc.incoming_hash,
                 )
-                return 1
+                return 1  # Hard error — data integrity; abort this shard immediately
             except Exception as exc:
-                _claim_fail(conn, chunk_id=chunk_id, worker_id=worker_id, error=str(exc))
+                fail_ok = _claim_fail(conn, chunk_id=chunk_id, worker_id=worker_id, error=str(exc))
+                if not fail_ok:
+                    emit_event(
+                        "OM_CLAIM_OWNERSHIP_LOST",
+                        chunk_id=chunk_id,
+                        worker_id=worker_id,
+                        phase="processing_fail",
+                    )
                 emit_event("OM_CHUNK_FAILED", chunk_id=chunk_id, error=str(exc))
                 return 1
     finally:
         conn.close()
 
-    return 0
+    # Return non-zero if any chunk in this run failed confirmation, processing,
+    # or ownership transition — even if other chunks succeeded.
+    return 1 if had_failures else 0
 
 
 def run(args: argparse.Namespace) -> int:

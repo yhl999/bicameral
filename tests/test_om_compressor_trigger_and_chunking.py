@@ -307,6 +307,7 @@ class TestOMClaimModeDoneConfirmFlow(unittest.TestCase):
             fh.write('\n')
 
     def test_run_claim_mode_marks_failed_when_done_confirm_fails(self):
+        """Done-confirm failure: chunk marked failed, run returns non-zero (run-level exit semantics)."""
         from scripts.om_compressor import ExtractorConfig, MessageRow, parse_args, run
 
         with tempfile.TemporaryDirectory() as td:
@@ -350,7 +351,8 @@ class TestOMClaimModeDoneConfirmFlow(unittest.TestCase):
             ):
                 rc = run(args)
 
-            self.assertEqual(rc, 0)
+            # Done-confirm failure now sets had_failures → run returns non-zero (item 3).
+            self.assertEqual(rc, 1)
             claim_db = f'{manifest}.claims.db'
             import sqlite3
 
@@ -423,6 +425,248 @@ class TestOMClaimModeDoneConfirmFlow(unittest.TestCase):
                 self.assertEqual(row[1], 0)
             finally:
                 conn.close()
+
+
+class TestSeedClaimsRetry(unittest.TestCase):
+    """seed_claims must reset failed chunks to pending so they can be retried (item 1)."""
+
+    def test_seed_claims_resets_failed_to_pending(self):
+        """A chunk that previously failed is reset to pending on next seed_claims call."""
+        from scripts.om_compressor import (
+            CLAIM_STATUS_FAILED,
+            CLAIM_STATUS_PENDING,
+            init_claim_db,
+            seed_claims,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                # Seed once so the chunk exists.
+                seed_claims(conn, ['chunk_retry'])
+                # Simulate a previous failure.
+                conn.execute(
+                    """
+                    UPDATE chunk_claims
+                    SET status = 'failed',
+                        worker_id = 'dead_worker',
+                        claimed_at = '2026-01-01T00:00:00Z',
+                        lease_expires_at = '2026-01-01T00:15:00Z',
+                        completed_at = '2026-01-01T00:16:00Z',
+                        fail_count = 1,
+                        error = 'something broke'
+                    WHERE chunk_id = 'chunk_retry'
+                    """
+                )
+                conn.commit()
+
+                # Verify it really is failed before retry.
+                status_before = conn.execute(
+                    'SELECT status FROM chunk_claims WHERE chunk_id=?', ('chunk_retry',)
+                ).fetchone()[0]
+                self.assertEqual(status_before, CLAIM_STATUS_FAILED)
+
+                # Calling seed_claims again should reset it to pending.
+                seed_claims(conn, ['chunk_retry'])
+
+                row = conn.execute(
+                    'SELECT status, worker_id, lease_expires_at, completed_at, error '
+                    'FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_retry',),
+                ).fetchone()
+                self.assertEqual(row[0], CLAIM_STATUS_PENDING)
+                self.assertIsNone(row[1], 'worker_id should be cleared')
+                self.assertIsNone(row[2], 'lease_expires_at should be cleared')
+                self.assertIsNone(row[3], 'completed_at should be cleared')
+                self.assertIsNone(row[4], 'error should be cleared')
+            finally:
+                conn.close()
+
+    def test_seed_claims_does_not_reset_done(self):
+        """A chunk in 'done' status must NOT be reset — would cause double-processing."""
+        from scripts.om_compressor import CLAIM_STATUS_DONE, init_claim_db, seed_claims
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                seed_claims(conn, ['chunk_done'])
+                conn.execute(
+                    "UPDATE chunk_claims SET status='done', completed_at='2026-01-01T00:00:00Z' "
+                    "WHERE chunk_id='chunk_done'"
+                )
+                conn.commit()
+
+                # Re-seeding must leave done chunks alone.
+                seed_claims(conn, ['chunk_done'])
+
+                status = conn.execute(
+                    'SELECT status FROM chunk_claims WHERE chunk_id=?', ('chunk_done',)
+                ).fetchone()[0]
+                self.assertEqual(status, CLAIM_STATUS_DONE)
+            finally:
+                conn.close()
+
+    def test_seed_claims_does_not_reset_claimed(self):
+        """An in-flight claimed chunk must NOT be reset by seed_claims."""
+        from scripts.om_compressor import CLAIM_STATUS_CLAIMED, init_claim_db, seed_claims
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                seed_claims(conn, ['chunk_claimed'])
+                conn.execute(
+                    "UPDATE chunk_claims SET status='claimed', worker_id='live_worker' "
+                    "WHERE chunk_id='chunk_claimed'"
+                )
+                conn.commit()
+
+                seed_claims(conn, ['chunk_claimed'])
+
+                row = conn.execute(
+                    'SELECT status, worker_id FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_claimed',),
+                ).fetchone()
+                self.assertEqual(row[0], CLAIM_STATUS_CLAIMED)
+                self.assertEqual(row[1], 'live_worker')
+            finally:
+                conn.close()
+
+
+class TestClaimOwnershipLost(unittest.TestCase):
+    """When _claim_done returns False, emit OM_CLAIM_OWNERSHIP_LOST and fail the run (item 2/3)."""
+
+    def _write_manifest(self, path: str, *, chunk_id: str, extractor_version: str) -> None:
+        row = {
+            'chunk_id': chunk_id,
+            'message_ids': ['m1'],
+            'message_count': 1,
+            'extractor_version': extractor_version,
+        }
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(row))
+            fh.write('\n')
+
+    def test_claim_done_ownership_lost_emits_event_and_returns_nonzero(self):
+        """_claim_done returning False → OM_CLAIM_OWNERSHIP_LOST emitted, run returns 1."""
+        from scripts.om_compressor import ExtractorConfig, MessageRow, parse_args, run
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = os.path.join(td, 'om_manifest.jsonl')
+            cfg = ExtractorConfig(
+                schema_version='2026-02-17',
+                prompt_template='x',
+                model_id='m',
+                extractor_version='ev1',
+            )
+            self._write_manifest(manifest, chunk_id='chunk_race', extractor_version=cfg.extractor_version)
+
+            args = parse_args([
+                '--mode', 'backfill',
+                '--claim-mode',
+                '--build-manifest', manifest,
+                '--shards', '1',
+                '--shard-index', '0',
+                '--max-chunks-per-run', '1',
+            ])
+
+            fake_session = MagicMock()
+            driver = _FakeDriver(fake_session)
+            msg = MessageRow(
+                message_id='m1',
+                source_session_id='s',
+                content='hello',
+                created_at='2026-02-28T00:00:00Z',
+                content_embedding=[],
+                om_extract_attempts=0,
+            )
+
+            emitted_events: list[dict] = []
+
+            def _capturing_emit(name: str, **payload):
+                emitted_events.append({'event': name, **payload})
+                print(json.dumps({'event': name, **payload}))
+
+            with (
+                patch('scripts.om_compressor._neo4j_driver', return_value=driver),
+                patch('scripts.om_compressor._ensure_neo4j_constraints'),
+                patch('scripts.om_compressor._load_extractor_config', return_value=cfg),
+                patch('scripts.om_compressor._fetch_messages_by_ids', return_value=[msg]),
+                patch('scripts.om_compressor._activate_energy_scores', return_value=([], [])),
+                patch('scripts.om_compressor._process_chunk', return_value={'chunk_id': 'chunk_race'}),
+                patch('scripts.om_compressor._confirm_chunk_done', return_value=True),
+                # _claim_done returns False → simulates ownership-lost race
+                patch('scripts.om_compressor._claim_done', return_value=False),
+                patch('scripts.om_compressor.emit_event', side_effect=_capturing_emit),
+            ):
+                rc = run(args)
+
+            self.assertEqual(rc, 1, 'ownership-lost should make the run return non-zero')
+            ownership_lost = [e for e in emitted_events if e['event'] == 'OM_CLAIM_OWNERSHIP_LOST']
+            self.assertTrue(
+                ownership_lost,
+                'OM_CLAIM_OWNERSHIP_LOST must be emitted when _claim_done returns False',
+            )
+            self.assertEqual(ownership_lost[0].get('phase'), 'done')
+
+    def test_claim_fail_ownership_lost_emits_event(self):
+        """_claim_fail returning False on done-confirm → OM_CLAIM_OWNERSHIP_LOST with phase=confirm_fail."""
+        from scripts.om_compressor import ExtractorConfig, MessageRow, parse_args, run
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = os.path.join(td, 'om_manifest.jsonl')
+            cfg = ExtractorConfig(
+                schema_version='2026-02-17',
+                prompt_template='x',
+                model_id='m',
+                extractor_version='ev1',
+            )
+            self._write_manifest(manifest, chunk_id='chunk_cf_race', extractor_version=cfg.extractor_version)
+
+            args = parse_args([
+                '--mode', 'backfill',
+                '--claim-mode',
+                '--build-manifest', manifest,
+                '--shards', '1',
+                '--shard-index', '0',
+                '--max-chunks-per-run', '1',
+            ])
+
+            fake_session = MagicMock()
+            driver = _FakeDriver(fake_session)
+            msg = MessageRow(
+                message_id='m1',
+                source_session_id='s',
+                content='hello',
+                created_at='2026-02-28T00:00:00Z',
+                content_embedding=[],
+                om_extract_attempts=0,
+            )
+
+            emitted_events: list[dict] = []
+
+            def _capturing_emit(name: str, **payload):
+                emitted_events.append({'event': name, **payload})
+                print(json.dumps({'event': name, **payload}))
+
+            with (
+                patch('scripts.om_compressor._neo4j_driver', return_value=driver),
+                patch('scripts.om_compressor._ensure_neo4j_constraints'),
+                patch('scripts.om_compressor._load_extractor_config', return_value=cfg),
+                patch('scripts.om_compressor._fetch_messages_by_ids', return_value=[msg]),
+                patch('scripts.om_compressor._activate_energy_scores', return_value=([], [])),
+                patch('scripts.om_compressor._process_chunk', return_value={'chunk_id': 'chunk_cf_race'}),
+                # confirm returns False → triggers _claim_fail path
+                patch('scripts.om_compressor._confirm_chunk_done', return_value=False),
+                # _claim_fail also returns False → race on the fail transition
+                patch('scripts.om_compressor._claim_fail', return_value=False),
+                patch('scripts.om_compressor.emit_event', side_effect=_capturing_emit),
+            ):
+                rc = run(args)
+
+            self.assertEqual(rc, 1, 'had_failures should be set when done-confirm+claim_fail both lose ownership')
+            ownership_lost = [e for e in emitted_events if e['event'] == 'OM_CLAIM_OWNERSHIP_LOST']
+            self.assertTrue(ownership_lost, 'OM_CLAIM_OWNERSHIP_LOST must be emitted')
+            self.assertEqual(ownership_lost[0].get('phase'), 'confirm_fail')
 
 
 if __name__ == '__main__':
