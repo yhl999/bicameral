@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -166,6 +169,260 @@ class TestSteadyVsBackfillMode(unittest.TestCase):
         self.assertTrue(args.claim_mode)
         self.assertEqual(args.shards, 4)
         self.assertEqual(args.shard_index, 1)
+
+
+class TestOMClaimStateDB(unittest.TestCase):
+    """Claim DB semantics for FR-11 throughput mode."""
+
+    def test_claim_db_schema_includes_lease_columns(self):
+        from scripts.om_compressor import init_claim_db
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                cols = {row[1] for row in conn.execute('PRAGMA table_info(chunk_claims)').fetchall()}
+                self.assertIn('lease_expires_at', cols)
+                self.assertIn('attempt_count', cols)
+                self.assertIn('claim_shard', cols)
+            finally:
+                conn.close()
+
+    def test_claim_chunk_respects_shard_partitioning(self):
+        from scripts.om_compressor import _claim_shard, claim_chunk, init_claim_db, seed_claims
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                chunk_ids = [f'chunk_{i:03d}' for i in range(12)]
+                seed_claims(conn, chunk_ids)
+
+                expected = {cid for cid in chunk_ids if (_claim_shard(cid) % 2) == 0}
+                claimed: set[str] = set()
+                while True:
+                    cid = claim_chunk(
+                        conn,
+                        worker_id='w0',
+                        shards=2,
+                        shard_index=0,
+                        lease_seconds=600,
+                    )
+                    if cid is None:
+                        break
+                    claimed.add(cid)
+
+                self.assertEqual(claimed, expected)
+            finally:
+                conn.close()
+
+    def test_stale_claim_can_be_recovered(self):
+        from scripts.om_compressor import claim_chunk, init_claim_db, seed_claims
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                seed_claims(conn, ['chunk_stale'])
+
+                first = claim_chunk(
+                    conn,
+                    worker_id='worker_a',
+                    shards=1,
+                    shard_index=0,
+                    lease_seconds=600,
+                )
+                self.assertEqual(first, 'chunk_stale')
+
+                conn.execute(
+                    "UPDATE chunk_claims SET lease_expires_at='1970-01-01T00:00:00Z' WHERE chunk_id=?",
+                    ('chunk_stale',),
+                )
+                conn.commit()
+
+                recovered = claim_chunk(
+                    conn,
+                    worker_id='worker_b',
+                    shards=1,
+                    shard_index=0,
+                    lease_seconds=600,
+                )
+                self.assertEqual(recovered, 'chunk_stale')
+            finally:
+                conn.close()
+
+
+class TestOMDoneConfirm(unittest.TestCase):
+    def test_confirm_chunk_done_true_when_all_messages_confirmed(self):
+        from scripts.om_compressor import _confirm_chunk_done
+
+        session = MagicMock()
+        session.run.return_value.single.return_value = {'total': 2, 'confirmed': 2}
+
+        ok = _confirm_chunk_done(session, message_ids=['m1', 'm2'], chunk_id='chunk_a')
+        self.assertTrue(ok)
+
+    def test_confirm_chunk_done_false_when_partial(self):
+        from scripts.om_compressor import _confirm_chunk_done
+
+        session = MagicMock()
+        session.run.return_value.single.return_value = {'total': 2, 'confirmed': 1}
+
+        ok = _confirm_chunk_done(session, message_ids=['m1', 'm2'], chunk_id='chunk_a')
+        self.assertFalse(ok)
+
+
+class _FakeSessionContext:
+    def __init__(self, session):
+        self._session = session
+
+    def __enter__(self):
+        return self._session
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, session):
+        self._session = session
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def session(self, database=None):
+        return _FakeSessionContext(self._session)
+
+
+class TestOMClaimModeDoneConfirmFlow(unittest.TestCase):
+    def _write_manifest(self, path: str, *, chunk_id: str, extractor_version: str) -> None:
+        row = {
+            'chunk_id': chunk_id,
+            'message_ids': ['m1'],
+            'message_count': 1,
+            'extractor_version': extractor_version,
+        }
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(row))
+            fh.write('\n')
+
+    def test_run_claim_mode_marks_failed_when_done_confirm_fails(self):
+        from scripts.om_compressor import ExtractorConfig, MessageRow, parse_args, run
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = os.path.join(td, 'om_manifest.jsonl')
+            cfg = ExtractorConfig(
+                schema_version='2026-02-17',
+                prompt_template='x',
+                model_id='m',
+                extractor_version='ev1',
+            )
+            self._write_manifest(manifest, chunk_id='chunk_1', extractor_version=cfg.extractor_version)
+
+            args = parse_args([
+                '--mode', 'backfill',
+                '--claim-mode',
+                '--build-manifest', manifest,
+                '--shards', '1',
+                '--shard-index', '0',
+                '--max-chunks-per-run', '1',
+            ])
+
+            fake_session = MagicMock()
+            driver = _FakeDriver(fake_session)
+            msg = MessageRow(
+                message_id='m1',
+                source_session_id='s',
+                content='hello',
+                created_at='2026-02-28T00:00:00Z',
+                content_embedding=[],
+                om_extract_attempts=0,
+            )
+
+            with (
+                patch('scripts.om_compressor._neo4j_driver', return_value=driver),
+                patch('scripts.om_compressor._ensure_neo4j_constraints'),
+                patch('scripts.om_compressor._load_extractor_config', return_value=cfg),
+                patch('scripts.om_compressor._fetch_messages_by_ids', return_value=[msg]),
+                patch('scripts.om_compressor._activate_energy_scores', return_value=([], [])),
+                patch('scripts.om_compressor._process_chunk', return_value={'chunk_id': 'chunk_1'}),
+                patch('scripts.om_compressor._confirm_chunk_done', return_value=False),
+            ):
+                rc = run(args)
+
+            self.assertEqual(rc, 0)
+            claim_db = f'{manifest}.claims.db'
+            import sqlite3
+
+            conn = sqlite3.connect(claim_db)
+            try:
+                row = conn.execute(
+                    'SELECT status, fail_count FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_1',),
+                ).fetchone()
+                self.assertEqual(row[0], 'failed')
+                self.assertEqual(row[1], 1)
+            finally:
+                conn.close()
+
+    def test_run_claim_mode_marks_done_after_done_confirm(self):
+        from scripts.om_compressor import ExtractorConfig, MessageRow, parse_args, run
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = os.path.join(td, 'om_manifest.jsonl')
+            cfg = ExtractorConfig(
+                schema_version='2026-02-17',
+                prompt_template='x',
+                model_id='m',
+                extractor_version='ev1',
+            )
+            self._write_manifest(manifest, chunk_id='chunk_2', extractor_version=cfg.extractor_version)
+
+            args = parse_args([
+                '--mode', 'backfill',
+                '--claim-mode',
+                '--build-manifest', manifest,
+                '--shards', '1',
+                '--shard-index', '0',
+                '--max-chunks-per-run', '1',
+            ])
+
+            fake_session = MagicMock()
+            driver = _FakeDriver(fake_session)
+            msg = MessageRow(
+                message_id='m1',
+                source_session_id='s',
+                content='hello',
+                created_at='2026-02-28T00:00:00Z',
+                content_embedding=[],
+                om_extract_attempts=0,
+            )
+
+            with (
+                patch('scripts.om_compressor._neo4j_driver', return_value=driver),
+                patch('scripts.om_compressor._ensure_neo4j_constraints'),
+                patch('scripts.om_compressor._load_extractor_config', return_value=cfg),
+                patch('scripts.om_compressor._fetch_messages_by_ids', return_value=[msg]),
+                patch('scripts.om_compressor._activate_energy_scores', return_value=([], [])),
+                patch('scripts.om_compressor._process_chunk', return_value={'chunk_id': 'chunk_2'}),
+                patch('scripts.om_compressor._confirm_chunk_done', return_value=True),
+            ):
+                rc = run(args)
+
+            self.assertEqual(rc, 0)
+            claim_db = f'{manifest}.claims.db'
+            import sqlite3
+
+            conn = sqlite3.connect(claim_db)
+            try:
+                row = conn.execute(
+                    'SELECT status, fail_count FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_2',),
+                ).fetchone()
+                self.assertEqual(row[0], 'done')
+                self.assertEqual(row[1], 0)
+            finally:
+                conn.close()
 
 
 if __name__ == '__main__':
