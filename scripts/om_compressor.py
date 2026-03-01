@@ -18,6 +18,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1532,8 +1534,9 @@ def seed_claims(conn: sqlite3.Connection, chunk_ids: list[str]) -> None:
         )
         # Reset previously failed chunks so they can be retried on the next run.
         # Only resets status=failed → pending; leaves done/claimed/pending rows untouched.
-        # Clears transient fields so the chunk re-enters the queue cleanly (no stale lease,
-        # worker, or error that would confuse the next worker to claim it).
+        # Dead-letter threshold: chunks that have failed >= DEAD_LETTER_ATTEMPTS times are
+        # NOT reset — retrying them indefinitely causes head-of-line blocking (poison pill).
+        # Leave them in failed status for dead-letter inspection and manual triage.
         conn.execute(
             """
             UPDATE chunk_claims
@@ -1545,8 +1548,9 @@ def seed_claims(conn: sqlite3.Connection, chunk_ids: list[str]) -> None:
                 error = NULL
             WHERE chunk_id = ?
               AND status = ?
+              AND COALESCE(fail_count, 0) < ?
             """,
-            (CLAIM_STATUS_PENDING, chunk_id, CLAIM_STATUS_FAILED),
+            (CLAIM_STATUS_PENDING, chunk_id, CLAIM_STATUS_FAILED, DEAD_LETTER_ATTEMPTS),
         )
     conn.commit()
 
@@ -2533,6 +2537,22 @@ def _claim_db_path_for_manifest(manifest_path: Path) -> Path:
     return manifest_path.with_name(f"{manifest_path.name}.claims.db")
 
 
+def _make_worker_id(shards: int, shard_index: int) -> str:
+    """Generate a globally unique worker ID for claim-mode multi-host execution.
+
+    Format: om-{hostname}-{shards}/{shard_index}-{pid}-{rand8}
+
+    Hostname makes the ID unique across machines; pid is unique within a host
+    at a given moment; the random 8-hex suffix prevents collisions across
+    crash/restart cycles that produce the same PID on the same host.
+    The shards/shard_index component preserves observability in log queries.
+    """
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    rand = uuid.uuid4().hex[:8]
+    return f"om-{hostname}-{shards}/{shard_index}-{pid}-{rand}"
+
+
 def _run_build_manifest(
     session: Any,
     *,
@@ -2615,13 +2635,40 @@ def _run_claim_mode(
     try:
         seed_claims(conn, list(manifest.keys()))
 
-        worker_id = f"om-{args.shards}-{args.shard_index}-{os.getpid()}"
+        # Reconcile stale rows: pending claim rows whose chunk_id is not in the current
+        # manifest can never be processed (they belong to a previous manifest generation).
+        # Mark them failed so they don't waste workers trying to claim them.
+        # Uses a SQLite temp table to handle arbitrarily large manifests safely.
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _om_manifest_ids (chunk_id TEXT PRIMARY KEY)"
+        )
+        conn.execute("DELETE FROM _om_manifest_ids")
+        conn.executemany(
+            "INSERT OR IGNORE INTO _om_manifest_ids VALUES (?)",
+            [(cid,) for cid in manifest],
+        )
+        conn.execute(
+            """
+            UPDATE chunk_claims
+            SET status = ?,
+                error = 'stale: chunk not in current manifest',
+                completed_at = ?
+            WHERE status = ?
+              AND chunk_id NOT IN (SELECT chunk_id FROM _om_manifest_ids)
+            """,
+            (CLAIM_STATUS_FAILED, now_iso(), CLAIM_STATUS_PENDING),
+        )
+        conn.execute("DROP TABLE IF EXISTS _om_manifest_ids")
+        conn.commit()
+
+        worker_id = _make_worker_id(int(args.shards), int(args.shard_index))
         lease_seconds = _claim_lease_seconds()
         processed = 0
+        total_attempts = 0  # total chunks claimed (successes + soft failures)
         had_failures = False  # tracks any confirmation/ownership/processing failure in this run
         max_chunks = max(1, int(args.max_chunks_per_run))
 
-        while processed < max_chunks:
+        while total_attempts < max_chunks:
             chunk_id = claim_chunk(
                 conn,
                 worker_id=worker_id,
@@ -2631,6 +2678,7 @@ def _run_claim_mode(
             )
             if not chunk_id:
                 break
+            total_attempts += 1
 
             manifest_row = manifest.get(chunk_id)
             if not manifest_row:

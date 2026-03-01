@@ -531,6 +531,92 @@ class TestSeedClaimsRetry(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_seed_claims_respects_dead_letter_threshold(self):
+        """A chunk with fail_count >= DEAD_LETTER_ATTEMPTS must NOT be reset by seed_claims.
+
+        This prevents poison-pill crash loops / head-of-line blocking: a chunk
+        that always fails should stay in dead-letter state rather than being
+        repeatedly reset to pending and reclaimed indefinitely.
+        """
+        from scripts.om_compressor import (
+            CLAIM_STATUS_FAILED,
+            DEAD_LETTER_ATTEMPTS,
+            init_claim_db,
+            seed_claims,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                seed_claims(conn, ['chunk_dead'])
+                # Simulate a chunk that has exhausted all allowed attempts.
+                conn.execute(
+                    """
+                    UPDATE chunk_claims
+                    SET status = 'failed',
+                        fail_count = ?,
+                        error = 'repeated extraction failure'
+                    WHERE chunk_id = 'chunk_dead'
+                    """,
+                    (DEAD_LETTER_ATTEMPTS,),
+                )
+                conn.commit()
+
+                # seed_claims must NOT reset this chunk — it has hit the dead-letter limit.
+                seed_claims(conn, ['chunk_dead'])
+
+                row = conn.execute(
+                    'SELECT status, fail_count FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_dead',),
+                ).fetchone()
+                self.assertEqual(row[0], CLAIM_STATUS_FAILED,
+                                 'Dead-lettered chunk must remain failed after seed_claims')
+                self.assertEqual(row[1], DEAD_LETTER_ATTEMPTS,
+                                 'fail_count must be preserved')
+            finally:
+                conn.close()
+
+    def test_seed_claims_resets_failed_below_dead_letter_threshold(self):
+        """A chunk with fail_count < DEAD_LETTER_ATTEMPTS IS still reset to pending.
+
+        Verifies the boundary: fail_count = DEAD_LETTER_ATTEMPTS - 1 should be
+        reset (one more retry is allowed); fail_count = DEAD_LETTER_ATTEMPTS
+        should not (tested in test_seed_claims_respects_dead_letter_threshold).
+        """
+        from scripts.om_compressor import (
+            CLAIM_STATUS_PENDING,
+            DEAD_LETTER_ATTEMPTS,
+            init_claim_db,
+            seed_claims,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix='.db') as f:
+            conn = init_claim_db(f.name)
+            try:
+                seed_claims(conn, ['chunk_retryable'])
+                conn.execute(
+                    """
+                    UPDATE chunk_claims
+                    SET status = 'failed',
+                        fail_count = ?,
+                        error = 'transient error'
+                    WHERE chunk_id = 'chunk_retryable'
+                    """,
+                    (DEAD_LETTER_ATTEMPTS - 1,),
+                )
+                conn.commit()
+
+                seed_claims(conn, ['chunk_retryable'])
+
+                row = conn.execute(
+                    'SELECT status FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_retryable',),
+                ).fetchone()
+                self.assertEqual(row[0], CLAIM_STATUS_PENDING,
+                                 'Chunk below dead-letter threshold must be retried')
+            finally:
+                conn.close()
+
 
 class TestClaimOwnershipLost(unittest.TestCase):
     """When _claim_done returns False, emit OM_CLAIM_OWNERSHIP_LOST and fail the run (item 2/3)."""
@@ -667,6 +753,228 @@ class TestClaimOwnershipLost(unittest.TestCase):
             ownership_lost = [e for e in emitted_events if e['event'] == 'OM_CLAIM_OWNERSHIP_LOST']
             self.assertTrue(ownership_lost, 'OM_CLAIM_OWNERSHIP_LOST must be emitted')
             self.assertEqual(ownership_lost[0].get('phase'), 'confirm_fail')
+
+
+class TestWorkerIdUniqueness(unittest.TestCase):
+    """worker_id must be globally unique across hosts for multi-host claim-mode (item 2)."""
+
+    def test_worker_id_contains_hostname_and_pid(self):
+        """worker_id must embed the current hostname and PID for observability."""
+        import socket
+
+        from scripts.om_compressor import _make_worker_id
+
+        wid = _make_worker_id(4, 1)
+        self.assertIn(socket.gethostname(), wid,
+                      'worker_id must contain the hostname for cross-host uniqueness')
+        self.assertIn(str(os.getpid()), wid,
+                      'worker_id must contain the PID for process-level uniqueness')
+        self.assertTrue(wid.startswith('om-'),
+                        "worker_id must start with 'om-' for log filterability")
+
+    def test_worker_id_unique_across_calls(self):
+        """Each call must produce a unique ID (random suffix prevents PID-reuse collisions)."""
+        from scripts.om_compressor import _make_worker_id
+
+        ids = {_make_worker_id(1, 0) for _ in range(10)}
+        self.assertEqual(len(ids), 10,
+                         'All generated worker_ids must be distinct (random suffix)')
+
+    def test_worker_id_encodes_shard_info(self):
+        """Shard metadata must appear in worker_id for observability in log queries."""
+        from scripts.om_compressor import _make_worker_id
+
+        wid = _make_worker_id(8, 3)
+        # Format: om-{host}-{shards}/{shard_index}-{pid}-{rand}
+        # The '8/3' token encodes shards/shard_index.
+        self.assertIn('8/3', wid, 'worker_id must embed shards/shard_index token')
+
+
+class TestMaxChunksPerRunCapsByAttempts(unittest.TestCase):
+    """max_chunks_per_run must cap by total claims (attempts), not only successes (item 3).
+
+    Before the fix: if every chunk failed done-confirm (soft failure), `processed`
+    stayed at 0 and the while-loop would exhaust all chunks in the manifest regardless
+    of --max-chunks-per-run.  After the fix a `total_attempts` counter ensures the
+    loop stops after at most max_chunks claimed chunks.
+    """
+
+    def _write_manifest(self, path: str, chunks: list) -> None:
+        with open(path, 'w', encoding='utf-8') as fh:
+            for row in chunks:
+                fh.write(json.dumps(row) + '\n')
+
+    def test_caps_loop_on_soft_failures(self):
+        """Loop stops after max_chunks attempts even when all chunks fail done-confirm."""
+        from scripts.om_compressor import ExtractorConfig, MessageRow, parse_args, run
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = os.path.join(td, 'om_manifest.jsonl')
+            cfg = ExtractorConfig(
+                schema_version='2026-02-17',
+                prompt_template='x',
+                model_id='m',
+                extractor_version='ev1',
+            )
+            # 3 chunks in manifest, but max_chunks_per_run=2 → only 2 should be attempted.
+            self._write_manifest(manifest, [
+                {
+                    'chunk_id': f'chunk_{i}',
+                    'message_ids': [f'm{i}'],
+                    'message_count': 1,
+                    'extractor_version': cfg.extractor_version,
+                }
+                for i in range(3)
+            ])
+
+            args = parse_args([
+                '--mode', 'backfill',
+                '--claim-mode',
+                '--build-manifest', manifest,
+                '--shards', '1',
+                '--shard-index', '0',
+                '--max-chunks-per-run', '2',
+            ])
+
+            fake_session = MagicMock()
+            driver = _FakeDriver(fake_session)
+            process_calls: list[str] = []
+
+            def fake_fetch(session, message_ids):
+                return [MessageRow(
+                    message_id=message_ids[0],
+                    source_session_id='s',
+                    content='hello',
+                    created_at='2026-02-28T00:00:00Z',
+                    content_embedding=[],
+                    om_extract_attempts=0,
+                )]
+
+            def fake_process(session, *, messages, chunk_id, cfg, observed_node_ids):
+                process_calls.append(chunk_id)
+                return {'chunk_id': chunk_id, 'messages': 1, 'nodes': 0, 'edges': 0}
+
+            with (
+                patch('scripts.om_compressor._neo4j_driver', return_value=driver),
+                patch('scripts.om_compressor._ensure_neo4j_constraints'),
+                patch('scripts.om_compressor._load_extractor_config', return_value=cfg),
+                patch('scripts.om_compressor._fetch_messages_by_ids', side_effect=fake_fetch),
+                patch('scripts.om_compressor._activate_energy_scores', return_value=([], [])),
+                patch('scripts.om_compressor._process_chunk', side_effect=fake_process),
+                # All done-confirms fail → soft failure, processed stays 0
+                patch('scripts.om_compressor._confirm_chunk_done', return_value=False),
+            ):
+                rc = run(args)
+
+            self.assertEqual(
+                len(process_calls), 2,
+                f'Expected exactly 2 chunks attempted (max_chunks_per_run=2), got {len(process_calls)}',
+            )
+            self.assertEqual(rc, 1, 'Soft failures should return non-zero')
+
+
+class TestStaleNonManifestRowReconciliation(unittest.TestCase):
+    """Pending claim rows not in the current manifest are marked failed (item 4).
+
+    If the manifest is rebuilt (new extractor_version or changed message set),
+    the claim DB may contain pending rows from the old manifest.  Those rows
+    can never be processed and would waste workers trying to claim them.
+    _run_claim_mode must reconcile them to failed status on startup.
+    """
+
+    def test_stale_pending_rows_marked_failed(self):
+        """Pending rows from a previous manifest generation are reconciled to failed."""
+        from pathlib import Path as _Path
+
+        from scripts.om_compressor import (
+            ExtractorConfig,
+            MessageRow,
+            _claim_db_path_for_manifest,
+            init_claim_db,
+            parse_args,
+            run,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = os.path.join(td, 'om_manifest.jsonl')
+            cfg = ExtractorConfig(
+                schema_version='2026-02-17',
+                prompt_template='x',
+                model_id='m',
+                extractor_version='ev1',
+            )
+            # Write a single-chunk manifest (only chunk_current).
+            row = {
+                'chunk_id': 'chunk_current',
+                'message_ids': ['m1'],
+                'message_count': 1,
+                'extractor_version': cfg.extractor_version,
+            }
+            with open(manifest, 'w') as fh:
+                fh.write(json.dumps(row) + '\n')
+
+            # Pre-seed the claim DB with a stale pending row from a previous manifest.
+            import sqlite3 as _sqlite3
+
+            claim_db = str(_claim_db_path_for_manifest(_Path(manifest)))
+            conn = init_claim_db(claim_db)
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunk_claims (chunk_id, claim_shard, status) "
+                    "VALUES (?, 0, 'pending')",
+                    ('chunk_stale_from_old_manifest',),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            args = parse_args([
+                '--mode', 'backfill',
+                '--claim-mode',
+                '--build-manifest', manifest,
+                '--shards', '1',
+                '--shard-index', '0',
+                '--max-chunks-per-run', '1',
+            ])
+
+            fake_session = MagicMock()
+            driver = _FakeDriver(fake_session)
+            msg = MessageRow(
+                message_id='m1',
+                source_session_id='s',
+                content='hello',
+                created_at='2026-02-28T00:00:00Z',
+                content_embedding=[],
+                om_extract_attempts=0,
+            )
+
+            with (
+                patch('scripts.om_compressor._neo4j_driver', return_value=driver),
+                patch('scripts.om_compressor._ensure_neo4j_constraints'),
+                patch('scripts.om_compressor._load_extractor_config', return_value=cfg),
+                patch('scripts.om_compressor._fetch_messages_by_ids', return_value=[msg]),
+                patch('scripts.om_compressor._activate_energy_scores', return_value=([], [])),
+                patch('scripts.om_compressor._process_chunk',
+                      return_value={'chunk_id': 'chunk_current', 'messages': 1,
+                                    'nodes': 0, 'edges': 0}),
+                patch('scripts.om_compressor._confirm_chunk_done', return_value=True),
+            ):
+                run(args)
+
+            # The stale row must have been reconciled to failed status.
+            conn = _sqlite3.connect(claim_db)
+            try:
+                stale = conn.execute(
+                    'SELECT status, error FROM chunk_claims WHERE chunk_id=?',
+                    ('chunk_stale_from_old_manifest',),
+                ).fetchone()
+                self.assertIsNotNone(stale, 'Stale row must still exist in DB')
+                self.assertEqual(stale[0], 'failed',
+                                 'Stale pending row must be reconciled to failed')
+                self.assertIn('stale', stale[1],
+                              "Error message must mention 'stale'")
+            finally:
+                conn.close()
 
 
 if __name__ == '__main__':
