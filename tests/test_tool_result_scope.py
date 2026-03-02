@@ -211,7 +211,9 @@ class TestAddEpisodeScopePolicyGate:
 
     def _run(self, coro):
         import asyncio
-        return asyncio.get_event_loop().run_until_complete(coro)
+        # asyncio.run() creates a fresh event loop each call, avoiding
+        # state pollution from other tests that close/clear the global loop.
+        return asyncio.run(coro)
 
     def test_disallowed_tool_name_raises_before_db(self):
         """bash is not allowlisted; add_episode must raise before any DB call."""
