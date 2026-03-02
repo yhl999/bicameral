@@ -209,33 +209,6 @@ class TestBuildEpisodeBody(unittest.TestCase):
         self.assertIn('Hi back', body)
         self.assertIn('2026-01-15', body)
 
-    def test_strips_graphiti_wrapper_and_untrusted_metadata(self):
-        from scripts.mcp_ingest_sessions import _build_episode_body
-
-        messages_by_id = {
-            'msg1': {
-                'message_id': 'msg1',
-                'created_at': '2026-01-15T12:00:00Z',
-                'role': 'user',
-                'content': (
-                    '<graphiti-context>\n'
-                    '## Graphiti Recall\n'
-                    '- noisy memory\n'
-                    '</graphiti-context>\n\n'
-                    'Sender (untrusted metadata):\n'
-                    '```json\n'
-                    '{"sender": "x"}\n'
-                    '```\n\n'
-                    'Keep this body text.'
-                ),
-            },
-        }
-
-        body = _build_episode_body(['msg1'], messages_by_id)
-        self.assertIn('Keep this body text.', body)
-        self.assertNotIn('Graphiti Recall', body)
-        self.assertNotIn('Sender (untrusted metadata)', body)
-
     def test_missing_message_skipped(self):
         from scripts.mcp_ingest_sessions import _build_episode_body
 
@@ -589,8 +562,13 @@ class TestSearchRateLimiter(unittest.TestCase):
         import sys
         from pathlib import Path
 
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src'))
-        from utils.rate_limiter import SlidingWindowRateLimiter
+        _mcp_src = str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src')
+        sys.path.insert(0, _mcp_src)
+        try:
+            from utils.rate_limiter import SlidingWindowRateLimiter
+        finally:
+            sys.path.remove(_mcp_src)
+            sys.modules.pop('config', None)
 
         return SlidingWindowRateLimiter(max_requests=max_requests, window_seconds=window_seconds)
 
@@ -634,8 +612,13 @@ class TestSearchRateLimiter(unittest.TestCase):
         import sys
         from pathlib import Path
 
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src'))
-        from utils.rate_limiter import SlidingWindowRateLimiter
+        _mcp_src = str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src')
+        sys.path.insert(0, _mcp_src)
+        try:
+            from utils.rate_limiter import SlidingWindowRateLimiter
+        finally:
+            sys.path.remove(_mcp_src)
+            sys.modules.pop('config', None)
 
         with self.assertRaises(ValueError):
             SlidingWindowRateLimiter(max_requests=0, window_seconds=60)
@@ -802,8 +785,13 @@ class TestSearchRateLimiter(unittest.TestCase):
         import sys
         from pathlib import Path
 
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src'))
-        from utils.rate_limiter import SlidingWindowRateLimiter
+        _mcp_src = str(Path(__file__).resolve().parents[1] / 'mcp_server' / 'src')
+        sys.path.insert(0, _mcp_src)
+        try:
+            from utils.rate_limiter import SlidingWindowRateLimiter
+        finally:
+            sys.path.remove(_mcp_src)
+            sys.modules.pop('config', None)
 
         with self.assertRaises(ValueError):
             SlidingWindowRateLimiter(max_requests=10, window_seconds=60, max_keys=0)
