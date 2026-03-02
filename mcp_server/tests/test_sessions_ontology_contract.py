@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / 'config' / 'extraction_ontologies.yaml'
+ROOT_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'config' / 'extraction_ontologies.yaml'
 
 TARGET_LANES = [
     's1_sessions_main',
@@ -115,3 +116,9 @@ def test_sessions_lanes_prompt_guidance_includes_hardening_rules():
         assert 'agent->person' in compact
         assert 'task/ticket->artifact' in compact
         assert 'environment->system' in compact
+
+
+def test_top_level_and_mcp_server_ontology_files_are_identical():
+    assert ROOT_CONFIG_PATH.exists(), f'Missing top-level config: {ROOT_CONFIG_PATH}'
+    assert CONFIG_PATH.exists(), f'Missing mcp_server config: {CONFIG_PATH}'
+    assert ROOT_CONFIG_PATH.read_text(encoding='utf-8') == CONFIG_PATH.read_text(encoding='utf-8')

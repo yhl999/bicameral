@@ -253,24 +253,18 @@ learning_self_audit:
 s1_sessions_main:
   extraction_mode: constrained_soft
   intent_guidance: >-
-    Extract durable session memory using only this ontology.
+    Use only this ontology for sessions memory.
     Allowed entity types: Person, Organization, Location, Event, Artifact, System,
     Preference, Requirement, Procedure.
     Allowed edges: PRODUCED, MODIFIED, DEPLOYED_TO, USES, INTEGRATES_WITH,
     DEPENDS_ON, LOCATED_AT, ATTENDED, PART_OF, PREFERS, REQUIRES.
-    Hard edge policy: never emit RELATES_TO, MENTIONS, DISCUSSED, or any other
-    generic connector edge. If no allowed edge applies, keep mention-only entities
-    as floating nodes instead of inventing relationships.
-    Guardrails:
-    - Preference: only stable defaults or explicit likes/dislikes (skip one-off phrasing).
-    - Requirement: only hard constraints, must statements, deadlines, or gating criteria.
-    - Procedure: only repeatable multi-step workflows with actionable order.
-    - Event: only concrete scheduled/past happenings with participants/time/place signal;
-      do not create vague "discussion" events.
-    Type aliases:
-    - Agent -> Person
-    - Task/Ticket -> Artifact (kind=task|ticket)
-    - Environment -> System (kind=env)
+    Never emit RELATES_TO, MENTIONS, DISCUSSED, or other generic connector edges.
+    If no grounded edge applies, keep mention-only entities as floating nodes.
+    Guardrails: Preference only stable defaults/likes; Requirement only explicit
+    constraints or gates; Procedure only repeatable ordered workflows; Event only
+    concrete scheduled/past happenings.
+    Type aliases: Agent -> Person; Task/Ticket -> Artifact (kind=task|ticket);
+    Environment -> System (kind=env).
   extraction_emphasis: >-
     Focus on durable personal/work context and operational facts with strict
     ontology-conformant edges. Prefer precision over coverage and allow floating
@@ -327,19 +321,15 @@ s1_sessions_main:
 s1_chatgpt_history:
   extraction_mode: constrained_soft
   intent_guidance: >-
-    ChatGPT history lane uses the same hardened sessions ontology as s1_sessions_main.
+    ChatGPT history uses the same hardened sessions ontology as s1_sessions_main.
     Allowed entity types: Person, Organization, Location, Event, Artifact, System,
     Preference, Requirement, Procedure.
     Allowed edges: PRODUCED, MODIFIED, DEPLOYED_TO, USES, INTEGRATES_WITH,
     DEPENDS_ON, LOCATED_AT, ATTENDED, PART_OF, PREFERS, REQUIRES.
-    Hard edge policy: never emit RELATES_TO, MENTIONS, DISCUSSED, or other generic
-    connectors. Mention-only entities are valid floating nodes when no grounded edge
-    exists.
-    Guardrails:
-    - Preference: stable defaults/likes only.
-    - Requirement: explicit constraints only.
-    - Procedure: repeatable ordered workflows only.
-    - Event: concrete happenings only; avoid vague discussion events.
+    Never emit RELATES_TO, MENTIONS, DISCUSSED, or other generic connectors.
+    Mention-only entities are valid floating nodes when no grounded edge exists.
+    Guardrails: Preference stable defaults only; Requirement explicit constraints only;
+    Procedure repeatable ordered workflows only; Event concrete happenings only.
     Type aliases: Agent -> Person; Task/Ticket -> Artifact (kind=task|ticket);
     Environment -> System (kind=env).
   extraction_emphasis: >-
