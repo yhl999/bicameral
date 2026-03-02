@@ -43,6 +43,34 @@ Actual user body.
     assert 'Actual user body.' in stripped
 
 
+def test_strip_graphiti_context_inline():
+    """Inline form: both tags on the same line must be stripped."""
+    content = '<graphiti-context>old memory item</graphiti-context>\n\nActual user body.'
+    stripped = strip_graphiti_context(content)
+    assert '<graphiti-context>' not in stripped
+    assert '</graphiti-context>' not in stripped
+    assert 'old memory item' not in stripped
+    assert 'Actual user body.' in stripped
+
+
+def test_strip_graphiti_context_inline_prefix_suffix():
+    """Inline form with surrounding text: surrounding text must be preserved."""
+    content = '[timestamp] <graphiti-context>memory</graphiti-context> rest of line\n'
+    stripped = strip_graphiti_context(content)
+    assert '<graphiti-context>' not in stripped
+    assert 'memory' not in stripped
+    assert '[timestamp]' in stripped
+    assert 'rest of line' in stripped
+
+
+def test_strip_graphiti_context_inline_case_insensitive():
+    """Inline wrapper detection is case-insensitive."""
+    content = '<GRAPHITI-CONTEXT>sensitive data</GRAPHITI-CONTEXT>\n\nBody.'
+    stripped = strip_graphiti_context(content)
+    assert 'sensitive data' not in stripped
+    assert 'Body.' in stripped
+
+
 def test_strip_ingestion_noise_removes_wrapper_and_metadata():
     content = """
 <graphiti-context>

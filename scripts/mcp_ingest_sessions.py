@@ -61,9 +61,22 @@ DEFAULT_SUBCHUNK_SIZE = 10_000
 # Group IDs that get automatic sub-chunking when evidence exceeds subchunk_size.
 _SUBCHUNK_GROUP_IDS = {'s1_sessions_main'}
 
+# Compiled per-line regex for the inline form:
+#   <graphiti-context>...</graphiti-context>  (both tags on the same line)
+# The pattern is non-greedy and operates per-line so it is naturally bounded
+# to a single line's length — no cross-line backtracking / ReDoS risk.
+_GRAPHITI_INLINE_RE = re.compile(
+    r'<graphiti-context>.*?</graphiti-context>',
+    re.IGNORECASE,
+)
+
 
 def strip_graphiti_context(content: str) -> str:
     """Remove <graphiti-context> ... </graphiti-context> wrappers.
+
+    Handles two forms:
+    1. Block form  – opening tag alone on one line, closing tag alone on another.
+    2. Inline form – both tags (and content) on the same line.
 
     Parses line-by-line so we only strip explicit wrapper blocks and avoid fragile,
     over-greedy regex behavior on large payloads.
@@ -75,8 +88,8 @@ def strip_graphiti_context(content: str) -> str:
 
     while i < n:
         if lines[i].strip().lower() == '<graphiti-context>':
-            # Scan for a matching closing wrapper. Cap scan to avoid pathological
-            # behavior on malformed input.
+            # Block form: scan for a matching closing wrapper. Cap scan to avoid
+            # pathological behavior on malformed input.
             k = i + 1
             found_end = False
             max_scan = min(n, i + 1 + 5000)
@@ -89,7 +102,10 @@ def strip_graphiti_context(content: str) -> str:
                 i = k + 1
                 continue
 
-        out.append(lines[i])
+        # Inline form: substitute any <graphiti-context>…</graphiti-context>
+        # spans that appear within the current line.
+        cleaned = _GRAPHITI_INLINE_RE.sub('', lines[i])
+        out.append(cleaned)
         i += 1
 
     return ''.join(out)
