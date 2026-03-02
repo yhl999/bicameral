@@ -209,6 +209,33 @@ class TestBuildEpisodeBody(unittest.TestCase):
         self.assertIn('Hi back', body)
         self.assertIn('2026-01-15', body)
 
+    def test_strips_graphiti_wrapper_and_untrusted_metadata(self):
+        from scripts.mcp_ingest_sessions import _build_episode_body
+
+        messages_by_id = {
+            'msg1': {
+                'message_id': 'msg1',
+                'created_at': '2026-01-15T12:00:00Z',
+                'role': 'user',
+                'content': (
+                    '<graphiti-context>\n'
+                    '## Graphiti Recall\n'
+                    '- noisy memory\n'
+                    '</graphiti-context>\n\n'
+                    'Sender (untrusted metadata):\n'
+                    '```json\n'
+                    '{"sender": "x"}\n'
+                    '```\n\n'
+                    'Keep this body text.'
+                ),
+            },
+        }
+
+        body = _build_episode_body(['msg1'], messages_by_id)
+        self.assertIn('Keep this body text.', body)
+        self.assertNotIn('Graphiti Recall', body)
+        self.assertNotIn('Sender (untrusted metadata)', body)
+
     def test_missing_message_skipped(self):
         from scripts.mcp_ingest_sessions import _build_episode_body
 
