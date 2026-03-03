@@ -257,22 +257,7 @@ def promote_candidate(
         row = core_result.single()
         summary = core_result.consume()
         if row is None:
-            # OMNode absent from Neo4j — emit event and skip gracefully.
-            # Covers verification-only promotion paths (e.g. re-runs after
-            # node eviction) where the verification record exists in
-            # candidates.db but the OMNode was never written to Neo4j or
-            # has since been removed.  Fail-closed: no CoreMemory is created.
-            _event(
-                "OM_PROMOTION_OMNODE_NOT_FOUND",
-                candidate_id=candidate_id,
-                core_memory_id=core_memory_id,
-            )
-            return {
-                "candidate_id": candidate_id,
-                "core_memory_id": core_memory_id,
-                "promoted": False,
-                "reason": "omnode_not_found",
-            }
+            raise RuntimeError(f"OMNode not found for candidate_id={candidate_id}")
         created = bool(summary.counters.nodes_created > 0)
 
         for message_id in verification.evidence_source_ids:
