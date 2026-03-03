@@ -1127,6 +1127,61 @@ def read_candidate_by_id(conn: sqlite3.Connection, candidate_id: str) -> dict[st
     return dict(row)
 
 
+def _recompute_policy_trace_for_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Recompute policy trace from canonical row fields (migration-safe fallback)."""
+    evidence_refs = _coerce_json(row.get("evidence_refs_json"), [])
+    if not isinstance(evidence_refs, list):
+        evidence_refs = []
+    evidence_stats = _coerce_json(row.get("evidence_stats_json"), {})
+    if not isinstance(evidence_stats, dict) or not evidence_stats:
+        evidence_stats = compute_evidence_stats(evidence_refs)
+
+    try:
+        value_obj: Any = json.loads(row.get("value_json") or "null")
+    except Exception:
+        value_obj = row.get("value_json")
+
+    confidence_raw = row.get("confidence")
+    try:
+        confidence = float(confidence_raw) if confidence_raw is not None else 0.0
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    return compute_policy_trace(
+        {
+            "subject": row.get("subject"),
+            "predicate": row.get("predicate"),
+            "scope": row.get("scope"),
+            "assertion_type": row.get("assertion_type"),
+            "value": value_obj,
+            "speaker_id": row.get("speaker_id"),
+            "confidence": confidence,
+            "conflict_with_fact_id": row.get("conflict_with_fact_id"),
+            "origin": "extracted",
+        },
+        evidence_stats,
+    )
+
+
+def _policy_trace_is_fresh(trace: dict[str, Any], *, active_version: str) -> bool:
+    """Return True when stored trace can be trusted for gate evaluation.
+
+    Freshness contract:
+    - trace is a non-empty dict
+    - contains a non-empty recommendation
+    - trace policy_version matches the currently active policy version
+    """
+    recommendation = trace.get("recommendation")
+    if not isinstance(recommendation, str) or not recommendation.strip():
+        return False
+
+    trace_policy_version = str(trace.get("policy_version") or "").strip()
+    if not trace_policy_version:
+        return False
+
+    return trace_policy_version == active_version
+
+
 def policy_allows_promotion(
     candidate_id: str,
     *,
@@ -1153,39 +1208,16 @@ def policy_allows_promotion(
     if row is None:
         return (False, "candidate_not_found")
 
-    # Prefer the stored trace (computed on upsert / last refresh).
+    active_version = active_policy_version()
+
+    # Prefer the stored trace only when it is fresh for the currently active
+    # policy version; otherwise recompute from canonical row fields.
     trace = _coerce_json(row.get("policy_trace_json"), {})
-    if not isinstance(trace, dict) or not trace:
-        # Recompute for pre-v3 rows that have no stored trace.
-        evidence_refs = _coerce_json(row.get("evidence_refs_json"), [])
-        if not isinstance(evidence_refs, list):
-            evidence_refs = []
-        evidence_stats = _coerce_json(row.get("evidence_stats_json"), {})
-        if not isinstance(evidence_stats, dict) or not evidence_stats:
-            evidence_stats = compute_evidence_stats(evidence_refs)
-        try:
-            value_obj: Any = json.loads(row.get("value_json") or "null")
-        except Exception:
-            value_obj = row.get("value_json")
-        confidence_raw = row.get("confidence")
-        try:
-            confidence = float(confidence_raw) if confidence_raw is not None else 0.0
-        except (TypeError, ValueError):
-            confidence = 0.0
-        trace = compute_policy_trace(
-            {
-                "subject": row.get("subject"),
-                "predicate": row.get("predicate"),
-                "scope": row.get("scope"),
-                "assertion_type": row.get("assertion_type"),
-                "value": value_obj,
-                "speaker_id": row.get("speaker_id"),
-                "confidence": confidence,
-                "conflict_with_fact_id": row.get("conflict_with_fact_id"),
-                "origin": "extracted",
-            },
-            evidence_stats,
-        )
+    if (
+        not isinstance(trace, dict)
+        or not _policy_trace_is_fresh(trace, active_version=active_version)
+    ):
+        trace = _recompute_policy_trace_for_row(row)
 
     recommendation = str(trace.get("recommendation") or "pending")
     # auto_promote and auto_supersede are the two auto-approvable outcomes.

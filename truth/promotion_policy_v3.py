@@ -192,11 +192,11 @@ def promote_candidate(
     """Promote an OM candidate to a CoreMemory node in Neo4j.
 
     Gate order (all must pass):
-    1. Unified v3 policy gate — when v3 is enabled and ``candidates_conn`` is
-       supplied, ``candidates_store.policy_allows_promotion()`` must return
-       (True, reason).  This is the **one decision contract** shared with the
-       graph-lane candidate path.  Rollback: set GRAPHITI_POLICY_V3_ENABLED=0
-       and the gate is bypassed entirely.
+    1. Unified v3 policy gate — when v3 is enabled, ``candidates_conn`` is
+       required and ``candidates_store.policy_allows_promotion()`` must return
+       (True, reason).  Missing ``candidates_conn`` fails closed.  This is the
+       **one decision contract** shared with the graph-lane candidate path.
+       Rollback: set GRAPHITI_POLICY_V3_ENABLED=0 and the gate is bypassed.
     2. OM verification gate — ``verification.verification_status`` must be
        "corroborated".  Always applied regardless of v3 flag.
     3. Fail-closed hard-block gate — ``hard_block_check(candidate_id)`` must
@@ -209,10 +209,23 @@ def promote_candidate(
 
     # ── Gate 1: Unified v3 policy decision contract ──────────────────────────
     # Consult the same decision engine used for lane candidates so OM and
-    # graph-lane paths share one promotion contract.  Skip when v3 is disabled
-    # (rollback) or when no candidates DB connection was supplied (legacy call
-    # sites that pre-date this integration).
-    if candidates_store.policy_v3_enabled() and candidates_conn is not None:
+    # graph-lane paths share one promotion contract.  Skip only when v3 is
+    # disabled (rollback).  Under v3, missing candidates_conn is fail-closed.
+    if candidates_store.policy_v3_enabled():
+        if candidates_conn is None:
+            gate_reason = "candidates_conn_missing"
+            _event(
+                "OM_PROMOTION_V3_POLICY_GATE_BLOCKED",
+                candidate_id=candidate_id,
+                gate_reason=gate_reason,
+            )
+            return {
+                "candidate_id": candidate_id,
+                "core_memory_id": core_memory_id,
+                "promoted": False,
+                "reason": f"v3_policy_gate:{gate_reason}",
+            }
+
         allowed, gate_reason = candidates_store.policy_allows_promotion(
             candidate_id,
             conn=candidates_conn,

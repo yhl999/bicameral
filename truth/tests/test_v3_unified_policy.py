@@ -478,6 +478,33 @@ class TestPolicyAllowsPromotion:
         finally:
             conn.close()
 
+    def test_recomputes_when_trace_version_is_stale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stored traces with stale policy_version must be recomputed fail-closed."""
+        monkeypatch.delenv(candidates.POLICY_V3_ENABLED_ENV, raising=False)
+        conn = _in_memory_db()
+        try:
+            c = _minimal_candidate(confidence=0.50)  # normally blocked
+            r = candidates.upsert_candidate(conn, **c)
+
+            # Inject stale trace (v2 under active v3) that would incorrectly allow.
+            stale_trace = candidates.json_c14n(
+                {"recommendation": "auto_promote", "policy_version": "promotion-v2"}
+            )
+            conn.execute(
+                "UPDATE candidates SET policy_trace_json = ? WHERE candidate_id = ?",
+                (stale_trace, r.candidate_id),
+            )
+            conn.commit()
+
+            allowed, reason = candidates.policy_allows_promotion(r.candidate_id, conn=conn)
+            assert allowed is False
+            assert reason != "auto_promote"
+            assert reason.startswith("recommendation=")
+        finally:
+            conn.close()
+
     def test_fallback_recompute_when_trace_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When policy_trace_json is empty (pre-v3 migration row), the function
         must recompute the trace from raw candidate fields."""
@@ -674,11 +701,10 @@ class TestPromotionPolicyV3GateIntegration:
         finally:
             conn.close()
 
-    def test_v3_gate_skipped_when_no_conn(
+    def test_v3_gate_fail_closed_when_no_conn(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Callers that don't supply candidates_conn (legacy call sites) must still
-        work: gate is bypassed, verification_status is the primary gate."""
+        """When v3 is enabled, missing candidates_conn must fail closed."""
         ppv3 = self._fake_promotion_policy_v3_module()
 
         conn, candidate_id = self._make_conn_with_conflicted_candidate(monkeypatch)
@@ -690,10 +716,10 @@ class TestPromotionPolicyV3GateIntegration:
                 verification=self._corroborated_verification(candidate_id),
                 hard_block_check=self._no_block,
                 neo4j_driver=driver,
-                candidates_conn=None,  # legacy: no conn
+                candidates_conn=None,
             )
-            # Gate skipped; verification corroborated; hard_block clear → promoted
-            assert result["promoted"] is True
+            assert result["promoted"] is False
+            assert result["reason"] == "v3_policy_gate:candidates_conn_missing"
         finally:
             conn.close()
 

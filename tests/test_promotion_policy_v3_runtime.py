@@ -79,7 +79,10 @@ def _verification(candidate_id: str = "cand-1") -> Any:
 def test_promote_candidate_created_is_deterministic_from_merge_counters(
     nodes_created: int,
     expected_created: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Runtime-only write-path test: disable v3 gate so candidates DB is not required.
+    monkeypatch.setenv("GRAPHITI_POLICY_V3_ENABLED", "0")
     driver = _FakeDriver(nodes_created=nodes_created)
 
     result = promotion_policy_v3.promote_candidate(
