@@ -20,7 +20,9 @@ Migration notes:
 """
 from __future__ import annotations
 
+import importlib
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +31,6 @@ import pytest
 # ─────────────────────────────────────────────────────────────────────────────
 # Import module under test
 # ─────────────────────────────────────────────────────────────────────────────
-
-import importlib
-import sys
 
 # Ensure the truth package is importable from repo root
 _TRUTH_PARENT = str(Path(__file__).resolve().parents[2])
@@ -299,7 +298,7 @@ class TestMigrationCompat:
 
             # Insert another v3 row
             c_v3b = _minimal_candidate(predicate="pref.v3_test_b")
-            r_v3b = candidates.upsert_candidate(conn, **c_v3b)
+            candidates.upsert_candidate(conn, **c_v3b)
 
             rows = conn.execute(
                 "SELECT policy_version FROM candidates ORDER BY created_at"
@@ -325,7 +324,7 @@ class TestMigrationCompat:
             )
             conn.commit()
 
-            result = candidates.refresh_candidate_policy_state(conn, r.candidate_id)
+            candidates.refresh_candidate_policy_state(conn, r.candidate_id)
             updated_row = conn.execute(
                 "SELECT policy_version FROM candidates WHERE candidate_id = ?",
                 (r.candidate_id,),
