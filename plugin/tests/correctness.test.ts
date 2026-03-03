@@ -9,6 +9,7 @@ import { createCaptureHook, stripInjectedContext } from '../hooks/capture.ts';
 import { createLegacyBeforeAgentStartHook } from '../hooks/legacy-before-agent-start.ts';
 import { createModelResolveHook } from '../hooks/model-resolve.ts';
 import { createRecallHook } from '../hooks/recall.ts';
+import { createContextMapAnchorHooks } from '../hooks/context-map-anchor.ts';
 import { deriveGroupLane } from '../lane-utils.ts';
 import { detectIntent } from '../intent/detector.ts';
 import type { IntentRuleSet } from '../intent/types.ts';
@@ -1815,4 +1816,89 @@ test('pack router resolves relative script path from packRouterRepoRoot, not pro
   // that spawn received the correct cwd.
   assert.ok(result, 'injector must succeed when relative script path is resolved from repoRoot');
   assert.ok(result.context.includes('relative cwd pack content'));
+});
+
+test('context-map anchor scaffold is disabled by default', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti-context-map-disabled-default-');
+  const mapPath = path.join(tempDir, 'context-map.md');
+  const metaPath = path.join(tempDir, 'context-map.meta.json');
+  fs.writeFileSync(mapPath, '# map\nnode-a -> node-b\n', 'utf8');
+  fs.writeFileSync(metaPath, '{"version":1}', 'utf8');
+
+  const hooks = createContextMapAnchorHooks({
+    config: {
+      contextMapPath: mapPath,
+      contextMapMetaPath: metaPath,
+    },
+  });
+
+  const ctx: Record<string, unknown> = {};
+  await hooks.session_start({}, ctx);
+  const result = await hooks.before_prompt_build({ prompt: 'hello' }, ctx);
+
+  assert.deepEqual(result, {});
+});
+
+test('context-map anchor only runs when lifecycle trigger fires', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti-context-map-trigger-gating-');
+  const mapPath = path.join(tempDir, 'context-map.md');
+  const metaPath = path.join(tempDir, 'context-map.meta.json');
+  fs.writeFileSync(mapPath, '# map\nalpha\n', 'utf8');
+  fs.writeFileSync(metaPath, '{"version":1}', 'utf8');
+
+  const hooks = createContextMapAnchorHooks({
+    config: {
+      enableContextMapAnchor: true,
+      contextMapPath: mapPath,
+      contextMapMetaPath: metaPath,
+      contextMapAnchorText: 'Use this context map.',
+    },
+  });
+
+  const ctx: Record<string, unknown> = {};
+
+  const withoutTrigger = await hooks.before_prompt_build({ prompt: 'first turn' }, ctx);
+  assert.deepEqual(withoutTrigger, {});
+
+  await hooks.session_start({}, ctx);
+  const afterSessionStart = await hooks.before_prompt_build({ prompt: 'first turn' }, ctx);
+  assert.ok(afterSessionStart.prependContext?.includes('<context-map-anchor>'));
+  assert.ok(afterSessionStart.prependContext?.includes('Use this context map.'));
+
+  const immediateSecondCall = await hooks.before_prompt_build({ prompt: 'second turn' }, ctx);
+  assert.deepEqual(immediateSecondCall, {});
+});
+
+test('context-map anchor hash-change gating is handled in hook logic', async (t) => {
+  const tempDir = makeTempDir(t, 'graphiti-context-map-hash-gating-');
+  const mapPath = path.join(tempDir, 'context-map.md');
+  const metaPath = path.join(tempDir, 'context-map.meta.json');
+  fs.writeFileSync(mapPath, '# map\nalpha\n', 'utf8');
+  fs.writeFileSync(metaPath, '{"version":1}', 'utf8');
+
+  const hooks = createContextMapAnchorHooks({
+    config: {
+      enableContextMapAnchor: true,
+      contextMapPath: mapPath,
+      contextMapMetaPath: metaPath,
+    },
+  });
+
+  const ctx: Record<string, unknown> = {};
+  await hooks.session_start({}, ctx);
+  const first = await hooks.before_prompt_build({ prompt: 'turn 1' }, ctx);
+  assert.ok(first.prependContext?.includes('<context-map-anchor>'));
+
+  await hooks.after_compaction({}, ctx);
+  const unchanged = await hooks.before_prompt_build({ prompt: 'turn 2' }, ctx);
+  assert.deepEqual(unchanged, {});
+
+  fs.writeFileSync(metaPath, '{"version":2}', 'utf8');
+  await hooks.after_compaction({}, ctx);
+  const changed = await hooks.before_prompt_build({ prompt: 'turn 3' }, ctx);
+  assert.ok(changed.prependContext?.includes('<context-map-anchor>'));
+
+  await hooks.before_reset({}, ctx);
+  const afterReset = await hooks.before_prompt_build({ prompt: 'turn 4' }, ctx);
+  assert.deepEqual(afterReset, {});
 });
