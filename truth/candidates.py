@@ -1178,10 +1178,7 @@ def _recompute_policy_trace_for_row(row: dict[str, Any]) -> dict[str, Any]:
             if isinstance(matched_cues, (list, tuple, set)):
                 content_cues = list(matched_cues)
 
-    if isinstance(content_cues, (list, tuple, set)):
-        content_cues = list(content_cues)
-    else:
-        content_cues = None
+    content_cues = list(content_cues) if isinstance(content_cues, (list, tuple, set)) else None
 
     conflict_with_fact_id = row.get("conflict_with_fact_id")
     conflict = bool(conflict_with_fact_id) or bool(trace_prev.get("conflict"))
