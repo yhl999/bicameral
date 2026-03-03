@@ -505,16 +505,77 @@ class TestPolicyAllowsPromotion:
         finally:
             conn.close()
 
-    def test_fallback_recompute_when_trace_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When policy_trace_json is empty (pre-v3 migration row), the function
-        must recompute the trace from raw candidate fields."""
+    def test_recompute_preserves_trace_only_content_cues(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stale-trace recompute must preserve cue-based risk escalation signals."""
         monkeypatch.delenv(candidates.POLICY_V3_ENABLED_ENV, raising=False)
         conn = _in_memory_db()
         try:
             c = _minimal_candidate(**self._AUTO_PROMOTE_CANDIDATE)
             r = candidates.upsert_candidate(conn, **c)
 
-            # Wipe the stored trace to simulate pre-v3 row
+            stale_trace = candidates.json_c14n(
+                {
+                    "policy_version": "promotion-v2",
+                    "origin": "extracted",
+                    "content_cues": ["password reset token"],
+                    "recommendation": "requires_approval",
+                }
+            )
+            conn.execute(
+                "UPDATE candidates SET policy_trace_json = ? WHERE candidate_id = ?",
+                (stale_trace, r.candidate_id),
+            )
+            conn.commit()
+
+            allowed, reason = candidates.policy_allows_promotion(r.candidate_id, conn=conn)
+            assert allowed is False
+            assert reason == "recommendation=requires_approval"
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("status", ["denied", "expired", "superseded"])
+    def test_terminal_statuses_block_even_if_trace_recommends_auto_promote(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
+    ) -> None:
+        """Terminal negative statuses must block promotion before trace pass-through."""
+        monkeypatch.delenv(candidates.POLICY_V3_ENABLED_ENV, raising=False)
+        conn = _in_memory_db()
+        try:
+            c = _minimal_candidate(**self._AUTO_PROMOTE_CANDIDATE)
+            r = candidates.upsert_candidate(conn, **c)
+
+            fresh_auto_promote = candidates.json_c14n(
+                {
+                    "policy_version": "promotion-v3",
+                    "evaluated_at": "2026-01-01T00:00:00Z",
+                    "recommendation": "auto_promote",
+                }
+            )
+            conn.execute(
+                "UPDATE candidates SET status = ?, policy_trace_json = ? WHERE candidate_id = ?",
+                (status, fresh_auto_promote, r.candidate_id),
+            )
+            conn.commit()
+
+            allowed, reason = candidates.policy_allows_promotion(r.candidate_id, conn=conn)
+            assert allowed is False
+            assert reason == f"status_terminal={status}"
+        finally:
+            conn.close()
+
+    def test_fallback_recompute_when_trace_empty_fails_safe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty traces (migration fallback) must not silently loosen to auto-promote."""
+        monkeypatch.delenv(candidates.POLICY_V3_ENABLED_ENV, raising=False)
+        conn = _in_memory_db()
+        try:
+            c = _minimal_candidate(**self._AUTO_PROMOTE_CANDIDATE)
+            r = candidates.upsert_candidate(conn, **c)
+
+            # Wipe the stored trace to simulate a row with no recoverable trace inputs.
             conn.execute(
                 "UPDATE candidates SET policy_trace_json = '{}' WHERE candidate_id = ?",
                 (r.candidate_id,),
@@ -522,10 +583,8 @@ class TestPolicyAllowsPromotion:
             conn.commit()
 
             allowed, reason = candidates.policy_allows_promotion(r.candidate_id, conn=conn)
-            # Even with empty trace, recomputation should reach auto_promote
-            assert allowed is True, (
-                f"Expected recomputed trace to yield auto_promote, got reason={reason!r}"
-            )
+            assert allowed is False
+            assert "auto_promote" not in reason
         finally:
             conn.close()
 
