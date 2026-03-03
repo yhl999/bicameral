@@ -1116,6 +1116,84 @@ def _normalize_reason(reason: str | None, *, fallback: str) -> str:
     return safe if safe else fallback
 
 
+def read_candidate_by_id(conn: sqlite3.Connection, candidate_id: str) -> dict[str, Any] | None:
+    """Read a candidate row by candidate_id. Returns None if not found."""
+    row = conn.execute(
+        "SELECT * FROM candidates WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def policy_allows_promotion(
+    candidate_id: str,
+    *,
+    conn: sqlite3.Connection,
+) -> tuple[bool, str]:
+    """Check whether the unified v3 policy allows auto-promotion for a candidate.
+
+    Returns (allowed: bool, reason: str).
+
+    Contract:
+    - Fail-closed: returns (False, "candidate_not_found") if the row is absent.
+    - Reads the stored policy_trace_json when present; recomputes from raw fields
+      when the trace is missing or stale (migration-safe for pre-v3 rows).
+    - Recommendations that allow promotion: "auto_promote", "auto_supersede".
+    - All other recommendations block promotion (requires_approval, pending, etc.).
+
+    This is the **one decision contract** referenced by both the lane-candidates
+    path (candidates.upsert_candidate / auto_promote_if_eligible) and the
+    OM-candidates path (promotion_policy_v3.promote_candidate).  Callers on the
+    OM path should guard with ``policy_v3_enabled()`` and only call this function
+    when v3 is active.
+    """
+    row = read_candidate_by_id(conn, candidate_id)
+    if row is None:
+        return (False, "candidate_not_found")
+
+    # Prefer the stored trace (computed on upsert / last refresh).
+    trace = _coerce_json(row.get("policy_trace_json"), {})
+    if not isinstance(trace, dict) or not trace:
+        # Recompute for pre-v3 rows that have no stored trace.
+        evidence_refs = _coerce_json(row.get("evidence_refs_json"), [])
+        if not isinstance(evidence_refs, list):
+            evidence_refs = []
+        evidence_stats = _coerce_json(row.get("evidence_stats_json"), {})
+        if not isinstance(evidence_stats, dict) or not evidence_stats:
+            evidence_stats = compute_evidence_stats(evidence_refs)
+        try:
+            value_obj: Any = json.loads(row.get("value_json") or "null")
+        except Exception:
+            value_obj = row.get("value_json")
+        confidence_raw = row.get("confidence")
+        try:
+            confidence = float(confidence_raw) if confidence_raw is not None else 0.0
+        except (TypeError, ValueError):
+            confidence = 0.0
+        trace = compute_policy_trace(
+            {
+                "subject": row.get("subject"),
+                "predicate": row.get("predicate"),
+                "scope": row.get("scope"),
+                "assertion_type": row.get("assertion_type"),
+                "value": value_obj,
+                "speaker_id": row.get("speaker_id"),
+                "confidence": confidence,
+                "conflict_with_fact_id": row.get("conflict_with_fact_id"),
+                "origin": "extracted",
+            },
+            evidence_stats,
+        )
+
+    recommendation = str(trace.get("recommendation") or "pending")
+    # auto_promote and auto_supersede are the two auto-approvable outcomes.
+    if recommendation in ("auto_promote", "auto_supersede"):
+        return (True, recommendation)
+    return (False, f"recommendation={recommendation}")
+
+
 def promote_candidate(
     conn: sqlite3.Connection,
     candidate_id: str,
