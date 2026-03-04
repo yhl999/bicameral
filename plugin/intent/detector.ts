@@ -11,7 +11,7 @@ import type {
 const DEFAULT_MIN_CONFIDENCE = 0.3;
 const DEFAULT_KEYWORD_WEIGHT = 1;
 const DEFAULT_STICKY_MAX_WORDS = 20;
-const DEFAULT_STICKY_SIGNALS = ['also', 'and', 'continue', 'what about', 'follow up'];
+const DEFAULT_STICKY_SIGNALS = ['also', 'continue', 'what about', 'follow up'];
 const SCORE_TIE_EPSILON = 1e-6;
 
 interface BoostMatch {
@@ -37,14 +37,32 @@ const wordCount = (text: string): number => {
   return trimmed.split(/\s+/).length;
 };
 
+const normalizeSignalText = (value: string): string =>
+  toLower(value).replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ');
+
+const hasSignalMatch = (prompt: string, signal: string): boolean => {
+  const normalizedPrompt = normalizeSignalText(prompt);
+  const normalizedSignal = normalizeSignalText(signal);
+
+  if (!normalizedPrompt || !normalizedSignal) {
+    return false;
+  }
+
+  if (!normalizedSignal.includes(' ')) {
+    const tokens = new Set(normalizedPrompt.split(' '));
+    return tokens.has(normalizedSignal);
+  }
+
+  return ` ${normalizedPrompt} `.includes(` ${normalizedSignal} `);
+};
+
 const shouldStick = (
   prompt: string,
   signals: string[],
   maxWords: number,
 ): StickyDecision => {
-  const promptLower = toLower(prompt);
   const isShortPrompt = wordCount(prompt) <= maxWords;
-  const hasSignal = signals.some((signal) => promptLower.includes(toLower(signal)));
+  const hasSignal = signals.some((signal) => hasSignalMatch(prompt, signal));
   return {
     shouldApply: isShortPrompt && hasSignal,
     isShortPrompt,

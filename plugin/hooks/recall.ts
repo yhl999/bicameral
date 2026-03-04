@@ -35,7 +35,12 @@ export interface RecallHookDeps {
  * <graphiti-context> block or confuse the model parser.
  */
 const escapeXml = (text: string): string =>
-  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 const LOW_INFO_SINGLE_TOKENS = new Set([
   'ok',
   'yes',
@@ -67,10 +72,10 @@ const LOW_INFO_SHORT_ACKS = new Set([
 ]);
 
 const NOVELTY_WINDOW_TURNS = 3;
+const MAX_NOVELTY_SESSIONS = 512;
 
 interface PreparedFact {
   text: string;
-  normalized: string;
   fingerprint: string;
 }
 
@@ -97,17 +102,25 @@ const isEmojiOnly = (prompt: string): boolean => {
   return withoutEmoji.length === 0;
 };
 
+const stripTrailingAckPunctuation = (value: string): string =>
+  value.replace(/[.!?]+$/g, '').trim();
+
 const isLowInformationPrompt = (prompt: string): boolean => {
-  const normalized = normalizeWhitespace(prompt).toLowerCase();
-  if (!normalized) {
+  const normalizedRaw = normalizeWhitespace(prompt).toLowerCase();
+  if (!normalizedRaw) {
     return false;
   }
 
-  if (/^[?.!]+$/.test(normalized)) {
+  if (/^[?.!]+$/.test(normalizedRaw)) {
     return true;
   }
 
-  if (isEmojiOnly(normalized)) {
+  if (isEmojiOnly(normalizedRaw)) {
+    return true;
+  }
+
+  const normalized = stripTrailingAckPunctuation(normalizedRaw);
+  if (!normalized) {
     return true;
   }
 
@@ -141,7 +154,6 @@ const dedupeFactsWithinTurn = (facts: Array<{ fact: string }>): {
     seen.add(normalized);
     prepared.push({
       text,
-      normalized,
       fingerprint: fingerprint(normalized),
     });
   }
@@ -170,18 +182,40 @@ const collectUsefulEntitySummaries = (
 
 const pushNoveltyTurn = (
   state: Map<string, string[][]>,
-  sessionStateKey: string,
+  sessionStateKey: string | undefined,
   fingerprintsForTurn: string[],
 ): void => {
+  if (!sessionStateKey) {
+    return;
+  }
+
   const current = state.get(sessionStateKey) ?? [];
   current.push(fingerprintsForTurn);
   while (current.length > NOVELTY_WINDOW_TURNS) {
     current.shift();
   }
+
+  // Refresh insertion order so we can evict least-recently-updated keys.
+  state.delete(sessionStateKey);
   state.set(sessionStateKey, current);
+
+  while (state.size > MAX_NOVELTY_SESSIONS) {
+    const oldestKey = state.keys().next().value;
+    if (typeof oldestKey !== 'string') {
+      break;
+    }
+    state.delete(oldestKey);
+  }
 };
 
-const getSeenFingerprints = (state: Map<string, string[][]>, sessionStateKey: string): Set<string> => {
+const getSeenFingerprints = (
+  state: Map<string, string[][]>,
+  sessionStateKey: string | undefined,
+): Set<string> => {
+  if (!sessionStateKey) {
+    return new Set<string>();
+  }
+
   const seen = new Set<string>();
   for (const turn of state.get(sessionStateKey) ?? []) {
     for (const value of turn) {
@@ -191,8 +225,8 @@ const getSeenFingerprints = (state: Map<string, string[][]>, sessionStateKey: st
   return seen;
 };
 
-const getSessionStateKey = (ctx: PackInjectorContext): string =>
-  ctx.sessionKey ?? ctx.messageProvider?.groupId ?? 'default';
+const getSessionStateKey = (ctx: PackInjectorContext): string | undefined =>
+  ctx.sessionKey ?? ctx.messageProvider?.groupId;
 
 const formatGraphitiContext = (facts: string[], entitySummaries: string[]): string => {
   const lines: string[] = [];

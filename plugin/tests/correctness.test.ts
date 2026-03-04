@@ -126,6 +126,19 @@ test('sticky intent requires explicit follow-up signal', () => {
   assert.equal(decision.matched, false);
 });
 
+test('sticky intent does not false-positive on substring-only matches', () => {
+  const { decision } = detectIntent(rules, {
+    prompt: 'random',
+    previousIntentId: 'summary',
+    enableSticky: true,
+    stickyMaxWords: 20,
+    stickySignals: ['and'],
+    defaultMinConfidence: 0.3,
+  });
+
+  assert.equal(decision.matched, false);
+});
+
 test('sticky intent applies when prompt is short and signal is present', () => {
   const { decision } = detectIntent(rules, {
     prompt: 'also',
@@ -1106,11 +1119,14 @@ test('recall hook low-information gate skips graphiti search and returns empty c
       },
     });
 
-    const result = await hook({ prompt: 'ok' }, { sessionKey: 'session-low-info' });
+    const prompts = ['ok', 'ok.', 'thanks!', 'got it!'];
+    for (const prompt of prompts) {
+      const result = await hook({ prompt }, { sessionKey: `session-low-info-${prompt}` });
+      assert.equal(result.prependContext, '');
+    }
 
     assert.equal(searchCalls, 0);
     assert.equal(packCalls, 0);
-    assert.equal(result.prependContext, '');
     assert.ok(logs.some((entry) => entry.includes('skip_low_info')));
   } finally {
     console.log = originalLog;
@@ -1179,6 +1195,27 @@ test('recall hook dedupes duplicate facts within a turn', async () => {
   } finally {
     console.log = originalLog;
   }
+});
+
+test('recall hook escapes quotes in graphiti facts and entities', async () => {
+  const hook = createRecallHook({
+    client: {
+      search: async () => ({
+        facts: [{ fact: 'He said "hello" and it\'s done' }],
+        entities: [{ summary: 'User\'s "profile" updated' }],
+      }),
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: { minPromptChars: 1 },
+  });
+
+  const result = await hook({ prompt: 'show escaped content' }, { sessionKey: 'session-xml-escape' });
+  const context = result.prependContext ?? '';
+
+  assert.ok(context.includes('&quot;hello&quot;'));
+  assert.ok(context.includes('it&apos;s done'));
+  assert.ok(context.includes('User&apos;s &quot;profile&quot; updated'));
 });
 
 test('recall hook suppresses recently injected facts with rolling novelty state', async () => {
@@ -1267,11 +1304,33 @@ test('recall hook novelty suppression expires after three turns', async () => {
   assert.ok((fifth.prependContext ?? '').includes('- Fact A'));
 });
 
+test('recall hook does not share novelty state when session/group key is missing', async () => {
+  const hook = createRecallHook({
+    client: {
+      search: async () => ({ facts: [{ fact: 'Fact A' }] }),
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: {
+      minPromptChars: 1,
+      singleTenant: true,
+      memoryGroupId: 'test-lane',
+    },
+  });
+
+  const first = await hook({ prompt: 'turn 1' }, {});
+  const second = await hook({ prompt: 'turn 2' }, {});
+
+  assert.ok((first.prependContext ?? '').includes('- Fact A'));
+  assert.ok((second.prependContext ?? '').includes('- Fact A'));
+});
 
 test('normalizeConfig drops empty memoryGroupId values', () => {
   const normalized = normalizeConfig({ memoryGroupId: '   ' });
   assert.equal(normalized.memoryGroupId, undefined);
-test('capabilityRequireIntent defaults to true and gates capability injection', async (t) => {
+});
+
+test('capabilityRequireIntent is backward-compatible by default and can be explicitly enabled', async (t) => {
   const tempDir = makeTempDir(t, 'graphiti-capability-gate-');
   const selectorScriptPath = path.join(tempDir, 'selector.js');
   fs.writeFileSync(
@@ -1280,22 +1339,31 @@ test('capabilityRequireIntent defaults to true and gates capability injection', 
     'utf8',
   );
 
-  const normalized = normalizeConfig({
+  const defaultConfig = normalizeConfig({
     enableCapabilityInjection: true,
     packRouterRepoRoot: tempDir,
     capabilitySelectorCommand: ['node', selectorScriptPath],
   });
-  assert.equal(normalized.capabilityRequireIntent, true);
+  assert.equal(defaultConfig.capabilityRequireIntent, false);
 
-  const injector = createCapabilityInjector({ config: normalized });
-  const withoutIntent = await injector({ prompt: 'select capability' });
-  assert.equal(withoutIntent, null);
+  const defaultInjector = createCapabilityInjector({ config: defaultConfig });
+  const defaultWithoutIntent = await defaultInjector({ prompt: 'select capability' });
+  assert.ok(defaultWithoutIntent?.includes('<capability-context'));
 
-  const withIntent = await injector({ prompt: 'select capability', intentId: 'summary' });
-  assert.ok(withIntent?.includes('<capability-context'));
-  assert.ok(withIntent?.includes('intent="summary"'));
-});
+  const strictConfig = normalizeConfig({
+    enableCapabilityInjection: true,
+    capabilityRequireIntent: true,
+    packRouterRepoRoot: tempDir,
+    capabilitySelectorCommand: ['node', selectorScriptPath],
+  });
 
+  const strictInjector = createCapabilityInjector({ config: strictConfig });
+  const strictWithoutIntent = await strictInjector({ prompt: 'select capability' });
+  assert.equal(strictWithoutIntent, null);
+
+  const strictWithIntent = await strictInjector({ prompt: 'select capability', intentId: 'summary' });
+  assert.ok(strictWithIntent?.includes('<capability-context'));
+  assert.ok(strictWithIntent?.includes('intent="summary"'));
 });
 
 test('recall hook prefers provider group over session key when memoryGroupId is unset', async () => {
