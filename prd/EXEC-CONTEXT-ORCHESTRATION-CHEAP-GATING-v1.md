@@ -26,7 +26,7 @@ This execution unit adds cheap deterministic fixes — no ML classifier, no back
 2. Suppress empty recall payloads (no wrapper tag when 0 facts returned).
 3. Add per-turn + rolling-window dedupe/novelty filter for recalled facts.
 4. Tighten sticky follow-up behavior so short acknowledgements do not keep injecting packs.
-5. Default capability injection to intent-required mode.
+5. Keep capability injection compatibility by default (intent-gated injection enabled only when explicitly opted into strict mode).
 
 ## Definition of Done (DoD)
 **DoD checklist:**
@@ -35,7 +35,7 @@ This execution unit adds cheap deterministic fixes — no ML classifier, no back
 - [ ] Duplicate fact lines within a single turn are collapsed.
 - [ ] Recently injected facts (rolling 3-turn window, session-local) are suppressed unless novelty threshold is met.
 - [ ] Sticky intent requires explicit follow-up signals (not just short word count).
-- [ ] `capabilityRequireIntent` defaults to `true` in plugin config.
+- [ ] `capabilityRequireIntent` defaults to `false` in plugin config (strict intent-only mode is an opt-in explicit setting).
 - [ ] Debug logging emits gating reasons (`skip_low_info`, `skip_empty_recall`, `deduped_N_facts`, `novelty_suppressed_N`).
 - [ ] Tests cover all gating behaviors above.
 
@@ -86,9 +86,9 @@ New behavior: sticky applies ONLY when BOTH conditions are met:
 This prevents "ok" / "yes" / "?" from inheriting the previous workflow intent.
 
 ### FR-5: Capability injection intent-gate default
-In `plugin/config.ts`, change `DEFAULT_CONFIG.capabilityRequireIntent` from `false` to `true`.
+In `plugin/config.ts`, keep `DEFAULT_CONFIG.capabilityRequireIntent` at `false` for default compatibility.
 
-This means capability subset injection only fires when a pack intent has been detected, which is the correct behavior for reducing noise.
+Set it to `true` explicitly when strict intent-only capability injection is desired; this reduces noise but is opt-in for compatibility. This means capability subset injection only fires when a pack intent has been detected in strict mode.
 
 ### FR-6: Observability
 All gating decisions should be logged via the existing `logger()` function (only emitted when `config.debug` is `true`):
