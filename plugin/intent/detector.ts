@@ -18,6 +18,12 @@ interface BoostMatch {
   matched: boolean;
   reason: string;
 }
+interface StickyDecision {
+  shouldApply: boolean;
+  isShortPrompt: boolean;
+  hasSignal: boolean;
+}
+
 
 type SuppressionSet = Set<string>;
 
@@ -35,12 +41,15 @@ const shouldStick = (
   prompt: string,
   signals: string[],
   maxWords: number,
-): boolean => {
+): StickyDecision => {
   const promptLower = toLower(prompt);
-  if (wordCount(prompt) <= maxWords) {
-    return true;
-  }
-  return signals.some((signal) => promptLower.includes(signal));
+  const isShortPrompt = wordCount(prompt) <= maxWords;
+  const hasSignal = signals.some((signal) => promptLower.includes(toLower(signal)));
+  return {
+    shouldApply: isShortPrompt && hasSignal,
+    isShortPrompt,
+    hasSignal,
+  };
 };
 
 const safeRegex = (
@@ -156,7 +165,8 @@ export const detectIntent = (
   const stickySignals = input.stickySignals ?? DEFAULT_STICKY_SIGNALS;
 
   if (enableSticky && input.previousIntentId) {
-    if (shouldStick(prompt, stickySignals, stickyMaxWords)) {
+    const stickyDecision = shouldStick(prompt, stickySignals, stickyMaxWords);
+    if (stickyDecision.shouldApply) {
       const stickyRule = ruleset.rules.find((rule) => rule.id === input.previousIntentId);
       if (stickyRule) {
         const decision = buildDecision(stickyRule, defaultMinConfidence, [
@@ -164,6 +174,8 @@ export const detectIntent = (
         ]);
         return { decision, candidates: [decision] };
       }
+    } else if (stickyDecision.isShortPrompt && !stickyDecision.hasSignal) {
+      input.logger?.('sticky_rejected_no_signal');
     }
   }
 
