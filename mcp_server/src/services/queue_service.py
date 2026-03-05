@@ -69,6 +69,52 @@ def _sanitize_episode_body(body: str) -> str:
     )
 
 
+def build_om_candidate_rows(
+    om_facts: list[dict[str, Any]],
+    *,
+    source_lane: str = 's1_observational_memory',
+) -> list[dict[str, Any]]:
+    """Build candidate-bridge rows from OM fact payloads.
+
+    Emits only rows with the required provenance contract fields.
+    """
+    rows: list[dict[str, Any]] = []
+
+    for fact in om_facts:
+        source_node_id = str(
+            fact.get('source_node_id') or fact.get('source_node_uuid') or ''
+        ).strip()
+        source_event_id = str(fact.get('uuid') or '').strip()
+        source_group_id = str(fact.get('group_id') or '').strip()
+        created_at = str(fact.get('created_at') or '').strip() or datetime.now(
+            timezone.utc
+        ).isoformat().replace('+00:00', 'Z')
+
+        if not source_node_id or not source_event_id or not source_group_id:
+            continue
+
+        evidence_refs = [
+            {
+                'evidence_id': source_event_id,
+                'source_key': f'om:{source_group_id}:{source_node_id}',
+                'scope': source_group_id,
+            }
+        ]
+
+        rows.append(
+            {
+                'source_lane': source_lane,
+                'source_node_id': source_node_id,
+                'source_event_id': source_event_id,
+                'source_group_id': source_group_id,
+                'evidence_refs': evidence_refs,
+                'created_at': created_at,
+            }
+        )
+
+    return rows
+
+
 class QueueService:
     """Service for managing sequential episode processing queues by group_id."""
 

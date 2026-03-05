@@ -46,6 +46,27 @@ FIXTURE_QUOTAS = {
     'cross_lane': 8,
 }
 
+# Harness contract: full key surface that the benchmark may send to each MCP tool.
+# Contract-check mode validates this surface against live tool schemas from tools/list.
+HARNESS_TOOL_ARGUMENT_KEYS: dict[str, set[str]] = {
+    'search_memory_facts': {
+        'query',
+        'group_ids',
+        'lane_alias',
+        'search_mode',
+        'max_facts',
+        'center_node_uuid',
+    },
+    'search_nodes': {
+        'query',
+        'group_ids',
+        'lane_alias',
+        'search_mode',
+        'max_nodes',
+        'entity_types',
+    },
+}
+
 
 class BenchmarkMCPClient:
     """Minimal MCP client for benchmark queries."""
@@ -127,6 +148,14 @@ class BenchmarkMCPClient:
             'jsonrpc': '2.0', 'id': 1,
             'method': 'tools/call',
             'params': {'name': name, 'arguments': arguments},
+        })
+
+    def list_tools(self) -> dict:
+        self.initialize()
+        return self._post({
+            'jsonrpc': '2.0', 'id': 1,
+            'method': 'tools/list',
+            'params': {},
         })
 
 
@@ -312,6 +341,152 @@ def validate_fixture(queries: list[dict]) -> list[str]:
             )
 
     return errors
+
+
+def _extract_tool_schemas(tools_list_response: dict) -> dict[str, dict[str, Any]]:
+    """Extract tool input schema map from MCP tools/list response."""
+    result = tools_list_response.get('result', {}) if isinstance(tools_list_response, dict) else {}
+    tools = result.get('tools', []) if isinstance(result, dict) else []
+    schema_by_tool: dict[str, dict[str, Any]] = {}
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get('name') or '').strip()
+        if not name:
+            continue
+        input_schema = tool.get('inputSchema')
+        if isinstance(input_schema, dict):
+            schema_by_tool[name] = input_schema
+
+    return schema_by_tool
+
+
+def evaluate_mcp_contract(
+    *,
+    tools_list_response: dict,
+    harness_keys: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
+    """Validate benchmark harness arg surface against live MCP tool schemas."""
+    harness = harness_keys or HARNESS_TOOL_ARGUMENT_KEYS
+    tool_schemas = _extract_tool_schemas(tools_list_response)
+
+    checks: list[dict[str, Any]] = []
+    missing_tools: list[str] = []
+    unsupported_args: dict[str, list[str]] = {}
+    missing_required_args: dict[str, list[str]] = {}
+
+    for tool_name, used_args in sorted(harness.items()):
+        schema = tool_schemas.get(tool_name)
+        if schema is None:
+            missing_tools.append(tool_name)
+            checks.append(
+                {
+                    'tool': tool_name,
+                    'present': False,
+                    'schema_properties': [],
+                    'schema_required': [],
+                    'harness_args': sorted(used_args),
+                    'unsupported_args': sorted(used_args),
+                    'missing_required_args': [],
+                    'ok': False,
+                }
+            )
+            continue
+
+        properties = schema.get('properties', {}) if isinstance(schema, dict) else {}
+        schema_props = (
+            {str(k) for k in properties.keys()} if isinstance(properties, dict) else set()
+        )
+
+        schema_required_raw = schema.get('required', []) if isinstance(schema, dict) else []
+        schema_required = (
+            {str(k) for k in schema_required_raw if isinstance(k, str)}
+            if isinstance(schema_required_raw, list)
+            else set()
+        )
+
+        unsupported = sorted(used_args - schema_props)
+        missing_required = sorted(schema_required - used_args)
+
+        if unsupported:
+            unsupported_args[tool_name] = unsupported
+        if missing_required:
+            missing_required_args[tool_name] = missing_required
+
+        checks.append(
+            {
+                'tool': tool_name,
+                'present': True,
+                'schema_properties': sorted(schema_props),
+                'schema_required': sorted(schema_required),
+                'harness_args': sorted(used_args),
+                'unsupported_args': unsupported,
+                'missing_required_args': missing_required,
+                'ok': (not unsupported and not missing_required),
+            }
+        )
+
+    passed = not missing_tools and not unsupported_args and not missing_required_args
+
+    return {
+        'passed': passed,
+        'missing_tools': missing_tools,
+        'unsupported_args': unsupported_args,
+        'missing_required_args': missing_required_args,
+        'checks': checks,
+    }
+
+
+def run_contract_check(args: argparse.Namespace) -> dict[str, Any]:
+    """Run contract-only validation (fail-closed) against live MCP tool schemas."""
+    client = BenchmarkMCPClient(args.mcp_url)
+    tools_resp = client.list_tools()
+
+    if isinstance(tools_resp, dict) and 'error' in tools_resp:
+        return {
+            'mode': 'contract-check-only',
+            'fixture_path': str(Path(args.fixture)),
+            'top_k': args.top_k,
+            'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'mcp_url': args.mcp_url,
+            'contract': {
+                'passed': False,
+                'missing_tools': [],
+                'unsupported_args': {},
+                'missing_required_args': {},
+                'checks': [],
+                'error': str(tools_resp['error']),
+            },
+            'passed': False,
+            'error': f'tools/list failed: {tools_resp["error"]}',
+        }
+
+    contract = evaluate_mcp_contract(tools_list_response=tools_resp)
+
+    output: dict[str, Any] = {
+        'mode': 'contract-check-only',
+        'fixture_path': str(Path(args.fixture)),
+        'top_k': args.top_k,
+        'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'mcp_url': args.mcp_url,
+        'contract': contract,
+        'passed': bool(contract.get('passed')),
+    }
+
+    if not output['passed']:
+        details: list[str] = []
+        if contract.get('missing_tools'):
+            details.append(f"missing tools={contract['missing_tools']}")
+        if contract.get('unsupported_args'):
+            details.append(f"unsupported args={contract['unsupported_args']}")
+        if contract.get('missing_required_args'):
+            details.append(f"missing required args={contract['missing_required_args']}")
+        output['error'] = 'Contract check failed closed: ' + (
+            '; '.join(details) if details else 'contract mismatch'
+        )
+
+    return output
 
 
 def run_benchmark(args: argparse.Namespace) -> dict:
@@ -520,6 +695,14 @@ def main():
         default='qmd query --json',
         help='QMD command template (default: qmd query --json)',
     )
+    ap.add_argument(
+        '--contract-check-only',
+        action='store_true',
+        help=(
+            'Validate harness argument schema against live MCP tool contracts and exit. '
+            'Fail-closed on drift.'
+        ),
+    )
     # ── Recall non-regression gate (Phase C / Slice 4) ──────────────────────
     ap.add_argument(
         '--recall-gate',
@@ -542,7 +725,16 @@ def main():
     )
     args = ap.parse_args()
 
-    results = run_benchmark(args)
+    import sys
+
+    try:
+        if args.contract_check_only:
+            results = run_contract_check(args)
+        else:
+            results = run_benchmark(args)
+    except Exception as exc:
+        print(f'ERROR: {exc}')
+        sys.exit(1)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -552,6 +744,16 @@ def main():
     )
 
     print(f'\nResults written to {output_path}')
+
+    if args.contract_check_only:
+        if results.get('passed'):
+            print('[contract-check] PASSED')
+            return
+        print('[contract-check] FAILED')
+        if results.get('error'):
+            print(f"[contract-check] {results['error']}")
+        sys.exit(1)
+
     agg = results['bicameral_aggregate']
     print(f'Bicameral mean recall@{args.top_k}: {agg["mean_combined_recall_at_k"]}')
     if 'qmd_aggregate' in results:
@@ -568,7 +770,6 @@ def main():
         print(f'\n[recall-gate] {gate["details"]}')
         if not gate['passed']:
             print('[recall-gate] FAILED — exiting with code 1')
-            import sys
             sys.exit(1)
         print('[recall-gate] PASSED')
 

@@ -53,7 +53,8 @@
     "expected_facts": ["morning routine", "daily pattern"],
     "expected_entities": ["Yuan Han Li"],
     "lane_alias": ["observational_memory"],
-    "notes": "OM routine extraction"
+    "notes": "OM routine extraction",
+    "target_group_ids": ["s1_observational_memory"]
   },
   {
     "id": "q008",
@@ -61,7 +62,8 @@
     "expected_facts": ["recurring", "theme", "pattern"],
     "expected_entities": [],
     "lane_alias": ["observational_memory"],
-    "notes": "OM theme detection"
+    "notes": "OM theme detection",
+    "target_group_ids": ["s1_observational_memory"]
   },
   {
     "id": "q009",
@@ -69,7 +71,8 @@
     "expected_facts": ["commitment", "promise", "will do"],
     "expected_entities": ["Yuan Han Li"],
     "lane_alias": ["observational_memory"],
-    "notes": "OM commitment tracking"
+    "notes": "OM commitment tracking",
+    "target_group_ids": ["s1_observational_memory"]
   },
   {
     "id": "q010",
