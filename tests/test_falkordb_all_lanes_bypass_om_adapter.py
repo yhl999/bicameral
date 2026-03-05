@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+from config.schema import GraphitiConfig
 from mcp_server.src import graphiti_mcp_server as server
 
 
@@ -11,6 +12,8 @@ def _run(coro):
 def _setup_falkordb_runtime(isolate_calls):
     original_graphiti_service = server.graphiti_service
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    if server.config is None:
+        server.config = GraphitiConfig()
     original_provider = server.config.database.provider
     original_group_id = server.config.graphiti.group_id
     original_methods = (

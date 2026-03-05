@@ -1473,10 +1473,7 @@ async def search_memory_facts(
                     return FactSearchResponse(message='No relevant facts found', facts=[])
                 om_facts = []
 
-            candidate_rows = build_om_candidate_rows(
-                om_facts,
-                source_lane=config.graphiti.group_id or (effective_group_ids[0] if effective_group_ids else ''),
-            )
+            candidate_rows = build_om_candidate_rows(om_facts)
 
             if _is_observational_memory_only_scope(effective_group_ids):
                 if not om_facts:
@@ -1527,10 +1524,7 @@ async def search_memory_facts(
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
         response = FactSearchResponse(message='Facts retrieved successfully', facts=merged_facts)
-        candidate_rows = build_om_candidate_rows(
-            om_facts,
-            source_lane=config.graphiti.group_id or (effective_group_ids[0] if effective_group_ids else ''),
-        )
+        candidate_rows = build_om_candidate_rows(om_facts)
         if candidate_rows:
             response = dict(response)
             response['candidate_rows'] = candidate_rows

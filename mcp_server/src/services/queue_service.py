@@ -71,8 +71,6 @@ def _sanitize_episode_body(body: str) -> str:
 
 def build_om_candidate_rows(
     om_facts: list[dict[str, Any]],
-    *,
-    source_lane: str = 's1_observational_memory',
 ) -> list[dict[str, Any]]:
     """Build candidate-bridge rows from OM fact payloads.
 
@@ -101,7 +99,7 @@ def build_om_candidate_rows(
 
         rows.append(
             {
-                'source_lane': source_lane,
+                'source_lane': source_group_id,
                 'source_node_id': source_node_id,
                 'source_event_id': source_event_id,
                 'source_group_id': source_group_id,
