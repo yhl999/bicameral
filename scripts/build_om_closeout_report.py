@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,23 @@ from typing import Any
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+_RUN_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _validate_run_id(run_id: str) -> str:
+    if '/' in run_id:
+        raise ValueError("run-id contains '/' which can escape artifact paths")
+    if '\\' in run_id:
+        raise ValueError("run-id contains '\\' which can escape artifact paths")
+    if '..' in run_id:
+        raise ValueError("run-id contains '..' path traversal segment")
+
+    if _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError('run-id must match only [A-Za-z0-9_-]')
+
+    return run_id
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -45,6 +64,8 @@ def build_report(
     pr_a_sha: str,
     overlay_manifest_ref: str,
 ) -> str:
+    run_id = _validate_run_id(run_id)
+
     benchmark = _load_json(benchmark_path)
     utility = _load_json(utility_path)
     lane_hygiene = _load_json(lane_hygiene_path)
@@ -133,14 +154,18 @@ def main() -> int:
     ap.add_argument('--overlay-manifest-ref', default='overlay-manifest.json')
     args = ap.parse_args()
 
-    report = build_report(
-        run_id=args.run_id,
-        benchmark_path=Path(args.benchmark),
-        utility_path=Path(args.utility),
-        lane_hygiene_path=Path(args.lane_hygiene),
-        pr_a_sha=args.pr_a_sha,
-        overlay_manifest_ref=args.overlay_manifest_ref,
-    )
+    try:
+        report = build_report(
+            run_id=args.run_id,
+            benchmark_path=Path(args.benchmark),
+            utility_path=Path(args.utility),
+            lane_hygiene_path=Path(args.lane_hygiene),
+            pr_a_sha=args.pr_a_sha,
+            overlay_manifest_ref=args.overlay_manifest_ref,
+        )
+    except ValueError as exc:
+        print(f'Invalid --run-id: {exc}', file=sys.stderr)
+        return 1
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

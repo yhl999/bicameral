@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +36,22 @@ OWNED_PATHS: set[str] = {
     'docs/runbooks/om-operations.md',
     'docs/runbooks/sessions-ingestion.md',
 }
+
+_RUN_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _validate_run_id(run_id: str) -> str:
+    if '/' in run_id:
+        raise ValueError("run-id contains '/' which can escape state output directory")
+    if '\\' in run_id:
+        raise ValueError("run-id contains '\\' which can escape state output directory")
+    if '..' in run_id:
+        raise ValueError("run-id contains '..' path traversal segment")
+
+    if _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError('run-id must match only [A-Za-z0-9_-]')
+
+    return run_id
 
 
 def _run(cmd: list[str], cwd: Path) -> str:
@@ -82,6 +100,12 @@ def main() -> int:
     ap.add_argument('--repo-root', default='.', help='Path inside target git repo')
     args = ap.parse_args()
 
+    try:
+        run_id = _validate_run_id(args.run_id)
+    except ValueError as exc:
+        print(f'Invalid --run-id: {exc}', file=sys.stderr)
+        return 1
+
     repo_root = _repo_root(Path(args.repo_root).resolve())
 
     changed_paths = sorted(
@@ -90,7 +114,7 @@ def main() -> int:
     out_of_scope = [p for p in changed_paths if p not in OWNED_PATHS]
 
     artifact = {
-        'run_id': args.run_id,
+        'run_id': run_id,
         'timestamp': _utc_now(),
         'repo_root': str(repo_root),
         'base_ref': args.base_ref,
@@ -100,7 +124,7 @@ def main() -> int:
         'ok': len(out_of_scope) == 0,
     }
 
-    out_path = repo_root / 'state' / f'owned_paths_preflight_{args.run_id}.json'
+    out_path = repo_root / 'state' / f'owned_paths_preflight_{run_id}.json'
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
 
