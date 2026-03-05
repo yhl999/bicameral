@@ -132,8 +132,8 @@ class TestValidateFixture(unittest.TestCase):
                 alias = {
                     's1_sessions_main': 'sessions_main',
                     's1_observational_memory': 'observational_memory',
-                    's1_curated': 'curated',
-                    's1_chatgpt': 'chatgpt',
+                    's1_curated_refs': 'curated',
+                    's1_chatgpt_history': 'chatgpt',
                 }.get(target_group_ids[0])
                 if alias in counts:
                     counts[alias] += 1

@@ -234,7 +234,7 @@
     ],
     "notes": "curated preference",
     "target_group_ids": [
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -253,7 +253,7 @@
     ],
     "notes": "curated lifestyle",
     "target_group_ids": [
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -272,7 +272,7 @@
     ],
     "notes": "curated procedures",
     "target_group_ids": [
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -292,7 +292,7 @@
     ],
     "notes": "curated requirements",
     "target_group_ids": [
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -311,7 +311,7 @@
     ],
     "notes": "curated locations",
     "target_group_ids": [
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -330,7 +330,7 @@
     ],
     "notes": "curated organizations",
     "target_group_ids": [
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -349,7 +349,7 @@
     ],
     "notes": "chatgpt finance domain",
     "target_group_ids": [
-      "s1_chatgpt"
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -366,7 +366,7 @@
     ],
     "notes": "chatgpt technical",
     "target_group_ids": [
-      "s1_chatgpt"
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -383,7 +383,7 @@
     ],
     "notes": "chatgpt research",
     "target_group_ids": [
-      "s1_chatgpt"
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -400,7 +400,7 @@
     ],
     "notes": "chatgpt creative",
     "target_group_ids": [
-      "s1_chatgpt"
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -422,7 +422,7 @@
     "notes": "cross-lane: sessions + curated finance",
     "target_group_ids": [
       "s1_sessions_main",
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -466,8 +466,8 @@
     "notes": "cross-lane: multi-source preferences",
     "target_group_ids": [
       "s1_sessions_main",
-      "s1_curated",
-      "s1_chatgpt"
+      "s1_curated_refs",
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -489,7 +489,7 @@
     "notes": "cross-lane: sessions + curated decisions",
     "target_group_ids": [
       "s1_sessions_main",
-      "s1_curated"
+      "s1_curated_refs"
     ]
   },
   {
@@ -508,7 +508,7 @@
     "notes": "cross-lane: OM + chatgpt overlap",
     "target_group_ids": [
       "s1_observational_memory",
-      "s1_chatgpt"
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -531,9 +531,9 @@
     "notes": "cross-lane: all-lane people graph",
     "target_group_ids": [
       "s1_sessions_main",
-      "s1_curated",
+      "s1_curated_refs",
       "s1_observational_memory",
-      "s1_chatgpt"
+      "s1_chatgpt_history"
     ]
   },
   {
@@ -576,7 +576,7 @@
     "notes": "cross-lane: system knowledge multi-hop",
     "target_group_ids": [
       "s1_sessions_main",
-      "s1_curated",
+      "s1_curated_refs",
       "s1_observational_memory"
     ]
   }

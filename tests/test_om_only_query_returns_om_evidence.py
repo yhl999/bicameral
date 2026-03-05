@@ -1,6 +1,8 @@
 import asyncio
 
-from mcp_server.src.services.search_service import SearchService
+from tests.helpers_mcp_import import load_search_service
+
+SearchService = load_search_service().SearchService
 
 
 class _FakeNeo4jService:

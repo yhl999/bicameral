@@ -50,8 +50,8 @@ FIXTURE_QUOTAS = {
 LANE_ALIAS_TO_GROUP_IDS: dict[str, list[str]] = {
     'sessions_main': ['s1_sessions_main'],
     'observational_memory': ['s1_observational_memory'],
-    'curated': ['s1_curated'],
-    'chatgpt': ['s1_chatgpt'],
+    'curated': ['s1_curated_refs'],
+    'chatgpt': ['s1_chatgpt_history'],
 }
 
 # Inverse lookup for optional validation and fixture analytics.

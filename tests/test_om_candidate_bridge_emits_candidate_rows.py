@@ -27,7 +27,7 @@ def _test_config(default_group_id: str):
             lane_aliases={
                 'sessions_main': ['s1_sessions_main'],
                 'observational_memory': ['s1_observational_memory'],
-                'curated': ['s1_curated'],
+                'curated': ['s1_curated_refs'],
             },
         ),
     )

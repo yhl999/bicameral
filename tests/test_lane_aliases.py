@@ -14,7 +14,7 @@ def _ensure_alias_config() -> None:
             lane_aliases={
                 'sessions_main': ['s1_sessions_main'],
                 'observational_memory': ['s1_observational_memory'],
-                'curated': ['s1_curated'],
+                'curated': ['s1_curated_refs'],
             },
         ),
     )
@@ -23,11 +23,11 @@ def _ensure_alias_config() -> None:
 def test_group_ids_take_precedence_over_lane_alias():
     _ensure_alias_config()
     effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
-        group_ids=['s1_sessions_main', 's1_curated'],
+        group_ids=['s1_sessions_main', 's1_curated_refs'],
         lane_alias=['observational_memory'],
     )
 
-    assert effective_group_ids == ['s1_sessions_main', 's1_curated']
+    assert effective_group_ids == ['s1_sessions_main', 's1_curated_refs']
     assert invalid_aliases == []
 
 
@@ -42,7 +42,7 @@ def test_lane_aliases_map_to_expected_groups_when_no_explicit_group_ids():
     assert effective_group_ids == [
         's1_sessions_main',
         's1_observational_memory',
-        's1_curated',
+        's1_curated_refs',
     ]
 
 
