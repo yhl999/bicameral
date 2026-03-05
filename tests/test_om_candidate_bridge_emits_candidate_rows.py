@@ -1,7 +1,9 @@
 import asyncio
+from types import SimpleNamespace
 
-from config.schema import GraphitiConfig
-from mcp_server.src import graphiti_mcp_server as server
+from tests.helpers_mcp_import import load_graphiti_mcp_server
+
+server = load_graphiti_mcp_server()
 
 REQUIRED_FIELDS = {
     'source_lane',
@@ -17,6 +19,20 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _test_config(default_group_id: str):
+    return SimpleNamespace(
+        database=SimpleNamespace(provider='neo4j'),
+        graphiti=SimpleNamespace(
+            group_id=default_group_id,
+            lane_aliases={
+                'sessions_main': ['s1_sessions_main'],
+                'observational_memory': ['s1_observational_memory'],
+                'curated': ['s1_curated'],
+            },
+        ),
+    )
+
+
 def _execute_search_with_om_facts(
     om_facts,
     *,
@@ -26,7 +42,7 @@ def _execute_search_with_om_facts(
     original_graphiti_service = server.graphiti_service
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
     if server.config is None:
-        server.config = GraphitiConfig()
+        server.config = _test_config(default_group_id)
     original_provider = server.config.database.provider
     original_group_id = server.config.graphiti.group_id
 

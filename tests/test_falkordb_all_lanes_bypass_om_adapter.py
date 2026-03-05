@@ -1,19 +1,34 @@
 import asyncio
 from types import SimpleNamespace
 
-from config.schema import GraphitiConfig
-from mcp_server.src import graphiti_mcp_server as server
+from tests.helpers_mcp_import import load_graphiti_mcp_server
+
+server = load_graphiti_mcp_server()
 
 
 def _run(coro):
     return asyncio.run(coro)
 
 
+def _test_config():
+    return SimpleNamespace(
+        database=SimpleNamespace(provider='neo4j'),
+        graphiti=SimpleNamespace(
+            group_id='s1_sessions_main',
+            lane_aliases={
+                'sessions_main': ['s1_sessions_main'],
+                'observational_memory': ['s1_observational_memory'],
+                'curated': ['s1_curated'],
+            },
+        ),
+    )
+
+
 def _setup_falkordb_runtime(isolate_calls):
     original_graphiti_service = server.graphiti_service
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
     if server.config is None:
-        server.config = GraphitiConfig()
+        server.config = _test_config()
     original_provider = server.config.database.provider
     original_group_id = server.config.graphiti.group_id
     original_methods = (

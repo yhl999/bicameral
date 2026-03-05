@@ -1,13 +1,6 @@
 import asyncio
-import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-MCP_SRC = ROOT / 'mcp_server' / 'src'
-if str(MCP_SRC) not in sys.path:
-    sys.path.insert(0, str(MCP_SRC))
-
-from services.search_service import SearchService
+from mcp_server.src.services.search_service import SearchService
 
 
 class _FakeNeo4jService:

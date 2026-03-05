@@ -8,6 +8,7 @@ classification per lane.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import subprocess
 import sys
@@ -19,11 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from truth.candidates import (
-    LANE_CORROBORATION_ONLY,
-    LANE_RETRIEVAL_ELIGIBLE_GLOBAL,
-    LANE_RETRIEVAL_ELIGIBLE_VC_SCOPED,
-)
+_truth_candidates = importlib.import_module('truth.candidates')
+LANE_CORROBORATION_ONLY = _truth_candidates.LANE_CORROBORATION_ONLY
+LANE_RETRIEVAL_ELIGIBLE_GLOBAL = _truth_candidates.LANE_RETRIEVAL_ELIGIBLE_GLOBAL
+LANE_RETRIEVAL_ELIGIBLE_VC_SCOPED = _truth_candidates.LANE_RETRIEVAL_ELIGIBLE_VC_SCOPED
 
 DECISIONS_BY_LANE: dict[str, str] = {
     's1_sessions_main': 'keep',

@@ -1,4 +1,6 @@
-from mcp_server.src.graphiti_mcp_server import _fuse_node_like_results
+from tests.helpers_mcp_import import load_graphiti_mcp_server
+
+_fuse_node_like_results = load_graphiti_mcp_server()._fuse_node_like_results
 
 
 def _item(*, uuid: str, summary: str, source: str) -> dict:
