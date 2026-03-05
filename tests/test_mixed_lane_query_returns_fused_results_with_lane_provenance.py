@@ -1,21 +1,54 @@
-from pathlib import Path
+from mcp_server.src.graphiti_mcp_server import _fuse_node_like_results
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SERVER_SRC = ROOT / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
-SEARCH_SERVICE_SRC = ROOT / 'mcp_server' / 'src' / 'services' / 'search_service.py'
+def _item(*, uuid: str, summary: str, source: str) -> dict:
+    return {
+        'uuid': uuid,
+        'name': f'fact-{uuid}',
+        'summary': summary,
+        'fact': f'fact-{uuid}',
+        'attributes': {'source': source},
+        'group_id': 's1_observational_memory',
+    }
 
 
-def test_mixed_lane_path_fuses_graphiti_and_om_results():
-    src = SERVER_SRC.read_text(encoding='utf-8')
-    assert 'merged_nodes = _fuse_node_like_results(' in src
-    assert 'supplemental=om_nodes' in src
-    assert 'merged_facts = _fuse_node_like_results(' in src
-    assert 'supplemental=om_facts' in src
+def test_fusion_prefers_graphiti_payload_on_uuid_overlap():
+    primary = [
+        _item(uuid='g1', summary='primary graphiti row', source='graphiti'),
+    ]
+    supplemental = [
+        _item(uuid='g1', summary='OM duplicate row', source='om'),
+        _item(uuid='g2', summary='OM only row', source='om'),
+    ]
+
+    fused = _fuse_node_like_results(
+        primary=primary,
+        supplemental=supplemental,
+        max_items=3,
+    )
+
+    assert len(fused) == 2
+    ids = [row['uuid'] for row in fused]
+    assert ids == ['g1', 'g2']
+    assert fused[0]['summary'] == 'primary graphiti row'
+    assert fused[0]['attributes']['source'] == 'graphiti'
 
 
-def test_om_payload_includes_lane_provenance_fields():
-    src = SEARCH_SERVICE_SRC.read_text(encoding='utf-8')
-    assert "'group_id': str(row.get('group_id') or group_id)" in src
-    assert "'attributes': {" in src
-    assert "'source': 'om_primitive'" in src
+def test_fusion_requires_non_empty_inputs_and_respects_cap():
+    primary = [_item(uuid='p1', summary='alpha', source='graphiti')]
+    supplemental = [_item(uuid='o1', summary='bravo', source='om')]
+
+    fused = _fuse_node_like_results(
+        primary=primary,
+        supplemental=supplemental,
+        max_items=1,
+    )
+    assert len(fused) == 1
+    assert fused[0]['uuid'] == 'p1'
+
+    fused_many = _fuse_node_like_results(
+        primary=primary,
+        supplemental=supplemental,
+        max_items=2,
+    )
+    assert len(fused_many) == 2

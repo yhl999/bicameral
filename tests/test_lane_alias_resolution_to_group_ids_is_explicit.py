@@ -1,22 +1,21 @@
-from pathlib import Path
+from mcp_server.src.graphiti_mcp_server import _resolve_effective_group_ids
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SERVER_SRC = ROOT / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
-CONFIG_YAML = ROOT / 'mcp_server' / 'config' / 'config.yaml'
+def test_explicit_group_ids_block_implicit_aliases():
+    effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+        group_ids=['s1_curated'],
+        lane_alias=['sessions_main'],
+    )
+
+    assert effective_group_ids == ['s1_curated']
+    assert invalid_aliases == []
 
 
-def test_lane_alias_resolution_function_is_explicit_and_ordered():
-    src = SERVER_SRC.read_text(encoding='utf-8')
+def test_empty_lane_aliases_are_respected_without_alias_validation_error():
+    effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+        group_ids=None,
+        lane_alias=[],
+    )
 
-    assert 'def _resolve_effective_group_ids(' in src
-    assert 'if group_ids is not None:' in src
-    assert 'elif lane_alias is not None:' in src
-    assert 'alias_map = config.graphiti.lane_aliases or {}' in src
-    assert "elif config.graphiti.group_id:" in src
-
-
-def test_lane_alias_config_maps_observational_memory_group_id():
-    cfg = CONFIG_YAML.read_text(encoding='utf-8')
-    assert 'lane_aliases:' in cfg
-    assert 'observational_memory: ["s1_observational_memory"]' in cfg
+    assert isinstance(effective_group_ids, list)
+    assert invalid_aliases == []

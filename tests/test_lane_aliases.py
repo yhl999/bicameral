@@ -1,35 +1,35 @@
-import unittest
-from pathlib import Path
+from mcp_server.src.graphiti_mcp_server import _resolve_effective_group_ids
 
 
-ROOT = Path(__file__).resolve().parents[1]
-MCP_SERVER = ROOT / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
-SCHEMA = ROOT / 'mcp_server' / 'src' / 'config' / 'schema.py'
-CONFIG_YAML = ROOT / 'mcp_server' / 'config' / 'config.yaml'
+def test_group_ids_take_precedence_over_lane_alias():
+    effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+        group_ids=['s1_sessions_main', 's1_curated'],
+        lane_alias=['observational_memory'],
+    )
+
+    assert effective_group_ids == ['s1_sessions_main', 's1_curated']
+    assert invalid_aliases == []
 
 
-class LaneAliasContractSourceTests(unittest.TestCase):
-    def test_search_tools_accept_lane_alias_and_search_mode(self):
-        src = MCP_SERVER.read_text()
-        self.assertIn('async def search_nodes(', src)
-        self.assertIn('lane_alias: list[str] | None = None', src)
-        self.assertIn("search_mode: str = 'hybrid'", src)
-        self.assertIn('async def search_memory_facts(', src)
+def test_lane_aliases_map_to_expected_groups_when_no_explicit_group_ids():
+    effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+        group_ids=None,
+        lane_alias=['sessions_main', 'observational_memory', 'curated'],
+    )
 
-    def test_group_resolution_precedence_is_present(self):
-        src = MCP_SERVER.read_text()
-        self.assertIn('def _resolve_effective_group_ids(', src)
-        self.assertIn('if group_ids:', src)
-        self.assertIn('if lane_alias is not None:', src)
-        self.assertIn('if config.graphiti.group_id:', src)
-
-    def test_schema_and_config_declare_lane_aliases(self):
-        schema = SCHEMA.read_text()
-        cfg = CONFIG_YAML.read_text()
-        self.assertIn('lane_aliases: dict[str, list[str]]', schema)
-        self.assertIn('lane_aliases:', cfg)
-        self.assertIn('sessions_main:', cfg)
+    assert invalid_aliases == []
+    assert effective_group_ids == [
+        's1_sessions_main',
+        's1_observational_memory',
+        's1_curated',
+    ]
 
 
-if __name__ == '__main__':
-    unittest.main()
+def test_unknown_alias_is_reported_and_rejected():
+    effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+        group_ids=None,
+        lane_alias=['unknown_alias'],
+    )
+
+    assert effective_group_ids == []
+    assert invalid_aliases == ['unknown_alias']

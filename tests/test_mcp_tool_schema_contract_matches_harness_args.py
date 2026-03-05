@@ -26,7 +26,6 @@ def test_contract_check_passes_when_harness_keys_match_schema():
             'search_memory_facts': [
                 'query',
                 'group_ids',
-                'lane_alias',
                 'search_mode',
                 'max_facts',
                 'center_node_uuid',
@@ -34,12 +33,15 @@ def test_contract_check_passes_when_harness_keys_match_schema():
             'search_nodes': [
                 'query',
                 'group_ids',
-                'lane_alias',
                 'search_mode',
                 'max_nodes',
                 'entity_types',
             ],
-        }
+        },
+        required_by_tool={
+            'search_memory_facts': ['query', 'max_facts'],
+            'search_nodes': ['query'],
+        },
     )
 
     contract = evaluate_mcp_contract(tools_list_response=response)
@@ -49,28 +51,28 @@ def test_contract_check_passes_when_harness_keys_match_schema():
     assert contract['missing_required_args'] == {}
 
 
-def test_contract_check_fails_closed_on_schema_drift():
-    # search_nodes is missing lane_alias to simulate drift.
+def test_contract_check_fails_closed_on_unsupported_harness_arg():
     response = _tools_response_with_properties(
         {
             'search_memory_facts': [
                 'query',
                 'group_ids',
-                'lane_alias',
-                'search_mode',
                 'max_facts',
-                'center_node_uuid',
             ],
             'search_nodes': [
                 'query',
                 'group_ids',
-                'search_mode',
                 'max_nodes',
-                'entity_types',
             ],
-        }
+        },
+        required_by_tool={
+            'search_memory_facts': ['query', 'max_facts'],
+            'search_nodes': ['query'],
+        },
     )
 
     contract = evaluate_mcp_contract(tools_list_response=response)
     assert contract['passed'] is False
-    assert contract['unsupported_args']['search_nodes'] == ['lane_alias']
+    assert contract['unsupported_args']['search_memory_facts'] == ['center_node_uuid', 'search_mode']
+    assert contract['unsupported_args']['search_nodes'] == ['entity_types', 'search_mode']
+    assert contract['missing_required_args'] == {}

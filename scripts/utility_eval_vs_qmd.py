@@ -20,8 +20,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.run_retrieval_benchmark import (
+from scripts.run_retrieval_benchmark import (  # noqa: E402
     BenchmarkMCPClient,
+    _query_scope_group_ids,
     compute_recall,
     run_bicameral_query,
     run_qmd_query,
@@ -88,12 +89,12 @@ def evaluate_utility_vs_qmd(
 
         expected_facts = query_item.get('expected_facts', []) or []
         expected_entities = query_item.get('expected_entities', []) or []
-        lane_alias = query_item.get('lane_alias')
+        target_group_ids = _query_scope_group_ids(query_item)
 
         bicameral = run_bicameral_query(
             client,
             query=query,
-            lane_alias=lane_alias,
+            group_ids=target_group_ids,
             search_mode='hybrid',
             top_k=top_k,
         )
@@ -116,7 +117,7 @@ def evaluate_utility_vs_qmd(
             {
                 'id': qid,
                 'query': query,
-                'lane_alias': lane_alias,
+                'target_group_ids': target_group_ids,
                 'bicameral': bicameral_eval,
                 'qmd': qmd_eval,
                 'winner': winner,

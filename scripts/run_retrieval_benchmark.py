@@ -46,13 +46,26 @@ FIXTURE_QUOTAS = {
     'cross_lane': 8,
 }
 
-# Harness contract: full key surface that the benchmark may send to each MCP tool.
+# Canonical fixture lane alias resolution used by benchmark wiring.
+LANE_ALIAS_TO_GROUP_IDS: dict[str, list[str]] = {
+    'sessions_main': ['s1_sessions_main'],
+    'observational_memory': ['s1_observational_memory'],
+    'curated': ['s1_curated'],
+    'chatgpt': ['s1_chatgpt'],
+}
+
+# Inverse lookup for optional validation and fixture analytics.
+GROUP_ID_TO_LANE_ALIAS = {
+    group_id: alias for alias, groups in LANE_ALIAS_TO_GROUP_IDS.items()
+    for group_id in groups
+}
+
+# Harness contract: key surface that the benchmark may send to each MCP tool.
 # Contract-check mode validates this surface against live tool schemas from tools/list.
 HARNESS_TOOL_ARGUMENT_KEYS: dict[str, set[str]] = {
     'search_memory_facts': {
         'query',
         'group_ids',
-        'lane_alias',
         'search_mode',
         'max_facts',
         'center_node_uuid',
@@ -60,7 +73,6 @@ HARNESS_TOOL_ARGUMENT_KEYS: dict[str, set[str]] = {
     'search_nodes': {
         'query',
         'group_ids',
-        'lane_alias',
         'search_mode',
         'max_nodes',
         'entity_types',
@@ -184,17 +196,73 @@ def extract_results_text(mcp_response: dict) -> str:
     return '\n'.join(parts)
 
 
+def _normalize_group_ids(raw_group_ids: Any) -> list[str]:
+    """Normalize target_group_ids payloads into an ordered, deduplicated list."""
+    if raw_group_ids is None:
+        return []
+    if not isinstance(raw_group_ids, list):
+        return [str(raw_group_ids)]
+
+    normalized: list[str] = []
+    for gid in raw_group_ids:
+        gid_str = str(gid).strip()
+        if gid_str:
+            normalized.append(gid_str)
+
+    seen = set()
+    deduped: list[str] = []
+    for gid in normalized:
+        if gid in seen:
+            continue
+        deduped.append(gid)
+        seen.add(gid)
+    return deduped
+
+
+def _query_scope_group_ids(query_item: dict[str, Any]) -> list[str]:
+    """Resolve group_ids for a benchmark query using target_group_ids first."""
+    explicit = query_item.get('target_group_ids')
+    if explicit is not None:
+        return _normalize_group_ids(explicit)
+
+    aliases = query_item.get('lane_alias', [])
+    if not isinstance(aliases, list):
+        return []
+
+    group_ids: list[str] = []
+    for alias in aliases:
+        mapped = LANE_ALIAS_TO_GROUP_IDS.get(str(alias).strip(), [])
+        group_ids.extend(mapped)
+    return _normalize_group_ids(group_ids)
+
+
+def _scope_categories(query_item: dict[str, Any]) -> list[str]:
+    """Derive fixture quota categories for validation."""
+    aliases = query_item.get('lane_alias', [])
+    if isinstance(aliases, list):
+        if len(aliases) > 1:
+            return ['cross_lane']
+        if aliases:
+            return [str(aliases[0])] if aliases[0] in FIXTURE_QUOTAS else []
+
+    target_group_ids = query_item.get('target_group_ids', [])
+    if isinstance(target_group_ids, list) and len(target_group_ids) > 1:
+        return ['cross_lane']
+    if target_group_ids:
+        alias = GROUP_ID_TO_LANE_ALIAS.get(str(target_group_ids[0]), '')
+        return [alias] if alias else []
+    return []
+
+
 def run_bicameral_query(
     client: BenchmarkMCPClient,
     query: str,
-    lane_alias: list[str] | None,
+    group_ids: list[str] | None,
     search_mode: str,
     top_k: int,
 ) -> dict:
     """Run a single Bicameral search query and return results."""
-    args: dict[str, Any] = {'query': query, 'max_facts': top_k}
-    if lane_alias:
-        args['lane_alias'] = lane_alias
+    args: dict[str, Any] = {'query': query, 'group_ids': group_ids, 'max_facts': top_k}
     if search_mode != 'hybrid':
         args['search_mode'] = search_mode
 
@@ -227,9 +295,7 @@ def run_bicameral_query(
                     except json.JSONDecodeError:
                         pass
 
-    node_args: dict[str, Any] = {'query': query, 'max_nodes': top_k}
-    if lane_alias:
-        node_args['lane_alias'] = lane_alias
+    node_args: dict[str, Any] = {'query': query, 'group_ids': group_ids, 'max_nodes': top_k}
     if search_mode != 'hybrid':
         node_args['search_mode'] = search_mode
     nodes_resp = client.call_tool('search_nodes', node_args)
@@ -325,14 +391,15 @@ def validate_fixture(queries: list[dict]) -> list[str]:
         'chatgpt': 0,
         'cross_lane': 0,
     }
+
     for q in queries:
-        aliases = q.get('lane_alias', [])
-        if len(aliases) > 1:
-            counts['cross_lane'] += 1
-        elif aliases:
-            alias = aliases[0]
-            if alias in counts:
-                counts[alias] += 1
+        if not isinstance(q, dict):
+            errors.append(f'query row is not an object: {q!r}')
+            continue
+        categories = _scope_categories(q)
+        for category in categories:
+            if category in counts:
+                counts[category] += 1
 
     for category, quota in FIXTURE_QUOTAS.items():
         if counts[category] < quota:
@@ -396,7 +463,7 @@ def evaluate_mcp_contract(
 
         properties = schema.get('properties', {}) if isinstance(schema, dict) else {}
         schema_props = (
-            {str(k) for k in properties.keys()} if isinstance(properties, dict) else set()
+            set(properties) if isinstance(properties, dict) else set()
         )
 
         schema_required_raw = schema.get('required', []) if isinstance(schema, dict) else []
@@ -518,7 +585,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         query_text = q['query']
         expected_facts = q.get('expected_facts', [])
         expected_entities = q.get('expected_entities', [])
-        lane_alias = q.get('lane_alias')
+        group_ids = _query_scope_group_ids(q)
 
         print(f'[{qi}/{len(queries)}] {qid}: {query_text[:60]}...')
 
@@ -526,7 +593,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         for mode in SEARCH_MODES:
             try:
                 result = run_bicameral_query(
-                    client, query_text, lane_alias, mode, top_k
+                    client, query_text, group_ids, mode, top_k
                 )
                 combined_text = result['facts_text'] + '\n' + result['nodes_text']
                 fact_recall = compute_recall(combined_text, expected_facts)
@@ -728,10 +795,7 @@ def main():
     import sys
 
     try:
-        if args.contract_check_only:
-            results = run_contract_check(args)
-        else:
-            results = run_benchmark(args)
+        results = run_contract_check(args) if args.contract_check_only else run_benchmark(args)
     except Exception as exc:
         print(f'ERROR: {exc}')
         sys.exit(1)

@@ -86,11 +86,9 @@ def build_om_candidate_rows(
         ).strip()
         source_event_id = str(fact.get('uuid') or '').strip()
         source_group_id = str(fact.get('group_id') or '').strip()
-        created_at = str(fact.get('created_at') or '').strip() or datetime.now(
-            timezone.utc
-        ).isoformat().replace('+00:00', 'Z')
+        created_at = str(fact.get('created_at') or '').strip()
 
-        if not source_node_id or not source_event_id or not source_group_id:
+        if not source_node_id or not source_event_id or not source_group_id or not created_at:
             continue
 
         evidence_refs = [
