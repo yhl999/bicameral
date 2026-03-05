@@ -16,31 +16,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 OWNED_PATHS: set[str] = {
-    'mcp_server/src/graphiti_mcp_server.py',
-    'mcp_server/src/config/schema.py',
-    'mcp_server/src/services/queue_service.py',
-    'mcp_server/config/config.yaml',
-    'mcp_server/config/extraction_ontologies.yaml',
-    'scripts/run_retrieval_benchmark.py',
-    'scripts/owned_paths_preflight.py',
-    'scripts/utility_eval_vs_qmd.py',
-    'scripts/lane_hygiene_audit.py',
-    'scripts/build_om_closeout_report.py',
-    'tests/test_mcp_tool_schema_contract_matches_harness_args.py',
-    'tests/test_lane_alias_resolution_to_group_ids_is_explicit.py',
-    'tests/test_om_only_query_returns_om_evidence.py',
-    'tests/test_mixed_lane_query_returns_fused_results_with_lane_provenance.py',
-    'tests/test_falkordb_all_lanes_bypass_om_adapter.py',
-    'tests/test_om_candidate_bridge_emits_candidate_rows.py',
-    'tests/fixtures/retrieval_benchmark_queries.json',
     'docs/runbooks/om-operations.md',
     'docs/runbooks/sessions-ingestion.md',
+    'mcp_server/src/graphiti_mcp_server.py',
+    'mcp_server/src/services/queue_service.py',
+    'scripts/build_om_closeout_report.py',
+    'scripts/lane_hygiene_audit.py',
+    'scripts/owned_paths_preflight.py',
+    'scripts/run_retrieval_benchmark.py',
+    'scripts/utility_eval_vs_qmd.py',
+    'tests/fixtures/retrieval_benchmark_queries.json',
+    'tests/helpers_mcp_import.py',
+    'tests/test_falkordb_all_lanes_bypass_om_adapter.py',
+    'tests/test_lane_alias_resolution_to_group_ids_is_explicit.py',
+    'tests/test_lane_aliases.py',
+    'tests/test_mcp_tool_schema_contract_matches_harness_args.py',
+    'tests/test_mixed_lane_query_returns_fused_results_with_lane_provenance.py',
+    'tests/test_om_candidate_bridge_emits_candidate_rows.py',
+    'tests/test_om_only_query_returns_om_evidence.py',
+    'tests/test_retrieval_benchmark.py',
+    'tests/test_run_id_sanitization_scripts.py',
 }
 
 _RUN_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+_RUN_ID_MAX_LEN = 128
 
 
 def _validate_run_id(run_id: str) -> str:
+    if len(run_id) > _RUN_ID_MAX_LEN:
+        raise ValueError(f'run-id exceeds max length ({_RUN_ID_MAX_LEN})')
+
     if '/' in run_id:
         raise ValueError("run-id contains '/' which can escape state output directory")
     if '\\' in run_id:

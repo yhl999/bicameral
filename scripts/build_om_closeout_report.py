@@ -18,9 +18,13 @@ def _utc_now() -> str:
 
 
 _RUN_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+_RUN_ID_MAX_LEN = 128
 
 
 def _validate_run_id(run_id: str) -> str:
+    if len(run_id) > _RUN_ID_MAX_LEN:
+        raise ValueError(f'run-id exceeds max length ({_RUN_ID_MAX_LEN})')
+
     if '/' in run_id:
         raise ValueError("run-id contains '/' which can escape artifact paths")
     if '\\' in run_id:
@@ -155,16 +159,22 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
+        run_id = _validate_run_id(args.run_id)
+    except ValueError as exc:
+        print(f'Invalid --run-id: {exc}', file=sys.stderr)
+        return 1
+
+    try:
         report = build_report(
-            run_id=args.run_id,
+            run_id=run_id,
             benchmark_path=Path(args.benchmark),
             utility_path=Path(args.utility),
             lane_hygiene_path=Path(args.lane_hygiene),
             pr_a_sha=args.pr_a_sha,
             overlay_manifest_ref=args.overlay_manifest_ref,
         )
-    except ValueError as exc:
-        print(f'Invalid --run-id: {exc}', file=sys.stderr)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     out_path = Path(args.out)
