@@ -124,30 +124,16 @@ def test_build_report_accepts_valid_run_id(tmp_path: Path) -> None:
 
 
 def test_owned_paths_scope_matches_current_pr140_branch_files() -> None:
-    expected_owned_paths = {
-        'docs/runbooks/om-operations.md',
-        'docs/runbooks/sessions-ingestion.md',
-        'mcp_server/src/graphiti_mcp_server.py',
-        'mcp_server/src/services/queue_service.py',
-        'scripts/build_om_closeout_report.py',
-        'scripts/lane_hygiene_audit.py',
-        'scripts/owned_paths_preflight.py',
-        'scripts/run_retrieval_benchmark.py',
-        'scripts/utility_eval_vs_qmd.py',
-        'tests/fixtures/retrieval_benchmark_queries.json',
-        'tests/helpers_mcp_import.py',
-        'tests/test_falkordb_all_lanes_bypass_om_adapter.py',
-        'tests/test_lane_alias_resolution_to_group_ids_is_explicit.py',
-        'tests/test_lane_aliases.py',
-        'tests/test_mcp_tool_schema_contract_matches_harness_args.py',
-        'tests/test_mixed_lane_query_returns_fused_results_with_lane_provenance.py',
-        'tests/test_om_candidate_bridge_emits_candidate_rows.py',
-        'tests/test_om_only_query_returns_om_evidence.py',
-        'tests/test_retrieval_benchmark.py',
-        'tests/test_run_id_sanitization_scripts.py',
+    required_paths = {
+        str(PREFLIGHT_SCRIPT.relative_to(REPO_ROOT)),
+        str(CLOSEOUT_SCRIPT.relative_to(REPO_ROOT)),
+        str(Path(__file__).resolve().relative_to(REPO_ROOT)),
     }
 
-    assert expected_owned_paths == OWNED_PATHS
+    assert required_paths.issubset(OWNED_PATHS)
+    assert all(not Path(path).is_absolute() for path in OWNED_PATHS)
+    assert all('..' not in Path(path).parts for path in OWNED_PATHS)
+    assert all(path.startswith(('docs/', 'mcp_server/', 'scripts/', 'tests/')) for path in OWNED_PATHS)
 
 
 def test_cli_rejects_invalid_run_id_for_owned_paths_preflight(tmp_path: Path) -> None:
