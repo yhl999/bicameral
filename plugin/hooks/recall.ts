@@ -6,6 +6,8 @@ import { deriveGroupLane } from '../lane-utils.ts';
 import type { PackContextResult } from './pack-injector.ts';
 import type { PackInjectorContext } from './pack-injector.ts';
 import { createCapabilityInjector } from './capability-injector.ts';
+import { classifyTurn } from '../policy/turn-classifier.ts';
+import type { TurnClassification } from '../policy/turn-classifier.ts';
 
 export interface BeforeAgentStartEvent {
   prompt: string;
@@ -35,16 +37,46 @@ export interface RecallHookDeps {
 const escapeXml = (text: string): string =>
   text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/**
+ * Format Graphiti search results for injection.
+ *
+ * NO-MEMORY-FOUND POLICY: when no facts are returned, return an empty string
+ * instead of an empty wrapper block. The model should not see any
+ * <graphiti-context> block when there is nothing to inject.
+ */
 const formatGraphitiContext = (results: GraphitiSearchResults): string => {
+  // No-memory-found: return nothing, not an empty wrapper
+  if (results.facts.length === 0) {
+    return '';
+  }
+
   const lines: string[] = [];
   lines.push('<graphiti-context>');
   lines.push('## Graphiti Recall');
+  for (const fact of results.facts) {
+    lines.push(`- ${escapeXml(fact.fact)}`);
+  }
+  lines.push('</graphiti-context>');
+  return lines.join('\n');
+};
+
+/**
+ * Format Graphiti results in task-update narrow mode.
+ * Caps facts to a narrow window and wraps with mode metadata.
+ */
+const TASK_UPDATE_MAX_FACTS = 4;
+
+const formatTaskUpdateContext = (results: GraphitiSearchResults): string => {
   if (results.facts.length === 0) {
-    lines.push('No relevant facts found.');
-  } else {
-    for (const fact of results.facts) {
-      lines.push(`- ${escapeXml(fact.fact)}`);
-    }
+    return '';
+  }
+
+  const narrowFacts = results.facts.slice(0, TASK_UPDATE_MAX_FACTS);
+  const lines: string[] = [];
+  lines.push('<graphiti-context mode="task-update-narrow">');
+  lines.push('## Task State (narrow recall)');
+  for (const fact of narrowFacts) {
+    lines.push(`- ${escapeXml(fact.fact)}`);
   }
   lines.push('</graphiti-context>');
   return lines.join('\n');
@@ -124,8 +156,19 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
   const capabilityInjector = createCapabilityInjector({ config });
 
   return async (event, ctx) => {
-    const parts: string[] = [];
     const prompt = event.prompt ?? '';
+    const { classification, reason } = classifyTurn(prompt);
+
+    // LOW-INFO SUPPRESSION POLICY:
+    // Operationally empty turns (ok, thanks, emoji-only, etc.) receive no
+    // context injection at all. This is a valid and common success case —
+    // null injection reduces noise without losing information.
+    if (classification === 'low-info') {
+      logger(`Turn suppressed (low-info): ${reason}`);
+      return { prependContext: '' };
+    }
+
+    const parts: string[] = [];
     let graphitiResults: GraphitiSearchResults | null = null;
 
     if (prompt.trim().length >= config.minPromptChars) {
@@ -144,7 +187,25 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
       } else {
         try {
           graphitiResults = await deps.client.search(prompt, groupIds);
-          parts.push(formatGraphitiContext(graphitiResults));
+
+          // TASK-UPDATE NARROW POLICY:
+          // When the turn is classified as a task-update request, constrain
+          // injection to narrow task-state fields (capped facts, mode metadata).
+          // This prevents broad memory dumps on simple status checks.
+          if (classification === 'task-update') {
+            logger(`Turn classified as task-update: ${reason}`);
+            const narrowContext = formatTaskUpdateContext(graphitiResults);
+            if (narrowContext) {
+              parts.push(narrowContext);
+            }
+          } else {
+            const fullContext = formatGraphitiContext(graphitiResults);
+            if (fullContext) {
+              parts.push(fullContext);
+            }
+            // NO-MEMORY-FOUND: if formatGraphitiContext returned empty string
+            // (zero facts), we simply don't push anything — no wrapper at all.
+          }
         } catch (error) {
           const message = (error as Error).message || 'unknown error';
           const safeReason = sanitizeReason(message);
@@ -159,34 +220,39 @@ export const createRecallHook = (deps: RecallHookDeps): RecallHook => {
         }
       }
     } else {
-      parts.push('');
+      // Prompt below minPromptChars — no recall, no wrapper
     }
 
     let packIntentId: string | undefined;
-    try {
-      const packResult = await deps.packInjector({
-        prompt,
-        graphitiResults,
-        ctx,
-      });
-      if (packResult?.context) {
-        parts.push(packResult.context);
-        packIntentId = packResult.intentId;
-      }
-    } catch (error) {
-      logger(`Pack injection failed: ${(error as Error).message}`);
-    }
 
-    try {
-      const capabilityContext = await capabilityInjector({
-        prompt,
-        intentId: packIntentId,
-      });
-      if (capabilityContext) {
-        parts.push(capabilityContext);
+    // TASK-UPDATE: skip pack injection for task-update turns — they need
+    // narrow task state, not workflow context.
+    if (classification !== 'task-update') {
+      try {
+        const packResult = await deps.packInjector({
+          prompt,
+          graphitiResults,
+          ctx,
+        });
+        if (packResult?.context) {
+          parts.push(packResult.context);
+          packIntentId = packResult.intentId;
+        }
+      } catch (error) {
+        logger(`Pack injection failed: ${(error as Error).message}`);
       }
-    } catch (error) {
-      logger(`Capability injection failed: ${(error as Error).message}`);
+
+      try {
+        const capabilityContext = await capabilityInjector({
+          prompt,
+          intentId: packIntentId,
+        });
+        if (capabilityContext) {
+          parts.push(capabilityContext);
+        }
+      } catch (error) {
+        logger(`Capability injection failed: ${(error as Error).message}`);
+      }
     }
 
     return { prependContext: parts.filter((part) => part.trim().length > 0).join('\n\n') };
