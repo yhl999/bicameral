@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from scripts.owned_paths_preflight import _validate_run_id as validate_preflight
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT_SCRIPT = REPO_ROOT / 'scripts' / 'owned_paths_preflight.py'
 CLOSEOUT_SCRIPT = REPO_ROOT / 'scripts' / 'build_om_closeout_report.py'
+OWNED_PATHS_SNAPSHOT_SHA256 = '99d60c9093e8060a636110203021c7b47b8565b3d9443baab88358cd10c20a38'
 
 
 @pytest.mark.parametrize('run_id', ['alpha-01', 'alpha_01', 'A1B2'])
@@ -134,6 +136,11 @@ def test_owned_paths_scope_matches_current_pr140_branch_files() -> None:
     assert all(not Path(path).is_absolute() for path in OWNED_PATHS)
     assert all('..' not in Path(path).parts for path in OWNED_PATHS)
     assert all(path.startswith(('docs/', 'mcp_server/', 'scripts/', 'tests/')) for path in OWNED_PATHS)
+
+
+def test_owned_paths_snapshot_fingerprint() -> None:
+    fingerprint = hashlib.sha256('\n'.join(sorted(OWNED_PATHS)).encode('utf-8')).hexdigest()
+    assert fingerprint == OWNED_PATHS_SNAPSHOT_SHA256
 
 
 def test_cli_rejects_invalid_run_id_for_owned_paths_preflight(tmp_path: Path) -> None:
