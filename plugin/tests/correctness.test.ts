@@ -2092,7 +2092,6 @@ test('turn-classifier: canonical low-info turns are classified as low-info', () 
     '?',
     'thanks', 'Thank you', 'thx', 'ty',
     'sounds good', 'Sounds Good',
-    'yep', 'yup', 'yeah', 'yes', 'no', 'nope', 'nah',
     'lol', 'lmao', 'haha',
     'nice', 'cool', 'great', 'awesome',
     'got it', 'gotcha', 'noted', 'sure',
@@ -2108,6 +2107,22 @@ test('turn-classifier: canonical low-info turns are classified as low-info', () 
       result.classification,
       'low-info',
       `Expected "${input}" to be low-info, got "${result.classification}" (${result.reason})`,
+    );
+  }
+});
+
+test('turn-classifier: bare approval/stop decisions are NOT low-info', () => {
+  const operationalDecisions = [
+    'yes', 'no', 'yep', 'yup', 'yeah', 'nope', 'nah',
+    'approve', 'approved', 'confirm', 'confirmed',
+    'reject', 'rejected', 'stop', 'cancel', 'abort',
+  ];
+  for (const input of operationalDecisions) {
+    const result = classifyTurn(input);
+    assert.equal(
+      result.classification,
+      'normal',
+      `Expected operational decision "${input}" to be normal, got "${result.classification}" (${result.reason})`,
     );
   }
 });
@@ -2153,7 +2168,7 @@ test('turn-classifier: carveout "do it" is NOT low-info', () => {
 test('turn-classifier: additional carveouts are not low-info', () => {
   const carveouts = [
     'ship it', 'run it', 'go ahead', 'approved',
-    'go', 'merge it', 'deploy it', 'book it',
+    'go', 'merge it', 'deploy it', 'book it', 'stop', 'cancel',
     '3pm works', 'noon works', 'tomorrow?', 'tonight?',
   ];
   for (const input of carveouts) {
@@ -2291,6 +2306,32 @@ test('recall hook processes "send it" carveout normally', async () => {
   );
 });
 
+test('recall hook processes bare "no" as an operational decision (not low-info)', async () => {
+  let searchCalled = false;
+  const hook = createRecallHook({
+    client: {
+      search: async () => {
+        searchCalled = true;
+        return { facts: [{ fact: 'Decision pending: deploy rollback approved if needed' }] };
+      },
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: { memoryGroupId: 's1_sessions_main', singleTenant: true, minPromptChars: 1 },
+  });
+
+  const result = await hook(
+    { prompt: 'no' },
+    { sessionKey: 'test-session' },
+  );
+
+  assert.ok(searchCalled, 'Graphiti search must be called for bare "no"');
+  assert.ok(
+    (result.prependContext ?? '').includes('Decision pending'),
+    'bare "no" must receive normal recall injection',
+  );
+});
+
 // ── Recall hook integration: no-memory-found ──────────────────────────────
 
 test('recall hook injects nothing when Graphiti returns zero facts (no wrapper)', async () => {
@@ -2366,6 +2407,41 @@ test('recall hook narrows injection for task-update requests', async () => {
     !context.includes('Wine preference'),
     'task-update must not dump unrelated facts (fact 7 should be cut)',
   );
+});
+
+test('recall hook task-update narrowing selects relevant task-state facts even when they appear later', async () => {
+  const hook = createRecallHook({
+    client: {
+      search: async () => ({
+        facts: [
+          { fact: 'Yuan prefers sushi for dinner' },
+          { fact: 'Office is near Union Square' },
+          { fact: 'Task: implement API endpoint' },
+          { fact: 'Meeting scheduled for Tuesday' },
+          { fact: 'Blocker: waiting on schema approval' },
+          { fact: 'Next step: write integration tests' },
+          { fact: 'Decision: hold deploy until QA sign-off' },
+        ],
+      }),
+      ingestMessages: async () => undefined,
+    },
+    packInjector: async () => null,
+    config: { memoryGroupId: 's1_sessions_main', singleTenant: true },
+  });
+
+  const result = await hook(
+    { prompt: 'task status' },
+    { sessionKey: 'test-session' },
+  );
+
+  const context = result.prependContext ?? '';
+  assert.ok(context.includes('Task: implement API endpoint'));
+  assert.ok(context.includes('Blocker: waiting on schema approval'));
+  assert.ok(context.includes('Next step: write integration tests'));
+  assert.ok(context.includes('Decision: hold deploy until QA sign-off'));
+  assert.ok(!context.includes('Yuan prefers sushi for dinner'));
+  assert.ok(!context.includes('Office is near Union Square'));
+  assert.ok(!context.includes('Meeting scheduled for Tuesday'));
 });
 
 test('recall hook skips pack injection for task-update turns', async () => {

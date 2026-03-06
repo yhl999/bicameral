@@ -62,16 +62,52 @@ const formatGraphitiContext = (results: GraphitiSearchResults): string => {
 
 /**
  * Format Graphiti results in task-update narrow mode.
- * Caps facts to a narrow window and wraps with mode metadata.
+ * Selects task-state relevant facts and caps output to a narrow window.
  */
 const TASK_UPDATE_MAX_FACTS = 4;
+
+const TASK_STATE_SIGNAL_PATTERNS: Array<{ pattern: RegExp; weight: number }> = [
+  // Blockers / impediments
+  { pattern: /\b(blocker|blocked|blocking|impediment|risk|issue|waiting on|dependency)\b/i, weight: 4 },
+  // Next actions / TODOs
+  { pattern: /\b(next step|next action|action item|follow[- ]up|todo|to do)\b/i, weight: 4 },
+  // Decisions / approvals / stops
+  { pattern: /\b(decision|decided|approve[sd]?|reject(?:ed)?|go[- ]ahead|stop(?:ped)?|cancel(?:led)?)\b/i, weight: 4 },
+  // Progress / status / state
+  { pattern: /\b(status|progress|state|checkpoint|milestone|eta|in progress|complete(?:d)?|done)\b/i, weight: 3 },
+  // Task identity references
+  { pattern: /\b(task|ticket|story|issue|pr|job|run|workstream)\b/i, weight: 2 },
+];
+
+const scoreTaskStateFact = (fact: string): number =>
+  TASK_STATE_SIGNAL_PATTERNS.reduce((score, signal) => {
+    if (!signal.pattern.test(fact)) {
+      return score;
+    }
+    return score + signal.weight;
+  }, 0);
 
 const formatTaskUpdateContext = (results: GraphitiSearchResults): string => {
   if (results.facts.length === 0) {
     return '';
   }
 
-  const narrowFacts = results.facts.slice(0, TASK_UPDATE_MAX_FACTS);
+  const narrowFacts = results.facts
+    .map((fact, index) => ({
+      fact,
+      index,
+      score: scoreTaskStateFact(fact.fact),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, TASK_UPDATE_MAX_FACTS)
+    .sort((a, b) => a.index - b.index)
+    .map((entry) => entry.fact);
+
+  if (narrowFacts.length === 0) {
+    return '';
+  }
+
   const lines: string[] = [];
   lines.push('<graphiti-context mode="task-update-narrow">');
   lines.push('## Task State (narrow recall)');
