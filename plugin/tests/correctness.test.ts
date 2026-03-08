@@ -18,6 +18,7 @@ import { detectIntent } from '../intent/detector.ts';
 import type { IntentRuleSet } from '../intent/types.ts';
 import { loadIntentRules, normalizeConfig } from '../config.ts';
 import type { PackRegistry } from '../config.ts';
+import { GraphitiClient } from '../client.ts';
 
 const rules: IntentRuleSet = {
   schema_version: 1,
@@ -2618,4 +2619,253 @@ test('instrumentation: no-memory-found is truly empty, not just shorter', async 
   assert.equal(context.length, 0, 'no-memory-found context must be exactly zero length');
   assert.ok(!context.includes('graphiti'), 'no-memory-found must not contain any graphiti markers');
   assert.ok(!context.includes('Recall'), 'no-memory-found must not contain any Recall headers');
+});
+
+test('GraphitiClient uses MCP tools/call search_memory_facts with session handshake', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const calls: Array<{
+    url: string;
+    headers: Record<string, string>;
+    body: Record<string, unknown>;
+  }> = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    const headerObject = Object.fromEntries(headers.entries());
+    const body = JSON.parse((init?.body as string) ?? '{}') as Record<string, unknown>;
+
+    calls.push({
+      url: String(input),
+      headers: headerObject,
+      body,
+    });
+
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'mcp-session-id': 'session-123',
+        },
+      });
+    }
+
+    if (calls.length === 2) {
+      return new Response('', {
+        status: 202,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        result: {
+          structuredContent: {
+            message: 'Facts retrieved successfully',
+            facts: [{ fact: 'MCP recall works' }],
+          },
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      },
+    );
+  }) as typeof fetch;
+
+  const client = new GraphitiClient({
+    baseUrl: 'http://localhost:8000',
+    recallTimeoutMs: 1500,
+    captureTimeoutMs: 1500,
+    maxFacts: 8,
+  });
+
+  const results = await client.search('what happened?', ['lane_a']);
+
+  assert.equal(results.facts.length, 1);
+  assert.equal(results.facts[0].fact, 'MCP recall works');
+
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].url, 'http://localhost:8000/mcp/');
+  assert.equal(calls[1].url, 'http://localhost:8000/mcp/');
+  assert.equal(calls[2].url, 'http://localhost:8000/mcp/');
+
+  assert.equal(calls[0].body.method, 'initialize');
+  assert.equal(calls[1].body.method, 'notifications/initialized');
+  assert.equal(calls[2].body.method, 'tools/call');
+
+  const callParams = calls[2].body.params as { name?: string; arguments?: Record<string, unknown> };
+  assert.equal(callParams.name, 'search_memory_facts');
+  assert.equal(callParams.arguments?.query, 'what happened?');
+  assert.deepEqual(callParams.arguments?.group_ids, ['lane_a']);
+  assert.equal(callParams.arguments?.max_facts, 8);
+
+  assert.equal(calls[2].headers['mcp-session-id'], 'session-123');
+});
+
+test('GraphitiClient retries once when server requires MCP session header', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const calls: Array<{
+    headers: Record<string, string>;
+    body: Record<string, unknown>;
+  }> = [];
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    const headerObject = Object.fromEntries(headers.entries());
+    const body = JSON.parse((init?.body as string) ?? '{}') as Record<string, unknown>;
+    calls.push({ headers: headerObject, body });
+
+    if (calls.length === 1) {
+      return new Response('Missing session ID', {
+        status: 400,
+        headers: {
+          'content-type': 'text/plain',
+          'mcp-session-id': 'session-retry',
+        },
+      });
+    }
+
+    if (calls.length === 2) {
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    }
+
+    if (calls.length === 3) {
+      return new Response('', {
+        status: 202,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        result: {
+          structuredContent: {
+            message: 'Facts retrieved successfully',
+            facts: [{ fact: 'retry succeeded' }],
+          },
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      },
+    );
+  }) as typeof fetch;
+
+  const client = new GraphitiClient({
+    baseUrl: 'http://localhost:8000',
+    recallTimeoutMs: 1500,
+    captureTimeoutMs: 1500,
+    maxFacts: 8,
+  });
+
+  const results = await client.search('retry case');
+  assert.equal(results.facts.length, 1);
+  assert.equal(results.facts[0].fact, 'retry succeeded');
+
+  assert.equal(calls.length, 4);
+  assert.equal(calls[0].body.method, 'initialize');
+  assert.equal(calls[1].body.method, 'initialize');
+  assert.equal(calls[1].headers['mcp-session-id'], 'session-retry');
+});
+
+test('GraphitiClient uses add_memory for capture ingestion', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const calls: Array<{ body: Record<string, unknown> }> = [];
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse((init?.body as string) ?? '{}') as Record<string, unknown>;
+    calls.push({ body });
+
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'mcp-session-id': 'session-xyz',
+        },
+      });
+    }
+
+    if (calls.length === 2) {
+      return new Response('', {
+        status: 202,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        result: {
+          structuredContent: {
+            message: 'Episode queued for processing',
+          },
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      },
+    );
+  }) as typeof fetch;
+
+  const client = new GraphitiClient({
+    baseUrl: 'http://localhost:8000/mcp',
+    recallTimeoutMs: 1500,
+    captureTimeoutMs: 1500,
+    maxFacts: 8,
+  });
+
+  await client.ingestMessages('lane_capture', [
+    { role_type: 'user', content: 'hello from user' },
+    { role_type: 'assistant', content: 'hello from assistant' },
+  ]);
+
+  assert.equal(calls.length, 3);
+
+  const toolCall = calls[2].body;
+  assert.equal(toolCall.method, 'tools/call');
+  const params = toolCall.params as { name?: string; arguments?: Record<string, unknown> };
+  assert.equal(params.name, 'add_memory');
+  assert.equal(params.arguments?.group_id, 'lane_capture');
+
+  const episodeBody = String(params.arguments?.episode_body ?? '');
+  assert.ok(episodeBody.includes('user: hello from user'));
+  assert.ok(episodeBody.includes('assistant: hello from assistant'));
 });
