@@ -48,6 +48,7 @@ Configuration is passed as JSON through `BICAMERAL_PLUGIN_CONFIG` (legacy fallba
 
 Notes:
 - The scaffold loader expects JSON content.
+- `graphitiBaseUrl` targets the Graphiti host; the plugin now talks MCP streamable HTTP and automatically appends `/mcp/` when missing.
 - `packRouterCommand` is optional. If omitted, the pack registry is used directly.
 - For command paths with spaces, wrap paths in quotes or use an array form:
   - `"packRouterCommand": "python3 \"scripts/pack router.py\""`
