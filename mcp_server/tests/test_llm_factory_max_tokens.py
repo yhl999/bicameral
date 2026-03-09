@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Regression tests for LLM factory max_tokens wiring."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 # Add the mcp_server src directory to the path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from config.schema import LLMConfig, LLMProvidersConfig, OpenAIProviderConfig
 import services.factories as factories
+from config.schema import LLMConfig, LLMProvidersConfig, OpenAIProviderConfig
 
 
 def test_openai_factory_passes_configured_max_tokens(monkeypatch):
