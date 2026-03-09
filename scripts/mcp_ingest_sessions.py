@@ -46,6 +46,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ingest.common import sanitize_for_graphiti
 from ingest.registry import get_registry
+from mcp_server.src.services.typed_replay_bridge import (
+    TypedReplayBridge,
+    build_bridge_metadata,
+    build_session_chunk_episode,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -57,6 +62,11 @@ DEFAULT_OVERLAP_CHUNKS = 10  # for incremental mode
 # this limit are deterministically split into sub-chunks with :p0/:p1/... suffixes.
 # This avoids LLM context_length_exceeded errors without lossy truncation.
 DEFAULT_SUBCHUNK_SIZE = 10_000
+_TYPED_TRUTH_MODE_DEFAULT = os.environ.get('TYPED_TRUTH_MODE', 'off').strip().lower() or 'off'
+_CHANGE_LEDGER_DB_DEFAULT = os.environ.get(
+    'CHANGE_LEDGER_DB',
+    str(Path(__file__).resolve().parents[1] / 'state' / 'change_ledger.db'),
+)
 
 # Group IDs that get automatic sub-chunking when evidence exceeds subchunk_size.
 _SUBCHUNK_GROUP_IDS = {'s1_sessions_main'}
@@ -926,6 +936,24 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Check integrity of claim-state DB and report status',
     )
+    ap.add_argument(
+        '--typed-truth-mode',
+        choices=['off', 'sidecar', 'only'],
+        default=_TYPED_TRUTH_MODE_DEFAULT,
+        help=(
+            'Typed truth bridge mode for evidence replay: '
+            'off (default), sidecar (append Episode asserts to ChangeLedger and also queue Graphiti), '
+            'or only (write only to ChangeLedger; skip add_memory).'
+        ),
+    )
+    ap.add_argument(
+        '--change-ledger-db',
+        default=_CHANGE_LEDGER_DB_DEFAULT,
+        help=(
+            'Path to the typed ChangeLedger SQLite DB '
+            f'(default: {_CHANGE_LEDGER_DB_DEFAULT})'
+        ),
+    )
 
     return ap
 
@@ -982,6 +1010,9 @@ def main():
 
     if args.subchunk_size <= 0:
         ap.error('--subchunk-size must be a positive integer')
+
+    if args.typed_truth_mode != 'off' and args.source_mode != 'evidence':
+        ap.error('--typed-truth-mode currently supports only --source-mode evidence')
 
     # Part B: OM path guard — warn when targeting the OM namespace
     _check_om_path_guard(args)
@@ -1449,6 +1480,89 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
         print(f'Errors: {errors}')
 
 
+def _typed_episode_title(ev: dict[str, Any], chunk_source_key: str) -> str | None:
+    source = ev.get('source') if isinstance(ev.get('source'), dict) else {}
+    session_id = str(source.get('session_id') or '').strip()
+    topic_id = str(source.get('topic_id') or '').strip()
+    agent_id = str(source.get('agent_id') or '').strip()
+    if session_id and topic_id:
+        return f'session:{agent_id or "main"}:{session_id}:topic-{topic_id}'
+    if session_id:
+        return f'session:{agent_id or "main"}:{session_id}'
+    return chunk_source_key or None
+
+
+
+def _typed_source_message_id(ev: dict[str, Any]) -> str | None:
+    start_id = str(ev.get('start_id') or '').strip()
+    if start_id:
+        return start_id
+    message_ids = ev.get('message_ids') or []
+    if isinstance(message_ids, list) and message_ids:
+        first = str(message_ids[0] or '').strip()
+        return first or None
+    return None
+
+
+
+def _write_typed_episode_bridge(
+    *,
+    bridge: TypedReplayBridge,
+    args: argparse.Namespace,
+    ev: dict[str, Any],
+    chunk_source_key: str,
+    sub_key: str,
+    sub_content: str,
+    content_hash: str,
+    episode_uuid: str,
+    evidence_id: str,
+) -> bool:
+    ts_range = ev.get('timestamp_range') if isinstance(ev.get('timestamp_range'), dict) else {}
+    started_at = str(ts_range.get('start') or '').strip() or None
+    ended_at = str(ts_range.get('end') or '').strip() or None
+    message_ids = ev.get('message_ids') if isinstance(ev.get('message_ids'), list) else []
+    start_id = str(ev.get('start_id') or '').strip() or None
+    end_id = str(ev.get('end_id') or '').strip() or None
+    episode = build_session_chunk_episode(
+        object_id=episode_uuid,
+        source_lane=args.group_id,
+        source_key=chunk_source_key,
+        source_episode_id=sub_key,
+        source_message_id=_typed_source_message_id(ev),
+        scope=ev.get('scope'),
+        summary=sub_content,
+        started_at=started_at,
+        ended_at=ended_at,
+        chunk_key=sub_key,
+        source_event_id=episode_uuid,
+        evidence_id=evidence_id or None,
+        start_id=start_id,
+        end_id=end_id,
+        title=_typed_episode_title(ev, chunk_source_key),
+        annotations=[
+            'bridge:typed_replay',
+            f'lane:{args.group_id}',
+            f'message_count:{len(message_ids)}',
+        ],
+    )
+    result = bridge.assert_episode_once(
+        episode,
+        metadata=build_bridge_metadata(
+            group_id=args.group_id,
+            source_key=chunk_source_key,
+            chunk_key=sub_key,
+            message_ids=message_ids,
+            evidence_id=evidence_id or None,
+            content_hash=content_hash,
+            scope=ev.get('scope'),
+            started_at=started_at,
+            ended_at=ended_at,
+        ),
+    )
+    return result.created
+
+
+
 def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
     """Evidence source mode: the original JSON-file-based ingestion path.
 
@@ -1568,11 +1682,15 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
         print(f'   New: {new}, Already ingested: {skipped}')
         return
 
-    client = MCPClient(args.mcp_url)
+    client = MCPClient(args.mcp_url) if args.typed_truth_mode != 'only' else None
+    typed_bridge = (
+        TypedReplayBridge(args.change_ledger_db) if args.typed_truth_mode != 'off' else None
+    )
 
     ok = 0
     skipped = 0
     errors = 0
+    typed_created = 0
     max_ts = 0.0
     subchunk_count = 0  # tracks how many sub-chunks were created from oversized evidence
 
@@ -1622,25 +1740,46 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             )
             episode_uuid = registry.compute_episode_uuid(chunk_uuid)
 
-            body = sanitize_for_graphiti(sub_content)
+            if typed_bridge is not None:
+                try:
+                    if _write_typed_episode_bridge(
+                        bridge=typed_bridge,
+                        args=args,
+                        ev=ev,
+                        chunk_source_key=chunk_source_key,
+                        sub_key=sub_key,
+                        sub_content=sub_content,
+                        content_hash=content_hash,
+                        episode_uuid=episode_uuid,
+                        evidence_id=str(evidence_id),
+                    ):
+                        typed_created += 1
+                except Exception as exc:
+                    print(f'[{i}/{len(batch)}] ERROR typed bridge {ep_name}: {exc}')
+                    errors += 1
+                    continue
 
-            res = client.call_tool(
-                'add_memory',
-                {
-                    'name': ep_name,
-                    'episode_body': body,
-                    'group_id': args.group_id,
-                    'source': 'text',
-                    'source_description': src_desc[:200],
-                    # NOTE: do NOT pass "uuid" — standalone MCP breaks with client-generated UUIDs
-                    # ("node X not found" error). Let the server generate its own.
-                },
-            )
+            if args.typed_truth_mode != 'only':
+                assert client is not None
+                body = sanitize_for_graphiti(sub_content)
 
-            if 'error' in res:
-                print(f'[{i}/{len(batch)}] ERROR enqueue {ep_name}: {res["error"]}')
-                errors += 1
-                continue
+                res = client.call_tool(
+                    'add_memory',
+                    {
+                        'name': ep_name,
+                        'episode_body': body,
+                        'group_id': args.group_id,
+                        'source': 'text',
+                        'source_description': src_desc[:200],
+                        # NOTE: do NOT pass "uuid" — standalone MCP breaks with client-generated UUIDs
+                        # ("node X not found" error). Let the server generate its own.
+                    },
+                )
+
+                if 'error' in res:
+                    print(f'[{i}/{len(batch)}] ERROR enqueue {ep_name}: {res["error"]}')
+                    errors += 1
+                    continue
 
             ok += 1
 
@@ -1658,8 +1797,13 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
                 source_key=chunk_source_key,
                 chunk_key=sub_key,
             )
-
-            time.sleep(args.sleep)
+            if args.typed_truth_mode == 'only':
+                registry.mark_extraction_succeeded(
+                    group_id=args.group_id,
+                    episode_uuid=episode_uuid,
+                )
+            else:
+                time.sleep(args.sleep)
 
         ts = get_evidence_timestamp(ev)
         if ts > max_ts:
@@ -1683,9 +1827,13 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             overlap_window=args.overlap,
         )
 
+    action = 'Materialized' if args.typed_truth_mode == 'only' else 'Queued'
     print(
-        f'\nQueued: {ok} episodes into group_id={args.group_id} (from {len(batch)} evidence chunks)'
+        f'\n{action}: {ok} episodes into group_id={args.group_id} '
+        f'(from {len(batch)} evidence chunks; typed_mode={args.typed_truth_mode})'
     )
+    if typed_bridge is not None:
+        print(f'Typed ledger writes: {typed_created} new episode assert(s) at {args.change_ledger_db}')
     if subchunk_count:
         print(f'Sub-chunked: {subchunk_count} sub-chunks created from oversized evidence')
     if skipped:

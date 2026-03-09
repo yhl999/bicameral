@@ -49,6 +49,13 @@ def _require(locator: dict[str, Any], *keys: str) -> list[str]:
     return [str(locator[key]) for key in keys]
 
 
+def _normalized_source_system(source_key: str | None) -> str:
+    prefix = str(source_key or '').split(':', 1)[0].strip().lower()
+    if prefix in {'session', 'sessions'}:
+        return 'sessions'
+    return prefix or 'legacy'
+
+
 class EvidenceRef(BaseModel):
     kind: EvidenceKind
     source_system: str
@@ -143,7 +150,7 @@ class EvidenceRef(BaseModel):
     @classmethod
     def from_legacy_ref(cls, ref: dict[str, Any]) -> EvidenceRef:
         source_key = str(ref.get('source_key') or ref.get('scope') or ref.get('source_family') or 'legacy').strip()
-        system = source_key.split(':', 1)[0].strip().lower() if source_key else 'legacy'
+        system = _normalized_source_system(source_key)
         evidence_id = str(
             ref.get('evidence_id')
             or ref.get('chunk_key')

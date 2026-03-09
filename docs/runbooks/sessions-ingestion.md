@@ -214,7 +214,33 @@ for shard in $(seq 0 19); do
     --force \
     > logs/worker-${shard}.log 2>&1 &
 done
+```
 
+### Typed Truth Replay Bridge (Phase 2 pre-ingestion)
+
+`mcp_ingest_sessions.py` now has an **opt-in** typed replay bridge for evidence-mode replays:
+
+- `--typed-truth-mode sidecar` — append canonical `Episode` asserts into `state/change_ledger.db` **and** continue queueing Graphiti via `add_memory`
+- `--typed-truth-mode only` — materialize only into the typed ChangeLedger; skip `add_memory`
+- `--change-ledger-db /path/to/change_ledger.db` — override the typed ledger path (defaults to `state/change_ledger.db`)
+
+Example: safe pre-ingestion replay into typed truth only:
+
+```bash
+python3 scripts/mcp_ingest_sessions.py \
+  --source-mode evidence \
+  --group-id s1_sessions_main \
+  --typed-truth-mode only \
+  --change-ledger-db state/change_ledger.db \
+  --limit 500
+```
+
+Notes:
+- This bridge is intentionally **off by default** so the live legacy runtime does not change behavior by accident.
+- Current scope is the **evidence replay path**. Neo4j source-mode and non-session ingest scripts still need explicit follow-up wiring.
+- The bridge writes stable `Episode` objects with canonical provenance (`source_lane`, `source_key`, `source_episode_id`, anchor `source_message_id`, event-log evidence ref, and replay metadata in the ledger event).
+
+```bash
 # Content groups (sequential with drain-waiting)
 nohup python scripts/ingest_content_groups.py \
   --backend neo4j --mcp-url http://localhost:8001/mcp \
