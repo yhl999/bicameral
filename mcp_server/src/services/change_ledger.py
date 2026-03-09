@@ -71,6 +71,25 @@ CREATE INDEX IF NOT EXISTS idx_change_events_object_recorded_at
     ON change_events(object_id, recorded_at, event_id);
 CREATE INDEX IF NOT EXISTS idx_change_events_target_recorded_at
     ON change_events(target_object_id, recorded_at, event_id);
+CREATE TABLE IF NOT EXISTS typed_roots (
+    root_id TEXT PRIMARY KEY,
+    latest_recorded_at TEXT NOT NULL,
+    object_type TEXT,
+    source_lane TEXT,
+    current_object_id TEXT,
+    current_version INTEGER NOT NULL DEFAULT 0,
+    current_payload_json TEXT,
+    search_text TEXT NOT NULL DEFAULT '',
+    lineage_event_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_typed_roots_latest_recorded_at
+    ON typed_roots(latest_recorded_at DESC, root_id);
+CREATE INDEX IF NOT EXISTS idx_typed_roots_object_type_latest
+    ON typed_roots(object_type, latest_recorded_at DESC, root_id);
+CREATE INDEX IF NOT EXISTS idx_typed_roots_source_lane_latest
+    ON typed_roots(source_lane, latest_recorded_at DESC, root_id);
+CREATE INDEX IF NOT EXISTS idx_typed_roots_source_lane_object_type_latest
+    ON typed_roots(source_lane, object_type, latest_recorded_at DESC, root_id);
 """
 
 
@@ -145,6 +164,26 @@ class ChangeLedger:
                 row.metadata_json,
             ),
         )
+        root_id = self._root_id_for_event_row(row)
+        if root_id:
+            _refresh_typed_root_row(self.conn, root_id)
+
+    def _root_id_for_event_row(self, row: ChangeEventRow) -> str | None:
+        if row.root_id:
+            return str(row.root_id)
+        for object_id in (row.object_id, row.target_object_id):
+            if not object_id:
+                continue
+            root_id = self.root_id_for_object(str(object_id))
+            if root_id:
+                return root_id
+        return None
+
+    def typed_root_snapshot(self, root_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM typed_roots WHERE root_id = ?",
+            (root_id,),
+        ).fetchone()
 
     def _build_event_row(
         self,
@@ -559,7 +598,97 @@ def connect(path: str | Path = DB_PATH_DEFAULT) -> sqlite3.Connection:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
+    _ensure_typed_root_index(conn)
     conn.commit()
+
+
+def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
+    root_count = int(conn.execute('SELECT count(*) FROM typed_roots').fetchone()[0])
+    event_root_count = int(
+        conn.execute(
+            """
+            SELECT count(DISTINCT COALESCE(root_id, object_id))
+              FROM change_events
+             WHERE COALESCE(root_id, object_id) IS NOT NULL
+            """
+        ).fetchone()[0]
+    )
+    if root_count == event_root_count:
+        return
+
+    conn.execute('DELETE FROM typed_roots')
+    root_rows = conn.execute(
+        """
+        SELECT DISTINCT COALESCE(root_id, object_id) AS root_id
+          FROM change_events
+         WHERE COALESCE(root_id, object_id) IS NOT NULL
+         ORDER BY root_id
+        """
+    ).fetchall()
+    for row in root_rows:
+        root_id = str(row['root_id']) if isinstance(row, sqlite3.Row) else str(row[0])
+        if root_id:
+            _refresh_typed_root_row(conn, root_id)
+
+
+def _refresh_typed_root_row(conn: sqlite3.Connection, root_id: str) -> None:
+    rows = conn.execute(
+        """
+        SELECT *
+          FROM change_events
+         WHERE root_id = ?
+            OR object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+            OR target_object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+         ORDER BY recorded_at, rowid
+        """,
+        (root_id, root_id, root_id),
+    ).fetchall()
+    if not rows:
+        conn.execute('DELETE FROM typed_roots WHERE root_id = ?', (root_id,))
+        return
+
+    objects = project_objects(rows)
+    if not objects:
+        conn.execute('DELETE FROM typed_roots WHERE root_id = ?', (root_id,))
+        return
+
+    current = next((obj for obj in reversed(objects) if obj.is_current), objects[-1])
+    latest_recorded_at = str(rows[-1]['recorded_at'])
+    current_payload_json = _canonical_json(current.model_dump(mode='json'))
+    search_text = '\n'.join(
+        _canonical_json(obj.model_dump(mode='json'))
+        for obj in objects
+    ).lower()
+
+    conn.execute(
+        """
+        INSERT INTO typed_roots(
+            root_id, latest_recorded_at, object_type, source_lane,
+            current_object_id, current_version, current_payload_json,
+            search_text, lineage_event_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(root_id) DO UPDATE SET
+            latest_recorded_at = excluded.latest_recorded_at,
+            object_type = excluded.object_type,
+            source_lane = excluded.source_lane,
+            current_object_id = excluded.current_object_id,
+            current_version = excluded.current_version,
+            current_payload_json = excluded.current_payload_json,
+            search_text = excluded.search_text,
+            lineage_event_count = excluded.lineage_event_count
+        """,
+        (
+            root_id,
+            latest_recorded_at,
+            current.object_type,
+            current.source_lane,
+            current.object_id,
+            int(current.version),
+            current_payload_json,
+            search_text,
+            len(rows),
+        ),
+    )
 
 
 def project_objects(events: list[ChangeEventRow | sqlite3.Row]) -> list[TypedMemoryObject]:

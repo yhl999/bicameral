@@ -9,11 +9,18 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject
+    from models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject, coerce_typed_object
     from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
     from services.evidence_callback import EvidenceCallbackRegistry
 except ImportError:  # pragma: no cover - package import path fallback
-    from ..models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject
+    from ..models.typed_memory import (
+        Episode,
+        EvidenceRef,
+        Procedure,
+        StateFact,
+        TypedMemoryObject,
+        coerce_typed_object,
+    )
     from .change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
     from .evidence_callback import EvidenceCallbackRegistry
 
@@ -140,7 +147,7 @@ class TypedRetrievalService:
             current_only=current_only,
         )
 
-        all_objects, materialization_limits = self._materialize_candidate_objects(
+        all_objects, materialization_limits, search_text_overrides = self._materialize_candidate_objects(
             query=query,
             object_types=normalized_object_types,
             metadata_filters=metadata_filters,
@@ -155,7 +162,11 @@ class TypedRetrievalService:
         if query_mode == 'current':
             filtered_objects = [obj for obj in filtered_objects if obj.is_current]
 
-        ranked_objects = _rank_objects(filtered_objects, query)
+        ranked_objects = _rank_objects(
+            filtered_objects,
+            query,
+            search_text_overrides=search_text_overrides,
+        )
         selected_objects = self._select_objects(
             ranked_objects,
             filtered_objects,
@@ -222,7 +233,7 @@ class TypedRetrievalService:
         query: str,
         object_types: set[str],
         metadata_filters: dict[str, Any],
-    ) -> tuple[list[TypedMemoryObject], dict[str, Any]]:
+    ) -> tuple[list[TypedMemoryObject], dict[str, Any], dict[str, str]]:
         assert self.ledger is not None
         root_ids, root_selection_strategy = self._candidate_root_ids(
             query=query,
@@ -231,11 +242,32 @@ class TypedRetrievalService:
             metadata_filters=metadata_filters,
         )
         objects: list[TypedMemoryObject] = []
+        search_text_overrides: dict[str, str] = {}
         materialized_roots = 0
+        snapshot_only_roots = 0
         skipped_roots = 0
         for root_id in root_ids:
+            snapshot = self._root_snapshot(root_id)
+            if snapshot is not None and int(snapshot['lineage_event_count'] or 0) > _MAX_LINEAGE_EVENTS:
+                snapshot_obj = self._snapshot_object(snapshot)
+                if snapshot_obj is not None:
+                    snapshot_only_roots += 1
+                    objects.append(snapshot_obj)
+                    search_text = str(snapshot['search_text'] or '').strip()
+                    if search_text:
+                        search_text_overrides[snapshot_obj.object_id] = search_text
+                    continue
+
             rows = self._events_for_root_limited(root_id=root_id, max_events=_MAX_LINEAGE_EVENTS)
             if rows is None:
+                snapshot_obj = self._snapshot_object(snapshot)
+                if snapshot_obj is not None:
+                    snapshot_only_roots += 1
+                    objects.append(snapshot_obj)
+                    search_text = str(snapshot['search_text'] or '').strip()
+                    if search_text:
+                        search_text_overrides[snapshot_obj.object_id] = search_text
+                    continue
                 skipped_roots += 1
                 continue
             materialized_roots += 1
@@ -244,12 +276,13 @@ class TypedRetrievalService:
         limits = {
             'candidate_roots': len(root_ids),
             'materialized_roots': materialized_roots,
+            'snapshot_only_roots_over_event_cap': snapshot_only_roots,
             'skipped_roots_over_event_cap': skipped_roots,
             'root_selection_strategy': root_selection_strategy,
             'max_candidate_roots': _MAX_CANDIDATE_ROOTS,
             'max_lineage_events': _MAX_LINEAGE_EVENTS,
         }
-        return sorted(objects, key=_object_sort_key), limits
+        return sorted(objects, key=_object_sort_key), limits, search_text_overrides
 
     def _candidate_root_ids(
         self,
@@ -260,7 +293,7 @@ class TypedRetrievalService:
         metadata_filters: dict[str, Any],
     ) -> tuple[list[str], str]:
         assert self.ledger is not None
-        base_filters = ['payload_json IS NOT NULL', 'COALESCE(root_id, object_id) IS NOT NULL']
+        base_filters = ['current_payload_json IS NOT NULL']
         base_params: list[Any] = []
 
         if object_types:
@@ -271,51 +304,44 @@ class TypedRetrievalService:
         source_lane_values = _coerce_sql_filter_values(metadata_filters.get('source_lane'))
         if source_lane_values:
             placeholders = ', '.join('?' for _ in source_lane_values)
-            base_filters.append(f"json_extract(payload_json, '$.source_lane') IN ({placeholders})")
+            base_filters.append(f'source_lane IN ({placeholders})')
             base_params.extend(source_lane_values)
 
+        query = str(query or '').strip()
         tokens = [
             token
             for token in _tokenize(query)
             if len(token) >= _MIN_QUERY_ROOT_TOKEN_LENGTH
         ][:_MAX_QUERY_ROOT_TOKENS]
         if tokens:
-            token_clause = ' OR '.join('instr(lower(payload_json), ?) > 0' for _ in tokens)
+            token_clause = ' OR '.join('instr(search_text, ?) > 0' for _ in tokens)
             where_clause = ' AND '.join([*base_filters, f'({token_clause})'])
             rows = self.ledger.conn.execute(
                 f"""
                 SELECT root_id
-                  FROM (
-                        SELECT COALESCE(root_id, object_id) AS root_id,
-                               MAX(recorded_at) AS latest_recorded_at
-                          FROM change_events
-                         WHERE {where_clause}
-                         GROUP BY COALESCE(root_id, object_id)
-                         ORDER BY latest_recorded_at DESC
-                         LIMIT ?
-                       )
-                 ORDER BY latest_recorded_at DESC
+                  FROM typed_roots
+                 WHERE {where_clause}
+                 ORDER BY latest_recorded_at DESC, root_id
+                 LIMIT ?
                 """,
                 [*base_params, *tokens, max_roots],
             ).fetchall()
             matched_roots = [str(row['root_id']) for row in rows if row['root_id']]
             if matched_roots:
                 return matched_roots, 'query_tokens'
+            return [], 'query_tokens_no_match'
+
+        if query:
+            return [], 'query_too_weak'
 
         where_clause = ' AND '.join(base_filters)
         rows = self.ledger.conn.execute(
             f"""
             SELECT root_id
-              FROM (
-                    SELECT COALESCE(root_id, object_id) AS root_id,
-                           MAX(recorded_at) AS latest_recorded_at
-                      FROM change_events
-                     WHERE {where_clause}
-                     GROUP BY COALESCE(root_id, object_id)
-                     ORDER BY latest_recorded_at DESC
-                     LIMIT ?
-                   )
-             ORDER BY latest_recorded_at DESC
+              FROM typed_roots
+             WHERE {where_clause}
+             ORDER BY latest_recorded_at DESC, root_id
+             LIMIT ?
             """,
             [*base_params, max_roots],
         ).fetchall()
@@ -338,6 +364,24 @@ class TypedRetrievalService:
         if len(rows) > max_events:
             return None
         return rows
+
+    def _root_snapshot(self, root_id: str) -> sqlite3.Row | None:
+        assert self.ledger is not None
+        snapshot_getter = getattr(self.ledger, 'typed_root_snapshot', None)
+        if callable(snapshot_getter):
+            return snapshot_getter(root_id)
+        return self.ledger.conn.execute(
+            'SELECT * FROM typed_roots WHERE root_id = ?',
+            (root_id,),
+        ).fetchone()
+
+    def _snapshot_object(self, snapshot: sqlite3.Row | None) -> TypedMemoryObject | None:
+        if snapshot is None:
+            return None
+        payload_json = snapshot['current_payload_json']
+        if not payload_json:
+            return None
+        return coerce_typed_object(json.loads(str(payload_json)))
 
     def _select_objects(
         self,
@@ -584,7 +628,12 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
-def _rank_objects(objects: list[TypedMemoryObject], query: str) -> list[ScoredObject]:
+def _rank_objects(
+    objects: list[TypedMemoryObject],
+    query: str,
+    *,
+    search_text_overrides: dict[str, str] | None = None,
+) -> list[ScoredObject]:
     query = str(query or '').strip()
     if not objects:
         return []
@@ -594,18 +643,21 @@ def _rank_objects(objects: list[TypedMemoryObject], query: str) -> list[ScoredOb
     query_lc = query.lower()
     query_tokens = set(_tokenize(query))
 
+    search_text_overrides = search_text_overrides or {}
+
     scored: list[ScoredObject] = []
     for obj in objects:
-        haystack = _searchable_text(obj)
+        haystack = search_text_overrides.get(obj.object_id) or _searchable_text(obj)
         haystack_lc = haystack.lower()
         haystack_tokens = set(_tokenize(haystack))
         overlap = len(query_tokens & haystack_tokens)
         substring_bonus = 3.0 if query_lc in haystack_lc else 0.0
+        lexical_score = float(overlap) + substring_bonus
+        if lexical_score <= 0:
+            continue
         current_bonus = 0.5 if obj.is_current else 0.0
         version_bonus = min(float(obj.version) * 0.05, 0.5)
-        score = float(overlap) + substring_bonus + current_bonus + version_bonus
-        if score <= 0:
-            continue
+        score = lexical_score + current_bonus + version_bonus
         scored.append(ScoredObject(obj=obj, score=score))
 
     scored.sort(key=lambda item: (-item.score, *_object_sort_key(item.obj)))

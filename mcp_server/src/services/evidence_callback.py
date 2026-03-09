@@ -89,6 +89,27 @@ class QMDEvidenceCallback:
             return normalized[: self.max_query_chars]
         return normalized
 
+    async def _read_stdout_capped(
+        self,
+        reader: asyncio.StreamReader | None,
+        *,
+        max_bytes: int,
+        chunk_size: int = 65536,
+    ) -> bytes | None:
+        if reader is None:
+            return b''
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await reader.read(chunk_size)
+            if not chunk:
+                return b''.join(chunks)
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            chunks.append(chunk)
+
     async def _run_qmd(self, query: str) -> dict[str, Any] | None:
         if not query:
             return None
@@ -105,27 +126,37 @@ class QMDEvidenceCallback:
                 '--',
                 query,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
         except (FileNotFoundError, OSError):
             return None
 
         try:
-            stdout, _stderr = await asyncio.wait_for(
-                process.communicate(),
+            stdout = await asyncio.wait_for(
+                self._read_stdout_capped(process.stdout, max_bytes=self.max_stdout_bytes),
                 timeout=float(self.timeout_seconds),
             )
         except asyncio.TimeoutError:
             process.kill()
-            await process.communicate()
+            await process.wait()
             return None
 
-        if process.returncode != 0:
+        if stdout is None:
+            process.kill()
+            await process.wait()
+            return None
+
+        try:
+            returncode = await asyncio.wait_for(process.wait(), timeout=float(self.timeout_seconds))
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return None
+
+        if returncode != 0:
             return None
 
         if not stdout:
-            return None
-        if len(stdout) > self.max_stdout_bytes:
             return None
 
         try:

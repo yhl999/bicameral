@@ -1,6 +1,7 @@
 import asyncio
 
 from mcp_server.src.models.typed_memory import EvidenceRef
+from mcp_server.src.services import evidence_callback as evidence_callback_module
 from mcp_server.src.services.evidence_callback import EvidenceCallbackRegistry, QMDEvidenceCallback
 
 
@@ -34,6 +35,30 @@ class _ExplodingCallback:
 
     async def resolve(self, ref):
         raise RuntimeError('boom')
+
+
+class _FakeProcess:
+    def __init__(self, stdout_chunks, *, returncode=0):
+        self._stdout_chunks = list(stdout_chunks)
+        self.stdout = None
+        self.returncode = None
+        self._returncode = returncode
+        self.killed = False
+
+    def bind_stdout(self):
+        self.stdout = asyncio.StreamReader()
+        for chunk in self._stdout_chunks:
+            self.stdout.feed_data(chunk)
+        self.stdout.feed_eof()
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        if self.returncode is None:
+            self.returncode = self._returncode
+        return self.returncode
 
 
 def _run(coro):
@@ -108,3 +133,28 @@ def test_qmd_query_text_and_stdout_are_bounded():
 
     assert len(query_text) == 16
     assert _run(callback._run_qmd('x')) is None
+
+
+def test_qmd_run_kills_process_when_stdout_exceeds_cap(monkeypatch):
+    callback = QMDEvidenceCallback(
+        command='fakeqmd query --json',
+        max_stdout_bytes=10,
+    )
+    process = _FakeProcess([b'12345', b'67890', b'X'])
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        assert kwargs['stderr'] == asyncio.subprocess.DEVNULL
+        process.bind_stdout()
+        return process
+
+    monkeypatch.setattr(evidence_callback_module.shutil, 'which', lambda _: '/usr/bin/fakeqmd')
+    monkeypatch.setattr(
+        evidence_callback_module.asyncio,
+        'create_subprocess_exec',
+        _fake_create_subprocess_exec,
+    )
+
+    result = _run(callback._run_qmd('overflow me'))
+
+    assert result is None
+    assert process.killed is True

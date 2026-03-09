@@ -1,7 +1,10 @@
 import asyncio
+import json
+import sqlite3
 from types import SimpleNamespace
 
 from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
+from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.typed_retrieval import ScoredObject, TypedRetrievalService
 
 
@@ -56,6 +59,20 @@ def _state_fact(*, object_id: str, root_id: str, version: int, value: str, is_cu
     )
 
 
+def _memory_ledger() -> ChangeLedger:
+    return ChangeLedger(sqlite3.connect(':memory:'))
+
+
+def _seed_assert(ledger: ChangeLedger, obj: StateFact, *, recorded_at: str = '2026-03-09T05:00:00Z') -> None:
+    ledger.append_event(
+        'assert',
+        actor_id='tester',
+        reason='seed',
+        recorded_at=recorded_at,
+        payload=obj.model_dump(mode='json'),
+    )
+
+
 def test_history_mode_keeps_best_root_score_for_multi_version_lineage():
     service = TypedRetrievalService(ledger=_FakeLedger())
     current = _state_fact(object_id='obj_current', root_id='root_a', version=2, value='espresso', is_current=True)
@@ -88,11 +105,13 @@ def test_search_caps_typed_limits_and_reports_applied_limits():
         {
             'candidate_roots': 1,
             'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
             'skipped_roots_over_event_cap': 0,
             'root_selection_strategy': 'test',
             'max_candidate_roots': 250,
             'max_lineage_events': 256,
         },
+        {},
     )
 
     response = _run(
@@ -116,7 +135,7 @@ def test_search_caps_typed_limits_and_reports_applied_limits():
     assert registry.calls[0]['max_items'] == 200
 
 
-def test_candidate_root_prefilter_uses_object_type_and_source_lane_scope():
+def test_candidate_root_prefilter_uses_root_index_and_scope_filters():
     executed = {}
 
     class _Conn:
@@ -135,7 +154,71 @@ def test_candidate_root_prefilter_uses_object_type_and_source_lane_scope():
     )
 
     assert root_ids == []
-    assert strategy == 'recent_roots'
+    assert strategy == 'query_tokens_no_match'
+    assert 'FROM typed_roots' in executed['sql']
+    assert 'change_events' not in executed['sql']
     assert 'object_type IN (?)' in executed['sql']
-    assert "json_extract(payload_json, '$.source_lane') IN (?, ?)" in executed['sql']
+    assert 'source_lane IN (?, ?)' in executed['sql']
     assert executed['params'][:3] == ['state_fact', 'lane_a', 'lane_b']
+
+
+def test_search_does_not_return_recent_unrelated_objects_for_nonmatching_query():
+    ledger = _memory_ledger()
+    _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='espresso'))
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(service.search(query='dragonfruit', object_types=['state']))
+
+    assert response['counts']['state'] == 0
+    assert response['message'] == 'No relevant typed memory found'
+    assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_tokens_no_match'
+
+
+def test_search_weak_query_fails_closed_instead_of_falling_back_to_recent_roots():
+    ledger = _memory_ledger()
+    _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='espresso'))
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(service.search(query='zz', object_types=['state']))
+
+    assert response['counts']['state'] == 0
+    assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_too_weak'
+
+
+def test_lineage_over_cap_uses_root_snapshot_instead_of_disappearing():
+    ledger = _memory_ledger()
+    obj = _state_fact(object_id='obj_1', root_id='root_1', version=42, value='espresso')
+    payload_json = json.dumps(obj.model_dump(mode='json'), ensure_ascii=False, sort_keys=True)
+    lineage_search_text = '\n'.join([payload_json.lower(), 'historical preference coffee'])
+    ledger.conn.execute(
+        """
+        INSERT INTO typed_roots(
+            root_id, latest_recorded_at, object_type, source_lane,
+            current_object_id, current_version, current_payload_json,
+            search_text, lineage_event_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            'root_1',
+            '2026-03-09T05:00:00Z',
+            'state_fact',
+            's1_sessions_main',
+            'obj_1',
+            42,
+            payload_json,
+            lineage_search_text,
+            999,
+        ),
+    )
+    ledger.conn.commit()
+
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+    service._candidate_root_ids = lambda **kwargs: (['root_1'], 'test_snapshot')
+    service._events_for_root_limited = lambda **kwargs: (_ for _ in ()).throw(AssertionError('should not read lineage'))
+
+    response = _run(service.search(query='coffee', object_types=['state']))
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'obj_1'
+    assert response['limits_applied']['materialization']['snapshot_only_roots_over_event_cap'] == 1
+    assert response['limits_applied']['materialization']['skipped_roots_over_event_cap'] == 0
