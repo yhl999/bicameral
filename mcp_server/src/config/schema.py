@@ -147,10 +147,14 @@ class LLMConfig(BaseModel):
     """LLM configuration."""
 
     provider: str = Field(default='openai', description='LLM provider')
-    model: str = Field(default='gpt-4o-mini', description='Model name')
+    model: str = Field(default='gpt-5.1-codex-mini', description='Model name')
     temperature: float | None = Field(
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )
+    reasoning_effort: str = Field(
+        default='medium', description='Reasoning effort for reasoning models (e.g. low|medium|high)'
+    )
+    verbosity: str = Field(default='low', description='Verbosity for reasoning-capable models')
     max_tokens: int = Field(default=4096, description='Max tokens')
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 

@@ -137,8 +137,8 @@ class LLMClientFactory:
                     return OpenAIClient(
                         config=llm_config,
                         max_tokens=config.max_tokens,
-                        reasoning='minimal',
-                        verbosity='low',
+                        reasoning=config.reasoning_effort,
+                        verbosity=config.verbosity,
                     )
                 else:
                     # For non-reasoning models, explicitly pass None to disable these parameters
