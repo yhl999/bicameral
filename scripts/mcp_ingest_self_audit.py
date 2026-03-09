@@ -25,7 +25,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = REPO_ROOT.parents[1]
 DEFAULT_INPUT_PATH = WORKSPACE_ROOT / 'memory' / 'self-audit.jsonl'
-DEFAULT_ONTOLOGY_PATH = WORKSPACE_ROOT / 'projects' / 'bicameral-private' / 'config' / 'procedure_extraction_ontology.yaml'
+DEFAULT_ONTOLOGY_PATH = REPO_ROOT / 'config' / 'procedure_extraction_ontology.yaml'
 
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -81,7 +81,9 @@ DEFAULT_ONTOLOGY: dict[str, Any] = {
 
 
 def load_ontology(path: Path | None = None) -> dict[str, Any]:
-    if path is None or not path.exists():
+    if path is None:
+        return dict(DEFAULT_ONTOLOGY)
+    if not path.exists():
         return dict(DEFAULT_ONTOLOGY)
 
     loaded = yaml.safe_load(path.read_text()) or {}
@@ -90,6 +92,16 @@ def load_ontology(path: Path | None = None) -> dict[str, Any]:
     merged = dict(DEFAULT_ONTOLOGY)
     merged.update(loaded)
     return merged
+
+
+
+def load_default_ontology(path: Path = DEFAULT_ONTOLOGY_PATH) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Default ontology path missing: {path}. '
+            'Ship config/procedure_extraction_ontology.yaml in this repo or pass --ontology explicitly.'
+        )
+    return load_ontology(path)
 
 
 
@@ -336,12 +348,38 @@ def sanitize_untrusted_audit_text(text: str | None) -> str | None:
 
 
 
+_JWT_RE = re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b')
+_OP_REF_RE = re.compile(r'\bop://[^\s,;"\')]+')
+_EMAIL_RE = re.compile(r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', re.IGNORECASE)
+_PHONE_RE = re.compile(r'(?<!\w)(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]\d{4}(?!\w)')
+_SECRET_LABEL_RE = re.compile(
+    r'\b('
+    r'api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|authorization|bearer|cookie|session(?:_id)?|credential'
+    r')\b(\s*[:=]\s*)([^\s,;"\']+)',
+    re.IGNORECASE,
+)
+_SECRET_LABEL_BLOB_RE = re.compile(
+    r'\b('
+    r'api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|authorization|bearer|cookie|session(?:_id)?|credential'
+    r')\b(\s+)('
+    r'[A-Fa-f0-9]{32,}|[A-Za-z0-9+/]{32,}={0,2}|[A-Za-z0-9_-]{24,}'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+
 def redact_sensitive(text: str | None) -> str | None:
     if text is None:
         return None
     redacted = str(text)
     redacted = re.sub(r'\bsk-[A-Za-z0-9_-]{20,}\b', '<REDACTED:OPENAI_KEY>', redacted)
-    redacted = re.sub(r'\b(api[_-]?key|token|secret|password)\b(\s*[:=]\s*)([^\s,;"\']+)', r'\1\2<REDACTED>', redacted, flags=re.IGNORECASE)
+    redacted = _JWT_RE.sub('<REDACTED:JWT>', redacted)
+    redacted = _OP_REF_RE.sub('<REDACTED:OP_REF>', redacted)
+    redacted = _EMAIL_RE.sub('<REDACTED:EMAIL>', redacted)
+    redacted = _PHONE_RE.sub('<REDACTED:PHONE>', redacted)
+    redacted = _SECRET_LABEL_RE.sub(r'\1\2<REDACTED>', redacted)
+    redacted = _SECRET_LABEL_BLOB_RE.sub(r'\1\2<REDACTED>', redacted)
     return redacted
 
 
@@ -467,7 +505,9 @@ def main() -> int:
     args = ap.parse_args()
 
     entries = load_entries_jsonl(Path(args.input))
-    emissions = build_emissions(entries, ontology=load_ontology(Path(args.ontology)))
+    ontology_path = Path(args.ontology).expanduser()
+    ontology = load_default_ontology() if ontology_path.resolve() == DEFAULT_ONTOLOGY_PATH.resolve() else load_ontology(ontology_path)
+    emissions = build_emissions(entries, ontology=ontology)
 
     if args.dry_run or not args.ledger_db:
         print(json.dumps(

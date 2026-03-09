@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = ROOT.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -17,7 +16,14 @@ from mcp_server.src.models.typed_memory import Episode, EvidenceRef, StateFact
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.procedure_evolution import ProcedureEvolutionService
 from mcp_server.src.services.procedure_service import ProcedureService
-from scripts.mcp_ingest_self_audit import SelfAuditEntry, build_emissions, ingest_emissions, load_ontology
+from scripts.mcp_ingest_self_audit import (
+    DEFAULT_ONTOLOGY_PATH,
+    SelfAuditEntry,
+    build_emissions,
+    ingest_emissions,
+    load_default_ontology,
+    load_ontology,
+)
 
 
 @pytest.fixture()
@@ -274,7 +280,7 @@ def test_feedback_rejects_synthetic_episode_and_mismatched_evidence(service: Pro
 
 
 def test_self_audit_emissions_create_episode_state_fact_and_procedure_candidate(ledger: ChangeLedger):
-    ontology = load_ontology(WORKSPACE_ROOT / 'projects' / 'bicameral-private' / 'config' / 'procedure_extraction_ontology.yaml')
+    ontology = load_default_ontology()
     entries = [
         SelfAuditEntry(
             ts='2026-03-08T23:10:00Z',
@@ -313,7 +319,7 @@ def test_self_audit_emissions_create_episode_state_fact_and_procedure_candidate(
 
 
 def test_self_audit_ingest_is_idempotent_and_redacts_state_fact_values(ledger: ChangeLedger):
-    ontology = load_ontology(WORKSPACE_ROOT / 'projects' / 'bicameral-private' / 'config' / 'procedure_extraction_ontology.yaml')
+    ontology = load_default_ontology()
     entries = [
         SelfAuditEntry(
             ts='2026-03-08T23:10:00Z',
@@ -357,6 +363,55 @@ def test_self_audit_ingest_is_idempotent_and_redacts_state_fact_values(ledger: C
         tracked_ids,
     ).fetchone()['count']
     assert row_count == len(tracked_ids)
+
+
+def test_self_audit_redaction_covers_jwt_op_refs_contact_data_and_secret_blobs():
+    ontology = load_default_ontology()
+    jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEyMyIsImVtYWlsIjoiYXJjaGllQGV4YW1wbGUuY29tIn0.signaturepayload123456'
+    op_ref = 'op://Archibald-Clawdbot/graphiti-api/credential'
+    email = 'archibald@example.com'
+    phone = '+1 (212) 555-0199'
+    hex_secret = '0123456789abcdef0123456789abcdef01234567'
+    base64_secret = 'QWxhZGRpbjpvcGVuLXNlc2FtZS10b2tlbi1ibG9iLXRoaXMtZmVl'  # long enough to look secret-ish
+    entries = [
+        SelfAuditEntry(
+            ts='2026-03-08T23:10:00Z',
+            src='memory/self-audit.jsonl',
+            key='security.secret-sprawl',
+            mode='nightly',
+            kind='security_miss',
+            miss=f'JWT leaked: {jwt}. 1Password ref {op_ref}. Contact {email} / {phone}.',
+            fix=f'Rotate token {jwt}; move secret={hex_secret}; replace credential {base64_secret}; update op ref {op_ref}; notify {email}.',
+        )
+    ]
+
+    emissions = build_emissions(entries, ontology=ontology)
+    payload = json.dumps(
+        {
+            'episode': emissions[0].episode.model_dump(mode='json'),
+            'facts': [fact.model_dump(mode='json') for fact in emissions[0].state_facts],
+            'procedures': emissions[0].procedure_candidates,
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+    for raw in (jwt, op_ref, email, phone, hex_secret, base64_secret):
+        assert raw not in payload
+    for placeholder in ('<REDACTED:JWT>', '<REDACTED:OP_REF>', '<REDACTED:EMAIL>', '<REDACTED:PHONE>', '<REDACTED>'):
+        assert placeholder in payload
+
+
+def test_default_ontology_path_is_repo_local_and_fail_sane_when_missing(tmp_path: Path):
+    assert DEFAULT_ONTOLOGY_PATH == ROOT / 'config' / 'procedure_extraction_ontology.yaml'
+    assert DEFAULT_ONTOLOGY_PATH.exists()
+    ontology = load_default_ontology()
+    assert ontology['source_lane'] == 'learning_self_audit'
+    assert ontology['policy_scope'] == 'private'
+
+    missing_default = tmp_path / 'config' / 'procedure_extraction_ontology.yaml'
+    with pytest.raises(FileNotFoundError, match='Default ontology path missing'):
+        load_default_ontology(missing_default)
 
 
 def test_emission_transaction_rollback_on_failure(ledger: ChangeLedger):
