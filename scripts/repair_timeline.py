@@ -355,7 +355,10 @@ async def repair_timeline(backend, host, port, group_id):
                 'Inspect the listed episode UUIDs and rerun only after the desired links can be created safely.'
             )
 
-        stale_edges = [edge for edge in existing_after_link if _edge_key(edge) not in desired_keys]
+        # Only prune edges that existed before this repair pass started.
+        # This avoids deleting concurrently-created NEXT_EPISODE edges that may
+        # be valid but were not part of the snapshot used to build `pairs`.
+        stale_edges = [edge for edge in existing_before if _edge_key(edge) not in desired_keys]
         if stale_edges:
             logger.info('Deleting %d stale NEXT_EPISODE edge(s) after staged validation...', len(stale_edges))
             await _delete_stale_timeline_edges(client, backend, group_id, stale_edges)

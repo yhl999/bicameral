@@ -567,6 +567,42 @@ def test_repair_timeline_stages_new_edges_before_pruning_stale_ones() -> None:
     assert 'DELETE r' not in fake_client.query_calls[1][0]
 
 
+def test_repair_timeline_refuses_pruning_edges_that_appeared_after_snapshot() -> None:
+    fake_client = FakeClient(
+        query_results=[
+            [
+                ['ep-1', '2026-03-09T09:00:00Z', '2026-03-09T09:00:00Z', 'session chunk: s:c0 (scope=private)', []],
+                ['ep-2', '2026-03-09T09:05:00Z', '2026-03-09T09:05:00Z', 'session chunk: s:c1 (scope=private)', []],
+            ],
+            [],
+            [],
+            [
+                ['ep-1', 'ep-2', 'timeline:ep-1->ep-2'],
+                ['ep-2', 'ep-3', 'concurrent-edge'],
+            ],
+            [
+                ['ep-1', 'ep-2', 'timeline:ep-1->ep-2'],
+                ['ep-2', 'ep-3', 'concurrent-edge'],
+            ],
+        ]
+    )
+
+    async def fake_get_graph_client(*args, **kwargs):
+        return fake_client
+
+    original = repair_timeline.get_graph_client
+    repair_timeline.get_graph_client = fake_get_graph_client
+    try:
+        with pytest.raises(RuntimeError, match='unexpected_edges'):
+            asyncio.run(repair_timeline.repair_timeline('neo4j', 'localhost', 7687, 's1_sessions_main'))
+    finally:
+        repair_timeline.get_graph_client = original
+
+    assert len(fake_client.query_calls) == 5
+    assert all('DELETE r' not in query for query, _ in fake_client.query_calls)
+
+
+
 def test_repair_timeline_refuses_ambiguous_groups_before_delete() -> None:
     fake_client = FakeClient(
         query_results=[
