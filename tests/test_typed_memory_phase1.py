@@ -1,3 +1,4 @@
+# ruff: noqa: E402, I001
 from __future__ import annotations
 
 import sqlite3
@@ -12,7 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mcp_server.src.models.typed_memory import EvidenceRef, EntityRegistryEntry, Procedure, StateFact
+from mcp_server.src.models.typed_memory import (
+    EntityRegistryEntry,
+    EvidenceRef,
+    Procedure,
+    StateFact,
+)
 from mcp_server.src.services.change_ledger import ChangeLedger
 from truth import candidates as candidates_store
 
@@ -304,15 +310,17 @@ def test_promote_candidate_fact_is_atomic():
             raise RuntimeError('simulated disk failure on second insert')
         return original_do_insert(ledger, row)
 
-    with patch.object(ChangeLedger, '_do_insert', side_effect=flaky_second_insert):
-        with pytest.raises(RuntimeError, match='simulated disk failure'):
-            ledger.promote_candidate_fact(
-                actor_id='test:actor',
-                reason='atomicity test',
-                policy_version='v3',
-                candidate_id='cand-atomic-test',
-                fact=fact_payload,
-            )
+    with (
+        patch.object(ChangeLedger, '_do_insert', side_effect=flaky_second_insert),
+        pytest.raises(RuntimeError, match='simulated disk failure'),
+    ):
+        ledger.promote_candidate_fact(
+            actor_id='test:actor',
+            reason='atomicity test',
+            policy_version='v3',
+            candidate_id='cand-atomic-test',
+            fact=fact_payload,
+        )
 
     count = ledger.conn.execute('SELECT count(*) FROM change_events').fetchone()[0]
     assert count == 0, (
@@ -504,7 +512,7 @@ def test_stale_conflict_id_does_not_yield_two_current_facts():
     assert ledger.current_state_facts()[0].value == 'two'
 
     # Promote v3 with STALE conflict_with_fact_id pointing at v1 (not v2)
-    r3 = ledger.promote_candidate_fact(
+    ledger.promote_candidate_fact(
         actor_id='test:actor', reason='v3 with stale conflict id', policy_version='v3',
         candidate_id='cand-stale-v3', fact=_fact('cand-stale-v3', 'three', 'ev-stale-3'),
         conflict_with_fact_id=r1.object_id,   # stale: v1 is not current

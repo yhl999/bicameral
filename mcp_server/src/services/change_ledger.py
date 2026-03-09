@@ -712,7 +712,7 @@ def _normalize_event_type(event_type: str) -> str:
 
 
 def _stable_object_id(seed: str) -> str:
-    digest = hashlib.sha256(f'object|{seed}'.encode('utf-8')).hexdigest()
+    digest = hashlib.sha256(f'object|{seed}'.encode()).hexdigest()
     return f'obj_{digest[:24]}'
 
 

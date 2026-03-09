@@ -1,3 +1,4 @@
+# ruff: noqa: E402, I001
 from __future__ import annotations
 
 import sqlite3
@@ -70,7 +71,7 @@ def test_auto_supersede_candidate_reuses_lineage_and_replaces_current_fact():
     conn = _candidate_db()
     ledger = _ledger()
 
-    first = candidates.upsert_candidate(conn, ledger=ledger, **_candidate_kwargs(predicate='pref.os', value={'value': 'macos'}))
+    candidates.upsert_candidate(conn, ledger=ledger, **_candidate_kwargs(predicate='pref.os', value={'value': 'macos'}))
     first_fact = ledger.current_state_facts()[0]
 
     second = candidates.upsert_candidate(
@@ -505,7 +506,7 @@ def test_change_ledger_connect_enables_wal_and_foreign_keys(tmp_path):
 def _simulate_promote_ledger_write_only(
     conn: sqlite3.Connection,
     candidate_id: str,
-    ledger: 'ChangeLedger',
+    ledger: ChangeLedger,
 ) -> str:
     """Simulate the partial failure: ledger write succeeds, candidates.db update does not.
 
@@ -513,7 +514,12 @@ def _simulate_promote_ledger_write_only(
     does NOT touch candidates.db afterwards.  Returns the promote event_id that
     landed in the ledger.
     """
-    from truth.candidates import _candidate_fact_payload, POLICY_VERSION_DEFAULT, _normalize_reason, _now_iso
+    from truth.candidates import (
+        POLICY_VERSION_DEFAULT,
+        _candidate_fact_payload,
+        _normalize_reason,
+        _now_iso,
+    )
 
     row = conn.execute(
         'SELECT * FROM candidates WHERE candidate_id = ?', (candidate_id,)

@@ -8,7 +8,6 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, Field, model_validator
 
-
 EvidenceKind = Literal[
     'qmd_chunk',
     'message',
@@ -66,7 +65,7 @@ class EvidenceRef(BaseModel):
     hash: str | None = None
 
     @model_validator(mode='after')
-    def ensure_canonical_uri(self) -> 'EvidenceRef':
+    def ensure_canonical_uri(self) -> EvidenceRef:
         self.canonical_uri = self.canonical_uri or self.build_canonical_uri(self.kind, self.locator)
         return self
 
@@ -142,7 +141,7 @@ class EvidenceRef(BaseModel):
         raise ValueError(f'Unsupported evidence kind: {kind}')
 
     @classmethod
-    def from_legacy_ref(cls, ref: dict[str, Any]) -> 'EvidenceRef':
+    def from_legacy_ref(cls, ref: dict[str, Any]) -> EvidenceRef:
         source_key = str(ref.get('source_key') or ref.get('scope') or ref.get('source_family') or 'legacy').strip()
         system = source_key.split(':', 1)[0].strip().lower() if source_key else 'legacy'
         evidence_id = str(
@@ -204,7 +203,7 @@ class TypedMemoryObjectBase(BaseModel):
     lifecycle_status: LifecycleStatus = 'asserted'
 
     @model_validator(mode='after')
-    def validate_contract(self) -> 'TypedMemoryObjectBase':
+    def validate_contract(self) -> TypedMemoryObjectBase:
         if not self.evidence_refs:
             raise ValueError('typed memory objects require at least one evidence_ref')
         if self.version < 1:

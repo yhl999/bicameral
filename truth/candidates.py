@@ -1353,24 +1353,25 @@ def promote_candidate(
         safe_reason = _normalize_reason(reason, fallback=decision)
 
         ledger_event_id = row["ledger_event_id"]
-        if not ledger_event_id:
-            # ── Cross-store retry reconciliation ──────────────────────────────
-            # Scenario: a prior attempt wrote the promote event to the ledger DB
-            # but the subsequent candidates.db UPDATE/commit failed.  On retry the
-            # DB row still has ledger_event_id=NULL.  Without this check we would
-            # write a duplicate promote (and the paired assert/supersede) event into
-            # the ledger, splitting the two stores permanently.
-            #
-            # Preferred approach (Phase-0 spec): reconcile from already-written
-            # ledger state before appending new events.  The promote event carries
-            # candidate_id so we can find it without any shared-transaction magic.
-            if hasattr(ledger, "promotion_event_for_candidate"):
-                existing_promote = ledger.promotion_event_for_candidate(candidate_id)
-                if existing_promote is not None:
-                    # Ledger write already landed; recover the event_id and skip
-                    # the write entirely.  The candidates.db UPDATE below will then
-                    # persist the recovered event_id and flip status to 'approved'.
-                    ledger_event_id = existing_promote.event_id
+        # ── Cross-store retry reconciliation ──────────────────────────────
+        # Scenario: a prior attempt wrote the promote event to the ledger DB
+        # but the subsequent candidates.db UPDATE/commit failed.  On retry the
+        # DB row still has ledger_event_id=NULL.  Without this check we would
+        # write a duplicate promote (and the paired assert/supersede) event into
+        # the ledger, splitting the two stores permanently.
+        #
+        # Preferred approach (Phase-0 spec): reconcile from already-written
+        # ledger state before appending new events.  The promote event carries
+        # candidate_id so we can find it without any shared-transaction magic.
+        if (
+            not ledger_event_id
+            and hasattr(ledger, "promotion_event_for_candidate")
+            and (existing_promote := ledger.promotion_event_for_candidate(candidate_id)) is not None
+        ):
+            # Ledger write already landed; recover the event_id and skip
+            # the write entirely.  The candidates.db UPDATE below will then
+            # persist the recovered event_id and flip status to 'approved'.
+            ledger_event_id = existing_promote.event_id
 
         if not ledger_event_id:
             fact_payload = _candidate_fact_payload(row)
