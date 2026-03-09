@@ -92,16 +92,18 @@ class ProcedureEvolutionService:
 
         for row in rows:
             metadata = _coerce_json(row['metadata_json'])
+            trusted_feedback = bool(metadata.get('trusted_feedback')) if isinstance(metadata, dict) else False
             if row['event_type'] == 'procedure_failure':
                 failure_count += 1
                 continue
 
             evidence_refs = metadata.get('evidence_refs') if isinstance(metadata, dict) else None
-            if isinstance(evidence_refs, list) and evidence_refs:
+            if trusted_feedback and isinstance(evidence_refs, list) and evidence_refs:
                 evidence_linked_successes += 1
 
-            for episode_id in _episode_ids_from_metadata(metadata):
-                distinct_episode_ids.add(episode_id)
+            if trusted_feedback:
+                for episode_id in _episode_ids_from_metadata(metadata):
+                    distinct_episode_ids.add(episode_id)
 
         return ProcedureFeedbackStats(
             evidence_linked_successes=evidence_linked_successes,

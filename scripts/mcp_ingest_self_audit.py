@@ -174,8 +174,8 @@ def build_emissions(
                         'value': {
                             'kind': entry.kind,
                             'mode': entry.mode,
-                            'miss': sanitize_untrusted_audit_text(entry.miss),
-                            'fix': sanitize_untrusted_audit_text(entry.fix),
+                            'miss': redact_sensitive(sanitize_untrusted_audit_text(entry.miss)),
+                            'fix': redact_sensitive(sanitize_untrusted_audit_text(entry.fix)),
                             'source_ref': f'self-audit://{entry_id}',
                         },
                         'scope': onto['policy_scope'],
@@ -202,7 +202,7 @@ def build_emissions(
                         'value': {
                             'kind': entry.kind,
                             'mode': entry.mode,
-                            'instruction': sanitize_untrusted_audit_text(entry.fix),
+                            'instruction': redact_sensitive(sanitize_untrusted_audit_text(entry.fix)),
                             'source_ref': f'self-audit://{entry_id}',
                         },
                         'scope': onto['policy_scope'],
@@ -237,52 +237,92 @@ def ingest_emissions(
     *,
     actor_id: str = 'self_audit:ingest',
 ) -> dict[str, int]:
+    """Ingest self-audit emissions into the ledger.
+
+    Idempotency: each object is checked for existence before writing.
+    Atomicity: each emission is ingested under BEGIN IMMEDIATE so a rerun can
+    safely fill gaps without racing another writer into duplicate creation.
+    """
     service = ProcedureService(ledger)
     counts = {'episodes': 0, 'state_facts': 0, 'procedure_candidates': 0}
 
     for emission in emissions:
-        ledger.append_event(
-            'assert',
-            actor_id=actor_id,
-            reason='self_audit_episode',
-            payload=emission.episode,
-            recorded_at=emission.entry.ts,
-        )
-        counts['episodes'] += 1
+        try:
+            ledger.conn.execute('BEGIN IMMEDIATE')
+            wrote_anything = False
 
-        for fact in emission.state_facts:
-            ledger.append_event(
-                'derive',
-                actor_id=actor_id,
-                reason='self_audit_state_fact',
-                payload=fact,
-                recorded_at=emission.entry.ts,
-            )
-            counts['state_facts'] += 1
+            if not _object_exists(ledger, emission.episode.object_id):
+                ledger.append_event(
+                    'assert',
+                    actor_id=actor_id,
+                    reason='self_audit_episode',
+                    payload=emission.episode,
+                    recorded_at=emission.entry.ts,
+                    _autocommit=False,
+                )
+                counts['episodes'] += 1
+                wrote_anything = True
 
-        for candidate in emission.procedure_candidates:
-            service.create_procedure(
-                actor_id=actor_id,
-                name=str(candidate['name']),
-                trigger=str(candidate['trigger']),
-                preconditions=list(candidate.get('preconditions') or []),
-                steps=list(candidate['steps']),
-                expected_outcome=str(candidate['expected_outcome']),
-                evidence_refs=list(candidate['evidence_refs']),
-                risk_level=str(candidate['risk_level']),
-                policy_scope=str(candidate['policy_scope']),
-                visibility_scope=str(candidate['visibility_scope']),
-                source_lane=str(candidate['source_lane']),
-                source_episode_id=str(candidate['source_episode_id']),
-                source_key=str(candidate['source_key']),
-                reason='self_audit_procedure_candidate',
-                recorded_at=emission.entry.ts,
-                derive=True,
-                promote=False,
-            )
-            counts['procedure_candidates'] += 1
+            for fact in emission.state_facts:
+                if not _object_exists(ledger, fact.object_id):
+                    ledger.append_event(
+                        'derive',
+                        actor_id=actor_id,
+                        reason='self_audit_state_fact',
+                        payload=fact,
+                        recorded_at=emission.entry.ts,
+                        _autocommit=False,
+                    )
+                    counts['state_facts'] += 1
+                    wrote_anything = True
+
+            for candidate in emission.procedure_candidates:
+                proc_id = str(candidate.get('object_id') or f'proc_sa_{candidate["entry_id"][:24]}')
+                root_id = str(candidate.get('root_id') or proc_id)
+                if not _object_exists(ledger, proc_id):
+                    service.create_procedure(
+                        actor_id=actor_id,
+                        name=str(candidate['name']),
+                        trigger=str(candidate['trigger']),
+                        preconditions=list(candidate.get('preconditions') or []),
+                        steps=list(candidate['steps']),
+                        expected_outcome=str(candidate['expected_outcome']),
+                        evidence_refs=list(candidate['evidence_refs']),
+                        risk_level=str(candidate['risk_level']),
+                        policy_scope=str(candidate['policy_scope']),
+                        visibility_scope=str(candidate['visibility_scope']),
+                        source_lane=str(candidate['source_lane']),
+                        source_episode_id=str(candidate['source_episode_id']),
+                        source_key=str(candidate['source_key']),
+                        reason='self_audit_procedure_candidate',
+                        recorded_at=emission.entry.ts,
+                        derive=True,
+                        promote=False,
+                        object_id=proc_id,
+                        root_id=root_id,
+                        _autocommit=False,
+                    )
+                    counts['procedure_candidates'] += 1
+                    wrote_anything = True
+
+            if wrote_anything:
+                ledger.conn.commit()
+            else:
+                ledger.conn.rollback()
+        except Exception:
+            ledger.conn.rollback()
+            raise
 
     return counts
+
+
+def _object_exists(ledger: ChangeLedger, object_id: str) -> bool:
+    """Check if a creation event already exists for the given object_id."""
+    row = ledger.conn.execute(
+        "SELECT 1 FROM change_events WHERE object_id = ? AND event_type IN ('assert', 'derive') LIMIT 1",
+        (object_id,),
+    ).fetchone()
+    return row is not None
 
 
 
@@ -368,6 +408,8 @@ def _procedure_candidate_for_entry(
         'source_key': ontology['source_key'],
         'evidence_refs': evidence_refs,
         'entry_id': entry_id,
+        'object_id': f'proc_sa_{entry_id[:24]}',
+        'root_id': f'proc_sa_{entry_id[:24]}',
     }
 
 

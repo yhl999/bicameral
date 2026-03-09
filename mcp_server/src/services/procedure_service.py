@@ -5,7 +5,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Any
 
-from mcp_server.src.models.typed_memory import EvidenceRef, Procedure
+from mcp_server.src.models.typed_memory import Episode, EvidenceRef, Procedure
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.procedure_evolution import ProcedureEvolutionService
 
@@ -51,15 +51,20 @@ class ProcedureService:
         recorded_at: str | None = None,
         derive: bool = False,
         promote: bool = False,
+        object_id: str | None = None,
+        root_id: str | None = None,
+        _autocommit: bool = True,
     ) -> Procedure:
         normalized_steps = [step.strip() for step in steps if isinstance(step, str) and step.strip()]
         if not normalized_steps:
             raise ValueError('steps must contain at least one non-empty step')
 
+        procedure_object_id = str(object_id or '').strip() or _new_procedure_id()
+        procedure_root_id = str(root_id or '').strip() or procedure_object_id
         procedure = Procedure.model_validate(
             {
-                'object_id': _new_procedure_id(),
-                'root_id': _new_procedure_id(),
+                'object_id': procedure_object_id,
+                'root_id': procedure_root_id,
                 'name': name.strip(),
                 'trigger': trigger.strip(),
                 'preconditions': [item.strip() for item in (preconditions or []) if isinstance(item, str) and item.strip()],
@@ -75,7 +80,7 @@ class ProcedureService:
                 'source_key': source_key,
             }
         )
-        procedure = procedure.model_copy(update={'root_id': procedure.object_id})
+        procedure = procedure.model_copy(update={'root_id': procedure.root_id or procedure.object_id})
 
         self.ledger.append_event(
             'derive' if derive else 'assert',
@@ -83,6 +88,7 @@ class ProcedureService:
             reason=reason,
             payload=procedure,
             recorded_at=recorded_at,
+            _autocommit=_autocommit,
         )
         if promote:
             self.ledger.append_event(
@@ -92,6 +98,7 @@ class ProcedureService:
                 object_id=procedure.object_id,
                 root_id=procedure.root_id,
                 recorded_at=recorded_at,
+                _autocommit=_autocommit,
             )
         return self.evolution.resolve_current(procedure.root_id)
 
@@ -135,15 +142,16 @@ class ProcedureService:
         if normalized_outcome not in {'success', 'failure'}:
             raise ValueError("outcome must be 'success' or 'failure'")
 
-        metadata: dict[str, Any] = {}
-        if episode_id:
-            metadata['episode_id'] = episode_id
-        if evidence_refs:
-            metadata['evidence_refs'] = [
-                ref.model_dump(mode='json') if isinstance(ref, EvidenceRef) else dict(ref)
-                for ref in evidence_refs
-                if ref
-            ]
+        trusted_episode_id, trusted_evidence_refs = self._trusted_feedback_provenance(
+            episode_id=episode_id,
+            evidence_refs=evidence_refs,
+        )
+        trusted_feedback = bool(trusted_episode_id and trusted_evidence_refs)
+
+        metadata: dict[str, Any] = {'trusted_feedback': trusted_feedback}
+        if trusted_feedback:
+            metadata['episode_id'] = trusted_episode_id
+            metadata['evidence_refs'] = [ref.model_dump(mode='json') for ref in trusted_evidence_refs]
         if notes:
             metadata['notes'] = notes.strip()
 
@@ -158,9 +166,9 @@ class ProcedureService:
 
         auto_promoted = False
         evolved = None
-        if normalized_outcome == 'success' and auto_promote:
+        if normalized_outcome == 'success' and auto_promote and trusted_feedback:
             auto_promoted = self.evolution.maybe_auto_promote(procedure.object_id)
-        elif normalized_outcome == 'failure':
+        elif normalized_outcome == 'failure' and trusted_feedback:
             evolved = self.evolution.evolve_from_feedback(
                 procedure.object_id,
                 actor_id=actor_id,
@@ -170,8 +178,8 @@ class ProcedureService:
                 revised_steps=revised_steps,
                 revised_expected_outcome=revised_expected_outcome,
                 promote=promote_evolved_version,
-                evidence_refs=evidence_refs,
-                source_episode_id=episode_id,
+                evidence_refs=trusted_evidence_refs,
+                source_episode_id=trusted_episode_id,
             )
 
         current = self.evolution.resolve_current(procedure.root_id)
@@ -181,6 +189,33 @@ class ProcedureService:
             evolved_from=procedure.object_id if evolved is not None else None,
             evolved_to=evolved.object_id if evolved is not None else None,
         )
+
+    def _trusted_feedback_provenance(
+        self,
+        *,
+        episode_id: str | None,
+        evidence_refs: list[EvidenceRef | dict[str, Any]] | None,
+    ) -> tuple[str | None, list[EvidenceRef]]:
+        normalized_episode_id = str(episode_id or '').strip() or None
+        parsed_refs = _coerce_feedback_evidence_refs(evidence_refs or [])
+
+        if not normalized_episode_id and not parsed_refs:
+            return None, []
+        if not normalized_episode_id:
+            raise ValueError('feedback evidence_refs require a valid episode_id')
+
+        candidate = self.ledger.materialize_object(normalized_episode_id)
+        if not isinstance(candidate, Episode):
+            raise ValueError(f'feedback episode_id not found: {normalized_episode_id}')
+
+        if not parsed_refs:
+            return candidate.object_id, []
+
+        episode_evidence_uris = {ref.canonical_uri for ref in candidate.evidence_refs}
+        trusted_refs = [ref for ref in parsed_refs if ref.canonical_uri in episode_evidence_uris]
+        if len(trusted_refs) != len(parsed_refs):
+            raise ValueError('feedback evidence_refs must belong to the referenced episode')
+        return candidate.object_id, trusted_refs
 
     def list_current_procedures(self, *, include_proposed: bool = False) -> list[Procedure]:
         rows = self.ledger.conn.execute(
@@ -238,7 +273,6 @@ class ProcedureService:
         return matches[: max(1, limit)]
 
 
-
 def _coerce_evidence_refs(raw_refs: list[EvidenceRef | dict[str, Any]]) -> list[EvidenceRef]:
     refs = [item if isinstance(item, EvidenceRef) else EvidenceRef.from_legacy_ref(item) for item in raw_refs or [] if item]
     if not refs:
@@ -247,15 +281,24 @@ def _coerce_evidence_refs(raw_refs: list[EvidenceRef | dict[str, Any]]) -> list[
     return [deduped[key] for key in sorted(deduped)]
 
 
+def _coerce_feedback_evidence_refs(raw_refs: list[EvidenceRef | dict[str, Any]]) -> list[EvidenceRef]:
+    if not raw_refs:
+        return []
+    deduped: dict[str, EvidenceRef] = {}
+    for item in raw_refs:
+        if not item:
+            continue
+        ref = item if isinstance(item, EvidenceRef) else EvidenceRef.from_legacy_ref(item)
+        deduped[ref.canonical_uri] = ref
+    return [deduped[key] for key in sorted(deduped)]
+
 
 def _new_procedure_id() -> str:
     return f'proc_{secrets.token_hex(12)}'
 
 
-
 def _tokenize(text: str) -> set[str]:
     return {token for token in re.findall(r'[a-z0-9]+', str(text or '').lower()) if len(token) >= 2}
-
 
 
 def _score_procedure(procedure: Procedure, query: str, query_terms: set[str]) -> tuple[float, list[str]]:
