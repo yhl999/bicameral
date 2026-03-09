@@ -44,7 +44,7 @@ _RESERVED_NODE_KEYS = {
     _CONFLICT_KEYS_KEY,
 }
 _IMMUTABLE_MERGE_KEYS = {'name'}
-_HOMONYM_PROOF_KEYS = (
+_STRONG_HOMONYM_PROOF_KEYS = (
     'canonical_id',
     'external_id',
     'source_id',
@@ -53,6 +53,9 @@ _HOMONYM_PROOF_KEYS = (
     'employee_id',
     'email',
     'emails',
+    'wikidata_id',
+)
+_WEAK_HOMONYM_PROOF_KEYS = (
     'phone',
     'website',
     'url',
@@ -61,8 +64,8 @@ _HOMONYM_PROOF_KEYS = (
     'twitter_handle',
     'github_username',
     'crunchbase_url',
-    'wikidata_id',
 )
+_HOMONYM_PROOF_KEYS = (*_STRONG_HOMONYM_PROOF_KEYS, *_WEAK_HOMONYM_PROOF_KEYS)
 
 
 def _created_at_sort_key(value) -> str:
@@ -479,12 +482,16 @@ def _bucket_identity_shape(records: list[dict[str, Any]], group_id: str) -> dict
     }
 
 
-def _collect_candidate_proof_values(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _collect_candidate_proof_values(
+    records: list[dict[str, Any]],
+    proof_keys: Iterable[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    keys = tuple(proof_keys or _HOMONYM_PROOF_KEYS)
     observed: dict[str, dict[str, Any]] = {}
     for record in records:
         props = dict(record.get('properties') or {})
         uuid = str(record.get('uuid') or '').strip()
-        for key in _HOMONYM_PROOF_KEYS:
+        for key in keys:
             value = props.get(key)
             if _normalize_proof_value(value) is None:
                 continue
@@ -492,9 +499,13 @@ def _collect_candidate_proof_values(records: list[dict[str, Any]]) -> dict[str, 
     return observed
 
 
-def _shared_homonym_proofs(records: list[dict[str, Any]]) -> dict[str, Any]:
+def _shared_homonym_proofs(
+    records: list[dict[str, Any]],
+    proof_keys: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    keys = tuple(proof_keys or _HOMONYM_PROOF_KEYS)
     proofs: dict[str, Any] = {}
-    for key in _HOMONYM_PROOF_KEYS:
+    for key in keys:
         normalized_values: list[str] = []
         representative_value: Any = None
         for record in records:
@@ -512,22 +523,99 @@ def _shared_homonym_proofs(records: list[dict[str, Any]]) -> dict[str, Any]:
     return proofs
 
 
-def _require_homonym_merge_proof(records: list[dict[str, Any]], group_id: str, bucket_name: str) -> None:
+def _bucket_proof_policy(records: list[dict[str, Any]], group_id: str) -> dict[str, Any]:
+    typed_labels: set[str] = set()
+    has_generic_nodes = False
+    for record in records:
+        normalized_labels = _normalize_typed_labels(record.get('labels'), group_id)
+        if normalized_labels:
+            typed_labels.update(normalized_labels)
+        else:
+            has_generic_nodes = True
+
+    has_person_labels = 'Person' in typed_labels
+    mode = 'strict_person_or_homonym'
+    if typed_labels and not has_generic_nodes and not has_person_labels:
+        mode = 'strict_typed_non_person'
+
+    return {
+        'mode': mode,
+        'allowed_keys': _STRONG_HOMONYM_PROOF_KEYS,
+        'blocked_weak_keys': _WEAK_HOMONYM_PROOF_KEYS,
+        'typed_labels': sorted(typed_labels),
+        'has_generic_nodes': has_generic_nodes,
+        'has_person_labels': has_person_labels,
+    }
+
+
+def _render_proof_value(value: Any) -> str:
+    rendered = _canonical_json(value)
+    if len(rendered) <= 120:
+        return rendered
+    return rendered[:117] + '...'
+
+
+def _format_authorizing_proof(proof: dict[str, Any] | None) -> str:
+    if not proof:
+        return ' proof=<none>'
+    return (
+        f" proof={proof.get('proof_key')}={_render_proof_value(proof.get('proof_value'))}"
+        f" policy={proof.get('policy_mode')}"
+    )
+
+
+def _suggest_homonym_inspect_query() -> str:
+    return (
+        'MATCH (n:Entity) WHERE n.group_id = $group_id AND n.uuid IN $uuids '
+        'RETURN n.uuid, labels(n) AS labels, n.name AS name, n.canonical_id AS canonical_id, '
+        'n.external_id AS external_id, n.email AS email, n.emails AS emails, '
+        'n.phone AS phone, n.domain AS domain, n.website AS website, n.url AS url '
+        'ORDER BY n.created_at ASC, n.uuid ASC'
+    )
+
+
+def _require_homonym_merge_proof(
+    records: list[dict[str, Any]],
+    group_id: str,
+    bucket_name: str,
+) -> dict[str, Any]:
     if len(records) < 2:
-        return
+        return {}
 
-    proofs = _shared_homonym_proofs(records)
-    if proofs:
-        return
+    policy = _bucket_proof_policy(records, group_id)
+    shared_authorizing_proofs = _shared_homonym_proofs(records, policy['allowed_keys'])
+    if shared_authorizing_proofs:
+        for key in policy['allowed_keys']:
+            if key in shared_authorizing_proofs:
+                return {
+                    'proof_key': key,
+                    'proof_value': shared_authorizing_proofs[key],
+                    'all_shared_proofs': shared_authorizing_proofs,
+                    'policy_mode': policy['mode'],
+                }
 
+    weak_shared_proofs = _shared_homonym_proofs(records, policy['blocked_weak_keys'])
     candidate_values = _collect_candidate_proof_values(records)
+    bucket_uuids = [str(record.get('uuid') or '').strip() for record in records]
+    inspect_params = {'group_id': group_id, 'uuids': bucket_uuids}
+    proof_fields_seen = {
+        str(record.get('uuid') or '').strip(): _proof_fields_present(record)
+        for record in records
+    }
+
     raise ValueError(
         'Refusing to merge same-name entities without shared identity proof. '
         f'name={bucket_name!r} group_id={group_id!r} '
+        f'bucket_uuids={bucket_uuids!r} '
         f'bucket_shape={_bucket_identity_shape(records, group_id)!r} '
+        f'proof_policy={policy!r} '
         f'nodes={_bucket_node_debug(records, group_id)!r} '
+        f'proof_fields_seen_by_uuid={proof_fields_seen!r} '
         f'candidate_proofs={candidate_values!r}. '
-        'Inspect the listed UUIDs, raw labels, and proof fields. Only merge manually after confirming a shared canonical_id/external_id/email/domain/profile URL across every node in the bucket.'
+        f'blocked_shared_weak_proofs={weak_shared_proofs!r}. '
+        f'suggested_inspect_query={_suggest_homonym_inspect_query()!r} '
+        f'suggested_inspect_params={inspect_params!r}. '
+        'Inspect this bucket manually before any override.'
     )
 
 
@@ -579,7 +667,11 @@ async def _prepare_bucket_merge(client, group_id: str, bucket: dict) -> dict[str
         group_id,
     )
     merge_records = await _load_merge_records(client, group_id, merged_uuids)
-    _require_homonym_merge_proof(merge_records, group_id, bucket_name=str(bucket.get('name') or ''))
+    merge_proof = _require_homonym_merge_proof(
+        merge_records,
+        group_id,
+        bucket_name=str(bucket.get('name') or ''),
+    )
     merged_payload = build_merged_entity_payload(merge_records, winner_uuid=winner_uuid, group_id=group_id)
 
     return {
@@ -589,6 +681,7 @@ async def _prepare_bucket_merge(client, group_id: str, bucket: dict) -> dict[str
         'merged_uuids': merged_uuids,
         'merged_labels': merged_labels,
         'merged_payload': merged_payload,
+        'merge_proof': merge_proof,
     }
 
 
@@ -602,6 +695,14 @@ async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> in
     merged_uuids = merge_plan['merged_uuids']
     merged_labels = merge_plan['merged_labels']
     merged_payload = merge_plan['merged_payload']
+    merge_proof = merge_plan.get('merge_proof') or {}
+
+    logger.info(
+        '  [proof] Authorized %r winner_uuid=%r%s',
+        bucket.get('name'),
+        winner_uuid,
+        _format_authorizing_proof(merge_proof),
+    )
 
     params = {
         'winner_uuid': winner_uuid,
@@ -795,6 +896,7 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
 
         if dry_run:
             mergeable_buckets = 0
+            refused_buckets = 0
             for bucket in buckets:
                 nodes = bucket['nodes']
                 typed_labels = sorted(
@@ -806,9 +908,10 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
                 )
                 label_suffix = f' labels={typed_labels}' if typed_labels else ''
                 try:
-                    await _prepare_bucket_merge(client, group_id, bucket)
+                    merge_plan = await _prepare_bucket_merge(client, group_id, bucket)
                 except ValueError as exc:
-                    logger.warning(
+                    refused_buckets += 1
+                    logger.error(
                         '  [dry-run] Refusing %r (%d node(s))%s: %s',
                         bucket['name'],
                         len(nodes),
@@ -819,12 +922,17 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
 
                 mergeable_buckets += 1
                 logger.info(
-                    '  [dry-run] Would merge %d copies of %r (keep oldest)%s',
+                    '  [dry-run] Would merge %d copies of %r (keep oldest)%s%s',
                     len(nodes),
                     bucket['name'],
                     label_suffix,
+                    _format_authorizing_proof(merge_plan.get('merge_proof')),
                 )
-            logger.info('Dry run complete. %d merge bucket(s) are mergeable.', mergeable_buckets)
+            logger.info(
+                'Dry run complete. %d merge bucket(s) are mergeable; %d bucket(s) were refused.',
+                mergeable_buckets,
+                refused_buckets,
+            )
             return
 
         total_merged = 0

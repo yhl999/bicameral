@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -489,6 +490,10 @@ def test_merge_bucket_refuses_same_name_same_type_without_proof() -> None:
     assert 'loser' in message
     assert 'labels' in message
     assert 'proof_fields_present' in message
+    assert 'bucket_uuids' in message
+    assert 'proof_policy' in message
+    assert 'suggested_inspect_query' in message
+    assert 'suggested_inspect_params' in message
 
 
 
@@ -528,6 +533,8 @@ def test_prepare_bucket_merge_refuses_generic_only_same_name_without_proof() -> 
     assert 'candidate_proofs={}' in message
     assert 'generic-older' in message
     assert 'generic-newer' in message
+    assert 'suggested_inspect_query' in message
+    assert 'suggested_inspect_params' in message
 
 
 
@@ -567,6 +574,45 @@ def test_prepare_bucket_merge_refuses_generic_plus_typed_without_shared_proof() 
     assert 'Person' in message
     assert 'external_id' in message
     assert 'proof_fields_present' in message
+    assert 'proof_fields_seen_by_uuid' in message
+
+
+def test_prepare_bucket_merge_refuses_shared_weak_domain_proof_for_person_merge() -> None:
+    fake_client = FakeClient(
+        query_results=[
+            [
+                _make_merge_row(
+                    'person-older',
+                    ['Entity', 'Person'],
+                    name='Alex Kim',
+                    created_at='2026-03-09T09:00:00Z',
+                    domain='example.com',
+                ),
+                _make_merge_row(
+                    'person-newer',
+                    ['Entity', 'Person'],
+                    name='Alex Kim',
+                    created_at='2026-03-09T09:05:00Z',
+                    domain='example.com',
+                ),
+            ]
+        ]
+    )
+    bucket = {
+        'name': 'Alex Kim',
+        'nodes': [
+            {'uuid': 'person-older', 'created_at': '2026-03-09T09:00:00Z', 'labels': ['Entity', 'Person']},
+            {'uuid': 'person-newer', 'created_at': '2026-03-09T09:05:00Z', 'labels': ['Entity', 'Person']},
+        ],
+    }
+
+    with pytest.raises(ValueError, match='same-name entities without shared identity proof') as exc:
+        asyncio.run(dedupe_nodes._prepare_bucket_merge(fake_client, 's1_sessions_main', bucket))
+
+    message = str(exc.value)
+    assert 'blocked_shared_weak_proofs' in message
+    assert 'domain' in message
+    assert 'example.com' in message
 
 
 
@@ -605,6 +651,9 @@ def test_prepare_bucket_merge_allows_generic_only_with_shared_external_id() -> N
     assert merge_plan['winner_uuid'] == 'generic-older'
     assert merge_plan['loser_uuids'] == ['generic-newer']
     assert merge_plan['merged_labels'] == []
+    assert merge_plan['merge_proof']['proof_key'] == 'external_id'
+    assert merge_plan['merge_proof']['proof_value'] == 'crm:alex-kim'
+    assert merge_plan['merge_proof']['policy_mode'].startswith('strict_')
 
 
 
@@ -643,6 +692,76 @@ def test_prepare_bucket_merge_allows_generic_plus_typed_with_shared_external_id(
     assert merge_plan['winner_uuid'] == 'generic-older'
     assert merge_plan['loser_uuids'] == ['typed-newer']
     assert merge_plan['merged_labels'] == ['Person']
+    assert merge_plan['merge_proof']['proof_key'] == 'external_id'
+    assert merge_plan['merge_proof']['proof_value'] == 'crm:alex-kim'
+    assert merge_plan['merge_proof']['policy_mode'].startswith('strict_')
+
+
+def test_dedupe_nodes_dry_run_reports_authorizing_proof_key_and_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_client = FakeClient(
+        query_results=[
+            [
+                [
+                    'Alex Kim',
+                    [
+                        {
+                            'uuid': 'generic-older',
+                            'created_at': '2026-03-09T09:00:00Z',
+                            'labels': ['Entity'],
+                        },
+                        {
+                            'uuid': 'typed-newer',
+                            'created_at': '2026-03-09T09:05:00Z',
+                            'labels': ['Entity', 'Person'],
+                        },
+                    ],
+                ]
+            ],
+            [
+                _make_merge_row(
+                    'generic-older',
+                    ['Entity'],
+                    name='Alex Kim',
+                    created_at='2026-03-09T09:00:00Z',
+                    external_id='crm:alex-kim',
+                ),
+                _make_merge_row(
+                    'typed-newer',
+                    ['Entity', 'Person'],
+                    name='Alex Kim',
+                    created_at='2026-03-09T09:05:00Z',
+                    external_id='crm:alex-kim',
+                ),
+            ],
+        ]
+    )
+
+    async def fake_get_graph_client(*args, **kwargs):
+        return fake_client
+
+    original = dedupe_nodes.get_graph_client
+    dedupe_nodes.get_graph_client = fake_get_graph_client
+    try:
+        with caplog.at_level(logging.INFO):
+            asyncio.run(
+                dedupe_nodes.dedupe_nodes(
+                    'neo4j',
+                    host='localhost',
+                    port=7687,
+                    group_id='s1_sessions_main',
+                    dry_run=True,
+                )
+            )
+    finally:
+        dedupe_nodes.get_graph_client = original
+
+    logs = '\n'.join(caplog.messages)
+    assert 'Would merge 2 copies of' in logs
+    assert 'proof=external_id=' in logs
+    assert 'crm:alex-kim' in logs
+    assert 'Dry run complete. 1 merge bucket(s) are mergeable; 0 bucket(s) were refused.' in logs
 
 
 
