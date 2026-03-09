@@ -45,7 +45,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ingest.common import sanitize_for_graphiti
-from ingest.registry import get_registry
+from ingest.registry import IngestRegistry, get_registry
+from mcp_server.src.services.typed_replay_bridge import (
+    TypedReplayBridge,
+    build_bridge_metadata,
+    build_session_chunk_episode,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -57,6 +62,11 @@ DEFAULT_OVERLAP_CHUNKS = 10  # for incremental mode
 # this limit are deterministically split into sub-chunks with :p0/:p1/... suffixes.
 # This avoids LLM context_length_exceeded errors without lossy truncation.
 DEFAULT_SUBCHUNK_SIZE = 10_000
+_TYPED_TRUTH_MODE_DEFAULT = 'off'
+_CHANGE_LEDGER_DB_DEFAULT = os.environ.get(
+    'CHANGE_LEDGER_DB',
+    str(Path(__file__).resolve().parents[1] / 'state' / 'change_ledger.db'),
+)
 
 # Group IDs that get automatic sub-chunking when evidence exceeds subchunk_size.
 _SUBCHUNK_GROUP_IDS = {'s1_sessions_main'}
@@ -926,6 +936,24 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Check integrity of claim-state DB and report status',
     )
+    ap.add_argument(
+        '--typed-truth-mode',
+        choices=['off', 'sidecar', 'only'],
+        default=_TYPED_TRUTH_MODE_DEFAULT,
+        help=(
+            'Typed truth bridge mode for evidence replay: '
+            'off (default), sidecar (append Episode asserts to ChangeLedger and also queue Graphiti), '
+            'or only (write only to ChangeLedger; skip add_memory).'
+        ),
+    )
+    ap.add_argument(
+        '--change-ledger-db',
+        default=_CHANGE_LEDGER_DB_DEFAULT,
+        help=(
+            'Path to the typed ChangeLedger SQLite DB '
+            f'(default: {_CHANGE_LEDGER_DB_DEFAULT})'
+        ),
+    )
 
     return ap
 
@@ -982,6 +1010,9 @@ def main():
 
     if args.subchunk_size <= 0:
         ap.error('--subchunk-size must be a positive integer')
+
+    if args.typed_truth_mode != 'off' and args.source_mode != 'evidence':
+        ap.error('--typed-truth-mode currently supports only --source-mode evidence')
 
     # Part B: OM path guard — warn when targeting the OM namespace
     _check_om_path_guard(args)
@@ -1449,6 +1480,128 @@ def _run_neo4j_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> No
         print(f'Errors: {errors}')
 
 
+def _typed_episode_title(ev: dict[str, Any], chunk_source_key: str) -> str | None:
+    source = ev.get('source') if isinstance(ev.get('source'), dict) else {}
+    session_id = str(source.get('session_id') or '').strip()
+    topic_id = str(source.get('topic_id') or '').strip()
+    agent_id = str(source.get('agent_id') or '').strip()
+    if session_id and topic_id:
+        return f'session:{agent_id or "main"}:{session_id}:topic-{topic_id}'
+    if session_id:
+        return f'session:{agent_id or "main"}:{session_id}'
+    return chunk_source_key or None
+
+
+
+def _typed_source_message_id(ev: dict[str, Any]) -> str | None:
+    start_id = str(ev.get('start_id') or '').strip()
+    if start_id:
+        return start_id
+    message_ids = ev.get('message_ids') or []
+    if isinstance(message_ids, list) and message_ids:
+        first = str(message_ids[0] or '').strip()
+        return first or None
+    return None
+
+
+def _open_existing_change_ledger(db_path: str) -> sqlite3.Connection | None:
+    ledger_path = Path(db_path)
+    if not ledger_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(ledger_path))
+        has_change_events = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='change_events'"
+        ).fetchone()
+        if has_change_events is None:
+            conn.close()
+            return None
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _change_ledger_has_episode(conn: sqlite3.Connection, object_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM change_events
+         WHERE object_id = ?
+           AND event_type IN ('assert', 'supersede', 'refine', 'derive')
+         LIMIT 1
+        """,
+        (object_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _write_typed_episode_bridge(
+    *,
+    bridge: TypedReplayBridge,
+    args: argparse.Namespace,
+    ev: dict[str, Any],
+    chunk_source_key: str,
+    parent_chunk_key: str,
+    sub_key: str,
+    sub_content: str,
+    content_hash: str,
+    episode_uuid: str,
+    evidence_id: str,
+) -> bool:
+    ts_range = ev.get('timestamp_range') if isinstance(ev.get('timestamp_range'), dict) else {}
+    started_at = str(ts_range.get('start') or '').strip() or None
+    ended_at = str(ts_range.get('end') or '').strip() or None
+    message_ids = ev.get('message_ids') if isinstance(ev.get('message_ids'), list) else []
+    is_subchunk = sub_key != parent_chunk_key
+    start_id = None if is_subchunk else str(ev.get('start_id') or '').strip() or None
+    end_id = None if is_subchunk else str(ev.get('end_id') or '').strip() or None
+    annotations = [
+        'bridge:typed_replay',
+        f'lane:{args.group_id}',
+        f'source_message_count:{len(message_ids)}',
+    ]
+    if is_subchunk:
+        annotations.extend(
+            [
+                'provenance:subchunk',
+                f'source_chunk:{parent_chunk_key}',
+            ]
+        )
+    episode = build_session_chunk_episode(
+        object_id=episode_uuid,
+        source_lane=args.group_id,
+        source_key=chunk_source_key,
+        source_episode_id=sub_key,
+        source_message_id=None if is_subchunk else _typed_source_message_id(ev),
+        scope=ev.get('scope'),
+        summary=sub_content,
+        started_at=started_at,
+        ended_at=ended_at,
+        chunk_key=sub_key,
+        evidence_id=evidence_id or None,
+        start_id=start_id,
+        end_id=end_id,
+        title=_typed_episode_title(ev, chunk_source_key),
+        annotations=annotations,
+    )
+    result = bridge.assert_episode_once(
+        episode,
+        metadata=build_bridge_metadata(
+            group_id=args.group_id,
+            source_key=chunk_source_key,
+            chunk_key=sub_key,
+            message_ids=message_ids,
+            evidence_id=evidence_id or None,
+            content_hash=content_hash,
+            scope=ev.get('scope'),
+            started_at=started_at,
+            ended_at=ended_at,
+        ),
+    )
+    return result.created
+
+
+
 def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) -> None:
     """Evidence source mode: the original JSON-file-based ingestion path.
 
@@ -1481,37 +1634,40 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
         )
     )
 
-    registry = get_registry()
+    registry = get_registry() if args.typed_truth_mode != 'only' else None
 
     # Registry source key for this *enqueue stream* (not per session).
     stream_source_key = f'sessions:{args.group_id}'
 
     # Incremental mode: filter to evidence beyond watermark minus overlap.
     if args.incremental:
-        state = registry.get_source_state(stream_source_key)
-        watermark = state.watermark if state else 0.0
-
-        overlap_ts = 0.0
-        if watermark > 0:
-            watermark_idx = next(
-                (i for i, e in enumerate(evidences) if get_evidence_timestamp(e) >= watermark),
-                len(evidences),
-            )
-            overlap_start = max(0, watermark_idx - args.overlap)
-            overlap_ts = (
-                get_evidence_timestamp(evidences[overlap_start])
-                if overlap_start < len(evidences)
-                else 0.0
-            )
-
-        if overlap_ts > 0:
-            original_count = len(evidences)
-            evidences = [e for e in evidences if get_evidence_timestamp(e) >= overlap_ts]
-            print(
-                f'📊 Incremental mode: {original_count} total → {len(evidences)} after watermark (overlap={args.overlap})'
-            )
+        if registry is None:
+            print('📊 Incremental mode with typed-truth-mode=only has no Graphiti watermark; processing selected evidence window as-is')
         else:
-            print(f'📊 Incremental mode: first run, processing all {len(evidences)} evidence')
+            state = registry.get_source_state(stream_source_key)
+            watermark = state.watermark if state else 0.0
+
+            overlap_ts = 0.0
+            if watermark > 0:
+                watermark_idx = next(
+                    (i for i, e in enumerate(evidences) if get_evidence_timestamp(e) >= watermark),
+                    len(evidences),
+                )
+                overlap_start = max(0, watermark_idx - args.overlap)
+                overlap_ts = (
+                    get_evidence_timestamp(evidences[overlap_start])
+                    if overlap_start < len(evidences)
+                    else 0.0
+                )
+
+            if overlap_ts > 0:
+                original_count = len(evidences)
+                evidences = [e for e in evidences if get_evidence_timestamp(e) >= overlap_ts]
+                print(
+                    f'📊 Incremental mode: {original_count} total → {len(evidences)} after watermark (overlap={args.overlap})'
+                )
+            else:
+                print(f'📊 Incremental mode: first run, processing all {len(evidences)} evidence')
 
     # Shard BEFORE offset/limit.
     if args.shards > 1:
@@ -1528,51 +1684,76 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
     subchunk_size = args.subchunk_size
 
     if args.dry_run:
+        existing_ledger_conn = (
+            _open_existing_change_ledger(args.change_ledger_db)
+            if args.typed_truth_mode != 'off' and not args.force
+            else None
+        )
         print(f'\n🔍 DRY RUN: Would process {len(batch)} evidence chunks')
         if do_subchunk:
             print(f'   Sub-chunking enabled (max {subchunk_size} chars per sub-chunk)')
         skipped = 0
         new = 0
         total_subchunks = 0
-        for ev in batch:
-            content = ev.get('content', '')
+        try:
+            for ev in batch:
+                content = ev.get('content', '')
 
-            chunk_key = ev.get('chunk_key') or ev.get('chunkKey')
-            source_key = ev.get('source_key')
-            chunk_idx = get_chunk_index(ev)
+                chunk_key = ev.get('chunk_key') or ev.get('chunkKey')
+                source_key = ev.get('source_key')
+                chunk_idx = get_chunk_index(ev)
 
-            if not (isinstance(chunk_key, str) and chunk_key):
-                base = source_key or stream_source_key
-                chunk_key = f'{base}:c{chunk_idx}'
+                if not (isinstance(chunk_key, str) and chunk_key):
+                    base = source_key or stream_source_key
+                    chunk_key = f'{base}:c{chunk_idx}'
 
-            chunk_source_key = source_key or (
-                chunk_key.split(':c', 1)[0] if ':c' in str(chunk_key) else stream_source_key
-            )
+                chunk_source_key = source_key or (
+                    chunk_key.split(':c', 1)[0] if ':c' in str(chunk_key) else stream_source_key
+                )
 
-            # Expand sub-chunks for counting
-            if do_subchunk:
-                sub_parts = subchunk_evidence(content, str(chunk_key), subchunk_size)
-            else:
-                sub_parts = [(str(chunk_key), strip_ingestion_noise(content))]
-
-            for sub_key, sub_content in sub_parts:
-                total_subchunks += 1
-                sub_hash = registry.compute_content_hash(sub_content)
-                if not args.force and registry.is_chunk_ingested(
-                    chunk_source_key, sub_key, sub_hash
-                ):
-                    skipped += 1
+                # Expand sub-chunks for counting
+                if do_subchunk:
+                    sub_parts = subchunk_evidence(content, str(chunk_key), subchunk_size)
                 else:
-                    new += 1
+                    sub_parts = [(str(chunk_key), strip_ingestion_noise(content))]
+
+                for sub_key, sub_content in sub_parts:
+                    total_subchunks += 1
+                    sub_hash = IngestRegistry.compute_content_hash(sub_content)
+                    if args.typed_truth_mode == 'only':
+                        chunk_uuid = IngestRegistry.compute_chunk_uuid(
+                            source_key=chunk_source_key,
+                            chunk_key=sub_key,
+                            content_hash=sub_hash,
+                        )
+                        episode_uuid = IngestRegistry.compute_episode_uuid(chunk_uuid)
+                        if (
+                            existing_ledger_conn is not None
+                            and _change_ledger_has_episode(existing_ledger_conn, episode_uuid)
+                        ):
+                            skipped += 1
+                        else:
+                            new += 1
+                    elif not args.force and registry is not None and registry.is_chunk_ingested(
+                        chunk_source_key, sub_key, sub_hash
+                    ):
+                        skipped += 1
+                    else:
+                        new += 1
+        finally:
+            if existing_ledger_conn is not None:
+                existing_ledger_conn.close()
         print(f'   Total episodes (after sub-chunking): {total_subchunks}')
         print(f'   New: {new}, Already ingested: {skipped}')
         return
 
-    client = MCPClient(args.mcp_url)
+    typed_bridge = TypedReplayBridge(args.change_ledger_db) if args.typed_truth_mode != 'off' else None
+    client = MCPClient(args.mcp_url) if args.typed_truth_mode != 'only' else None
 
     ok = 0
     skipped = 0
     errors = 0
+    typed_created = 0
     max_ts = 0.0
     subchunk_count = 0  # tracks how many sub-chunks were created from oversized evidence
 
@@ -1604,62 +1785,92 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             sub_parts = [(str(chunk_key), strip_ingestion_noise(content))]
 
         for sub_key, sub_content in sub_parts:
-            # Registry content hash (shortened) for dedup.
-            content_hash = registry.compute_content_hash(sub_content)
-            if not args.force and registry.is_chunk_ingested(
-                chunk_source_key, sub_key, content_hash
-            ):
-                skipped += 1
-                continue
+            content_hash = IngestRegistry.compute_content_hash(sub_content)
+            graphiti_already_ingested = (
+                args.typed_truth_mode != 'only'
+                and not args.force
+                and registry is not None
+                and registry.is_chunk_ingested(chunk_source_key, sub_key, content_hash)
+            )
 
             ep_name = f'{sub_key}:{evidence_id[:8] or content_hash[:8]}'
             src_desc = f'session chunk: {sub_key} (scope={scope or "unknown"})'
 
-            chunk_uuid = registry.compute_chunk_uuid(
+            chunk_uuid = IngestRegistry.compute_chunk_uuid(
                 source_key=chunk_source_key,
                 chunk_key=sub_key,
                 content_hash=content_hash,
             )
-            episode_uuid = registry.compute_episode_uuid(chunk_uuid)
+            episode_uuid = IngestRegistry.compute_episode_uuid(chunk_uuid)
 
-            body = sanitize_for_graphiti(sub_content)
-
-            res = client.call_tool(
-                'add_memory',
-                {
-                    'name': ep_name,
-                    'episode_body': body,
-                    'group_id': args.group_id,
-                    'source': 'text',
-                    'source_description': src_desc[:200],
-                    # NOTE: do NOT pass "uuid" — standalone MCP breaks with client-generated UUIDs
-                    # ("node X not found" error). Let the server generate its own.
-                },
-            )
-
-            if 'error' in res:
-                print(f'[{i}/{len(batch)}] ERROR enqueue {ep_name}: {res["error"]}')
-                errors += 1
+            typed_result_created = None
+            if typed_bridge is not None:
+                try:
+                    typed_result_created = _write_typed_episode_bridge(
+                        bridge=typed_bridge,
+                        args=args,
+                        ev=ev,
+                        chunk_source_key=chunk_source_key,
+                        parent_chunk_key=str(chunk_key),
+                        sub_key=sub_key,
+                        sub_content=sub_content,
+                        content_hash=content_hash,
+                        episode_uuid=episode_uuid,
+                        evidence_id=str(evidence_id),
+                    )
+                    if typed_result_created:
+                        typed_created += 1
+                    elif args.typed_truth_mode == 'only':
+                        skipped += 1
+                        continue
+                except Exception as exc:
+                    print(f'[{i}/{len(batch)}] ERROR typed bridge {ep_name}: {exc}')
+                    errors += 1
+                    continue
+            if graphiti_already_ingested:
+                skipped += 1
                 continue
+
+            if args.typed_truth_mode != 'only':
+                assert client is not None
+                body = sanitize_for_graphiti(sub_content)
+
+                res = client.call_tool(
+                    'add_memory',
+                    {
+                        'name': ep_name,
+                        'episode_body': body,
+                        'group_id': args.group_id,
+                        'source': 'text',
+                        'source_description': src_desc[:200],
+                        # NOTE: do NOT pass "uuid" — standalone MCP breaks with client-generated UUIDs
+                        # ("node X not found" error). Let the server generate its own.
+                    },
+                )
+
+                if 'error' in res:
+                    print(f'[{i}/{len(batch)}] ERROR enqueue {ep_name}: {res["error"]}')
+                    errors += 1
+                    continue
 
             ok += 1
 
-            registry.record_chunk(
-                chunk_uuid=chunk_uuid,
-                source_key=chunk_source_key,
-                chunk_key=sub_key,
-                content_hash=content_hash,
-                evidence_id=evidence_id or '(missing)',
-            )
-            registry.record_extraction_queued(
-                group_id=args.group_id,
-                episode_uuid=episode_uuid,
-                chunk_uuid=chunk_uuid,
-                source_key=chunk_source_key,
-                chunk_key=sub_key,
-            )
-
-            time.sleep(args.sleep)
+            if registry is not None:
+                registry.record_chunk(
+                    chunk_uuid=chunk_uuid,
+                    source_key=chunk_source_key,
+                    chunk_key=sub_key,
+                    content_hash=content_hash,
+                    evidence_id=evidence_id or '(missing)',
+                )
+                registry.record_extraction_queued(
+                    group_id=args.group_id,
+                    episode_uuid=episode_uuid,
+                    chunk_uuid=chunk_uuid,
+                    source_key=chunk_source_key,
+                    chunk_key=sub_key,
+                )
+                time.sleep(args.sleep)
 
         ts = get_evidence_timestamp(ev)
         if ts > max_ts:
@@ -1670,8 +1881,8 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
                 f'[{i}/{len(batch)}] queued {chunk_key} ({len(sub_parts)} part{"s" if len(sub_parts) > 1 else ""})'
             )
 
-    # Update watermark for this enqueue stream.
-    if ok > 0 and max_ts > 0:
+    # Update watermark for this enqueue stream only when Graphiti ingest bookkeeping is active.
+    if registry is not None and ok > 0 and max_ts > 0:
         registry.update_source_watermark(
             source_key=stream_source_key,
             source_type='session',
@@ -1683,9 +1894,13 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             overlap_window=args.overlap,
         )
 
+    action = 'Materialized' if args.typed_truth_mode == 'only' else 'Queued'
     print(
-        f'\nQueued: {ok} episodes into group_id={args.group_id} (from {len(batch)} evidence chunks)'
+        f'\n{action}: {ok} episodes into group_id={args.group_id} '
+        f'(from {len(batch)} evidence chunks; typed_mode={args.typed_truth_mode})'
     )
+    if typed_bridge is not None:
+        print(f'Typed ledger writes: {typed_created} new episode assert(s) at {args.change_ledger_db}')
     if subchunk_count:
         print(f'Sub-chunked: {subchunk_count} sub-chunks created from oversized evidence')
     if skipped:

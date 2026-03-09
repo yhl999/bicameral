@@ -61,6 +61,10 @@ CREATE INDEX IF NOT EXISTS idx_change_events_object_recorded_at
     ON change_events(object_id, recorded_at, event_id);
 CREATE INDEX IF NOT EXISTS idx_change_events_target_recorded_at
     ON change_events(target_object_id, recorded_at, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_change_events_create_object_id
+    ON change_events(object_id)
+    WHERE object_id IS NOT NULL
+      AND event_type IN ('assert', 'supersede', 'refine', 'derive');
 """
 
 
