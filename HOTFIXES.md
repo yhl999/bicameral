@@ -72,6 +72,17 @@ Because the velocity of upstream `getzep/graphiti` is high, we track explicit pa
 - Rationale: Private overlay-only changes cannot persist core extraction behavior because runtime rebuild hard-resets to public `origin/main` before reapplying overlay. This behavior must live in public core to survive deterministic rebuild and unblock 3C extraction quality gates.
 - Notes: Log output path can be overridden with `GRAPHITI_DROPPED_CANDIDATES_LOG`.
 
+### 6) Extraction Token-Cap Propagation
+- Purpose: Prevent live extraction from silently reverting to Graphiti Core's 16k default token budget during downstream edge extraction stages.
+- Files:
+  - `graphiti_core/utils/maintenance/edge_operations.py`
+- Behavior:
+  - `extract_edges()` no longer hardcodes `16384` as the edge-extraction budget.
+  - The edge extraction stage now clamps to the active LLM client's configured `max_tokens`, preserving runtime/provider caps during end-to-end ingest.
+- Rationale: Without this, OpenRouter-backed live extraction can fail with `402 Payment Required` even when runtime config sets a lower cap (for example `4096`), because the edge stage bypasses the configured limit and requests a larger response budget than the account can afford.
+- Validation: Disposable-group live canary passed after this fix (`add_memory` -> extraction -> `get_episodes` -> `search_memory_facts`).
+- Patch: `patches/graphiti_core/utils/maintenance/edge_operations.py.patch`
+
 ## How to Sync Upstream
 
 To safely absorb upstream updates while keeping these hotfixes:

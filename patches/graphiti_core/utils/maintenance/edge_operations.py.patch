@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/utils/maintenance/edge_operations.py b/graphiti_core/utils/maintenance/edge_operations.py
-index 18e384e..b9f4166 100644
+index 18e384e..270f2f8 100644
 --- a/graphiti_core/utils/maintenance/edge_operations.py
 +++ b/graphiti_core/utils/maintenance/edge_operations.py
 @@ -15,8 +15,11 @@ limitations under the License.
@@ -14,7 +14,7 @@ index 18e384e..b9f4166 100644
  
  from pydantic import BaseModel
  from typing_extensions import LiteralString
-@@ -46,6 +49,175 @@ from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exac
+@@ -46,6 +49,187 @@ from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exac
  
  logger = logging.getLogger(__name__)
  
@@ -32,6 +32,7 @@ index 18e384e..b9f4166 100644
 +    'IS_RELATED_TO',
 +    'IS_RELATED',
 +    'MENTIONS',
++    'DISCUSSED',
 +    'CONNECTED_TO',
 +    'ASSOCIATED_WITH',
 +    'HAS',
@@ -187,10 +188,21 @@ index 18e384e..b9f4166 100644
 +        return True  # generic noise → drop
 +    return False  # specific off-ontology → allow (limited)
 +
++
++# ---------------------------------------------------------------------------
++# Public API alias (no leading underscore) for use by external maintenance
++# scripts and downstream tooling.
++# ---------------------------------------------------------------------------
++
++#: Public alias for :func:`_normalize_relation_type`.
++#: Normalizes a relation type string to canonical SCREAMING_SNAKE_CASE.
++#: Safe to call from offline maintenance scripts and ingestion helpers.
++normalize_relation_type = _normalize_relation_type
++
  
  def build_episodic_edges(
      entity_nodes: list[EntityNode],
-@@ -94,7 +266,18 @@ async def extract_edges(
+@@ -94,7 +278,18 @@ async def extract_edges(
      group_id: str = '',
      edge_types: dict[str, type[BaseModel]] | None = None,
      custom_extraction_instructions: str | None = None,
@@ -209,7 +221,7 @@ index 18e384e..b9f4166 100644
      start = time()
  
      extract_edges_max_tokens = 16384
-@@ -134,6 +317,7 @@ async def extract_edges(
+@@ -134,6 +329,7 @@ async def extract_edges(
          'reference_time': episode.valid_at,
          'edge_types': edge_types_context,
          'custom_extraction_instructions': custom_extraction_instructions or '',
@@ -217,14 +229,32 @@ index 18e384e..b9f4166 100644
      }
  
      llm_response = await llm_client.generate_response(
-@@ -168,6 +352,39 @@ async def extract_edges(
+@@ -168,6 +364,57 @@ async def extract_edges(
  
          edges_data.append(edge_data)
  
 +    # -----------------------------------------------------------------------
++    # Universal SCREAMING_SNAKE_CASE normalization (all extraction modes)
++    # -----------------------------------------------------------------------
++    # Regardless of mode, always normalize edge relation_type to canonical
++    # SCREAMING_SNAKE_CASE before storing.  This is a cosmetic-only transform:
++    # it collapses whitespace/hyphens/punctuation into underscores and
++    # uppercases — it never drops an edge or changes its semantic meaning.
++    # Downstream dedup and search benefit from a consistent representation.
++    for edge_data in edges_data:
++        norm = _normalize_relation_type(edge_data.relation_type)
++        if norm != edge_data.relation_type:
++            logger.debug(
++                'edge_norm: normalized relation_type %r → %r',
++                edge_data.relation_type,
++                norm,
++            )
++            edge_data.relation_type = norm
++
++    # -----------------------------------------------------------------------
 +    # constrained_soft post-extraction enforcement
 +    # -----------------------------------------------------------------------
-+    # After entity-name validation, apply two enforcement passes:
++    # After universal normalization, apply constrained_soft-specific passes:
 +    #   1. Canonicalize near-miss relation types to ontology names.
 +    #   2. Filter generic off-ontology noise.
 +    # This is intentionally done in code (not prompt) to avoid conflicting
@@ -257,7 +287,7 @@ index 18e384e..b9f4166 100644
      end = time()
      logger.debug(f'Extracted {len(edges_data)} new edges in {(end - start) * 1000:.0f} ms')
  
-@@ -241,6 +458,7 @@ async def resolve_extracted_edges(
+@@ -241,6 +488,7 @@ async def resolve_extracted_edges(
      entities: list[EntityNode],
      edge_types: dict[str, type[BaseModel]],
      edge_type_map: dict[tuple[str, str], list[str]],
@@ -265,7 +295,7 @@ index 18e384e..b9f4166 100644
  ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
      """Resolve extracted edges against existing graph context.
  
-@@ -373,26 +591,47 @@ async def resolve_extracted_edges(
+@@ -373,26 +621,47 @@ async def resolve_extracted_edges(
          edge_types_lst.append(extracted_edge_types)
  
      # resolve edges with related edges in the graph and find invalidation candidates
@@ -332,7 +362,7 @@ index 18e384e..b9f4166 100644
      )
  
      resolved_edges: list[EntityEdge] = []
-@@ -467,6 +706,7 @@ async def resolve_extracted_edge(
+@@ -467,6 +736,7 @@ async def resolve_extracted_edge(
      existing_edges: list[EntityEdge],
      episode: EpisodicNode,
      edge_type_candidates: dict[str, type[BaseModel]] | None = None,
@@ -340,7 +370,7 @@ index 18e384e..b9f4166 100644
  ) -> tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]:
      """Resolve an extracted edge against existing graph context.
  
-@@ -524,6 +764,36 @@ async def resolve_extracted_edge(
+@@ -524,6 +794,36 @@ async def resolve_extracted_edge(
                  resolved.episodes.append(episode.uuid)
              return resolved, [], []
  
@@ -377,7 +407,7 @@ index 18e384e..b9f4166 100644
      start = time()
  
      # Prepare context for LLM with continuous indexing
-@@ -628,7 +898,7 @@ async def resolve_extracted_edge(
+@@ -628,7 +928,7 @@ async def resolve_extracted_edge(
  
      end = time()
      logger.debug(
