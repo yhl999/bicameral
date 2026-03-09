@@ -10,7 +10,7 @@ llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq
   model: "gpt-5.1-codex-mini"
   reasoning_effort: "medium"
-  verbosity: "low"
+  verbosity: "medium"
   max_tokens: 4096
   
   providers:
