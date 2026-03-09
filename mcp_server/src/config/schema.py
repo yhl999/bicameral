@@ -154,7 +154,7 @@ class LLMConfig(BaseModel):
     reasoning_effort: str = Field(
         default='medium', description='Reasoning effort for reasoning models (e.g. low|medium|high)'
     )
-    verbosity: str = Field(default='low', description='Verbosity for reasoning-capable models')
+    verbosity: str = Field(default='medium', description='Verbosity for reasoning-capable models')
     max_tokens: int = Field(default=4096, description='Max tokens')
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
