@@ -7,7 +7,10 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ..models.typed_memory import EvidenceRef
+try:
+    from models.typed_memory import EvidenceRef
+except ImportError:  # pragma: no cover - package import path fallback
+    from ..models.typed_memory import EvidenceRef
 
 
 class EvidenceCallback(Protocol):

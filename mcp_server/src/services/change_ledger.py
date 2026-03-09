@@ -9,18 +9,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Relative import — no try/except needed: this module is always imported as
-# part of the mcp_server.src.services package, never run as a top-level script.
-from ..models.typed_memory import (
-    EntityRegistry,
-    EntityRegistryEntry,
-    Episode,
-    EvidenceRef,
-    Procedure,
-    StateFact,
-    TypedMemoryObject,
-    coerce_typed_object,
-)
+try:
+    from models.typed_memory import (
+        EntityRegistry,
+        EntityRegistryEntry,
+        Episode,
+        EvidenceRef,
+        Procedure,
+        StateFact,
+        TypedMemoryObject,
+        coerce_typed_object,
+    )
+except ImportError:  # pragma: no cover - package import path fallback
+    from ..models.typed_memory import (
+        EntityRegistry,
+        EntityRegistryEntry,
+        Episode,
+        EvidenceRef,
+        Procedure,
+        StateFact,
+        TypedMemoryObject,
+        coerce_typed_object,
+    )
 
 CANONICAL_EVENT_TYPES = frozenset(
     {

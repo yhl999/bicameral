@@ -8,9 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject
-from .change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
-from .evidence_callback import EvidenceCallbackRegistry
+try:
+    from models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject
+    from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
+    from services.evidence_callback import EvidenceCallbackRegistry
+except ImportError:  # pragma: no cover - package import path fallback
+    from ..models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject
+    from .change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
+    from .evidence_callback import EvidenceCallbackRegistry
 
 _OBJECT_TYPE_ALIASES = {
     'state': 'state_fact',

@@ -1377,6 +1377,45 @@ async def search_nodes(
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
+async def _search_typed_memory_contract(
+    *,
+    query: str,
+    effective_group_ids: list[str],
+    object_types: list[str] | None,
+    metadata_filters: dict[str, Any] | None,
+    history_mode: str,
+    current_only: bool | None,
+    max_results: int,
+    max_evidence: int,
+) -> dict[str, Any] | ErrorResponse:
+    if max_results <= 0:
+        return ErrorResponse(error='max_results must be a positive integer')
+    if max_evidence <= 0:
+        return ErrorResponse(error='max_evidence must be a positive integer')
+    if metadata_filters is not None and not isinstance(metadata_filters, dict):
+        return ErrorResponse(error='metadata_filters must be an object/dict when provided')
+
+    try:
+        effective_filters = dict(metadata_filters or {})
+        if effective_group_ids:
+            effective_filters['source_lane'] = {'in': effective_group_ids}
+
+        service = TypedRetrievalService()
+        return await service.search(
+            query=query,
+            object_types=object_types,
+            metadata_filters=effective_filters,
+            history_mode=history_mode,
+            current_only=current_only,
+            max_results=max_results,
+            max_evidence=max_evidence,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error searching typed memory: {error_msg}')
+        return ErrorResponse(error=f'Error searching typed memory: {error_msg}')
+
+
 @mcp.tool()
 async def search_memory_facts(
     query: str,
@@ -1385,37 +1424,50 @@ async def search_memory_facts(
     search_mode: str = 'hybrid',
     max_facts: int = 10,
     center_node_uuid: str | None = None,
+    result_format: str = 'facts',
+    object_types: list[str] | None = None,
+    metadata_filters: dict[str, Any] | None = None,
+    history_mode: str = 'auto',
+    current_only: bool | None = None,
+    max_results: int | None = None,
+    max_evidence: int = 20,
     ctx: Context | None = None,
-) -> FactSearchResponse | ErrorResponse:
-    """Search the graph memory for relevant facts.
+) -> dict[str, Any] | ErrorResponse:
+    """Search memory through the established facts surface.
+
+    Default behavior preserves the legacy facts-only contract. Set
+    ``result_format='typed'`` to opt into the Phase 3 typed retrieval contract
+    (state + episodes + procedures + evidence buckets) without introducing a
+    second MCP search surface.
 
     Args:
         query: The search query
         group_ids: Optional explicit list of group IDs to filter results (highest precedence)
         lane_alias: Optional lane aliases resolved via config.graphiti.lane_aliases
-        search_mode: Retrieval mode: hybrid|semantic|keyword
-        max_facts: Maximum number of facts to return (default: 10)
-        center_node_uuid: Optional UUID of a node to center the search around
+        search_mode: Retrieval mode for legacy facts path: hybrid|semantic|keyword
+        max_facts: Maximum number of facts to return (default: 10). Also used as
+            the default typed result cap when ``result_format='typed'`` and
+            ``max_results`` is omitted.
+        center_node_uuid: Optional UUID of a node to center the legacy facts search around
+        result_format: facts|typed
+        object_types: Optional typed bucket filter. Accepted values: state|episodes|procedures
+        metadata_filters: Optional typed metadata filter map applied against typed object fields
+        history_mode: Typed retrieval mode: auto|current|history|all
+        current_only: Optional explicit override for current-only typed retrieval
+        max_results: Optional typed result cap override
+        max_evidence: Maximum number of typed evidence items to surface
     """
     global graphiti_service
 
-    if graphiti_service is None:
-        return ErrorResponse(error='Graphiti service not initialized')
-
     try:
+        normalized_result_format = (result_format or 'facts').strip().lower()
+        if normalized_result_format not in {'facts', 'typed'}:
+            return ErrorResponse(error="result_format must be one of: 'facts', 'typed'")
+
         # Validate max_facts parameter and apply defense-in-depth cap.
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
         max_facts = min(max_facts, _MAX_FACTS_CAP)
-
-        normalized_mode = (search_mode or 'hybrid').strip().lower()
-        if normalized_mode not in VALID_SEARCH_MODES:
-            return ErrorResponse(
-                error=(
-                    f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
-                    f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
-                )
-            )
 
         # Resolve group scope BEFORE deriving the rate-limit key so the key is
         # based on trusted, validated IDs — not raw caller-supplied input which
@@ -1446,6 +1498,31 @@ async def search_memory_facts(
                     'search_memory_facts global fallback rate limit exceeded (anon caller)',
                 )
                 return ErrorResponse(error='rate limit exceeded; retry later')
+
+        if normalized_result_format == 'typed':
+            effective_max_results = max_facts if max_results is None else max_results
+            return await _search_typed_memory_contract(
+                query=query,
+                effective_group_ids=effective_group_ids,
+                object_types=object_types,
+                metadata_filters=metadata_filters,
+                history_mode=history_mode,
+                current_only=current_only,
+                max_results=effective_max_results,
+                max_evidence=max_evidence,
+            )
+
+        if graphiti_service is None:
+            return ErrorResponse(error='Graphiti service not initialized')
+
+        normalized_mode = (search_mode or 'hybrid').strip().lower()
+        if normalized_mode not in VALID_SEARCH_MODES:
+            return ErrorResponse(
+                error=(
+                    f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
+                    f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
+                )
+            )
 
         # OM adapter path: search OM ontology edges directly from OM primitives.
         # Gate this path to Neo4j only; non-Neo4j backends (for example
@@ -1534,74 +1611,6 @@ async def search_memory_facts(
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
-
-
-@mcp.tool()
-async def search_memory_all(
-    query: str,
-    group_ids: list[str] | None = None,
-    lane_alias: list[str] | None = None,
-    object_types: list[str] | None = None,
-    metadata_filters: dict[str, Any] | None = None,
-    history_mode: str = 'auto',
-    current_only: bool | None = None,
-    max_results: int = 10,
-    max_evidence: int = 20,
-) -> dict[str, Any] | ErrorResponse:
-    """Search typed memory objects across state, episodes, procedures, and evidence.
-
-    Args:
-        query: The retrieval query
-        group_ids: Optional explicit list of group IDs to scope source_lane filtering
-        lane_alias: Optional lane aliases resolved via config.graphiti.lane_aliases
-        object_types: Optional bucket filter. Accepted values: state|episodes|procedures
-        metadata_filters: Optional metadata filter map applied against typed object fields
-        history_mode: auto|current|history|all
-        current_only: Optional explicit override for current-only retrieval
-        max_results: Maximum number of result roots/items to surface
-        max_evidence: Maximum number of evidence items to surface
-    """
-    try:
-        if max_results <= 0:
-            return ErrorResponse(error='max_results must be a positive integer')
-        if max_evidence <= 0:
-            return ErrorResponse(error='max_evidence must be a positive integer')
-        if metadata_filters is not None and not isinstance(metadata_filters, dict):
-            return ErrorResponse(error='metadata_filters must be an object/dict when provided')
-
-        effective_group_ids: list[str] = []
-        invalid_aliases: list[str] = []
-        if config is not None:
-            effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
-                group_ids=group_ids,
-                lane_alias=lane_alias,
-            )
-        elif group_ids is not None:
-            effective_group_ids = _unique_preserve_order(group_ids)
-        elif lane_alias is not None:
-            invalid_aliases = list(lane_alias)
-
-        if invalid_aliases:
-            return ErrorResponse(error=f'Unknown lane aliases: {", ".join(invalid_aliases)}')
-
-        effective_filters = dict(metadata_filters or {})
-        if effective_group_ids:
-            effective_filters['source_lane'] = {'in': effective_group_ids}
-
-        service = TypedRetrievalService()
-        return await service.search(
-            query=query,
-            object_types=object_types,
-            metadata_filters=effective_filters,
-            history_mode=history_mode,
-            current_only=current_only,
-            max_results=max_results,
-            max_evidence=max_evidence,
-        )
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f'Error searching typed memory: {error_msg}')
-        return ErrorResponse(error=f'Error searching typed memory: {error_msg}')
 
 
 @mcp.tool()
