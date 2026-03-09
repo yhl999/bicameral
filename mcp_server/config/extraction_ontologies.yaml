@@ -26,13 +26,49 @@ om_extractor:
 # Content Inspiration — Short-Form
 # ─────────────────────────────────────────────
 s1_inspiration_short_form:
+  extraction_mode: constrained_soft
+  intent_guidance: >-
+    Focus on short-form craft that is immediately reusable: hooks, compression, punchlines,
+    engagement triggers, and sequencing.
+    Every extraction must root from exactly one ShortFormPiece anchor node per episode,
+    and all relationship edges must originate from that anchor.
+    Evidence requirement: every emitted RhetoricalMove, HookPattern, VoiceQuality, and
+    CompressionTechnique must be supported by a concrete phrase/pattern in the source
+    text (quoted span or clearly paraphrased observable move), and include
+    evidence_span + craft_type + pattern_template + when_to_use fields.
+    Anti-abstraction rule: do not emit generic tone labels without a concrete move.
+    Anti-meta reject rule: reject tautological/meta commentary (e.g., "this post uses
+    rhetorical techniques", "engages readers", "shows voice/style") unless tied to a
+    specific observed move with evidence_span.
+    If a VoiceQuality is emitted, pair it with at least one concrete move/hook signal.
+    Duplicate suppression: within a single piece, do not emit repeated near-synonym
+    USES_MOVE entities unless they map to distinct evidence spans.
+    Emit-empty rule: if snippet is too low-signal to support at least one HookPattern
+    or RhetoricalMove with evidence, return empty extraction.
+    Use only ontology edges: USES_MOVE, OPENS_WITH, EXHIBITS, TRIGGERED,
+    AUTHORED_BY, COMPRESSES_VIA. Do not emit generic connector edges.
   extraction_emphasis: >-
     Focus on hooks, compression, punch, and engagement triggers.
     Prioritize rhetorical moves and voice/tone over topic or thesis.
     Extract what makes short-form content effective — first-line formulas,
     compression techniques, and engagement signals.
 
+  anchor_entity_types:
+    - ShortFormPiece
+  craft_required_fields:
+    - evidence_span
+    - craft_type
+    - pattern_template
+    - when_to_use
+  craft_field_descriptions:
+    evidence_span: "Exact quoted phrase/span from the source short-form piece proving the move."
+    craft_type: "Normalized craft move category (hook, rhetorical move, compression move, voice move)."
+    pattern_template: "Reusable pattern distilled from the observed move."
+    when_to_use: "Concrete conditions where this pattern should be applied."
+
   entity_types:
+    - name: ShortFormPiece
+      description: "The source short-form text (tweet, post, caption) used as the anchor node for all extraction edges."
     - name: RhetoricalMove
       description: "A specific technique used in the piece (e.g. cold open with absurd analogy, one-liner callback)"
     - name: HookPattern
@@ -48,28 +84,62 @@ s1_inspiration_short_form:
 
   relationship_types:
     - name: USES_MOVE
-      description: "Piece → RhetoricalMove"
+      description: "ShortFormPiece → RhetoricalMove"
     - name: OPENS_WITH
-      description: "Piece → HookPattern"
+      description: "ShortFormPiece → HookPattern"
     - name: EXHIBITS
-      description: "Piece → VoiceQuality"
+      description: "ShortFormPiece → VoiceQuality"
     - name: TRIGGERED
-      description: "Piece → EngagementSignal"
+      description: "ShortFormPiece → EngagementSignal"
     - name: AUTHORED_BY
-      description: "Piece → AuthorStyle"
+      description: "ShortFormPiece → AuthorStyle"
     - name: COMPRESSES_VIA
-      description: "Piece → CompressionTechnique"
+      description: "ShortFormPiece → CompressionTechnique"
 
 # ─────────────────────────────────────────────
 # Content Inspiration — Long-Form
 # ─────────────────────────────────────────────
 s1_inspiration_long_form:
+  extraction_mode: constrained_soft
+  intent_guidance: >-
+    Focus on argument structure, narrative arc, transitions, and sustained voice patterns
+    that are useful for drafting long-form writing.
+    Every extraction must root from exactly one LongFormPiece anchor node per episode,
+    and all relationship edges must originate from that anchor.
+    Specificity requirement: avoid generic statements like "employs rhetorical strategies".
+    Emit named techniques (e.g., concession-pivot, callback, inversion, escalation,
+    question-bridge) with concrete supporting evidence from the text and include
+    evidence_span + craft_type + pattern_template + when_to_use fields.
+    Typed constraints: USES_MOVE -> RhetoricalMove; STRUCTURED_AS -> NarrativeArc or
+    ArgumentStructure; TRANSITIONS_VIA -> TransitionTechnique only when a real bridge
+    move is present.
+    If no concrete structural/rhetorical craft is identifiable, return empty extraction
+    instead of forcing generic labels.
+    Anti-meta reject rule: reject prose-about-prose statements (e.g., "employs rhetorical
+    strategies", "keeps readers engaged") unless grounded in explicit move evidence.
+    Use only ontology edges: USES_MOVE, STRUCTURED_AS, EXHIBITS, TRANSITIONS_VIA,
+    AUTHORED_BY, OPENS_WITH, TRIGGERED. Avoid generic connector edges.
   extraction_emphasis: >-
     Focus on argument structure, narrative arc, transitions, and sustained voice.
     Extract how long-form pieces build and maintain reader engagement across sections.
     Prioritize structural and rhetorical patterns over individual facts or claims.
 
+  anchor_entity_types:
+    - LongFormPiece
+  craft_required_fields:
+    - evidence_span
+    - craft_type
+    - pattern_template
+    - when_to_use
+  craft_field_descriptions:
+    evidence_span: "Exact quoted phrase/span from long-form source proving the structural move."
+    craft_type: "Normalized long-form craft category (arc, argument move, transition, opening move, voice move)."
+    pattern_template: "Reusable long-form writing pattern distilled from the observed move."
+    when_to_use: "Concrete draft context where this long-form pattern should be used."
+
   entity_types:
+    - name: LongFormPiece
+      description: "The source long-form text (essay, article, blog post) used as the anchor node for all extraction edges."
     - name: RhetoricalMove
       description: "Long-form technique (e.g. extended analogy across sections, dialectical pivot, callback close)"
     - name: NarrativeArc
@@ -89,31 +159,65 @@ s1_inspiration_long_form:
 
   relationship_types:
     - name: USES_MOVE
-      description: "Piece → RhetoricalMove"
+      description: "LongFormPiece → RhetoricalMove"
     - name: STRUCTURED_AS
-      description: "Piece → NarrativeArc or ArgumentStructure"
+      description: "LongFormPiece → NarrativeArc or ArgumentStructure"
     - name: EXHIBITS
-      description: "Piece → VoiceQuality"
+      description: "LongFormPiece → VoiceQuality"
     - name: TRANSITIONS_VIA
-      description: "Section → TransitionTechnique"
+      description: "LongFormPiece → TransitionTechnique"
     - name: AUTHORED_BY
-      description: "Piece → AuthorStyle"
+      description: "LongFormPiece → AuthorStyle"
     - name: OPENS_WITH
-      description: "Piece → OpeningStrategy"
+      description: "LongFormPiece → OpeningStrategy"
     - name: TRIGGERED
-      description: "Piece → EngagementSignal"
+      description: "LongFormPiece → EngagementSignal"
 
 # ─────────────────────────────────────────────
 # Writing Samples — Yuan's Own
 # ─────────────────────────────────────────────
 s1_writing_samples:
+  extraction_mode: constrained_soft
+  intent_guidance: >-
+    Extract reusable author-voice primitives (style/craft), not topic summaries.
+    Priority order: SignaturePhrase, RegisterMarker, VoiceFingerprint,
+    StructuralPattern, ToneShift.
+    Hard evidence rule: emit style entities only when grounded in explicit lexical or
+    structural evidence in the current sample and include
+    evidence_span + craft_type + pattern_template + when_to_use fields.
+    Style-only gate: suppress topic/entity facts unless they directly evidence style.
+    If style evidence is weak, emit one RegisterMarker fallback (or emit-empty if truly
+    content-free).
+    Quality rule: avoid generic statements (e.g., "mix of formal and casual tones")
+    unless paired with concrete indicators (wording choice, syntax pattern,
+    transition move, cadence shift).
+    Anti-meta reject rule: reject tautological self-descriptions (e.g., "shows the
+    author's voice/style") when no explicit evidence_span + pattern_template is present.
+    Always emit exactly one WritingSample anchor node per episode.
+    Use only ontology edges: DEMONSTRATES, FOLLOWS, SIGNALS, CONTAINS, SHIFTS_VIA,
+    SIGNALS_STYLE. Never emit generic connector edges.
+    Prefer canonical names over near-synonyms across episodes.
   extraction_emphasis: >-
-    Focus on voice fingerprint, structural patterns, and register variation.
-    Extract what makes this writing uniquely Yuan's — characteristic moves,
-    signature phrases, tone shifts. Keep topic extraction light.
-    Weight unassisted and unedited samples higher for voice authenticity.
+    Extract reusable style primitives for author-voice modeling (not topic knowledge).
+    Prioritize: SignaturePhrase, RegisterMarker, VoiceFingerprint, StructuralPattern, ToneShift.
+    Emit only when grounded in explicit evidence. Return empty if no clear style signal.
+
+  anchor_entity_types:
+    - WritingSample
+  craft_required_fields:
+    - evidence_span
+    - craft_type
+    - pattern_template
+    - when_to_use
+  craft_field_descriptions:
+    evidence_span: "Exact quoted phrase/span from the writing sample that proves the style signal."
+    craft_type: "Normalized style/craft move category (voice fingerprint, structural move, register cue, phrase pattern)."
+    pattern_template: "Reusable writing pattern distilled from this style signal."
+    when_to_use: "Concrete conditions where this style pattern should be used in new drafts."
 
   entity_types:
+    - name: WritingSample
+      description: "A concrete text sample/post/message from the author used as the anchor node for style extraction."
     - name: VoiceFingerprint
       description: "Characteristic writing move unique to the author (e.g. Machiavelli-meets-f-bomb register shift, parenthetical self-deprecation)"
     - name: StructuralPattern
@@ -127,15 +231,17 @@ s1_writing_samples:
 
   relationship_types:
     - name: DEMONSTRATES
-      description: "Sample → VoiceFingerprint"
+      description: "WritingSample → VoiceFingerprint"
     - name: FOLLOWS
-      description: "Sample → StructuralPattern"
+      description: "WritingSample → StructuralPattern"
     - name: SIGNALS
-      description: "Sample → RegisterMarker"
+      description: "WritingSample → RegisterMarker"
     - name: CONTAINS
-      description: "Sample → SignaturePhrase"
+      description: "WritingSample → SignaturePhrase"
     - name: SHIFTS_VIA
-      description: "Sample → ToneShift"
+      description: "WritingSample → ToneShift"
+    - name: SIGNALS_STYLE
+      description: "SignaturePhrase → VoiceFingerprint"
 
 # ─────────────────────────────────────────────
 # Content Strategy
