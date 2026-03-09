@@ -14,11 +14,31 @@ import argparse
 import asyncio
 import logging
 import sys
+from typing import Any
 
 from graph_driver import add_backend_args, get_graph_client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _time_sort_key(value: Any) -> str:
+    if value is None:
+        return '9999-12-31T23:59:59.999999+00:00'
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()
+    return str(value)
+
+
+def sort_episodes_for_timeline(episodes: list[dict]) -> list[dict]:
+    return sorted(
+        episodes,
+        key=lambda episode: (
+            _time_sort_key(episode.get('valid_at') or episode.get('created_at')),
+            _time_sort_key(episode.get('created_at') or episode.get('valid_at')),
+            str(episode.get('uuid') or ''),
+        ),
+    )
 
 
 def build_timeline_pairs(episodes: list[dict], group_id: str) -> list[dict[str, object]]:
@@ -44,36 +64,27 @@ async def repair_timeline(backend, host, port, group_id):
 
     try:
         logger.info('Deleting existing NEXT_EPISODE edges...')
-        if backend == 'neo4j':
-            await client.query(
-                'MATCH (e1:Episodic)-[r:NEXT_EPISODE]->(e2:Episodic) '
-                'WHERE e1.group_id = $group_id AND e2.group_id = $group_id DELETE r',
-                {'group_id': group_id},
-            )
-        else:
-            await client.query('MATCH ()-[r:NEXT_EPISODE]->() DELETE r')
+        await client.query(
+            'MATCH (e1:Episodic)-[r:NEXT_EPISODE]->(e2:Episodic) '
+            'WHERE e1.group_id = $group_id AND e2.group_id = $group_id DELETE r',
+            {'group_id': group_id},
+        )
 
         logger.info('Fetching episodes...')
-        if backend == 'neo4j':
-            query = """
-            MATCH (e:Episodic)
-            WHERE e.group_id = $group_id
-            RETURN e.uuid, e.reference_time, e.created_at
-            ORDER BY e.reference_time ASC, e.created_at ASC, e.uuid ASC
-            """
-            res = await client.query(query, {'group_id': group_id})
-        else:
-            query = """
-            MATCH (e:Episodic)
-            RETURN e.uuid, e.reference_time, e.created_at
-            ORDER BY e.reference_time ASC, e.created_at ASC, e.uuid ASC
-            """
-            res = await client.query(query)
+        query = """
+        MATCH (e:Episodic)
+        WHERE e.group_id = $group_id
+        RETURN e.uuid, e.valid_at, e.created_at
+        ORDER BY coalesce(e.valid_at, e.created_at) ASC, e.created_at ASC, e.uuid ASC
+        """
+        res = await client.query(query, {'group_id': group_id})
 
-        episodes = [
-            {'uuid': rec[0], 'reference_time': rec[1], 'created_at': rec[2]}
-            for rec in res.result_set
-        ]
+        episodes = sort_episodes_for_timeline(
+            [
+                {'uuid': rec[0], 'valid_at': rec[1], 'created_at': rec[2]}
+                for rec in res.result_set
+            ]
+        )
         logger.info(f'Found {len(episodes)} episodes. Rebuilding chain...')
 
         if len(episodes) < 2:
@@ -89,6 +100,7 @@ async def repair_timeline(backend, host, port, group_id):
                 for pair in chunk:
                     q_single = """
                     MATCH (a:Episodic {uuid: $prev}), (b:Episodic {uuid: $curr})
+                    WHERE a.group_id = $group_id AND b.group_id = $group_id
                     MERGE (a)-[e:NEXT_EPISODE {uuid: $uuid}]->(b)
                     SET e.group_id = $group_id,
                         e.created_at = $created_at
