@@ -141,10 +141,20 @@ class LLMClientFactory:
 
                 # Only pass reasoning/verbosity parameters for reasoning models (gpt-5 family)
                 if is_reasoning_model:
-                    return OpenAIClient(config=llm_config, reasoning='minimal', verbosity='low')
+                    return OpenAIClient(
+                        config=llm_config,
+                        max_tokens=config.max_tokens,
+                        reasoning='minimal',
+                        verbosity='low',
+                    )
                 else:
                     # For non-reasoning models, explicitly pass None to disable these parameters
-                    return OpenAIClient(config=llm_config, reasoning=None, verbosity=None)
+                    return OpenAIClient(
+                        config=llm_config,
+                        max_tokens=config.max_tokens,
+                        reasoning=None,
+                        verbosity=None,
+                    )
 
             case 'azure_openai':
                 if not HAS_AZURE_LLM:

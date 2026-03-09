@@ -9,6 +9,7 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodicNode
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.utils.maintenance.edge_operations import (
+    extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
 )
@@ -606,3 +607,43 @@ def test_canonicalize_caret_variant_snaps_to_ontology():
     names = frozenset({'USES_MOVE', 'OPENS_WITH'})
     result = _canonicalize_edge_name('USES^MOVE', names)
     assert result == 'USES_MOVE'
+
+
+@pytest.mark.asyncio
+async def test_extract_edges_respects_llm_client_max_tokens(monkeypatch):
+    from graphiti_core.utils.maintenance import edge_operations as edge_ops
+
+    monkeypatch.setattr(edge_ops.prompt_library.extract_edges, 'edge', lambda _context: 'prompt')
+
+    llm_client = MagicMock()
+    llm_client.max_tokens = 2048
+    llm_client.generate_response = AsyncMock(return_value={'edges': []})
+
+    clients = SimpleNamespace(llm_client=llm_client)
+    episode = EpisodicNode(
+        uuid='episode_uuid',
+        name='Episode',
+        group_id='group_1',
+        source='message',
+        source_description='desc',
+        content='Ada Canary prefers jasmine tea and writes Rust.',
+        valid_at=datetime.now(timezone.utc),
+    )
+    node = EntityNode(
+        uuid='node_uuid',
+        name='Ada Canary',
+        group_id='group_1',
+        labels=['Person'],
+    )
+
+    result = await extract_edges(
+        clients,
+        episode,
+        [node],
+        [],
+        {},
+        group_id='group_1',
+    )
+
+    assert result == []
+    assert llm_client.generate_response.await_args.kwargs['max_tokens'] == 2048

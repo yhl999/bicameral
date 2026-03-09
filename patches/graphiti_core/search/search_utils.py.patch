@@ -1,8 +1,19 @@
 diff --git a/graphiti_core/search/search_utils.py b/graphiti_core/search/search_utils.py
-index 88c8922..12807c2 100644
+index 88c8922..93c1d12 100644
 --- a/graphiti_core/search/search_utils.py
 +++ b/graphiti_core/search/search_utils.py
-@@ -1792,6 +1792,81 @@ def rrf(
+@@ -82,6 +82,10 @@ def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> f
+ 
+ 
+ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver):
++    # Fail-closed: empty list means no groups are accessible — return no query (=> no results).
++    # None means no group restriction (all records).
++    if group_ids is not None and len(group_ids) == 0:
++        return ''
+     if driver.provider == GraphProvider.KUZU:
+         # Kuzu only supports simple queries.
+         if len(query.split(' ')) > MAX_QUERY_LENGTH:
+@@ -1792,6 +1796,81 @@ def rrf(
      ]
  
  

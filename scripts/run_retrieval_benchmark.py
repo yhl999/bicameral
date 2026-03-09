@@ -22,6 +22,7 @@ import argparse
 import json
 import shlex
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -83,10 +84,12 @@ HARNESS_TOOL_ARGUMENT_KEYS: dict[str, set[str]] = {
 class BenchmarkMCPClient:
     """Minimal MCP client for benchmark queries."""
 
-    def __init__(self, url: str = MCP_URL_DEFAULT):
+    def __init__(self, url: str = MCP_URL_DEFAULT, min_tool_interval_s: float = 0.0):
         self.url = url
         self.session_id: str | None = None
         self.initialized = False
+        self.min_tool_interval_s = max(0.0, float(min_tool_interval_s))
+        self._last_tool_call_started_at: float | None = None
 
     def _http_post(self, payload: dict, extra_headers: dict | None = None) -> dict:
         data = json.dumps(payload).encode('utf-8')
@@ -154,8 +157,22 @@ class BenchmarkMCPClient:
         )
         self.initialized = True
 
+    def _throttle_tool_call(self) -> None:
+        if self.min_tool_interval_s <= 0:
+            self._last_tool_call_started_at = time.monotonic()
+            return
+        now = time.monotonic()
+        if self._last_tool_call_started_at is not None:
+            elapsed = now - self._last_tool_call_started_at
+            remaining = self.min_tool_interval_s - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+                now = time.monotonic()
+        self._last_tool_call_started_at = now
+
     def call_tool(self, name: str, arguments: dict) -> dict:
         self.initialize()
+        self._throttle_tool_call()
         return self._post({
             'jsonrpc': '2.0', 'id': 1,
             'method': 'tools/call',
@@ -254,6 +271,10 @@ def _scope_categories(query_item: dict[str, Any]) -> list[str]:
     return []
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    return 'rate limit exceeded' in str(exc).lower()
+
+
 def run_bicameral_query(
     client: BenchmarkMCPClient,
     query: str,
@@ -333,6 +354,32 @@ def run_bicameral_query(
         'facts_text': extract_results_text(facts_resp),
         'nodes_text': extract_results_text(nodes_resp),
     }
+
+
+def run_bicameral_query_with_retries(
+    client: BenchmarkMCPClient,
+    query: str,
+    group_ids: list[str] | None,
+    search_mode: str,
+    top_k: int,
+    *,
+    max_rate_limit_retries: int,
+    rate_limit_backoff_s: float,
+) -> dict:
+    attempt = 0
+    while True:
+        try:
+            return run_bicameral_query(client, query, group_ids, search_mode, top_k)
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt >= max_rate_limit_retries:
+                raise
+            sleep_s = max(0.0, float(rate_limit_backoff_s)) * (attempt + 1)
+            print(
+                f'  rate-limited [{search_mode}] attempt {attempt + 1}/{max_rate_limit_retries + 1}; '
+                f'sleeping {sleep_s:.1f}s before retry'
+            )
+            time.sleep(sleep_s)
+            attempt += 1
 
 
 _QMD_TIMEOUT_SECONDS = 120  # QMD loads large ML models per invocation; allow generous budget
@@ -573,8 +620,12 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     top_k = args.top_k
     do_qmd = args.compare_qmd
 
-    # Initialize MCP client
-    client = BenchmarkMCPClient(args.mcp_url)
+    # Initialize MCP client. Throttle by default so the benchmark does not trip
+    # the MCP search limiter while evaluating many queries × modes.
+    client = BenchmarkMCPClient(
+        args.mcp_url,
+        min_tool_interval_s=args.min_tool_interval_s,
+    )
 
     query_results = []
     bicameral_scores = []
@@ -592,8 +643,14 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         mode_scores = {}
         for mode in SEARCH_MODES:
             try:
-                result = run_bicameral_query(
-                    client, query_text, group_ids, mode, top_k
+                result = run_bicameral_query_with_retries(
+                    client,
+                    query_text,
+                    group_ids,
+                    mode,
+                    top_k,
+                    max_rate_limit_retries=args.max_rate_limit_retries,
+                    rate_limit_backoff_s=args.rate_limit_backoff_s,
                 )
                 combined_text = result['facts_text'] + '\n' + result['nodes_text']
                 fact_recall = compute_recall(combined_text, expected_facts)
@@ -761,6 +818,27 @@ def main():
         '--qmd-command',
         default='qmd query --json',
         help='QMD command template (default: qmd query --json)',
+    )
+    ap.add_argument(
+        '--min-tool-interval-s',
+        type=float,
+        default=1.05,
+        help=(
+            'Minimum sleep between MCP tool calls. Default 1.05s keeps the benchmark '
+            'below the server search limit of ~60 requests/minute.'
+        ),
+    )
+    ap.add_argument(
+        '--max-rate-limit-retries',
+        type=int,
+        default=2,
+        help='Retry count when MCP search returns rate limit exceeded (default: 2)',
+    )
+    ap.add_argument(
+        '--rate-limit-backoff-s',
+        type=float,
+        default=10.0,
+        help='Base backoff in seconds for rate-limit retries (default: 10)',
     )
     ap.add_argument(
         '--contract-check-only',
