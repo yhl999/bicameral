@@ -129,8 +129,10 @@ class EvidenceRef(BaseModel):
             # evidence refs and would produce nonsensical canonical URIs.
             start_line = max(1, int(locator.get('start_line') or 1))
             end_line = max(start_line, int(locator.get('end_line') or start_line))
-            # repo is a single segment; path preserves slashes (it is a filesystem path).
-            return f'file://{quote(repo, safe=_seg_safe)}/{path}#L{start_line}-L{end_line}'
+            # Percent-encode unsafe characters in file path segments while
+            # preserving path separators.
+            path_escaped = quote(path, safe=f'{_seg_safe}/')
+            return f'file://{quote(repo, safe=_seg_safe)}/{path_escaped}#L{start_line}-L{end_line}'
         if kind == 'doc_chunk':
             system, document_id, chunk_id = _require(locator, 'system', 'document_id', 'chunk_id')
             return (
