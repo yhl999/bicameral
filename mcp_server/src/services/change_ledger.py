@@ -71,6 +71,10 @@ CREATE INDEX IF NOT EXISTS idx_change_events_object_recorded_at
     ON change_events(object_id, recorded_at, event_id);
 CREATE INDEX IF NOT EXISTS idx_change_events_target_recorded_at
     ON change_events(target_object_id, recorded_at, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_change_events_create_object_id
+    ON change_events(object_id)
+    WHERE object_id IS NOT NULL
+      AND event_type IN ('assert', 'supersede', 'refine', 'derive');
 CREATE TABLE IF NOT EXISTS typed_roots (
     root_id TEXT PRIMARY KEY,
     latest_recorded_at TEXT NOT NULL,
@@ -781,9 +785,11 @@ def project_objects(events: list[ChangeEventRow | sqlite3.Row]) -> list[TypedMem
                 }
             )
         elif event.event_type == 'procedure_success' and isinstance(current, Procedure):
-            objects[target_id] = current.model_copy(update={'success_count': current.success_count + 1})
+            if _is_trusted_feedback_event(event.metadata_json):
+                objects[target_id] = current.model_copy(update={'success_count': current.success_count + 1})
         elif event.event_type == 'procedure_failure' and isinstance(current, Procedure):
-            objects[target_id] = current.model_copy(update={'fail_count': current.fail_count + 1})
+            if _is_trusted_feedback_event(event.metadata_json):
+                objects[target_id] = current.model_copy(update={'fail_count': current.fail_count + 1})
     return sorted(objects.values(), key=lambda obj: (obj.root_id, obj.version, obj.object_id))
 
 
@@ -910,6 +916,16 @@ def _now_iso() -> str:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def _is_trusted_feedback_event(metadata_json: str | None) -> bool:
+    if not metadata_json:
+        return False
+    try:
+        metadata = json.loads(metadata_json)
+    except Exception:
+        return False
+    return bool(isinstance(metadata, dict) and metadata.get('trusted_feedback'))
 
 
 def _ensure_str_list(value: Any) -> list[str]:

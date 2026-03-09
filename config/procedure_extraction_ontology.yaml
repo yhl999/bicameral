@@ -1,0 +1,39 @@
+version: procedure-extraction-ontology-v0
+subject: agent:archibald
+policy_scope: private
+visibility_scope: private
+source_lane: learning_self_audit
+source_key: memory:self-audit
+low_risk_key_prefixes:
+  - workflow.
+  - ops.
+  - tools.
+  - update.
+high_risk_key_prefixes:
+  - security.
+  - auth.
+  - credentials.
+  - legal.
+  - finance.
+  - health.
+imperative_verbs:
+  - use
+  - read
+  - run
+  - restart
+  - check
+  - verify
+  - inspect
+  - update
+  - add
+  - remove
+  - reload
+  - open
+step_splitters:
+  - ";"
+  - " then "
+  - " and then "
+  - " -> "
+  - "\n- "
+  - "\n* "
+min_candidate_steps: 2
