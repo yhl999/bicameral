@@ -121,6 +121,32 @@ def test_evidence_ref_uses_locked_canonical_uri_shapes():
     assert sql_ref.canonical_uri == 'sql://taste_db/wine/bottles#pk=%7B%22id%22%3A7%7D'
 
 
+
+def test_canonical_uri_file_path_is_percent_encoded():
+    spacey_ref = EvidenceRef(
+        kind='file',
+        source_system='workspace',
+        locator={
+            'repo': 'workspace',
+            'path': 'docs/user guides/notes.md',
+            'start_line': 3,
+            'end_line': 4,
+        },
+    )
+
+    assert spacey_ref.canonical_uri == 'file://workspace/docs/user%20guides/notes.md#L3-L4'
+
+def test_change_ledger_connect_creates_missing_parent_directory(tmp_path):
+    ledger_db = tmp_path / 'state' / 'nested' / 'change_ledger.db'
+
+    # Ensure the directory does not exist before constructing the ledger
+    assert not ledger_db.exists()
+
+    _ = ChangeLedger(ledger_db)
+
+    assert ledger_db.exists()
+
+
 def test_change_ledger_projects_state_fact_lifecycle():
     ledger = _ledger()
     original = StateFact.model_validate(

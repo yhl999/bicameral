@@ -588,7 +588,10 @@ def connect(path: str | Path = DB_PATH_DEFAULT) -> sqlite3.Connection:
     races to acquire the RESERVED lock gets SQLITE_BUSY immediately instead of
     retrying.  5 s is generous for a local file-backed DB; adjust if needed.
     """
-    conn = sqlite3.connect(str(path))
+    db_path = Path(path)
+    if db_path.name != ':memory:':
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     # WAL mode: better concurrency for readers; durable write-ahead log.
     conn.execute('PRAGMA journal_mode=WAL')
