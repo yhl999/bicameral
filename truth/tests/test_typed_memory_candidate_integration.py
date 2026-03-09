@@ -484,3 +484,266 @@ def test_change_ledger_connect_enables_wal_and_foreign_keys(tmp_path):
         assert fk_on == 1, 'Expected foreign_keys=ON'
     finally:
         conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GPT P1 Blocker — Cross-store retry consistency / idempotency
+#
+# Regression tests for the partial-failure scenario where the ledger write
+# succeeds but the subsequent candidates.db UPDATE/commit fails.
+#
+# Without the reconciliation fix:
+#   - promote retry → duplicate promote (+ assert/supersede) events in ledger
+#   - deny retry    → duplicate invalidate events in ledger
+#
+# With the fix, both paths are idempotent: a retry recovers the already-written
+# ledger event_id (promote) or skips the duplicate write (invalidate), then
+# completes only the missing candidates.db UPDATE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _simulate_promote_ledger_write_only(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    ledger: 'ChangeLedger',
+) -> str:
+    """Simulate the partial failure: ledger write succeeds, candidates.db update does not.
+
+    Calls promote_candidate_fact() directly as promote_candidate() would, but
+    does NOT touch candidates.db afterwards.  Returns the promote event_id that
+    landed in the ledger.
+    """
+    from truth.candidates import _candidate_fact_payload, POLICY_VERSION_DEFAULT, _normalize_reason, _now_iso
+
+    row = conn.execute(
+        'SELECT * FROM candidates WHERE candidate_id = ?', (candidate_id,)
+    ).fetchone()
+    assert row is not None, f'candidate {candidate_id!r} not found in DB'
+
+    fact_payload = _candidate_fact_payload(row)
+    decided_at = _now_iso()
+    safe_reason = _normalize_reason('test_partial_failure', fallback='auto_promote')
+
+    result = ledger.promote_candidate_fact(
+        actor_id='policy:v3',
+        reason=safe_reason,
+        policy_version=row['policy_version'] or POLICY_VERSION_DEFAULT,
+        candidate_id=candidate_id,
+        fact=fact_payload,
+        conflict_with_fact_id=row['conflict_with_fact_id'],
+        seeded_supersede_ok=False,
+        recorded_at=decided_at,
+    )
+    # Deliberately do NOT update candidates.db — this is the partial-failure state.
+    return result.event_id
+
+
+def test_promote_retry_after_partial_failure_no_duplicate_ledger_events():
+    """Retry of promote_candidate after partial failure must not duplicate ledger events.
+
+    Simulated failure sequence:
+      1. promote_candidate_fact() writes assert+promote to ledger DB → committed
+      2. candidates.db UPDATE/commit never happens (crash / connection drop)
+      3. Caller retries promote_candidate() with the candidate still in 'pending' state
+
+    Expected outcome:
+      - Ledger event count stays at 2 (assert + promote, no duplicates)
+      - candidates.db is updated to 'approved' with the recovered ledger_event_id
+      - The promoted StateFact is the only current fact in the ledger
+    """
+    conn = _candidate_db()
+    ledger = _ledger()
+
+    # Insert a candidate that requires manual approval (low confidence → not auto-promoted).
+    result = candidates.upsert_candidate(
+        conn,
+        ledger=ledger,
+        **_candidate_kwargs(
+            predicate='pref.retry_promote_test',
+            value={'value': 'neovim'},
+            confidence=0.50,  # below auto-promote threshold → requires_approval
+        ),
+    )
+    assert result.status in {'requires_approval', 'pending'}, (
+        f'Expected requires_approval/pending, got: {result.status!r}'
+    )
+
+    # Confirm: no ledger events yet (candidate was never promoted).
+    events_before = ledger.conn.execute('SELECT count(*) FROM change_events').fetchone()[0]
+    assert events_before == 0
+
+    # Simulate partial failure: ledger write succeeds, candidates.db update fails.
+    partial_event_id = _simulate_promote_ledger_write_only(
+        conn, result.candidate_id, ledger
+    )
+
+    # Ledger now has 2 events (assert + promote); candidates.db still has original state.
+    events_after_partial = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_partial == 2, (
+        f'Expected 2 ledger events after partial write, got {events_after_partial}'
+    )
+    row_partial = conn.execute(
+        'SELECT status, ledger_event_id FROM candidates WHERE candidate_id = ?',
+        (result.candidate_id,),
+    ).fetchone()
+    assert row_partial['ledger_event_id'] is None, (
+        'candidates.db ledger_event_id must be NULL (simulating failed DB update)'
+    )
+    assert row_partial['status'] != 'approved', (
+        'candidates.db status must not be approved yet (simulating failed DB update)'
+    )
+
+    # ── Retry promote_candidate ───────────────────────────────────────────────
+    # This is what the real caller would do after the partial failure.
+    updated, recovered_event_id = candidates.promote_candidate(
+        conn,
+        result.candidate_id,
+        actor_id='policy:v3',
+        reason='retry after partial failure',
+        ledger=ledger,
+    )
+
+    # Idempotency: no new ledger events were written.
+    events_after_retry = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_retry == 2, (
+        f'Retry must not duplicate ledger events: expected 2, got {events_after_retry}'
+    )
+
+    # The recovered event_id must match the one that was written during the
+    # partial failure — not a new one.
+    assert recovered_event_id == partial_event_id, (
+        f'Retry must recover the existing promote event_id '
+        f'(got {recovered_event_id!r}, expected {partial_event_id!r})'
+    )
+
+    # candidates.db must now reflect the successful promotion.
+    assert updated == 1, 'candidates.db UPDATE must have applied on retry'
+    row_after = conn.execute(
+        'SELECT status, ledger_event_id FROM candidates WHERE candidate_id = ?',
+        (result.candidate_id,),
+    ).fetchone()
+    assert row_after['status'] == 'approved', (
+        f'candidates.db status must be approved after retry, got: {row_after["status"]!r}'
+    )
+    assert row_after['ledger_event_id'] == partial_event_id, (
+        'candidates.db ledger_event_id must be set to the recovered promote event_id'
+    )
+
+    # Final state: exactly one current fact in the ledger.
+    current_facts = ledger.current_state_facts()
+    assert len(current_facts) == 1, (
+        f'Expected exactly 1 current fact after retry, got {len(current_facts)}'
+    )
+    assert current_facts[0].value == {'value': 'neovim'}, (
+        f'Current fact value mismatch: {current_facts[0].value!r}'
+    )
+
+
+def test_deny_retry_after_partial_failure_no_duplicate_invalidate_events():
+    """Retry of deny_candidate after partial failure must not duplicate invalidate events.
+
+    Simulated failure sequence:
+      1. Candidate is fully promoted (assert+promote in ledger, 'approved' in candidates.db)
+      2. deny_candidate() is called:
+         a. ledger.append_event('invalidate', ...) succeeds → committed in ledger
+         b. candidates.db UPDATE/commit never happens (crash / connection drop)
+      3. Caller retries deny_candidate() — candidate is still 'approved' in candidates.db
+
+    Expected outcome:
+      - Ledger event count stays at 3 (assert + promote + invalidate, no duplicates)
+      - candidates.db is updated to 'denied' on retry
+      - The fact is still non-current in the ledger (invalidate already applied)
+    """
+    conn = _candidate_db()
+    ledger = _ledger()
+
+    # Step 1: Fully promote a candidate.
+    result = candidates.upsert_candidate(
+        conn,
+        ledger=ledger,
+        **_candidate_kwargs(
+            predicate='pref.retry_deny_test',
+            value={'value': 'emacs'},
+        ),
+    )
+    assert result.status == 'approved', f'Expected approved, got: {result.status!r}'
+
+    promoted_facts = ledger.current_state_facts()
+    assert len(promoted_facts) == 1
+    promoted_fact = promoted_facts[0]
+
+    events_after_promote = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_promote == 2  # assert + promote
+
+    # Step 2: Simulate partial deny failure.
+    # Write the invalidate event directly to the ledger (as deny_candidate would),
+    # but do NOT update candidates.db.
+    inv_object_id = promoted_fact.object_id
+    ledger.append_event(
+        'invalidate',
+        actor_id='ui:yuan',
+        reason='test_partial_deny_failure',
+        object_id=inv_object_id,
+        root_id=ledger.root_id_for_object(inv_object_id),
+    )
+
+    # Ledger now has 3 events; candidates.db still says 'approved'.
+    events_after_partial = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_partial == 3, (
+        f'Expected 3 ledger events after partial invalidate write, got {events_after_partial}'
+    )
+    row_partial = conn.execute(
+        'SELECT status FROM candidates WHERE candidate_id = ?',
+        (result.candidate_id,),
+    ).fetchone()
+    assert row_partial['status'] == 'approved', (
+        'candidates.db status must still be approved (simulating failed DB update)'
+    )
+
+    # Verify fact is already non-current in the ledger (invalidate landed).
+    current_after_partial = ledger.current_state_facts()
+    assert len(current_after_partial) == 0, (
+        'Fact should already be non-current after partial ledger write'
+    )
+
+    # ── Retry deny_candidate ──────────────────────────────────────────────────
+    updated, _ = candidates.deny_candidate(
+        conn,
+        result.candidate_id,
+        actor_id='ui:yuan',
+        reason='retry after partial deny failure',
+        ledger=ledger,
+    )
+
+    # Idempotency: no new ledger events were written.
+    events_after_retry = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_retry == 3, (
+        f'Retry must not duplicate invalidate events: expected 3, got {events_after_retry}'
+    )
+
+    # candidates.db must now reflect the denial.
+    assert updated == 1, 'candidates.db UPDATE must have applied on retry'
+    row_after = conn.execute(
+        'SELECT status FROM candidates WHERE candidate_id = ?',
+        (result.candidate_id,),
+    ).fetchone()
+    assert row_after['status'] == 'denied', (
+        f'candidates.db status must be denied after retry, got: {row_after["status"]!r}'
+    )
+
+    # Ledger state: fact is still non-current (no double-invalidate, no resurrection).
+    current_after_retry = ledger.current_state_facts()
+    assert len(current_after_retry) == 0, (
+        f'Fact must remain non-current after retry (no ledger resurrection), '
+        f'found: {current_after_retry!r}'
+    )

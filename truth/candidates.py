@@ -1344,6 +1344,25 @@ def promote_candidate(
 
     ledger_event_id = row["ledger_event_id"]
     if not ledger_event_id:
+        # ── Cross-store retry reconciliation ──────────────────────────────────
+        # Scenario: a prior attempt wrote the promote event to the ledger DB
+        # but the subsequent candidates.db UPDATE/commit failed.  On retry the
+        # DB row still has ledger_event_id=NULL.  Without this check we would
+        # write a duplicate promote (and the paired assert/supersede) event into
+        # the ledger, splitting the two stores permanently.
+        #
+        # Preferred approach (Phase-0 spec): reconcile from already-written
+        # ledger state before appending new events.  The promote event carries
+        # candidate_id so we can find it without any shared-transaction magic.
+        if hasattr(ledger, "promotion_event_for_candidate"):
+            existing_promote = ledger.promotion_event_for_candidate(candidate_id)
+            if existing_promote is not None:
+                # Ledger write already landed; recover the event_id and skip
+                # the write entirely.  The candidates.db UPDATE below will then
+                # persist the recovered event_id and flip status to 'approved'.
+                ledger_event_id = existing_promote.event_id
+
+    if not ledger_event_id:
         fact_payload = _candidate_fact_payload(row)
         if not hasattr(ledger, "promote_candidate_fact"):
             # Hard-fail: the old-style ledger interface (uppercase "PROMOTE"
@@ -1429,13 +1448,33 @@ def deny_candidate(
         if ledger_event_id:
             inv_object_id = ledger.object_id_for_event(ledger_event_id)
             if inv_object_id:
-                ledger.append_event(
-                    "invalidate",
-                    actor_id=actor_id,
-                    reason=safe_reason,
-                    object_id=inv_object_id,
-                    root_id=ledger.root_id_for_object(inv_object_id),
-                )
+                # ── Cross-store retry reconciliation ──────────────────────────
+                # Scenario: a prior attempt wrote the invalidate event to the
+                # ledger DB but the subsequent candidates.db UPDATE/commit
+                # failed.  On retry the DB row still has status != 'denied',
+                # so the early-return guard above does not fire and we reach
+                # this branch again.  Without this check we would append a
+                # duplicate invalidate event, permanently splitting the audit
+                # trail.
+                #
+                # Reconcile from already-written ledger state: look up whether
+                # an invalidate event already exists for this object before
+                # writing.  If one is found, skip the append — the ledger is
+                # already correct; only the candidates.db UPDATE is missing.
+                already_invalidated = False
+                if hasattr(ledger, "invalidate_event_for_object"):
+                    already_invalidated = (
+                        ledger.invalidate_event_for_object(inv_object_id) is not None
+                    )
+
+                if not already_invalidated:
+                    ledger.append_event(
+                        "invalidate",
+                        actor_id=actor_id,
+                        reason=safe_reason,
+                        object_id=inv_object_id,
+                        root_id=ledger.root_id_for_object(inv_object_id),
+                    )
                 # Note: ledger_event_id is NOT updated here; it retains
                 # provenance to the original promotion event.  The invalidate
                 # event is now in the ledger for the audit trail.

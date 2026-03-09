@@ -288,6 +288,44 @@ class ChangeLedger:
         ).fetchone()
         return str(row['object_id']) if row and row['object_id'] else None
 
+    def promotion_event_for_candidate(self, candidate_id: str) -> ChangeEventRow | None:
+        """Return the first promote event for a candidate_id, or None.
+
+        Used by promote_candidate() to reconcile after a partial failure where
+        the ledger write succeeded but the candidates DB update did not commit.
+        Querying by candidate_id instead of re-writing prevents duplicate
+        promote events on retry.
+        """
+        row = self.conn.execute(
+            """
+            SELECT * FROM change_events
+             WHERE candidate_id = ? AND event_type = 'promote'
+             ORDER BY recorded_at, rowid
+             LIMIT 1
+            """,
+            (candidate_id,),
+        ).fetchone()
+        return _row_to_event(row) if row else None
+
+    def invalidate_event_for_object(self, object_id: str) -> ChangeEventRow | None:
+        """Return the most recent invalidate event for object_id, or None.
+
+        Used by deny_candidate() to reconcile after a partial failure where
+        the ledger invalidate write succeeded but the candidates DB update did
+        not commit.  Checking before writing prevents duplicate invalidate
+        events on retry.
+        """
+        row = self.conn.execute(
+            """
+            SELECT * FROM change_events
+             WHERE object_id = ? AND event_type = 'invalidate'
+             ORDER BY recorded_at DESC, rowid DESC
+             LIMIT 1
+            """,
+            (object_id,),
+        ).fetchone()
+        return _row_to_event(row) if row else None
+
     def materialize_lineage(self, root_id: str) -> list[TypedMemoryObject]:
         events = self.events_for_root(root_id)
         return project_objects(events)
