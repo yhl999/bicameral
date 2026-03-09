@@ -39,6 +39,7 @@ from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClient
 from services.ontology_registry import OntologyRegistry
 from services.queue_service import QueueService, build_om_candidate_rows
 from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
+from services.typed_retrieval import TypedRetrievalService
 from utils.formatting import format_fact_result
 from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
@@ -1533,6 +1534,74 @@ async def search_memory_facts(
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
+
+
+@mcp.tool()
+async def search_memory_all(
+    query: str,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    object_types: list[str] | None = None,
+    metadata_filters: dict[str, Any] | None = None,
+    history_mode: str = 'auto',
+    current_only: bool | None = None,
+    max_results: int = 10,
+    max_evidence: int = 20,
+) -> dict[str, Any] | ErrorResponse:
+    """Search typed memory objects across state, episodes, procedures, and evidence.
+
+    Args:
+        query: The retrieval query
+        group_ids: Optional explicit list of group IDs to scope source_lane filtering
+        lane_alias: Optional lane aliases resolved via config.graphiti.lane_aliases
+        object_types: Optional bucket filter. Accepted values: state|episodes|procedures
+        metadata_filters: Optional metadata filter map applied against typed object fields
+        history_mode: auto|current|history|all
+        current_only: Optional explicit override for current-only retrieval
+        max_results: Maximum number of result roots/items to surface
+        max_evidence: Maximum number of evidence items to surface
+    """
+    try:
+        if max_results <= 0:
+            return ErrorResponse(error='max_results must be a positive integer')
+        if max_evidence <= 0:
+            return ErrorResponse(error='max_evidence must be a positive integer')
+        if metadata_filters is not None and not isinstance(metadata_filters, dict):
+            return ErrorResponse(error='metadata_filters must be an object/dict when provided')
+
+        effective_group_ids: list[str] = []
+        invalid_aliases: list[str] = []
+        if config is not None:
+            effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+                group_ids=group_ids,
+                lane_alias=lane_alias,
+            )
+        elif group_ids is not None:
+            effective_group_ids = _unique_preserve_order(group_ids)
+        elif lane_alias is not None:
+            invalid_aliases = list(lane_alias)
+
+        if invalid_aliases:
+            return ErrorResponse(error=f'Unknown lane aliases: {", ".join(invalid_aliases)}')
+
+        effective_filters = dict(metadata_filters or {})
+        if effective_group_ids:
+            effective_filters['source_lane'] = {'in': effective_group_ids}
+
+        service = TypedRetrievalService()
+        return await service.search(
+            query=query,
+            object_types=object_types,
+            metadata_filters=effective_filters,
+            history_mode=history_mode,
+            current_only=current_only,
+            max_results=max_results,
+            max_evidence=max_evidence,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error searching typed memory: {error_msg}')
+        return ErrorResponse(error=f'Error searching typed memory: {error_msg}')
 
 
 @mcp.tool()
