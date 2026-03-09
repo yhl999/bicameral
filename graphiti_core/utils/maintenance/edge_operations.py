@@ -292,8 +292,8 @@ async def extract_edges(
     """
     start = time()
 
-    extract_edges_max_tokens = 16384
     llm_client = clients.llm_client
+    extract_edges_max_tokens = min(16384, int(getattr(llm_client, 'max_tokens', 16384)))
 
     # Build mapping from edge type name to list of valid signatures
     edge_type_signatures_map: dict[str, list[tuple[str, str]]] = {}

@@ -1,5 +1,5 @@
 diff --git a/graphiti_core/graphiti.py b/graphiti_core/graphiti.py
-index 619607a..afd4f88 100644
+index 619607a..6ea9c9a 100644
 --- a/graphiti_core/graphiti.py
 +++ b/graphiti_core/graphiti.py
 @@ -14,9 +14,14 @@ See the License for the specific language governing permissions and
@@ -351,16 +351,17 @@ index 619607a..afd4f88 100644
      async def _process_episode_data(
          self,
          episode: EpisodicNode,
-@@ -803,6 +1083,8 @@ class Graphiti:
+@@ -803,6 +1083,9 @@ class Graphiti:
          custom_extraction_instructions: str | None = None,
          saga: str | SagaNode | None = None,
          saga_previous_episode_uuid: str | None = None,
 +        dedupe_mode: Literal['semantic', 'deterministic'] = 'semantic',
 +        extraction_mode: str = 'permissive',
++        tool_name: str | None = None,
      ) -> AddEpisodeResults:
          """
          Process an episode and update the graph.
-@@ -850,6 +1132,21 @@ class Graphiti:
+@@ -850,6 +1133,21 @@ class Graphiti:
              query to find the most recent episode. Useful for efficiently adding multiple episodes
              to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
              as this parameter for the next episode.
@@ -382,7 +383,30 @@ index 619607a..afd4f88 100644
  
          Returns
          -------
-@@ -934,6 +1231,12 @@ class Graphiti:
+@@ -872,6 +1170,22 @@ class Graphiti:
+                 background_tasks.add_task(graphiti.add_episode, **episode_data.dict())
+                 return {"message": "Episode processing started"}
+         """
++        # --- Scope policy gate (must run before any DB writes) ---
++        # If a tool_name is provided the episode originates from a tool result.
++        # Only allowlisted tools may be ingested; all others fail closed.
++        if tool_name is not None:
++            try:
++                from config.tool_result_allowlist import enforce_tool_result_scope
++                enforce_tool_result_scope(tool_name)
++            except ImportError:
++                # config package not on path — enforce a closed default: reject
++                # any named tool result rather than silently allowing everything.
++                raise ValueError(
++                    f'tool_name={tool_name!r} was supplied but the scope-policy '
++                    'allowlist (config.tool_result_allowlist) is not importable. '
++                    'Refusing to ingest tool result to fail closed.'
++                )
++
+         start = time()
+         now = utc_now()
+ 
+@@ -934,6 +1248,12 @@ class Graphiti:
                      entity_types,
                      excluded_entity_types,
                      custom_extraction_instructions,
@@ -395,7 +419,7 @@ index 619607a..afd4f88 100644
                  )
  
                  nodes, uuid_map, _ = await resolve_extracted_nodes(
-@@ -959,6 +1262,8 @@ class Graphiti:
+@@ -959,6 +1279,8 @@ class Graphiti:
                      nodes,
                      uuid_map,
                      custom_extraction_instructions,
@@ -404,7 +428,7 @@ index 619607a..afd4f88 100644
                  )
  
                  entity_edges = resolved_edges + invalidated_edges
-@@ -974,11 +1279,19 @@ class Graphiti:
+@@ -974,11 +1296,19 @@ class Graphiti:
                      edges=new_edges,
                  )
  
@@ -426,7 +450,7 @@ index 619607a..afd4f88 100644
                      now,
                      group_id,
                      saga,
-@@ -992,7 +1305,7 @@ class Graphiti:
+@@ -992,7 +1322,7 @@ class Graphiti:
                      communities, community_edges = await semaphore_gather(
                          *[
                              update_community(self.driver, self.llm_client, self.embedder, node)
@@ -435,7 +459,7 @@ index 619607a..afd4f88 100644
                          ],
                          max_coroutines=self.max_coroutines,
                      )
-@@ -1006,8 +1319,8 @@ class Graphiti:
+@@ -1006,8 +1336,8 @@ class Graphiti:
                          'episode.source': source.value,
                          'episode.reference_time': reference_time.isoformat(),
                          'group_id': group_id,
@@ -446,7 +470,7 @@ index 619607a..afd4f88 100644
                          'edge.invalidated_count': len(invalidated_edges),
                          'previous_episodes.count': len(previous_episodes),
                          'entity_types.count': len(entity_types) if entity_types else 0,
-@@ -1023,8 +1336,8 @@ class Graphiti:
+@@ -1023,8 +1353,8 @@ class Graphiti:
                  return AddEpisodeResults(
                      episode=episode,
                      episodic_edges=episodic_edges,
