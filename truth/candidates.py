@@ -700,6 +700,7 @@ def connect(db_path: Path | str = DB_PATH_DEFAULT) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     init_db(conn)
     return conn
 
@@ -1312,106 +1313,118 @@ def promote_candidate(
             "absent-from-ledger split-brain."
         )
 
-    row = conn.execute(
-        "SELECT * FROM candidates WHERE candidate_id = ?",
-        (candidate_id,),
-    ).fetchone()
-    if row is None:
-        return (0, None)
+    try:
+        # Serialize same-candidate decisioning at the candidates DB before any
+        # ledger write.  Without this gate, two concurrent callers can both see
+        # ledger_event_id=NULL and each append assert/promote into the ledger.
+        conn.execute("BEGIN IMMEDIATE")
 
-    # Guard: block re-approval of denied candidates (split-brain prevention).
-    #
-    # A candidate that was promoted and then denied has:
-    #   - candidates.db status = "denied"
-    #   - ledger_event_id = <original promotion event>
-    #   - ledger = an invalidate event making the fact non-current
-    #
-    # Calling promote_candidate again would flip candidates.db back to
-    # "approved" while the ledger's invalidate event still makes the fact
-    # non-current — a split-brain that violates the ledger-as-source-of-truth
-    # contract.  "denied" is a terminal lifecycle state; to re-introduce a
-    # denied fact, create a new candidate with fresh evidence.
-    if row["status"] == "denied":
-        return (0, None)
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return (0, None)
 
-    # Guard: don't re-promote or write duplicate ledger events
-    if row["status"] in ("approved", "auto_promoted") and row["ledger_event_id"]:
-        return (0, row["ledger_event_id"])
-
-    decision = _decision_for_actor(actor_id)
-    decided_at = _now_iso()
-    safe_reason = _normalize_reason(reason, fallback=decision)
-
-    ledger_event_id = row["ledger_event_id"]
-    if not ledger_event_id:
-        # ── Cross-store retry reconciliation ──────────────────────────────────
-        # Scenario: a prior attempt wrote the promote event to the ledger DB
-        # but the subsequent candidates.db UPDATE/commit failed.  On retry the
-        # DB row still has ledger_event_id=NULL.  Without this check we would
-        # write a duplicate promote (and the paired assert/supersede) event into
-        # the ledger, splitting the two stores permanently.
+        # Guard: block re-approval of denied candidates (split-brain prevention).
         #
-        # Preferred approach (Phase-0 spec): reconcile from already-written
-        # ledger state before appending new events.  The promote event carries
-        # candidate_id so we can find it without any shared-transaction magic.
-        if hasattr(ledger, "promotion_event_for_candidate"):
-            existing_promote = ledger.promotion_event_for_candidate(candidate_id)
-            if existing_promote is not None:
-                # Ledger write already landed; recover the event_id and skip
-                # the write entirely.  The candidates.db UPDATE below will then
-                # persist the recovered event_id and flip status to 'approved'.
-                ledger_event_id = existing_promote.event_id
+        # A candidate that was promoted and then denied has:
+        #   - candidates.db status = "denied"
+        #   - ledger_event_id = <original promotion event>
+        #   - ledger = an invalidate event making the fact non-current
+        #
+        # Calling promote_candidate again would flip candidates.db back to
+        # "approved" while the ledger's invalidate event still makes the fact
+        # non-current — a split-brain that violates the ledger-as-source-of-truth
+        # contract.  "denied" is a terminal lifecycle state; to re-introduce a
+        # denied fact, create a new candidate with fresh evidence.
+        if row["status"] == "denied":
+            conn.rollback()
+            return (0, None)
 
-    if not ledger_event_id:
-        fact_payload = _candidate_fact_payload(row)
-        if not hasattr(ledger, "promote_candidate_fact"):
-            # Hard-fail: the old-style ledger interface (uppercase "PROMOTE"
-            # event vocabulary) is dead and contract-drifted.  Any ledger that
-            # does not implement promote_candidate_fact is incompatible with the
-            # Phase 0 locked change-event vocabulary.  Prefer explicit failure
-            # over silently writing malformed events.
-            raise TypeError(
-                f"ledger of type {type(ledger).__name__!r} does not implement "
-                "promote_candidate_fact().  Only ChangeLedger instances are "
-                "supported.  The legacy PROMOTE/DENY uppercase event vocabulary "
-                "is retired; update the caller to pass a ChangeLedger."
+        # Guard: don't re-promote or write duplicate ledger events
+        if row["status"] in ("approved", "auto_promoted") and row["ledger_event_id"]:
+            conn.rollback()
+            return (0, row["ledger_event_id"])
+
+        decision = _decision_for_actor(actor_id)
+        decided_at = _now_iso()
+        safe_reason = _normalize_reason(reason, fallback=decision)
+
+        ledger_event_id = row["ledger_event_id"]
+        if not ledger_event_id:
+            # ── Cross-store retry reconciliation ──────────────────────────────
+            # Scenario: a prior attempt wrote the promote event to the ledger DB
+            # but the subsequent candidates.db UPDATE/commit failed.  On retry the
+            # DB row still has ledger_event_id=NULL.  Without this check we would
+            # write a duplicate promote (and the paired assert/supersede) event into
+            # the ledger, splitting the two stores permanently.
+            #
+            # Preferred approach (Phase-0 spec): reconcile from already-written
+            # ledger state before appending new events.  The promote event carries
+            # candidate_id so we can find it without any shared-transaction magic.
+            if hasattr(ledger, "promotion_event_for_candidate"):
+                existing_promote = ledger.promotion_event_for_candidate(candidate_id)
+                if existing_promote is not None:
+                    # Ledger write already landed; recover the event_id and skip
+                    # the write entirely.  The candidates.db UPDATE below will then
+                    # persist the recovered event_id and flip status to 'approved'.
+                    ledger_event_id = existing_promote.event_id
+
+        if not ledger_event_id:
+            fact_payload = _candidate_fact_payload(row)
+            if not hasattr(ledger, "promote_candidate_fact"):
+                # Hard-fail: the old-style ledger interface (uppercase "PROMOTE"
+                # event vocabulary) is dead and contract-drifted.  Any ledger that
+                # does not implement promote_candidate_fact is incompatible with the
+                # Phase 0 locked change-event vocabulary.  Prefer explicit failure
+                # over silently writing malformed events.
+                raise TypeError(
+                    f"ledger of type {type(ledger).__name__!r} does not implement "
+                    "promote_candidate_fact().  Only ChangeLedger instances are "
+                    "supported.  The legacy PROMOTE/DENY uppercase event vocabulary "
+                    "is retired; update the caller to pass a ChangeLedger."
+                )
+            promotion_result = ledger.promote_candidate_fact(
+                actor_id=actor_id,
+                reason=safe_reason,
+                policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
+                candidate_id=candidate_id,
+                fact=fact_payload,
+                conflict_with_fact_id=row["conflict_with_fact_id"],
+                seeded_supersede_ok=bool(
+                    _coerce_json(row["policy_trace_json"], {}).get("seeded_supersede_ok")
+                ),
+                recorded_at=decided_at,
             )
-        promotion_result = ledger.promote_candidate_fact(
-            actor_id=actor_id,
-            reason=safe_reason,
-            policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
-            candidate_id=candidate_id,
-            fact=fact_payload,
-            conflict_with_fact_id=row["conflict_with_fact_id"],
-            seeded_supersede_ok=bool(
-                _coerce_json(row["policy_trace_json"], {}).get("seeded_supersede_ok")
-            ),
-            recorded_at=decided_at,
-        )
-        ledger_event_id = promotion_result.event_id
+            ledger_event_id = promotion_result.event_id
 
-    res = conn.execute(
-        """
-        UPDATE candidates
-           SET status = 'approved',
-               decided_at = ?,
-               actor_id = ?,
-               decision = ?,
-               decision_reason = ?,
-               ledger_event_id = COALESCE(?, ledger_event_id)
-         WHERE candidate_id = ?
-        """,
-        (
-            decided_at,
-            actor_id,
-            decision,
-            safe_reason,
-            ledger_event_id,
-            candidate_id,
-        ),
-    )
-    conn.commit()
-    return (res.rowcount, ledger_event_id)
+        res = conn.execute(
+            """
+            UPDATE candidates
+               SET status = 'approved',
+                   decided_at = ?,
+                   actor_id = ?,
+                   decision = ?,
+                   decision_reason = ?,
+                   ledger_event_id = COALESCE(?, ledger_event_id)
+             WHERE candidate_id = ?
+            """,
+            (
+                decided_at,
+                actor_id,
+                decision,
+                safe_reason,
+                ledger_event_id,
+                candidate_id,
+            ),
+        )
+        conn.commit()
+        return (res.rowcount, ledger_event_id)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def deny_candidate(
@@ -1423,68 +1436,90 @@ def deny_candidate(
 ) -> tuple[int, str | None]:
     """Deny a candidate."""
 
-    row = conn.execute(
-        "SELECT * FROM candidates WHERE candidate_id = ?",
-        (candidate_id,),
-    ).fetchone()
-    if row is None:
-        return (0, None)
+    try:
+        # Serialize same-candidate denial at the candidates DB before any
+        # ledger write so concurrent deny calls cannot both append invalidate.
+        conn.execute("BEGIN IMMEDIATE")
 
-    # Guard: don't re-deny or write duplicate ledger events
-    if row["status"] == "denied" and row["ledger_event_id"]:
-        return (0, row["ledger_event_id"])
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return (0, None)
 
-    decided_at = _now_iso()
-    safe_reason = _normalize_reason(reason, fallback="denied")
+        # Guard: don't re-deny or write duplicate ledger events
+        if row["status"] == "denied" and row["ledger_event_id"]:
+            conn.rollback()
+            return (0, row["ledger_event_id"])
 
-    ledger_event_id = row["ledger_event_id"]
-    if ledger is not None and hasattr(ledger, "promote_candidate_fact"):
-        # New-style ChangeLedger path.
-        # If the candidate was previously promoted, write an 'invalidate' event
-        # so the ledger's append-only audit trail remains complete.
-        # If it was never promoted (no ledger_event_id), nothing entered the
-        # ledger, so no ledger event is needed — the candidates DB row is the
-        # sole audit record for the denial.
-        if ledger_event_id:
+        decided_at = _now_iso()
+        safe_reason = _normalize_reason(reason, fallback="denied")
+
+        ledger_event_id = row["ledger_event_id"]
+        previously_promoted = bool(ledger_event_id)
+        if previously_promoted:
+            # Fail closed: once a candidate has a promotion event recorded, we
+            # must be able to invalidate that exact ledger truth before we mark
+            # candidates.db as denied.  Otherwise candidates.db could say
+            # "denied" while the ledger still leaves the fact current.
+            if ledger is None:
+                raise ValueError(
+                    f"deny_candidate() requires a compatible ledger to deny "
+                    f"previously promoted candidate {candidate_id!r}."
+                )
+            if not (
+                hasattr(ledger, "promote_candidate_fact")
+                and hasattr(ledger, "object_id_for_event")
+                and hasattr(ledger, "root_id_for_object")
+                and hasattr(ledger, "append_event")
+            ):
+                raise TypeError(
+                    f"ledger of type {type(ledger).__name__!r} is incompatible "
+                    "with deny_candidate() for previously promoted candidates.  "
+                    "Only ChangeLedger-compatible instances are supported."
+                )
+
             inv_object_id = ledger.object_id_for_event(ledger_event_id)
-            if inv_object_id:
-                # ── Cross-store retry reconciliation ──────────────────────────
-                # Scenario: a prior attempt wrote the invalidate event to the
-                # ledger DB but the subsequent candidates.db UPDATE/commit
-                # failed.  On retry the DB row still has status != 'denied',
-                # so the early-return guard above does not fire and we reach
-                # this branch again.  Without this check we would append a
-                # duplicate invalidate event, permanently splitting the audit
-                # trail.
-                #
-                # Reconcile from already-written ledger state: look up whether
-                # an invalidate event already exists for this object before
-                # writing.  If one is found, skip the append — the ledger is
-                # already correct; only the candidates.db UPDATE is missing.
-                already_invalidated = False
-                if hasattr(ledger, "invalidate_event_for_object"):
-                    already_invalidated = (
-                        ledger.invalidate_event_for_object(inv_object_id) is not None
-                    )
+            if not inv_object_id:
+                raise ValueError(
+                    f"deny_candidate() could not resolve ledger_event_id "
+                    f"{ledger_event_id!r} for candidate {candidate_id!r}; "
+                    "refusing to mark candidates.db denied while ledger truth "
+                    "may still be current."
+                )
 
-                if not already_invalidated:
-                    ledger.append_event(
-                        "invalidate",
-                        actor_id=actor_id,
-                        reason=safe_reason,
-                        object_id=inv_object_id,
-                        root_id=ledger.root_id_for_object(inv_object_id),
-                    )
-                # Note: ledger_event_id is NOT updated here; it retains
-                # provenance to the original promotion event.  The invalidate
-                # event is now in the ledger for the audit trail.
-    elif ledger is not None and not ledger_event_id:
-        # Hard-fail: the old-style ledger interface (uppercase "DENY" event
-        # vocabulary) is dead and contract-drifted.  An old-style ledger that
-        # does not implement promote_candidate_fact reached the deny path
-        # without a previous promotion event, which is an unexpected state.
-        # Prefer explicit failure over silently writing malformed events.
-        if not hasattr(ledger, "promote_candidate_fact"):
+            # ── Cross-store retry reconciliation ──────────────────────────────
+            # Scenario: a prior attempt wrote the invalidate event to the ledger
+            # DB but the subsequent candidates.db UPDATE/commit failed.  On
+            # retry the DB row still has status != 'denied', so the early-return
+            # guard above does not fire and we reach this branch again.  Without
+            # this check we would append a duplicate invalidate event,
+            # permanently splitting the audit trail.
+            already_invalidated = False
+            if hasattr(ledger, "invalidate_event_for_object"):
+                already_invalidated = (
+                    ledger.invalidate_event_for_object(inv_object_id) is not None
+                )
+
+            if not already_invalidated:
+                ledger.append_event(
+                    "invalidate",
+                    actor_id=actor_id,
+                    reason=safe_reason,
+                    object_id=inv_object_id,
+                    root_id=ledger.root_id_for_object(inv_object_id),
+                )
+            # Note: ledger_event_id is NOT updated here; it retains provenance
+            # to the original promotion event.  The invalidate event is now in
+            # the ledger for the audit trail.
+        elif ledger is not None and not hasattr(ledger, "promote_candidate_fact"):
+            # Hard-fail: the old-style ledger interface (uppercase "DENY" event
+            # vocabulary) is dead and contract-drifted.  An old-style ledger that
+            # does not implement promote_candidate_fact reached the deny path
+            # without a previous promotion event, which is an unexpected state.
+            # Prefer explicit failure over silently writing malformed events.
             raise TypeError(
                 f"ledger of type {type(ledger).__name__!r} does not implement "
                 "promote_candidate_fact().  Only ChangeLedger instances are "
@@ -1492,27 +1527,30 @@ def deny_candidate(
                 "is retired; update the caller to pass a ChangeLedger."
             )
 
-    res = conn.execute(
-        """
-        UPDATE candidates
-           SET status = 'denied',
-               decided_at = ?,
-               actor_id = ?,
-               decision = 'denied',
-               decision_reason = ?,
-               ledger_event_id = COALESCE(?, ledger_event_id)
-         WHERE candidate_id = ?
-        """,
-        (
-            decided_at,
-            actor_id,
-            safe_reason,
-            ledger_event_id,
-            candidate_id,
-        ),
-    )
-    conn.commit()
-    return (res.rowcount, ledger_event_id)
+        res = conn.execute(
+            """
+            UPDATE candidates
+               SET status = 'denied',
+                   decided_at = ?,
+                   actor_id = ?,
+                   decision = 'denied',
+                   decision_reason = ?,
+                   ledger_event_id = COALESCE(?, ledger_event_id)
+             WHERE candidate_id = ?
+            """,
+            (
+                decided_at,
+                actor_id,
+                safe_reason,
+                ledger_event_id,
+                candidate_id,
+            ),
+        )
+        conn.commit()
+        return (res.rowcount, ledger_event_id)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def auto_promote_if_eligible(

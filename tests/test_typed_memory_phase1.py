@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from mcp_server.src.models.typed_memory import EvidenceRef, EntityRegistryEntry, Procedure, StateFact
 from mcp_server.src.services.change_ledger import ChangeLedger
+from truth import candidates as candidates_store
 
 
 def _ledger() -> ChangeLedger:
@@ -32,6 +33,40 @@ def _message_ref(message_id: str = 'm1') -> EvidenceRef:
             'message_id': message_id,
         },
     )
+
+
+def _candidate_ref(evidence_id: str) -> dict[str, str]:
+    return {
+        'source_key': 'sessions:s1',
+        'evidence_id': evidence_id,
+        'scope': 's1_sessions_main',
+    }
+
+
+def _seed_candidate(conn: sqlite3.Connection, *, predicate: str, value: str) -> str:
+    result = candidates_store.upsert_candidate(
+        conn,
+        subject='user:principal',
+        predicate=predicate,
+        scope='private',
+        assertion_type='preference',
+        value=value,
+        evidence_refs=[_candidate_ref(f'ev-{predicate}-{value}')],
+        speaker_id='owner',
+        confidence=0.91,
+        origin='manual_test',
+        reason='manual_test',
+    )
+    return result.candidate_id
+
+
+def _candidate_row(conn: sqlite3.Connection, candidate_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        'SELECT * FROM candidates WHERE candidate_id = ?',
+        (candidate_id,),
+    ).fetchone()
+    assert row is not None
+    return row
 
 
 def test_evidence_ref_uses_locked_canonical_uri_shapes():
@@ -606,3 +641,257 @@ def test_concurrent_connections_cannot_produce_two_current_facts(tmp_path):
         f'got {len(current_for_pred)}: '
         + str([(f.object_id, f.value) for f in current_for_pred])
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #147 remaining P1 blockers — deny fail-closed + same-candidate idempotency
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_deny_promoted_candidate_with_ledger_none_fails_closed(tmp_path):
+    candidates_db = tmp_path / 'candidates-none.db'
+    ledger_db = tmp_path / 'ledger-none.db'
+
+    conn = candidates_store.connect(candidates_db)
+    ledger = ChangeLedger(ledger_db)
+    candidate_id = _seed_candidate(
+        conn,
+        predicate='pref.deny_requires_ledger_none',
+        value='vim',
+    )
+    _, promotion_event_id = candidates_store.promote_candidate(
+        conn,
+        candidate_id,
+        actor_id='ui:yuan',
+        reason='promote before deny-none test',
+        ledger=ledger,
+    )
+    assert promotion_event_id is not None
+
+    with pytest.raises(ValueError, match='requires a compatible ledger'):
+        candidates_store.deny_candidate(
+            conn,
+            candidate_id,
+            actor_id='ui:yuan',
+            reason='deny without ledger',
+            ledger=None,
+        )
+
+    row = _candidate_row(conn, candidate_id)
+    assert row['status'] == 'approved'
+    assert row['ledger_event_id'] == promotion_event_id
+    assert ledger.current_object(ledger.root_id_for_object(ledger.object_id_for_event(promotion_event_id))) is not None
+
+
+def test_deny_promoted_candidate_with_incompatible_legacy_ledger_fails_closed(tmp_path):
+    candidates_db = tmp_path / 'candidates-legacy.db'
+    ledger_db = tmp_path / 'ledger-legacy.db'
+
+    conn = candidates_store.connect(candidates_db)
+    ledger = ChangeLedger(ledger_db)
+    candidate_id = _seed_candidate(
+        conn,
+        predicate='pref.deny_requires_legacy',
+        value='emacs',
+    )
+    _, promotion_event_id = candidates_store.promote_candidate(
+        conn,
+        candidate_id,
+        actor_id='ui:yuan',
+        reason='promote before legacy deny test',
+        ledger=ledger,
+    )
+    assert promotion_event_id is not None
+
+    class LegacyLedger:
+        pass
+
+    with pytest.raises(TypeError, match='incompatible with deny_candidate'):
+        candidates_store.deny_candidate(
+            conn,
+            candidate_id,
+            actor_id='ui:yuan',
+            reason='deny with legacy ledger',
+            ledger=LegacyLedger(),
+        )
+
+    row = _candidate_row(conn, candidate_id)
+    assert row['status'] == 'approved'
+    assert row['ledger_event_id'] == promotion_event_id
+
+
+def test_deny_promoted_candidate_with_unresolvable_ledger_event_fails_closed(tmp_path):
+    candidates_db = tmp_path / 'candidates-missing-event.db'
+    ledger_db = tmp_path / 'ledger-missing-event.db'
+
+    conn = candidates_store.connect(candidates_db)
+    ledger = ChangeLedger(ledger_db)
+    candidate_id = _seed_candidate(
+        conn,
+        predicate='pref.deny_requires_resolve',
+        value='helix',
+    )
+    _, promotion_event_id = candidates_store.promote_candidate(
+        conn,
+        candidate_id,
+        actor_id='ui:yuan',
+        reason='promote before missing-event deny test',
+        ledger=ledger,
+    )
+    assert promotion_event_id is not None
+
+    conn.execute(
+        'UPDATE candidates SET ledger_event_id = ? WHERE candidate_id = ?',
+        ('evt_missing_promote', candidate_id),
+    )
+    conn.commit()
+
+    with pytest.raises(ValueError, match='could not resolve ledger_event_id'):
+        candidates_store.deny_candidate(
+            conn,
+            candidate_id,
+            actor_id='ui:yuan',
+            reason='deny with missing promotion event',
+            ledger=ledger,
+        )
+
+    row = _candidate_row(conn, candidate_id)
+    assert row['status'] == 'approved'
+    assert row['ledger_event_id'] == 'evt_missing_promote'
+
+
+def test_concurrent_same_candidate_promote_does_not_duplicate_ledger_events(tmp_path):
+    candidates_db = tmp_path / 'candidates-concurrent-promote.db'
+    ledger_db = tmp_path / 'ledger-concurrent-promote.db'
+
+    base_conn = candidates_store.connect(candidates_db)
+    ChangeLedger(ledger_db)  # prime schema before the race; test candidate logic, not DB bootstrap lock timing
+    candidate_id = _seed_candidate(
+        base_conn,
+        predicate='pref.same_candidate_promote',
+        value='zed',
+    )
+
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+    results: list[tuple[int, str | None]] = []
+
+    def _promote() -> None:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = candidates_store.connect(candidates_db)
+            ledger = ChangeLedger(ledger_db)
+            barrier.wait()
+            results.append(
+                candidates_store.promote_candidate(
+                    conn,
+                    candidate_id,
+                    actor_id='ui:yuan',
+                    reason='concurrent promote same candidate',
+                    ledger=ledger,
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    t1 = threading.Thread(target=_promote)
+    t2 = threading.Thread(target=_promote)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert errors == []
+    assert len(results) == 2
+    assert {ledger_event_id for _, ledger_event_id in results} == {
+        next(ledger_event_id for _, ledger_event_id in results if ledger_event_id is not None)
+    }
+
+    row = _candidate_row(base_conn, candidate_id)
+    assert row['status'] == 'approved'
+    assert row['ledger_event_id'] is not None
+
+    ledger = ChangeLedger(ledger_db)
+    rows = ledger.conn.execute(
+        'SELECT event_type FROM change_events WHERE candidate_id = ? ORDER BY rowid',
+        (candidate_id,),
+    ).fetchall()
+    assert [r['event_type'] for r in rows] == ['assert', 'promote']
+
+
+def test_concurrent_same_candidate_deny_does_not_duplicate_invalidate_events(tmp_path):
+    candidates_db = tmp_path / 'candidates-concurrent-deny.db'
+    ledger_db = tmp_path / 'ledger-concurrent-deny.db'
+
+    base_conn = candidates_store.connect(candidates_db)
+    setup_ledger = ChangeLedger(ledger_db)
+    candidate_id = _seed_candidate(
+        base_conn,
+        predicate='pref.same_candidate_deny',
+        value='nano',
+    )
+    _, promotion_event_id = candidates_store.promote_candidate(
+        base_conn,
+        candidate_id,
+        actor_id='ui:yuan',
+        reason='promote before concurrent deny test',
+        ledger=setup_ledger,
+    )
+    assert promotion_event_id is not None
+    promoted_object_id = setup_ledger.object_id_for_event(promotion_event_id)
+    assert promoted_object_id is not None
+
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+    results: list[tuple[int, str | None]] = []
+
+    def _deny() -> None:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = candidates_store.connect(candidates_db)
+            ledger = ChangeLedger(ledger_db)
+            barrier.wait()
+            results.append(
+                candidates_store.deny_candidate(
+                    conn,
+                    candidate_id,
+                    actor_id='ui:yuan',
+                    reason='concurrent deny same candidate',
+                    ledger=ledger,
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    t1 = threading.Thread(target=_deny)
+    t2 = threading.Thread(target=_deny)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert errors == []
+    assert len(results) == 2
+    assert all(ledger_event_id == promotion_event_id for _, ledger_event_id in results)
+
+    row = _candidate_row(base_conn, candidate_id)
+    assert row['status'] == 'denied'
+    assert row['ledger_event_id'] == promotion_event_id
+
+    ledger = ChangeLedger(ledger_db)
+    rows = ledger.conn.execute(
+        '''
+        SELECT event_type
+          FROM change_events
+         WHERE object_id = ?
+         ORDER BY rowid
+        ''',
+        (promoted_object_id,),
+    ).fetchall()
+    assert [r['event_type'] for r in rows] == ['assert', 'promote', 'invalidate']
