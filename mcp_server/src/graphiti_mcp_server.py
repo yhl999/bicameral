@@ -94,6 +94,8 @@ except (ValueError, TypeError):
 # regardless of what value the client passes in max_nodes / max_facts.
 _MAX_NODES_CAP = 200
 _MAX_FACTS_CAP = 200
+_MAX_TYPED_RESULTS_CAP = 200
+_MAX_TYPED_EVIDENCE_CAP = 200
 
 
 def _env_float(
@@ -1392,6 +1394,8 @@ async def _search_typed_memory_contract(
         return ErrorResponse(error='max_results must be a positive integer')
     if max_evidence <= 0:
         return ErrorResponse(error='max_evidence must be a positive integer')
+    max_results = min(max_results, _MAX_TYPED_RESULTS_CAP)
+    max_evidence = min(max_evidence, _MAX_TYPED_EVIDENCE_CAP)
     if metadata_filters is not None and not isinstance(metadata_filters, dict):
         return ErrorResponse(error='metadata_filters must be an object/dict when provided')
 
@@ -1500,7 +1504,26 @@ async def search_memory_facts(
                 return ErrorResponse(error='rate limit exceeded; retry later')
 
         if normalized_result_format == 'typed':
+            normalized_mode = (search_mode or 'hybrid').strip().lower()
+            if normalized_mode not in VALID_SEARCH_MODES:
+                return ErrorResponse(
+                    error=(
+                        f'Invalid search_mode: {_sanitize_for_error(str(search_mode))!r}. '
+                        f'Expected one of: {sorted(VALID_SEARCH_MODES)}'
+                    )
+                )
+            if normalized_mode != 'hybrid':
+                return ErrorResponse(
+                    error="search_mode is not supported for result_format='typed'; use 'hybrid' or omit it"
+                )
+            if center_node_uuid is not None:
+                return ErrorResponse(
+                    error="center_node_uuid is not supported for result_format='typed'"
+                )
+
             effective_max_results = max_facts if max_results is None else max_results
+            effective_max_results = min(effective_max_results, _MAX_TYPED_RESULTS_CAP)
+            effective_max_evidence = min(max_evidence, _MAX_TYPED_EVIDENCE_CAP)
             return await _search_typed_memory_contract(
                 query=query,
                 effective_group_ids=effective_group_ids,
@@ -1509,7 +1532,7 @@ async def search_memory_facts(
                 history_mode=history_mode,
                 current_only=current_only,
                 max_results=effective_max_results,
-                max_evidence=max_evidence,
+                max_evidence=effective_max_evidence,
             )
 
         if graphiti_service is None:

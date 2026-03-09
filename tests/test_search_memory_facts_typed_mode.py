@@ -135,6 +135,90 @@ def test_search_memory_facts_typed_mode_honors_explicit_max_results():
     assert fake_service.calls[0]['max_results'] == 9
 
 
+def test_search_memory_facts_typed_mode_rejects_non_hybrid_search_mode():
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        response = _run(
+            server.search_memory_facts(
+                query='coffee',
+                result_format='typed',
+                search_mode='semantic',
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert response == {
+        'error': "search_mode is not supported for result_format='typed'; use 'hybrid' or omit it"
+    }
+
+
+def test_search_memory_facts_typed_mode_rejects_center_node_uuid():
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        response = _run(
+            server.search_memory_facts(
+                query='coffee',
+                result_format='typed',
+                center_node_uuid='node-123',
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert response == {'error': "center_node_uuid is not supported for result_format='typed'"}
+
+
+def test_search_memory_facts_typed_mode_caps_requested_limits_before_service_call():
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_service_cls = server.TypedRetrievalService
+
+    fake_service = _FakeTypedRetrievalService(
+        {
+            'message': 'Typed memory retrieved successfully',
+            'query_mode': 'all',
+            'state': [],
+            'episodes': [],
+            'procedures': [],
+            'evidence': [],
+            'counts': {'state': 0, 'episodes': 0, 'procedures': 0, 'evidence': 0},
+        }
+    )
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.TypedRetrievalService = lambda: fake_service
+
+        _run(
+            server.search_memory_facts(
+                query='coffee',
+                result_format='typed',
+                max_results=999,
+                max_evidence=999,
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.TypedRetrievalService = original_service_cls
+
+    assert fake_service.calls[0]['max_results'] == 200
+    assert fake_service.calls[0]['max_evidence'] == 200
+
+
 def test_search_memory_facts_rejects_unknown_result_format():
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
     try:

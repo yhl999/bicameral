@@ -77,6 +77,12 @@ _STOPWORDS = {
     'when',
     'with',
 }
+_MAX_TYPED_RESULTS_CAP = 200
+_MAX_TYPED_EVIDENCE_CAP = 200
+_MAX_CANDIDATE_ROOTS = 250
+_MAX_LINEAGE_EVENTS = 256
+_MAX_QUERY_ROOT_TOKENS = 8
+_MIN_QUERY_ROOT_TOKEN_LENGTH = 3
 
 
 @dataclass(frozen=True)
@@ -110,10 +116,21 @@ class TypedRetrievalService:
         max_results: int = 10,
         max_evidence: int = 20,
     ) -> dict[str, Any]:
-        if max_results <= 0:
+        try:
+            requested_max_results = int(max_results)
+        except (TypeError, ValueError):
+            raise ValueError('max_results must be a positive integer') from None
+        try:
+            requested_max_evidence = int(max_evidence)
+        except (TypeError, ValueError):
+            raise ValueError('max_evidence must be a positive integer') from None
+
+        if requested_max_results <= 0:
             raise ValueError('max_results must be a positive integer')
-        if max_evidence <= 0:
+        if requested_max_evidence <= 0:
             raise ValueError('max_evidence must be a positive integer')
+        effective_max_results = min(requested_max_results, _MAX_TYPED_RESULTS_CAP)
+        effective_max_evidence = min(requested_max_evidence, _MAX_TYPED_EVIDENCE_CAP)
 
         normalized_object_types = _normalize_object_types(object_types)
         metadata_filters = dict(metadata_filters or {})
@@ -123,7 +140,11 @@ class TypedRetrievalService:
             current_only=current_only,
         )
 
-        all_objects = self._materialize_all_objects()
+        all_objects, materialization_limits = self._materialize_candidate_objects(
+            query=query,
+            object_types=normalized_object_types,
+            metadata_filters=metadata_filters,
+        )
         filtered_objects = [
             obj
             for obj in all_objects
@@ -135,24 +156,51 @@ class TypedRetrievalService:
             filtered_objects = [obj for obj in filtered_objects if obj.is_current]
 
         ranked_objects = _rank_objects(filtered_objects, query)
-        selected_objects = self._select_objects(ranked_objects, filtered_objects, query_mode, max_results)
+        selected_objects = self._select_objects(
+            ranked_objects,
+            filtered_objects,
+            query_mode,
+            effective_max_results,
+        )
         bucketed = self._bucket_objects(selected_objects)
-        evidence = await self._resolve_evidence(selected_objects, max_evidence=max_evidence)
+        evidence = await self._resolve_evidence(
+            selected_objects,
+            max_evidence=effective_max_evidence,
+        )
+        limits_applied = {
+            'max_results': {
+                'requested': requested_max_results,
+                'effective': effective_max_results,
+            },
+            'max_evidence': {
+                'requested': requested_max_evidence,
+                'effective': effective_max_evidence,
+            },
+            'materialization': materialization_limits,
+        }
+        filters_applied = {
+            'object_types': sorted(normalized_object_types) if normalized_object_types else [],
+            'metadata_filters': metadata_filters,
+        }
 
         total_objects = sum(len(bucket) for bucket in bucketed.values())
         if total_objects == 0:
             return {
                 'message': 'No relevant typed memory found',
+                'result_format': 'typed',
                 'query_mode': query_mode,
                 'state': [],
                 'episodes': [],
                 'procedures': [],
                 'evidence': [],
                 'counts': {'state': 0, 'episodes': 0, 'procedures': 0, 'evidence': 0},
+                'filters_applied': filters_applied,
+                'limits_applied': limits_applied,
             }
 
         return {
             'message': 'Typed memory retrieved successfully',
+            'result_format': 'typed',
             'query_mode': query_mode,
             'state': bucketed['state'],
             'episodes': bucketed['episodes'],
@@ -164,28 +212,132 @@ class TypedRetrievalService:
                 'procedures': len(bucketed['procedures']),
                 'evidence': len(evidence),
             },
-            'filters_applied': {
-                'object_types': sorted(normalized_object_types) if normalized_object_types else [],
-                'metadata_filters': metadata_filters,
-            },
+            'filters_applied': filters_applied,
+            'limits_applied': limits_applied,
         }
 
-    def _materialize_all_objects(self) -> list[TypedMemoryObject]:
+    def _materialize_candidate_objects(
+        self,
+        *,
+        query: str,
+        object_types: set[str],
+        metadata_filters: dict[str, Any],
+    ) -> tuple[list[TypedMemoryObject], dict[str, Any]]:
+        assert self.ledger is not None
+        root_ids, root_selection_strategy = self._candidate_root_ids(
+            query=query,
+            max_roots=_MAX_CANDIDATE_ROOTS,
+            object_types=object_types,
+            metadata_filters=metadata_filters,
+        )
+        objects: list[TypedMemoryObject] = []
+        materialized_roots = 0
+        skipped_roots = 0
+        for root_id in root_ids:
+            rows = self._events_for_root_limited(root_id=root_id, max_events=_MAX_LINEAGE_EVENTS)
+            if rows is None:
+                skipped_roots += 1
+                continue
+            materialized_roots += 1
+            objects.extend(project_objects(rows))
+
+        limits = {
+            'candidate_roots': len(root_ids),
+            'materialized_roots': materialized_roots,
+            'skipped_roots_over_event_cap': skipped_roots,
+            'root_selection_strategy': root_selection_strategy,
+            'max_candidate_roots': _MAX_CANDIDATE_ROOTS,
+            'max_lineage_events': _MAX_LINEAGE_EVENTS,
+        }
+        return sorted(objects, key=_object_sort_key), limits
+
+    def _candidate_root_ids(
+        self,
+        *,
+        query: str,
+        max_roots: int,
+        object_types: set[str],
+        metadata_filters: dict[str, Any],
+    ) -> tuple[list[str], str]:
+        assert self.ledger is not None
+        base_filters = ['payload_json IS NOT NULL', 'COALESCE(root_id, object_id) IS NOT NULL']
+        base_params: list[Any] = []
+
+        if object_types:
+            placeholders = ', '.join('?' for _ in object_types)
+            base_filters.append(f'object_type IN ({placeholders})')
+            base_params.extend(sorted(object_types))
+
+        source_lane_values = _coerce_sql_filter_values(metadata_filters.get('source_lane'))
+        if source_lane_values:
+            placeholders = ', '.join('?' for _ in source_lane_values)
+            base_filters.append(f"json_extract(payload_json, '$.source_lane') IN ({placeholders})")
+            base_params.extend(source_lane_values)
+
+        tokens = [
+            token
+            for token in _tokenize(query)
+            if len(token) >= _MIN_QUERY_ROOT_TOKEN_LENGTH
+        ][:_MAX_QUERY_ROOT_TOKENS]
+        if tokens:
+            token_clause = ' OR '.join('instr(lower(payload_json), ?) > 0' for _ in tokens)
+            where_clause = ' AND '.join([*base_filters, f'({token_clause})'])
+            rows = self.ledger.conn.execute(
+                f"""
+                SELECT root_id
+                  FROM (
+                        SELECT COALESCE(root_id, object_id) AS root_id,
+                               MAX(recorded_at) AS latest_recorded_at
+                          FROM change_events
+                         WHERE {where_clause}
+                         GROUP BY COALESCE(root_id, object_id)
+                         ORDER BY latest_recorded_at DESC
+                         LIMIT ?
+                       )
+                 ORDER BY latest_recorded_at DESC
+                """,
+                [*base_params, *tokens, max_roots],
+            ).fetchall()
+            matched_roots = [str(row['root_id']) for row in rows if row['root_id']]
+            if matched_roots:
+                return matched_roots, 'query_tokens'
+
+        where_clause = ' AND '.join(base_filters)
+        rows = self.ledger.conn.execute(
+            f"""
+            SELECT root_id
+              FROM (
+                    SELECT COALESCE(root_id, object_id) AS root_id,
+                           MAX(recorded_at) AS latest_recorded_at
+                      FROM change_events
+                     WHERE {where_clause}
+                     GROUP BY COALESCE(root_id, object_id)
+                     ORDER BY latest_recorded_at DESC
+                     LIMIT ?
+                   )
+             ORDER BY latest_recorded_at DESC
+            """,
+            [*base_params, max_roots],
+        ).fetchall()
+        return [str(row['root_id']) for row in rows if row['root_id']], 'recent_roots'
+
+    def _events_for_root_limited(self, *, root_id: str, max_events: int) -> list[sqlite3.Row] | None:
         assert self.ledger is not None
         rows = self.ledger.conn.execute(
-            'SELECT * FROM change_events ORDER BY recorded_at, rowid'
+            """
+            SELECT *
+              FROM change_events
+             WHERE root_id = ?
+                OR object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+                OR target_object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+             ORDER BY recorded_at, rowid
+             LIMIT ?
+            """,
+            (root_id, root_id, root_id, max_events + 1),
         ).fetchall()
-        grouped_rows: dict[str, list[sqlite3.Row]] = defaultdict(list)
-        for row in rows:
-            root_key = str(row['root_id'] or row['object_id'] or row['target_object_id'] or '').strip()
-            if not root_key:
-                continue
-            grouped_rows[root_key].append(row)
-
-        objects: list[TypedMemoryObject] = []
-        for group_rows in grouped_rows.values():
-            objects.extend(project_objects(group_rows))
-        return sorted(objects, key=_object_sort_key)
+        if len(rows) > max_events:
+            return None
+        return rows
 
     def _select_objects(
         self,
@@ -201,20 +353,33 @@ class TypedRetrievalService:
             return ranked_objects[:max_results]
 
         selected_roots: list[str] = []
+        selected_root_set: set[str] = set()
         for scored in ranked_objects:
-            if scored.obj.root_id not in selected_roots:
-                selected_roots.append(scored.obj.root_id)
+            if scored.obj.root_id in selected_root_set:
+                continue
+            selected_root_set.add(scored.obj.root_id)
+            selected_roots.append(scored.obj.root_id)
             if len(selected_roots) >= max_results:
                 break
 
-        root_scores = {scored.obj.root_id: scored.score for scored in ranked_objects}
-        expanded = [obj for obj in filtered_objects if obj.root_id in selected_roots]
-        expanded.sort(key=lambda obj: (root_scores.get(obj.root_id, 0.0), *_object_sort_key(obj)), reverse=True)
+        root_scores: dict[str, float] = {}
+        for scored in ranked_objects:
+            root_id = scored.obj.root_id
+            existing = root_scores.get(root_id)
+            if existing is None or scored.score > existing:
+                root_scores[root_id] = scored.score
 
-        result: list[ScoredObject] = []
-        for obj in expanded:
-            result.append(ScoredObject(obj=obj, score=root_scores.get(obj.root_id, 0.0)))
-        result.sort(key=lambda item: (-item.score, item.obj.root_id, item.obj.version, item.obj.object_id))
+        expanded = [obj for obj in filtered_objects if obj.root_id in selected_roots]
+        result = [ScoredObject(obj=obj, score=root_scores.get(obj.root_id, 0.0)) for obj in expanded]
+        result.sort(
+            key=lambda item: (
+                -item.score,
+                item.obj.root_id,
+                0 if item.obj.is_current else 1,
+                -item.obj.version,
+                item.obj.object_id,
+            )
+        )
         return result
 
     def _bucket_objects(self, selected_objects: list[ScoredObject]) -> dict[str, list[dict[str, Any]]]:
@@ -306,6 +471,22 @@ def _matches_metadata_filters(obj: TypedMemoryObject, metadata_filters: dict[str
         if not _matches_filter_value(actual, expected):
             return False
     return True
+
+
+def _coerce_sql_filter_values(expected: Any) -> list[str]:
+    if isinstance(expected, dict):
+        if 'eq' in expected:
+            value = expected['eq']
+            return [str(value)] if value not in (None, '') else []
+        if 'in' in expected:
+            values = expected.get('in') or []
+            return [str(value) for value in values if value not in (None, '')]
+        return []
+    if isinstance(expected, (list, tuple, set)):
+        return [str(value) for value in expected if value not in (None, '')]
+    if expected in (None, ''):
+        return []
+    return [str(expected)]
 
 
 def _lookup_path(payload: dict[str, Any], path: str) -> Any:

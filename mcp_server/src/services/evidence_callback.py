@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import shlex
 import shutil
-import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -11,6 +12,8 @@ try:
     from models.typed_memory import EvidenceRef
 except ImportError:  # pragma: no cover - package import path fallback
     from ..models.typed_memory import EvidenceRef
+
+logger = logging.getLogger(__name__)
 
 
 class EvidenceCallback(Protocol):
@@ -65,6 +68,8 @@ class QMDEvidenceCallback:
 
     command: str = 'qmd query --json'
     timeout_seconds: int = 30
+    max_query_chars: int = 512
+    max_stdout_bytes: int = 256_000
     name: str = 'qmd'
 
     def supports(self, ref: EvidenceRef) -> bool:
@@ -79,9 +84,12 @@ class QMDEvidenceCallback:
             str(ref.snippet or '').strip(),
         ]
         query = ' '.join(part for part in parts if part)
-        return query.strip() or str(ref.canonical_uri or '')
+        normalized = ' '.join((query.strip() or str(ref.canonical_uri or '')).split())
+        if len(normalized) > self.max_query_chars:
+            return normalized[: self.max_query_chars]
+        return normalized
 
-    def _run_qmd(self, query: str) -> dict[str, Any] | None:
+    async def _run_qmd(self, query: str) -> dict[str, Any] | None:
         if not query:
             return None
 
@@ -92,19 +100,36 @@ class QMDEvidenceCallback:
             return None
 
         try:
-            result = subprocess.run(
-                [*cmd_parts, '--', query],
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=True,
+            process = await asyncio.create_subprocess_exec(
+                *cmd_parts,
+                '--',
+                query,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, OSError):
             return None
 
         try:
-            return json.loads(result.stdout)
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=float(self.timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return None
+
+        if process.returncode != 0:
+            return None
+
+        if not stdout:
+            return None
+        if len(stdout) > self.max_stdout_bytes:
+            return None
+
+        try:
+            return json.loads(stdout.decode('utf-8', errors='replace'))
         except json.JSONDecodeError:
             return None
 
@@ -124,7 +149,7 @@ class QMDEvidenceCallback:
             'status': 'resolved',
         }
 
-        enriched = self._run_qmd(self._query_text(ref))
+        enriched = await self._run_qmd(self._query_text(ref))
         if enriched is None:
             return payload
 
@@ -148,6 +173,7 @@ class EvidenceCallbackRegistry:
     callbacks: list[EvidenceCallback] = field(
         default_factory=lambda: [QMDEvidenceCallback(), PassThroughEvidenceCallback()]
     )
+    max_concurrency: int = 8
 
     def callback_for(self, ref: EvidenceRef) -> EvidenceCallback:
         for callback in self.callbacks:
@@ -169,12 +195,36 @@ class EvidenceCallbackRegistry:
                 continue
             unique_refs[uri] = ref
 
-        resolved_items: list[dict[str, Any]] = []
-        for canonical_uri, ref in unique_refs.items():
+        items = list(unique_refs.items())
+        if max_items is not None:
+            capped_max_items = max(0, int(max_items))
+            items = items[:capped_max_items]
+
+        semaphore = asyncio.Semaphore(max(1, int(self.max_concurrency)))
+        fallback = PassThroughEvidenceCallback()
+
+        async def _resolve_one(canonical_uri: str, ref: EvidenceRef) -> dict[str, Any]:
             callback = self.callback_for(ref)
-            payload = await callback.resolve(ref)
-            payload['object_ids'] = sorted(set(object_ids_by_uri.get(canonical_uri, []))) if object_ids_by_uri else []
-            resolved_items.append(payload)
-            if max_items is not None and len(resolved_items) >= max_items:
-                break
-        return resolved_items
+            async with semaphore:
+                try:
+                    payload = await callback.resolve(ref)
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    logger.warning(
+                        'Evidence resolver failed (resolver=%s, uri=%s): %s',
+                        callback.name,
+                        canonical_uri,
+                        type(exc).__name__,
+                    )
+                    payload = await fallback.resolve(ref)
+                    payload['resolver'] = callback.name
+                    payload['status'] = 'resolution_failed'
+
+            payload['object_ids'] = (
+                sorted(set(object_ids_by_uri.get(canonical_uri, []))) if object_ids_by_uri else []
+            )
+            return payload
+
+        tasks = [asyncio.create_task(_resolve_one(uri, ref)) for uri, ref in items]
+        if not tasks:
+            return []
+        return await asyncio.gather(*tasks)
