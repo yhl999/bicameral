@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +11,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+
+if 'graph_driver' not in sys.modules:
+    graph_driver = types.ModuleType('graph_driver')
+    graph_driver.add_backend_args = lambda parser: parser
+    graph_driver.get_graph_client = lambda *args, **kwargs: None
+    sys.modules['graph_driver'] = graph_driver
 
 
 dedupe_nodes = importlib.import_module('scripts.dedupe_nodes')
