@@ -586,14 +586,14 @@ def test_prepare_bucket_merge_refuses_shared_weak_domain_proof_for_person_merge(
                     ['Entity', 'Person'],
                     name='Alex Kim',
                     created_at='2026-03-09T09:00:00Z',
-                    domain='example.com',
+                    domain='example-domain-local',
                 ),
                 _make_merge_row(
                     'person-newer',
                     ['Entity', 'Person'],
                     name='Alex Kim',
                     created_at='2026-03-09T09:05:00Z',
-                    domain='example.com',
+                    domain='example-domain-local',
                 ),
             ]
         ]
@@ -612,7 +612,7 @@ def test_prepare_bucket_merge_refuses_shared_weak_domain_proof_for_person_merge(
     message = str(exc.value)
     assert 'blocked_shared_weak_proofs' in message
     assert 'domain' in message
-    assert 'example.com' in message
+    assert 'example-domain-local' in message
 
 
 
