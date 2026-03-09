@@ -187,6 +187,52 @@ def test_high_risk_procedure_never_auto_promotes(ledger: ChangeLedger, service: 
     assert last_result.procedure.success_count == 6
 
 
+def test_untrusted_failure_does_not_poison_auto_promotion(ledger: ChangeLedger, service: ProcedureService):
+    procedure = service.create_procedure(
+        actor_id='tester',
+        name='Check browser service',
+        trigger='When Playwright or CDP tools fail to connect',
+        steps=['Run browser status', 'Start browser if stopped', 'Retry the task'],
+        expected_outcome='Browser service is available before automation runs',
+        evidence_refs=[_legacy_ref('ev-create')],
+        risk_level='low',
+    )
+
+    ledger.append_event(
+        'procedure_failure',
+        actor_id='runner',
+        object_id=procedure.object_id,
+        root_id=procedure.root_id,
+        metadata={'trusted_feedback': False, 'notes': 'spoofed external feedback'},
+    )
+
+    current_after_untrusted = service.evolution.resolve_current(procedure.root_id)
+    assert current_after_untrusted.fail_count == 0
+
+    last_result = None
+    for episode_id, evidence_id in [('ep-1', 'ev-success-1'), ('ep-2', 'ev-success-2'), ('ep-3', 'ev-success-3')]:
+        success_ref = _legacy_ref(evidence_id)
+        _append_feedback_episode(ledger, episode_id, [success_ref])
+        last_result = service.record_feedback(
+            procedure.root_id,
+            outcome='success',
+            actor_id='runner',
+            episode_id=episode_id,
+            evidence_refs=[success_ref],
+        )
+
+    assert last_result is not None
+    current = last_result.procedure
+    assert current.promotion_status == 'promoted'
+    assert current.success_count == 3
+    assert current.fail_count == 0
+
+    stats = ProcedureEvolutionService(ledger).feedback_stats(current.object_id)
+    assert stats.evidence_linked_successes == 3
+    assert stats.distinct_episode_count == 3
+    assert stats.failure_count == 0
+
+
 def test_feedback_rejects_synthetic_episode_and_mismatched_evidence(service: ProcedureService, ledger: ChangeLedger):
     procedure = service.create_procedure(
         actor_id='tester',
@@ -208,6 +254,14 @@ def test_feedback_rejects_synthetic_episode_and_mismatched_evidence(service: Pro
         )
 
     _append_feedback_episode(ledger, 'ep-real', [_legacy_ref('ev-real')])
+    with pytest.raises(ValueError, match='trusted evidence_refs'):
+        service.record_feedback(
+            procedure.root_id,
+            outcome='success',
+            actor_id='runner',
+            episode_id='ep-real',
+        )
+
     with pytest.raises(ValueError, match='must belong to the referenced episode'):
         service.record_feedback(
             procedure.root_id,
@@ -325,9 +379,8 @@ def test_emission_transaction_rollback_on_failure(ledger: ChangeLedger):
 
     with patch.object(
         ProcedureService, 'create_procedure', side_effect=RuntimeError('simulated failure')
-    ):
-        with pytest.raises(RuntimeError, match='simulated failure'):
-            ingest_emissions(ledger, emissions)
+    ), pytest.raises(RuntimeError, match='simulated failure'):
+        ingest_emissions(ledger, emissions)
 
     # Nothing should have been committed
     row = ledger.conn.execute('SELECT COUNT(*) as cnt FROM change_events').fetchone()

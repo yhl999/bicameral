@@ -49,6 +49,14 @@ def _candidate_ref(evidence_id: str) -> dict[str, str]:
     }
 
 
+def _legacy_ref(evidence_id: str) -> dict[str, str]:
+    return {
+        'source_key': 'learning:self-audit',
+        'evidence_id': evidence_id,
+        'scope': 'learning_self_audit',
+    }
+
+
 def _seed_candidate(conn: sqlite3.Connection, *, predicate: str, value: str) -> str:
     result = candidates_store.upsert_candidate(
         conn,
@@ -191,17 +199,86 @@ def test_procedure_success_and_failure_update_counters():
         }
     )
 
+    trusted_metadata = {
+        'trusted_feedback': True,
+        'episode_id': 'ep-1',
+        'evidence_refs': [_legacy_ref('ev-1')],
+    }
+
     ledger.append_event('assert', actor_id='extractor', payload=procedure, recorded_at='2026-03-08T22:00:00Z')
     ledger.append_event('promote', actor_id='ui:yuan', object_id='proc_v1', root_id='proc_v1')
-    ledger.append_event('procedure_success', actor_id='runner', object_id='proc_v1', root_id='proc_v1')
-    ledger.append_event('procedure_success', actor_id='runner', object_id='proc_v1', root_id='proc_v1')
-    ledger.append_event('procedure_failure', actor_id='runner', object_id='proc_v1', root_id='proc_v1')
+    ledger.append_event(
+        'procedure_success',
+        actor_id='runner',
+        object_id='proc_v1',
+        root_id='proc_v1',
+        metadata=trusted_metadata,
+    )
+    ledger.append_event(
+        'procedure_success',
+        actor_id='runner',
+        object_id='proc_v1',
+        root_id='proc_v1',
+        metadata={**trusted_metadata, 'episode_id': 'ep-2', 'evidence_refs': [_legacy_ref('ev-2')]},
+    )
+    ledger.append_event(
+        'procedure_failure',
+        actor_id='runner',
+        object_id='proc_v1',
+        root_id='proc_v1',
+        metadata={**trusted_metadata, 'episode_id': 'ep-3', 'evidence_refs': [_legacy_ref('ev-3')]},
+    )
 
     materialized = ledger.materialize_object('proc_v1')
     assert isinstance(materialized, Procedure)
     assert materialized.promotion_status == 'promoted'
     assert materialized.success_count == 2
     assert materialized.fail_count == 1
+
+
+def test_untrusted_procedure_feedback_events_do_not_update_counters():
+    ledger = _ledger()
+    procedure = Procedure.model_validate(
+        {
+            'object_id': 'proc_v1',
+            'root_id': 'proc_v1',
+            'name': 'Launch code-loop-runner',
+            'trigger': 'non-trivial coding task',
+            'preconditions': ['repo clean'],
+            'steps': ['prepare repo', 'launch runner', 'monitor logs'],
+            'expected_outcome': 'runner completes without watchdog death',
+            'policy_scope': 'internal',
+            'visibility_scope': 'internal',
+            'evidence_refs': [_message_ref('p1')],
+            'created_at': '2026-03-08T22:00:00Z',
+        }
+    )
+
+    ledger.append_event('assert', actor_id='extractor', payload=procedure, recorded_at='2026-03-08T22:00:00Z')
+    ledger.append_event('promote', actor_id='ui:yuan', object_id='proc_v1', root_id='proc_v1')
+    ledger.append_event(
+        'procedure_failure',
+        actor_id='runner',
+        object_id='proc_v1',
+        root_id='proc_v1',
+        metadata={'trusted_feedback': False},
+    )
+    ledger.append_event(
+        'procedure_success',
+        actor_id='runner',
+        object_id='proc_v1',
+        root_id='proc_v1',
+        metadata={
+            'trusted_feedback': False,
+            'episode_id': 'ep-1',
+            'evidence_refs': [_legacy_ref('ev-1')],
+        },
+    )
+
+    materialized = ledger.materialize_object('proc_v1')
+    assert isinstance(materialized, Procedure)
+    assert materialized.success_count == 0
+    assert materialized.fail_count == 0
 
 
 def test_entity_registry_resolves_aliases_and_external_ids():

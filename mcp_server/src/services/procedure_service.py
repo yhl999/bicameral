@@ -146,12 +146,14 @@ class ProcedureService:
             episode_id=episode_id,
             evidence_refs=evidence_refs,
         )
-        trusted_feedback = bool(trusted_episode_id and trusted_evidence_refs)
+        if not trusted_episode_id or not trusted_evidence_refs:
+            raise ValueError('procedure feedback requires trusted evidence_refs bound to the referenced episode')
 
-        metadata: dict[str, Any] = {'trusted_feedback': trusted_feedback}
-        if trusted_feedback:
-            metadata['episode_id'] = trusted_episode_id
-            metadata['evidence_refs'] = [ref.model_dump(mode='json') for ref in trusted_evidence_refs]
+        metadata: dict[str, Any] = {
+            'trusted_feedback': True,
+            'episode_id': trusted_episode_id,
+            'evidence_refs': [ref.model_dump(mode='json') for ref in trusted_evidence_refs],
+        }
         if notes:
             metadata['notes'] = notes.strip()
 
@@ -161,14 +163,14 @@ class ProcedureService:
             reason=reason or f'procedure_{normalized_outcome}',
             object_id=procedure.object_id,
             root_id=procedure.root_id,
-            metadata=metadata or None,
+            metadata=metadata,
         )
 
         auto_promoted = False
         evolved = None
-        if normalized_outcome == 'success' and auto_promote and trusted_feedback:
+        if normalized_outcome == 'success' and auto_promote:
             auto_promoted = self.evolution.maybe_auto_promote(procedure.object_id)
-        elif normalized_outcome == 'failure' and trusted_feedback:
+        elif normalized_outcome == 'failure':
             evolved = self.evolution.evolve_from_feedback(
                 procedure.object_id,
                 actor_id=actor_id,
