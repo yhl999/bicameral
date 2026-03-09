@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from models.typed_memory import Episode, EvidenceRef, Procedure, StateFact, TypedMemoryObject, coerce_typed_object
+    from models.typed_memory import (
+        Episode,
+        EvidenceRef,
+        Procedure,
+        StateFact,
+        TypedMemoryObject,
+        coerce_typed_object,
+    )
     from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
     from services.evidence_callback import EvidenceCallbackRegistry
 except ImportError:  # pragma: no cover - package import path fallback

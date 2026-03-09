@@ -171,9 +171,9 @@ async def _run() -> None:
         max_evidence=10,
     )
     assert history['query_mode'] == 'history'
-    assert [item['object_id'] for item in history['state']] == ['fact_coffee_v1', 'fact_coffee_v2']
-    assert history['state'][0]['superseded_by'] == 'fact_coffee_v2'
-    assert history['state'][1]['parent_id'] == 'fact_coffee_v1'
+    assert [item['object_id'] for item in history['state']] == ['fact_coffee_v2', 'fact_coffee_v1']
+    assert history['state'][0]['parent_id'] == 'fact_coffee_v1'
+    assert history['state'][1]['superseded_by'] == 'fact_coffee_v2'
 
     mixed = await service.search(
         query='launch',
