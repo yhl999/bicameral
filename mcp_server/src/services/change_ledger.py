@@ -384,6 +384,31 @@ class ChangeLedger:
         parent_id: str | None = None
         root_id = typed_object.root_id
 
+        # ── Central enforcement: one current object per conflict set ─────────
+        # Architecture lock (Phase 0): there must be exactly one is_current=True
+        # object per (subject, predicate, scope) triple at all times.
+        #
+        # The caller's conflict_with_fact_id is unreliable in two ways:
+        #   - missing: caller omitted it entirely (upstream wiring gap)
+        #   - stale:   caller provided an object_id that is no longer the
+        #              current occupant of the conflict set (e.g. an already-
+        #              superseded predecessor)
+        #
+        # In either case we must find the *actual* current occupant and use it
+        # as the supersession target.  This scan runs only for StateFact
+        # promotions (conflict sets are defined only on state facts).
+        if isinstance(typed_object, StateFact):
+            _conflict_set = typed_object.conflict_set
+            for _current in self.current_state_facts():
+                if (
+                    _current.conflict_set == _conflict_set
+                    and _current.object_id != typed_object.object_id
+                ):
+                    # Override whatever (or nothing) the caller passed — the
+                    # actual current occupant is the authoritative target.
+                    conflict_with_fact_id = _current.object_id
+                    break
+
         # Always supersede when a conflicting prior fact is explicitly identified
         # and still exists in the ledger.  This enforces the one-current-object
         # rule regardless of whether the promotion is automated or manual.

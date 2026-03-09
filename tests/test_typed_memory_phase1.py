@@ -351,6 +351,145 @@ def test_legacy_ref_with_evidence_id_is_unchanged():
     assert 'stable-id-42' in ev.canonical_uri
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GPT P1 Blocker 1 — one-current-object rule enforced without conflict_with_fact_id
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_missing_conflict_id_does_not_yield_two_current_facts():
+    """Promoting two facts with the same conflict set (subject+predicate+scope)
+    must result in exactly one current fact even when conflict_with_fact_id is
+    NOT passed on the second promotion call.
+
+    Prior bug: the second promote_candidate_fact would issue an 'assert' event
+    (instead of 'supersede') creating two is_current=True facts in the same
+    conflict set.  The central enforcement scan in promote_candidate_fact must
+    detect the existing current occupant and override creation_type to 'supersede'.
+    """
+    ledger = _ledger()
+
+    fact_a_payload = {
+        'subject': 'user:principal',
+        'predicate': 'pref.missing_conflict_id_test',
+        'scope': 'private',
+        'assertion_type': 'preference',
+        'value': 'vim',
+        'evidence_refs': [{'source_key': 's:1', 'evidence_id': 'ev-a', 'scope': 's1_sessions_main'}],
+    }
+    fact_b_payload = {
+        'subject': 'user:principal',
+        'predicate': 'pref.missing_conflict_id_test',  # same conflict set
+        'scope': 'private',
+        'assertion_type': 'preference',
+        'value': 'emacs',
+        'evidence_refs': [{'source_key': 's:1', 'evidence_id': 'ev-b', 'scope': 's1_sessions_main'}],
+    }
+
+    result_a = ledger.promote_candidate_fact(
+        actor_id='test:actor',
+        reason='promote A',
+        policy_version='v3',
+        candidate_id='cand-no-conflict-id-a',
+        fact=fact_a_payload,
+        # conflict_with_fact_id intentionally absent
+    )
+
+    current_after_a = ledger.current_state_facts()
+    assert len(current_after_a) == 1
+    assert isinstance(current_after_a[0], StateFact)
+    assert current_after_a[0].value == 'vim'
+
+    result_b = ledger.promote_candidate_fact(
+        actor_id='test:actor',
+        reason='promote B — same conflict set, no conflict_with_fact_id',
+        policy_version='v3',
+        candidate_id='cand-no-conflict-id-b',
+        fact=fact_b_payload,
+        # conflict_with_fact_id intentionally absent — central enforcement must handle
+    )
+
+    current_after_b = ledger.current_state_facts()
+    assert len(current_after_b) == 1, (
+        f'Expected exactly 1 current fact after second promotion (no conflict_id), '
+        f'got {len(current_after_b)}: '
+        + str([(f.object_id, f.value) for f in current_after_b])
+    )
+    assert current_after_b[0].value == 'emacs', (
+        f'Expected fact B (emacs) to be current, got: {current_after_b[0].value!r}'
+    )
+
+    # Lineage: A must have been superseded and share root with B
+    lineage = ledger.materialize_lineage(result_a.root_id)
+    assert len(lineage) == 2, f'Expected 2 objects in lineage, got {len(lineage)}'
+    fact_a_obj = next(obj for obj in lineage if obj.object_id == result_a.object_id)
+    fact_b_obj = next(obj for obj in lineage if obj.object_id == result_b.object_id)
+
+    assert fact_a_obj.is_current is False, 'Fact A must not be current after supersession'
+    assert fact_a_obj.superseded_by == fact_b_obj.object_id
+    assert fact_b_obj.root_id == result_a.root_id, 'Fact B must inherit fact A root'
+    assert fact_b_obj.version == 2
+
+
+def test_stale_conflict_id_does_not_yield_two_current_facts():
+    """A stale conflict_with_fact_id (pointing to a non-current predecessor) must
+    not create two current facts.  The central enforcement scan must detect that
+    the stale ID is no longer the current occupant of the conflict set and
+    redirect the supersession to the actual current fact.
+
+    Scenario: v1 superseded by v2; caller tries to promote v3 with
+    conflict_with_fact_id=v1 (stale).  Without the fix, v3 would supersede v1
+    (already non-current) while v2 remains current — two current facts in the
+    same conflict set.
+    """
+    ledger = _ledger()
+
+    def _fact(cand_id: str, val: str, ev_id: str) -> dict:
+        return {
+            'subject': 'user:principal',
+            'predicate': 'pref.stale_conflict_test',
+            'scope': 'private',
+            'assertion_type': 'preference',
+            'value': val,
+            'evidence_refs': [{'source_key': 's:1', 'evidence_id': ev_id, 'scope': 's1_sessions_main'}],
+        }
+
+    # Promote v1 (becomes current)
+    r1 = ledger.promote_candidate_fact(
+        actor_id='test:actor', reason='v1', policy_version='v3',
+        candidate_id='cand-stale-v1', fact=_fact('cand-stale-v1', 'one', 'ev-stale-1'),
+    )
+    # Promote v2 superseding v1 (v2 becomes current)
+    r2 = ledger.promote_candidate_fact(
+        actor_id='test:actor', reason='v2', policy_version='v3',
+        candidate_id='cand-stale-v2', fact=_fact('cand-stale-v2', 'two', 'ev-stale-2'),
+        conflict_with_fact_id=r1.object_id,
+    )
+    assert len(ledger.current_state_facts()) == 1
+    assert ledger.current_state_facts()[0].value == 'two'
+
+    # Promote v3 with STALE conflict_with_fact_id pointing at v1 (not v2)
+    r3 = ledger.promote_candidate_fact(
+        actor_id='test:actor', reason='v3 with stale conflict id', policy_version='v3',
+        candidate_id='cand-stale-v3', fact=_fact('cand-stale-v3', 'three', 'ev-stale-3'),
+        conflict_with_fact_id=r1.object_id,   # stale: v1 is not current
+    )
+
+    current_after_v3 = ledger.current_state_facts()
+    assert len(current_after_v3) == 1, (
+        f'Expected exactly 1 current fact after v3 promotion with stale conflict_id, '
+        f'got {len(current_after_v3)}: '
+        + str([(f.object_id, f.value) for f in current_after_v3])
+    )
+    assert current_after_v3[0].value == 'three', (
+        f'Expected v3 to be current, got: {current_after_v3[0].value!r}'
+    )
+
+    # v2 must now be superseded
+    v2_obj = ledger.materialize_object(r2.object_id)
+    assert v2_obj is not None
+    assert v2_obj.is_current is False, 'v2 must be superseded after v3 promotion'
+
+
 def test_canonical_uri_path_segment_with_slash_is_encoded():
     """A locator component containing a literal slash must be percent-encoded.
 

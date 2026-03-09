@@ -336,6 +336,141 @@ def test_deny_unpromoted_candidate_no_ledger_event_needed():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GPT P1 Blocker 2 — deny → re-approve must not create ledger split-brain
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_deny_then_reapprove_is_blocked_prevents_split_brain():
+    """Re-approving a denied candidate must be blocked to prevent ledger split-brain.
+
+    Timeline that exposed the bug:
+      1. Candidate promoted → ledger: assert+promote events; candidates.db: approved
+      2. Candidate denied   → ledger: invalidate event;    candidates.db: denied
+      3. promote_candidate called again → (before fix) candidates.db flipped to
+         'approved' but ledger still had invalidate event making fact non-current.
+         Result: split-brain — candidates.db says approved, ledger says non-current.
+
+    Fix: 'denied' is a terminal candidates lifecycle state. promote_candidate
+    must return (0, None) immediately when the candidate is denied, preventing
+    any candidates.db update and leaving ledger state untouched.
+    """
+    conn = _candidate_db()
+    ledger = _ledger()
+
+    # Step 1: auto-promote (low-risk owner speaker → auto_promoted)
+    result = candidates.upsert_candidate(
+        conn, ledger=ledger, **_candidate_kwargs(predicate='pref.split_brain_test')
+    )
+    assert result.status == 'approved', f'Expected approved, got: {result.status!r}'
+
+    # Verify: one current fact in ledger
+    assert len(ledger.current_state_facts()) == 1
+
+    # Step 2: deny the promoted candidate (writes invalidate to ledger)
+    deny_updated, _ = candidates.deny_candidate(
+        conn, result.candidate_id,
+        actor_id='ui:yuan', reason='changed mind', ledger=ledger,
+    )
+    assert deny_updated == 1
+
+    # Verify state after denial
+    row_denied = conn.execute(
+        'SELECT status FROM candidates WHERE candidate_id = ?', (result.candidate_id,)
+    ).fetchone()
+    assert row_denied['status'] == 'denied'
+    assert len(ledger.current_state_facts()) == 0, (
+        'Fact should be non-current in ledger after denial'
+    )
+
+    # Count ledger events: should be exactly 3 (assert, promote, invalidate)
+    events_after_deny = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_deny == 3
+
+    # Step 3: attempt re-approval — must be blocked
+    re_updated, re_event_id = candidates.promote_candidate(
+        conn, result.candidate_id,
+        actor_id='ui:yuan', reason='oops, reverting denial', ledger=ledger,
+    )
+
+    # The guard must return (0, None) — no rows updated, no event id
+    assert re_updated == 0, (
+        f'Re-approval of denied candidate must be blocked; '
+        f'promote_candidate returned rowcount={re_updated}'
+    )
+    assert re_event_id is None, (
+        f'No ledger event id should be returned for blocked re-approval, got: {re_event_id!r}'
+    )
+
+    # Step 4: candidates.db must still be 'denied' — not 'approved'
+    row_after = conn.execute(
+        'SELECT status FROM candidates WHERE candidate_id = ?', (result.candidate_id,)
+    ).fetchone()
+    assert row_after['status'] == 'denied', (
+        f'candidates.db status must remain denied after blocked re-approval, '
+        f'got: {row_after["status"]!r}'
+    )
+
+    # Step 5: ledger must not have grown — still 3 events, still no current facts
+    events_after_reapprove = ledger.conn.execute(
+        'SELECT count(*) FROM change_events'
+    ).fetchone()[0]
+    assert events_after_reapprove == 3, (
+        f'Ledger must not gain new events after blocked re-approval, '
+        f'got {events_after_reapprove} (expected 3)'
+    )
+    assert len(ledger.current_state_facts()) == 0, (
+        'Ledger must still show no current facts after blocked re-approval (no split-brain)'
+    )
+
+
+def test_deny_never_promoted_then_reapprove_is_also_blocked():
+    """An unpromoted (never reached ledger) denied candidate must also be blocked
+    from re-approval.  'denied' is always terminal regardless of whether the
+    candidate ever touched the ledger.
+    """
+    conn = _candidate_db()
+    ledger = _ledger()
+
+    # Insert a low-confidence candidate that requires manual approval
+    result = candidates.upsert_candidate(
+        conn, ledger=ledger,
+        **_candidate_kwargs(
+            predicate='pref.unpromoted_deny_test',
+            confidence=0.50,   # below auto-promote threshold
+        ),
+    )
+    assert result.status in {'requires_approval', 'pending'}, (
+        f'Expected requires_approval/pending, got: {result.status!r}'
+    )
+
+    # Deny it (never touched the ledger)
+    candidates.deny_candidate(
+        conn, result.candidate_id,
+        actor_id='ui:yuan', reason='not needed', ledger=ledger,
+    )
+    assert conn.execute(
+        'SELECT status FROM candidates WHERE candidate_id = ?', (result.candidate_id,)
+    ).fetchone()['status'] == 'denied'
+
+    # Attempt re-approval — must be blocked even though ledger was never involved
+    re_updated, re_event_id = candidates.promote_candidate(
+        conn, result.candidate_id,
+        actor_id='ui:yuan', reason='trying to reinstate', ledger=ledger,
+    )
+    assert re_updated == 0, (
+        f'Re-approval of denied (never-promoted) candidate must be blocked, '
+        f'promote_candidate returned rowcount={re_updated}'
+    )
+    assert re_event_id is None
+
+    # Ledger must remain empty
+    events = ledger.conn.execute('SELECT count(*) FROM change_events').fetchone()[0]
+    assert events == 0, f'Ledger must stay empty, got {events} events'
+
+
 def test_change_ledger_connect_enables_wal_and_foreign_keys(tmp_path):
     """The change_ledger.connect() helper must enable WAL and foreign_keys."""
     from mcp_server.src.services.change_ledger import connect

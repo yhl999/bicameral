@@ -1301,6 +1301,21 @@ def promote_candidate(
     if row is None:
         return (0, None)
 
+    # Guard: block re-approval of denied candidates (split-brain prevention).
+    #
+    # A candidate that was promoted and then denied has:
+    #   - candidates.db status = "denied"
+    #   - ledger_event_id = <original promotion event>
+    #   - ledger = an invalidate event making the fact non-current
+    #
+    # Calling promote_candidate again would flip candidates.db back to
+    # "approved" while the ledger's invalidate event still makes the fact
+    # non-current — a split-brain that violates the ledger-as-source-of-truth
+    # contract.  "denied" is a terminal lifecycle state; to re-introduce a
+    # denied fact, create a new candidate with fresh evidence.
+    if row["status"] == "denied":
+        return (0, None)
+
     # Guard: don't re-promote or write duplicate ledger events
     if row["status"] in ("approved", "auto_promoted") and row["ledger_event_id"]:
         return (0, row["ledger_event_id"])
