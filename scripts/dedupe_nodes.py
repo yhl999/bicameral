@@ -24,6 +24,12 @@ from typing import Any
 
 from graph_driver import add_backend_args, get_graph_client
 
+try:
+    from graph_driver import GraphDriverSetupError
+except ImportError:  # pragma: no cover - test stubs may omit the concrete error type
+    class GraphDriverSetupError(RuntimeError):
+        pass
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,25 @@ _RESERVED_NODE_KEYS = {
     _CONFLICT_KEYS_KEY,
 }
 _IMMUTABLE_MERGE_KEYS = {'name'}
+_HOMONYM_PROOF_KEYS = (
+    'canonical_id',
+    'external_id',
+    'source_id',
+    'source_entity_id',
+    'resolved_entity_id',
+    'employee_id',
+    'email',
+    'emails',
+    'phone',
+    'website',
+    'url',
+    'domain',
+    'linkedin_url',
+    'twitter_handle',
+    'github_username',
+    'crunchbase_url',
+    'wikidata_id',
+)
 
 
 def _created_at_sort_key(value) -> str:
@@ -389,16 +414,139 @@ def _validate_merge_bucket(bucket: dict) -> list[dict]:
     return nodes
 
 
-async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> int:
+def _normalize_proof_value(value: Any) -> str | None:
+    if _is_missing_value(value):
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        return _canonical_json(normalized) if normalized else None
+    if isinstance(value, (list, tuple, set)):
+        normalized_items = []
+        for item in value:
+            if _is_missing_value(item):
+                continue
+            if isinstance(item, str):
+                item_text = item.strip().casefold()
+                if item_text:
+                    normalized_items.append(item_text)
+            elif not isinstance(item, dict):
+                normalized_items.append(item)
+        if not normalized_items:
+            return None
+        return _canonical_json(sorted(normalized_items, key=str))
+    if isinstance(value, dict):
+        return None
+    return _canonical_json(value)
+
+
+def _bucket_node_debug(records: list[dict[str, Any]] | list[dict], group_id: str) -> list[dict[str, Any]]:
+    debug_rows: list[dict[str, Any]] = []
+    for record in records:
+        props = dict(record.get('properties') or {})
+        debug_rows.append(
+            {
+                'uuid': str(record.get('uuid') or '').strip(),
+                'created_at': props.get('created_at', record.get('created_at')),
+                'typed_labels': sorted(_normalize_typed_labels(record.get('labels'), group_id)),
+            }
+        )
+    return debug_rows
+
+
+def _collect_candidate_proof_values(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    observed: dict[str, dict[str, Any]] = {}
+    for record in records:
+        props = dict(record.get('properties') or {})
+        uuid = str(record.get('uuid') or '').strip()
+        for key in _HOMONYM_PROOF_KEYS:
+            value = props.get(key)
+            if _normalize_proof_value(value) is None:
+                continue
+            observed.setdefault(key, {})[uuid] = value
+    return observed
+
+
+def _shared_homonym_proofs(records: list[dict[str, Any]]) -> dict[str, Any]:
+    proofs: dict[str, Any] = {}
+    for key in _HOMONYM_PROOF_KEYS:
+        normalized_values: list[str] = []
+        representative_value: Any = None
+        for record in records:
+            props = dict(record.get('properties') or {})
+            value = props.get(key)
+            normalized = _normalize_proof_value(value)
+            if normalized is None:
+                break
+            normalized_values.append(normalized)
+            if representative_value is None:
+                representative_value = value
+        else:
+            if len(set(normalized_values)) == 1 and representative_value is not None:
+                proofs[key] = representative_value
+    return proofs
+
+
+def _require_homonym_merge_proof(records: list[dict[str, Any]], group_id: str, bucket_name: str) -> None:
+    typed_groups: dict[frozenset[str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        typed_labels = _normalize_typed_labels(record.get('labels'), group_id)
+        if typed_labels:
+            typed_groups[typed_labels].append(record)
+
+    for typed_labels, group_records in typed_groups.items():
+        if len(group_records) < 2:
+            continue
+
+        proofs = _shared_homonym_proofs(group_records)
+        if proofs:
+            continue
+
+        candidate_values = _collect_candidate_proof_values(group_records)
+        raise ValueError(
+            'Refusing to merge same-name typed entities without stronger identity proof. '
+            f'name={bucket_name!r} group_id={group_id!r} typed_labels={sorted(typed_labels)!r} '
+            f'nodes={_bucket_node_debug(group_records, group_id)!r} '
+            f'candidate_proofs={candidate_values!r}. '
+            'Inspect the listed node UUIDs for shared external IDs, emails, domains, or profile URLs and merge manually only if they are truly the same entity.'
+        )
+
+
+async def _inspect_remaining_relationships(client, group_id: str, node_uuids: list[str]) -> list[dict[str, Any]]:
+    if not node_uuids:
+        return []
+
+    query = """
+    MATCH (loser:Entity)
+    WHERE loser.group_id = $group_id AND loser.uuid IN $node_uuids
+    OPTIONAL MATCH (loser)-[r]-()
+    RETURN loser.uuid AS loser_uuid, type(r) AS rel_type, count(r) AS rel_count
+    ORDER BY loser_uuid ASC, rel_type ASC
+    """
+    res = await client.query(query, {'group_id': group_id, 'node_uuids': node_uuids})
+    rows: list[dict[str, Any]] = []
+    for loser_uuid, rel_type, rel_count in res.result_set:
+        if rel_type is None or not rel_count:
+            continue
+        rows.append(
+            {
+                'loser_uuid': loser_uuid,
+                'rel_type': rel_type,
+                'rel_count': rel_count,
+            }
+        )
+    return rows
+
+
+async def _prepare_bucket_merge(client, group_id: str, bucket: dict) -> dict[str, Any] | None:
     nodes = _validate_merge_bucket(bucket)
     if len(nodes) < 2:
-        return 0
+        return None
 
     winner = nodes[0]
     losers = nodes[1:]
     loser_uuids = [str(node['uuid']) for node in losers]
     if not loser_uuids:
-        return 0
+        return None
 
     winner_uuid = str(winner['uuid'])
     merged_uuids = [winner_uuid, *loser_uuids]
@@ -411,7 +559,29 @@ async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> in
         group_id,
     )
     merge_records = await _load_merge_records(client, group_id, merged_uuids)
+    _require_homonym_merge_proof(merge_records, group_id, bucket_name=str(bucket.get('name') or ''))
     merged_payload = build_merged_entity_payload(merge_records, winner_uuid=winner_uuid, group_id=group_id)
+
+    return {
+        'nodes': nodes,
+        'winner_uuid': winner_uuid,
+        'loser_uuids': loser_uuids,
+        'merged_uuids': merged_uuids,
+        'merged_labels': merged_labels,
+        'merged_payload': merged_payload,
+    }
+
+
+async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> int:
+    merge_plan = await _prepare_bucket_merge(client, group_id, bucket)
+    if merge_plan is None:
+        return 0
+
+    winner_uuid = merge_plan['winner_uuid']
+    loser_uuids = merge_plan['loser_uuids']
+    merged_uuids = merge_plan['merged_uuids']
+    merged_labels = merge_plan['merged_labels']
+    merged_payload = merge_plan['merged_payload']
 
     params = {
         'winner_uuid': winner_uuid,
@@ -572,8 +742,13 @@ async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> in
     try:
         await client.run_in_transaction(merge_queries)
     except Exception as exc:
+        remaining = await _inspect_remaining_relationships(client, group_id, loser_uuids)
         raise RuntimeError(
-            f"Refusing to complete dedupe for {bucket['name']!r}; unexpected or unre-written relationships remain on loser nodes."
+            'Refusing to complete dedupe after relationship rewrites failed. '
+            f'name={bucket.get("name")!r} group_id={group_id!r} winner_uuid={winner_uuid!r} '
+            f'loser_uuids={loser_uuids!r} typed_labels={sorted(merged_labels)!r} '
+            f'remaining_relationships={remaining!r}. '
+            'Inspect the listed loser UUIDs and the reported relationship types/counts before attempting a manual merge.'
         ) from exc
     return len(loser_uuids)
 
@@ -599,6 +774,7 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
             return
 
         if dry_run:
+            mergeable_buckets = 0
             for bucket in buckets:
                 nodes = bucket['nodes']
                 typed_labels = sorted(
@@ -609,13 +785,26 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
                     }
                 )
                 label_suffix = f' labels={typed_labels}' if typed_labels else ''
+                try:
+                    await _prepare_bucket_merge(client, group_id, bucket)
+                except ValueError as exc:
+                    logger.warning(
+                        '  [dry-run] Refusing %r (%d node(s))%s: %s',
+                        bucket['name'],
+                        len(nodes),
+                        label_suffix,
+                        exc,
+                    )
+                    continue
+
+                mergeable_buckets += 1
                 logger.info(
                     '  [dry-run] Would merge %d copies of %r (keep oldest)%s',
                     len(nodes),
                     bucket['name'],
                     label_suffix,
                 )
-            logger.info('Dry run complete. %d merge bucket(s) would be deduped.', len(buckets))
+            logger.info('Dry run complete. %d merge bucket(s) are mergeable.', mergeable_buckets)
             return
 
         total_merged = 0
@@ -631,8 +820,13 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     add_backend_args(parser)
-    parser.add_argument('--host', default='localhost')
-    parser.add_argument('--port', type=int, default=6379)
+    parser.add_argument('--host', default=None, help='Defaults to localhost unless backend env overrides it.')
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=None,
+        help='Defaults to 7687 for Neo4j or 6379 for FalkorDB unless backend env overrides it.',
+    )
     parser.add_argument('--group-id', required=True)
     parser.add_argument(
         '--dry-run',
@@ -653,4 +847,11 @@ if __name__ == '__main__':
         logger.error('Pass --confirm-destructive to proceed, or --dry-run to preview.')
         sys.exit(1)
 
-    asyncio.run(dedupe_nodes(args.backend, args.host, args.port, args.group_id, dry_run=args.dry_run))
+    try:
+        asyncio.run(dedupe_nodes(args.backend, args.host, args.port, args.group_id, dry_run=args.dry_run))
+    except GraphDriverSetupError as exc:
+        logger.error('%s', exc)
+        sys.exit(2)
+    except (RuntimeError, ValueError) as exc:
+        logger.error('%s', exc)
+        sys.exit(1)

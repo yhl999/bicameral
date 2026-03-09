@@ -203,6 +203,7 @@ def test_merge_bucket_scopes_destructive_queries_by_group_id_and_uses_plain_dele
                         'group_id': 's1_sessions_main',
                         'created_at': '2026-03-09T09:00:00Z',
                         'summary': '',
+                        'external_id': 'crm:ada',
                     },
                 ],
                 [
@@ -215,6 +216,7 @@ def test_merge_bucket_scopes_destructive_queries_by_group_id_and_uses_plain_dele
                         'created_at': '2026-03-09T09:05:00Z',
                         'summary': 'Ada founded Example Labs.',
                         'name_embedding': [0.1, 0.2],
+                        'external_id': 'crm:ada',
                     },
                 ],
             ]
@@ -257,6 +259,61 @@ def test_merge_bucket_rejects_blank_uuid() -> None:
 
     with pytest.raises(ValueError, match='blank uuid'):
         asyncio.run(dedupe_nodes._merge_bucket(fake_client, 'neo4j', 's1_sessions_main', bucket))
+
+
+def test_merge_bucket_surfaces_remaining_relationship_diagnostics_on_failure() -> None:
+    class FailingClient(FakeClient):
+        async def run_in_transaction(self, queries: list[tuple[str, dict]]):
+            self.transaction_calls.append(queries)
+            raise RuntimeError('delete blocked')
+
+    fake_client = FailingClient(
+        query_results=[
+            [
+                [
+                    'winner',
+                    ['Entity'],
+                    {
+                        'uuid': 'winner',
+                        'name': 'Ada',
+                        'group_id': 's1_sessions_main',
+                        'created_at': '2026-03-09T09:00:00Z',
+                        'summary': '',
+                        'external_id': 'crm:123',
+                    },
+                ],
+                [
+                    'loser',
+                    ['Entity'],
+                    {
+                        'uuid': 'loser',
+                        'name': 'Ada',
+                        'group_id': 's1_sessions_main',
+                        'created_at': '2026-03-09T09:05:00Z',
+                        'summary': '',
+                        'external_id': 'crm:123',
+                    },
+                ],
+            ],
+            [['loser', 'RELATES_TO', 2], ['loser', 'HAS_MEMBER', 1]],
+        ]
+    )
+    bucket = {
+        'name': 'Ada',
+        'nodes': [
+            {'uuid': 'winner', 'created_at': '2026-03-09T09:00:00Z', 'labels': ['Entity']},
+            {'uuid': 'loser', 'created_at': '2026-03-09T09:05:00Z', 'labels': ['Entity']},
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match='remaining_relationships') as exc:
+        asyncio.run(dedupe_nodes._merge_bucket(fake_client, 'neo4j', 's1_sessions_main', bucket))
+
+    message = str(exc.value)
+    assert 'loser' in message
+    assert 'RELATES_TO' in message
+    assert 'HAS_MEMBER' in message
+    assert 'winner_uuid' in message
 
 
 def test_sort_episodes_for_timeline_prefers_valid_at_with_created_at_fallback() -> None:
@@ -340,8 +397,12 @@ def test_build_timeline_groups_refuses_episode_in_multiple_sagas() -> None:
         }
     ]
 
-    with pytest.raises(ValueError, match='belongs to multiple sagas'):
+    with pytest.raises(ValueError, match='belongs to multiple sagas') as exc:
         repair_timeline.build_timeline_groups(episodes)
+
+    assert 'ep-1' in str(exc.value)
+    assert 'saga-1' in str(exc.value)
+    assert 'saga-2' in str(exc.value)
 
 
 def test_build_timeline_pairs_assigns_group_and_deterministic_uuid() -> None:
@@ -371,6 +432,52 @@ def test_build_timeline_pairs_assigns_group_and_deterministic_uuid() -> None:
     ]
 
 
+def test_merge_bucket_refuses_same_name_same_type_without_proof() -> None:
+    fake_client = FakeClient(
+        query_results=[
+            [
+                [
+                    'winner',
+                    ['Entity', 'Person'],
+                    {
+                        'uuid': 'winner',
+                        'name': 'Alex Kim',
+                        'group_id': 's1_sessions_main',
+                        'created_at': '2026-03-09T09:00:00Z',
+                    },
+                ],
+                [
+                    'loser',
+                    ['Entity', 'Person'],
+                    {
+                        'uuid': 'loser',
+                        'name': 'Alex Kim',
+                        'group_id': 's1_sessions_main',
+                        'created_at': '2026-03-09T09:05:00Z',
+                    },
+                ],
+            ]
+        ]
+    )
+    bucket = {
+        'name': 'Alex Kim',
+        'nodes': [
+            {'uuid': 'winner', 'created_at': '2026-03-09T09:00:00Z', 'labels': ['Entity', 'Person']},
+            {'uuid': 'loser', 'created_at': '2026-03-09T09:05:00Z', 'labels': ['Entity', 'Person']},
+        ],
+    }
+
+    with pytest.raises(ValueError, match='same-name typed entities without stronger identity proof') as exc:
+        asyncio.run(dedupe_nodes._merge_bucket(fake_client, 'neo4j', 's1_sessions_main', bucket))
+
+    message = str(exc.value)
+    assert 'Alex Kim' in message
+    assert 'winner' in message
+    assert 'loser' in message
+    assert 'typed_labels' in message
+
+
+
 def test_repair_timeline_scopes_falkordb_queries_and_uses_valid_at() -> None:
     fake_client = FakeClient(
         query_results=[
@@ -380,6 +487,8 @@ def test_repair_timeline_scopes_falkordb_queries_and_uses_valid_at() -> None:
             ],
             [],
             [],
+            [['ep-1', 'ep-2', 'timeline:ep-1->ep-2']],
+            [['ep-1', 'ep-2', 'timeline:ep-1->ep-2']],
         ]
     )
 
@@ -393,7 +502,7 @@ def test_repair_timeline_scopes_falkordb_queries_and_uses_valid_at() -> None:
     finally:
         repair_timeline.get_graph_client = original
 
-    assert len(fake_client.query_calls) == 3
+    assert len(fake_client.query_calls) == 5
 
     fetch_query, fetch_params = fake_client.query_calls[0]
     assert 'RETURN e.uuid,' in fetch_query
@@ -402,15 +511,60 @@ def test_repair_timeline_scopes_falkordb_queries_and_uses_valid_at() -> None:
     assert 'coalesce(e.valid_at, e.created_at)' in fetch_query
     assert fetch_params == {'group_id': 's1_sessions_main'}
 
-    delete_query, delete_params = fake_client.query_calls[1]
-    assert 'e1.group_id = $group_id AND e2.group_id = $group_id' in delete_query
-    assert delete_params == {'group_id': 's1_sessions_main'}
+    existing_query, existing_params = fake_client.query_calls[1]
+    assert 'MATCH (a:Episodic)-[r:NEXT_EPISODE]->(b:Episodic)' in existing_query
+    assert existing_params == {'group_id': 's1_sessions_main'}
 
     link_query, link_params = fake_client.query_calls[2]
     assert 'WHERE a.group_id = $group_id AND b.group_id = $group_id' in link_query
     assert link_params['prev'] == 'ep-1'
     assert link_params['curr'] == 'ep-2'
     assert link_params['group_id'] == 's1_sessions_main'
+
+
+
+def test_repair_timeline_stages_new_edges_before_pruning_stale_ones() -> None:
+    fake_client = FakeClient(
+        query_results=[
+            [
+                ['ep-2', '2026-03-09T09:30:00Z', '2026-03-09T09:31:00Z', 'session chunk: s:c1 (scope=private)', []],
+                ['ep-1', None, '2026-03-09T09:00:00Z', 'session chunk: s:c0 (scope=private)', []],
+            ],
+            [['ep-1', 'ep-2', 'legacy-edge']],
+            [],
+            [
+                ['ep-1', 'ep-2', 'legacy-edge'],
+                ['ep-1', 'ep-2', 'timeline:ep-1->ep-2'],
+            ],
+            [],
+            [['ep-1', 'ep-2', 'timeline:ep-1->ep-2']],
+        ]
+    )
+
+    async def fake_get_graph_client(*args, **kwargs):
+        return fake_client
+
+    original = repair_timeline.get_graph_client
+    repair_timeline.get_graph_client = fake_get_graph_client
+    try:
+        asyncio.run(repair_timeline.repair_timeline('falkordb', 'localhost', 6379, 's1_sessions_main'))
+    finally:
+        repair_timeline.get_graph_client = original
+
+    assert len(fake_client.query_calls) == 6
+    link_query, _ = fake_client.query_calls[2]
+    delete_query, delete_params = fake_client.query_calls[4]
+
+    assert 'MERGE (a)-[e:NEXT_EPISODE {uuid: $uuid}]->(b)' in link_query
+    assert 'DELETE r' in delete_query
+    assert "coalesce(toString(r.uuid), '') = $edge_uuid" in delete_query
+    assert delete_params == {
+        'prev': 'ep-1',
+        'curr': 'ep-2',
+        'edge_uuid': 'legacy-edge',
+        'group_id': 's1_sessions_main',
+    }
+    assert 'DELETE r' not in fake_client.query_calls[1][0]
 
 
 def test_repair_timeline_refuses_ambiguous_groups_before_delete() -> None:
