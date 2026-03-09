@@ -15,12 +15,18 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel
+
+if __name__ == 'mcp_server.src.services.ontology_registry':
+    sys.modules.setdefault('services.ontology_registry', sys.modules[__name__])
+elif __name__ == 'services.ontology_registry':
+    sys.modules.setdefault('mcp_server.src.services.ontology_registry', sys.modules[__name__])
 
 logger = logging.getLogger(__name__)
 

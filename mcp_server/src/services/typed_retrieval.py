@@ -606,10 +606,7 @@ def _tokenize(value: str) -> list[str]:
 
 
 def _contains_cjk_character(value: str) -> bool:
-    for char in str(value or ''):
-        if any(start <= char <= end for start, end in _CJK_RANGES):
-            return True
-    return False
+    return any(any(start <= char <= end for start, end in _CJK_RANGES) for char in str(value or ''))
 
 
 def _tokenless_exact_query(value: str) -> str | None:
