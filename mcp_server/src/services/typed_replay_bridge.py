@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,12 +40,21 @@ def canonical_scope(scope: str | None) -> str:
     return _TYPED_SCOPE_FALLBACK
 
 
+def canonical_session_identity(value: str | None) -> str:
+    raw = str(value or '').strip()
+    if not raw:
+        return raw
+    prefix, sep, rest = raw.partition(':')
+    if prefix.strip().lower() in {'session', 'sessions'}:
+        return f'session:{rest}' if sep else 'session'
+    return raw
+
+
 def build_session_chunk_evidence_ref(
     *,
     source_key: str,
     source_lane: str,
     source_episode_id: str,
-    source_event_id: str,
     chunk_key: str,
     evidence_id: str | None,
     start_id: str | None,
@@ -53,13 +63,16 @@ def build_session_chunk_evidence_ref(
     snippet: str | None,
 ) -> EvidenceRef:
     system = canonical_source_system(source_key, default='sessions')
+    canonical_stream = canonical_session_identity(source_key)
+    canonical_source_episode_id = canonical_session_identity(source_episode_id)
+    canonical_chunk_key = canonical_session_identity(chunk_key)
     locator: dict[str, Any] = {
         'system': system,
-        'stream': source_key,
-        'event_id': source_event_id,
+        'stream': canonical_stream,
+        'event_id': canonical_source_episode_id or canonical_chunk_key,
         'lane': source_lane,
-        'source_episode_id': source_episode_id,
-        'chunk_key': chunk_key,
+        'source_episode_id': canonical_source_episode_id,
+        'chunk_key': canonical_chunk_key,
     }
     if evidence_id:
         locator['evidence_id'] = evidence_id
@@ -88,7 +101,6 @@ def build_session_chunk_episode(
     started_at: str | None,
     ended_at: str | None,
     chunk_key: str,
-    source_event_id: str,
     evidence_id: str | None,
     start_id: str | None,
     end_id: str | None,
@@ -100,7 +112,6 @@ def build_session_chunk_episode(
         source_key=source_key,
         source_lane=source_lane,
         source_episode_id=source_episode_id,
-        source_event_id=source_event_id,
         chunk_key=chunk_key,
         evidence_id=evidence_id,
         start_id=start_id,
@@ -138,6 +149,16 @@ class TypedReplayBridge:
         self.db_path = Path(db_path)
         self.ledger = ChangeLedger(self.db_path)
 
+    def get_episode(self, object_id: str) -> Episode | None:
+        existing = self.ledger.materialize_object(object_id)
+        if existing is None:
+            return None
+        if not isinstance(existing, Episode):
+            raise ValueError(
+                f'Existing object_id {object_id!r} is not an Episode: {existing.object_type}'
+            )
+        return existing
+
     def assert_episode_once(
         self,
         episode: Episode,
@@ -146,24 +167,33 @@ class TypedReplayBridge:
         reason: str = BRIDGE_REASON,
         metadata: dict[str, Any] | None = None,
     ) -> BridgeWriteResult:
-        existing = self.ledger.materialize_object(episode.object_id)
-        if existing is not None:
-            if not isinstance(existing, Episode):
-                raise ValueError(
-                    f'Existing object_id {episode.object_id!r} is not an Episode: '
-                    f'{existing.object_type}'
-                )
-            return BridgeWriteResult(episode=existing, created=False, event_id=None)
+        try:
+            self.ledger.conn.execute('BEGIN IMMEDIATE')
+            existing = self.get_episode(episode.object_id)
+            if existing is not None:
+                self.ledger.conn.commit()
+                return BridgeWriteResult(episode=existing, created=False, event_id=None)
 
-        event = self.ledger.append_event(
-            'assert',
-            actor_id=actor_id,
-            reason=reason,
-            recorded_at=episode.created_at,
-            payload=episode,
-            metadata=metadata,
-        )
-        return BridgeWriteResult(episode=episode, created=True, event_id=event.event_id)
+            event = self.ledger.append_event(
+                'assert',
+                actor_id=actor_id,
+                reason=reason,
+                recorded_at=episode.created_at,
+                payload=episode,
+                metadata=metadata,
+                _autocommit=False,
+            )
+            self.ledger.conn.commit()
+            return BridgeWriteResult(episode=episode, created=True, event_id=event.event_id)
+        except sqlite3.IntegrityError:
+            self.ledger.conn.rollback()
+            existing = self.get_episode(episode.object_id)
+            if existing is not None:
+                return BridgeWriteResult(episode=existing, created=False, event_id=None)
+            raise
+        except Exception:
+            self.ledger.conn.rollback()
+            raise
 
     def list_current_episodes(self) -> list[Episode]:
         rows = self.ledger.conn.execute(

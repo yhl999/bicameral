@@ -56,6 +56,23 @@ def _normalized_source_system(source_key: str | None) -> str:
     return prefix or 'legacy'
 
 
+def _normalized_session_identity(value: str | None) -> str:
+    raw = str(value or '').strip()
+    if not raw:
+        return raw
+    prefix, sep, rest = raw.partition(':')
+    if prefix.strip().lower() in {'session', 'sessions'}:
+        return f'session:{rest}' if sep else 'session'
+    return raw
+
+
+def _normalized_event_log_component(system: str | None, value: str | None) -> str:
+    raw = str(value or '').strip()
+    if _normalized_source_system(system) == 'sessions':
+        return _normalized_session_identity(raw)
+    return raw
+
+
 class EvidenceRef(BaseModel):
     kind: EvidenceKind
     source_system: str
@@ -117,6 +134,9 @@ class EvidenceRef(BaseModel):
             )
         if kind == 'event_log':
             system, stream, event_id = _require(locator, 'system', 'stream', 'event_id')
+            system = _normalized_source_system(system)
+            stream = _normalized_event_log_component(system, stream)
+            event_id = _normalized_event_log_component(system, event_id)
             return (
                 f'eventlog://{quote(system, safe=_seg_safe)}'
                 f'/{quote(stream, safe=_seg_safe)}'
@@ -173,8 +193,8 @@ class EvidenceRef(BaseModel):
             evidence_id = 'h' + hashlib.sha256(_ref_str.encode()).hexdigest()[:16]
         locator = {
             'system': system or 'legacy',
-            'stream': source_key or system or 'legacy',
-            'event_id': evidence_id,
+            'stream': _normalized_event_log_component(system, source_key or system or 'legacy'),
+            'event_id': _normalized_event_log_component(system, evidence_id),
         }
         return cls(
             kind='event_log',

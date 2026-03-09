@@ -237,6 +237,8 @@ python3 scripts/mcp_ingest_sessions.py \
 
 Notes:
 - This bridge is intentionally **off by default** so the live legacy runtime does not change behavior by accident.
+- `--typed-truth-mode only` is an explicit CLI opt-in; ambient env defaults should not silently flip a replay into typed-only mode.
+- `--typed-truth-mode only` materializes typed Episodes without updating Graphiti chunk/extraction/watermark registry state.
 - Current scope is the **evidence replay path**. Neo4j source-mode and non-session ingest scripts still need explicit follow-up wiring.
 - The bridge writes stable `Episode` objects with canonical provenance (`source_lane`, `source_key`, `source_episode_id`, anchor `source_message_id`, event-log evidence ref, and replay metadata in the ledger event).
 

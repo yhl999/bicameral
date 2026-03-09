@@ -45,7 +45,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ingest.common import sanitize_for_graphiti
-from ingest.registry import get_registry
+from ingest.registry import IngestRegistry, get_registry
 from mcp_server.src.services.typed_replay_bridge import (
     TypedReplayBridge,
     build_bridge_metadata,
@@ -62,7 +62,7 @@ DEFAULT_OVERLAP_CHUNKS = 10  # for incremental mode
 # this limit are deterministically split into sub-chunks with :p0/:p1/... suffixes.
 # This avoids LLM context_length_exceeded errors without lossy truncation.
 DEFAULT_SUBCHUNK_SIZE = 10_000
-_TYPED_TRUTH_MODE_DEFAULT = os.environ.get('TYPED_TRUTH_MODE', 'off').strip().lower() or 'off'
+_TYPED_TRUTH_MODE_DEFAULT = 'off'
 _CHANGE_LEDGER_DB_DEFAULT = os.environ.get(
     'CHANGE_LEDGER_DB',
     str(Path(__file__).resolve().parents[1] / 'state' / 'change_ledger.db'),
@@ -1511,6 +1511,7 @@ def _write_typed_episode_bridge(
     args: argparse.Namespace,
     ev: dict[str, Any],
     chunk_source_key: str,
+    parent_chunk_key: str,
     sub_key: str,
     sub_content: str,
     content_hash: str,
@@ -1521,8 +1522,21 @@ def _write_typed_episode_bridge(
     started_at = str(ts_range.get('start') or '').strip() or None
     ended_at = str(ts_range.get('end') or '').strip() or None
     message_ids = ev.get('message_ids') if isinstance(ev.get('message_ids'), list) else []
-    start_id = str(ev.get('start_id') or '').strip() or None
-    end_id = str(ev.get('end_id') or '').strip() or None
+    is_subchunk = sub_key != parent_chunk_key
+    start_id = None if is_subchunk else str(ev.get('start_id') or '').strip() or None
+    end_id = None if is_subchunk else str(ev.get('end_id') or '').strip() or None
+    annotations = [
+        'bridge:typed_replay',
+        f'lane:{args.group_id}',
+        f'source_message_count:{len(message_ids)}',
+    ]
+    if is_subchunk:
+        annotations.extend(
+            [
+                'provenance:subchunk',
+                f'source_chunk:{parent_chunk_key}',
+            ]
+        )
     episode = build_session_chunk_episode(
         object_id=episode_uuid,
         source_lane=args.group_id,
@@ -1534,16 +1548,11 @@ def _write_typed_episode_bridge(
         started_at=started_at,
         ended_at=ended_at,
         chunk_key=sub_key,
-        source_event_id=episode_uuid,
         evidence_id=evidence_id or None,
         start_id=start_id,
         end_id=end_id,
         title=_typed_episode_title(ev, chunk_source_key),
-        annotations=[
-            'bridge:typed_replay',
-            f'lane:{args.group_id}',
-            f'message_count:{len(message_ids)}',
-        ],
+        annotations=annotations,
     )
     result = bridge.assert_episode_once(
         episode,
@@ -1595,37 +1604,40 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
         )
     )
 
-    registry = get_registry()
+    registry = get_registry() if args.typed_truth_mode != 'only' else None
 
     # Registry source key for this *enqueue stream* (not per session).
     stream_source_key = f'sessions:{args.group_id}'
 
     # Incremental mode: filter to evidence beyond watermark minus overlap.
     if args.incremental:
-        state = registry.get_source_state(stream_source_key)
-        watermark = state.watermark if state else 0.0
-
-        overlap_ts = 0.0
-        if watermark > 0:
-            watermark_idx = next(
-                (i for i, e in enumerate(evidences) if get_evidence_timestamp(e) >= watermark),
-                len(evidences),
-            )
-            overlap_start = max(0, watermark_idx - args.overlap)
-            overlap_ts = (
-                get_evidence_timestamp(evidences[overlap_start])
-                if overlap_start < len(evidences)
-                else 0.0
-            )
-
-        if overlap_ts > 0:
-            original_count = len(evidences)
-            evidences = [e for e in evidences if get_evidence_timestamp(e) >= overlap_ts]
-            print(
-                f'📊 Incremental mode: {original_count} total → {len(evidences)} after watermark (overlap={args.overlap})'
-            )
+        if registry is None:
+            print('📊 Incremental mode with typed-truth-mode=only has no Graphiti watermark; processing selected evidence window as-is')
         else:
-            print(f'📊 Incremental mode: first run, processing all {len(evidences)} evidence')
+            state = registry.get_source_state(stream_source_key)
+            watermark = state.watermark if state else 0.0
+
+            overlap_ts = 0.0
+            if watermark > 0:
+                watermark_idx = next(
+                    (i for i, e in enumerate(evidences) if get_evidence_timestamp(e) >= watermark),
+                    len(evidences),
+                )
+                overlap_start = max(0, watermark_idx - args.overlap)
+                overlap_ts = (
+                    get_evidence_timestamp(evidences[overlap_start])
+                    if overlap_start < len(evidences)
+                    else 0.0
+                )
+
+            if overlap_ts > 0:
+                original_count = len(evidences)
+                evidences = [e for e in evidences if get_evidence_timestamp(e) >= overlap_ts]
+                print(
+                    f'📊 Incremental mode: {original_count} total → {len(evidences)} after watermark (overlap={args.overlap})'
+                )
+            else:
+                print(f'📊 Incremental mode: first run, processing all {len(evidences)} evidence')
 
     # Shard BEFORE offset/limit.
     if args.shards > 1:
@@ -1640,6 +1652,7 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
     # Determine whether sub-chunking is active for this group.
     do_subchunk = args.group_id in _SUBCHUNK_GROUP_IDS
     subchunk_size = args.subchunk_size
+    typed_bridge = TypedReplayBridge(args.change_ledger_db) if args.typed_truth_mode != 'off' else None
 
     if args.dry_run:
         print(f'\n🔍 DRY RUN: Would process {len(batch)} evidence chunks')
@@ -1671,8 +1684,19 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
 
             for sub_key, sub_content in sub_parts:
                 total_subchunks += 1
-                sub_hash = registry.compute_content_hash(sub_content)
-                if not args.force and registry.is_chunk_ingested(
+                sub_hash = IngestRegistry.compute_content_hash(sub_content)
+                if args.typed_truth_mode == 'only':
+                    chunk_uuid = IngestRegistry.compute_chunk_uuid(
+                        source_key=chunk_source_key,
+                        chunk_key=sub_key,
+                        content_hash=sub_hash,
+                    )
+                    episode_uuid = IngestRegistry.compute_episode_uuid(chunk_uuid)
+                    if not args.force and typed_bridge is not None and typed_bridge.get_episode(episode_uuid):
+                        skipped += 1
+                    else:
+                        new += 1
+                elif not args.force and registry is not None and registry.is_chunk_ingested(
                     chunk_source_key, sub_key, sub_hash
                 ):
                     skipped += 1
@@ -1683,9 +1707,6 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
         return
 
     client = MCPClient(args.mcp_url) if args.typed_truth_mode != 'only' else None
-    typed_bridge = (
-        TypedReplayBridge(args.change_ledger_db) if args.typed_truth_mode != 'off' else None
-    )
 
     ok = 0
     skipped = 0
@@ -1722,10 +1743,12 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             sub_parts = [(str(chunk_key), strip_ingestion_noise(content))]
 
         for sub_key, sub_content in sub_parts:
-            # Registry content hash (shortened) for dedup.
-            content_hash = registry.compute_content_hash(sub_content)
-            if not args.force and registry.is_chunk_ingested(
-                chunk_source_key, sub_key, content_hash
+            content_hash = IngestRegistry.compute_content_hash(sub_content)
+            if (
+                args.typed_truth_mode != 'only'
+                and not args.force
+                and registry is not None
+                and registry.is_chunk_ingested(chunk_source_key, sub_key, content_hash)
             ):
                 skipped += 1
                 continue
@@ -1733,27 +1756,33 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
             ep_name = f'{sub_key}:{evidence_id[:8] or content_hash[:8]}'
             src_desc = f'session chunk: {sub_key} (scope={scope or "unknown"})'
 
-            chunk_uuid = registry.compute_chunk_uuid(
+            chunk_uuid = IngestRegistry.compute_chunk_uuid(
                 source_key=chunk_source_key,
                 chunk_key=sub_key,
                 content_hash=content_hash,
             )
-            episode_uuid = registry.compute_episode_uuid(chunk_uuid)
+            episode_uuid = IngestRegistry.compute_episode_uuid(chunk_uuid)
 
+            typed_result_created = None
             if typed_bridge is not None:
                 try:
-                    if _write_typed_episode_bridge(
+                    typed_result_created = _write_typed_episode_bridge(
                         bridge=typed_bridge,
                         args=args,
                         ev=ev,
                         chunk_source_key=chunk_source_key,
+                        parent_chunk_key=str(chunk_key),
                         sub_key=sub_key,
                         sub_content=sub_content,
                         content_hash=content_hash,
                         episode_uuid=episode_uuid,
                         evidence_id=str(evidence_id),
-                    ):
+                    )
+                    if typed_result_created:
                         typed_created += 1
+                    elif args.typed_truth_mode == 'only':
+                        skipped += 1
+                        continue
                 except Exception as exc:
                     print(f'[{i}/{len(batch)}] ERROR typed bridge {ep_name}: {exc}')
                     errors += 1
@@ -1783,26 +1812,21 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
 
             ok += 1
 
-            registry.record_chunk(
-                chunk_uuid=chunk_uuid,
-                source_key=chunk_source_key,
-                chunk_key=sub_key,
-                content_hash=content_hash,
-                evidence_id=evidence_id or '(missing)',
-            )
-            registry.record_extraction_queued(
-                group_id=args.group_id,
-                episode_uuid=episode_uuid,
-                chunk_uuid=chunk_uuid,
-                source_key=chunk_source_key,
-                chunk_key=sub_key,
-            )
-            if args.typed_truth_mode == 'only':
-                registry.mark_extraction_succeeded(
+            if registry is not None:
+                registry.record_chunk(
+                    chunk_uuid=chunk_uuid,
+                    source_key=chunk_source_key,
+                    chunk_key=sub_key,
+                    content_hash=content_hash,
+                    evidence_id=evidence_id or '(missing)',
+                )
+                registry.record_extraction_queued(
                     group_id=args.group_id,
                     episode_uuid=episode_uuid,
+                    chunk_uuid=chunk_uuid,
+                    source_key=chunk_source_key,
+                    chunk_key=sub_key,
                 )
-            else:
                 time.sleep(args.sleep)
 
         ts = get_evidence_timestamp(ev)
@@ -1814,8 +1838,8 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
                 f'[{i}/{len(batch)}] queued {chunk_key} ({len(sub_parts)} part{"s" if len(sub_parts) > 1 else ""})'
             )
 
-    # Update watermark for this enqueue stream.
-    if ok > 0 and max_ts > 0:
+    # Update watermark for this enqueue stream only when Graphiti ingest bookkeeping is active.
+    if registry is not None and ok > 0 and max_ts > 0:
         registry.update_source_watermark(
             source_key=stream_source_key,
             source_type='session',
