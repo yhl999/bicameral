@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -67,12 +68,25 @@ class EvidenceRef(BaseModel):
 
     @staticmethod
     def build_canonical_uri(kind: EvidenceKind, locator: dict[str, Any]) -> str:
+        # RFC 3986 pchar-safe set (no slash, no hash, no question mark).
+        # Encoding slashes and hashes in path *segments* prevents ambiguous
+        # URI parsing when component values contain those characters.
+        _seg_safe = '-._~:@!$&\'()*+,;='
+
         if kind == 'qmd_chunk':
             collection, document_id, chunk_id = _require(locator, 'collection', 'document_id', 'chunk_id')
-            return f'qmd://{collection}/{document_id}#chunk={chunk_id}'
+            return (
+                f'qmd://{quote(collection, safe=_seg_safe)}'
+                f'/{quote(document_id, safe=_seg_safe)}'
+                f'#chunk={quote(chunk_id, safe=_seg_safe)}'
+            )
         if kind == 'message':
             system, conversation_id, message_id = _require(locator, 'system', 'conversation_id', 'message_id')
-            return f'msg://{system}/{conversation_id}/{message_id}'
+            return (
+                f'msg://{quote(system, safe=_seg_safe)}'
+                f'/{quote(conversation_id, safe=_seg_safe)}'
+                f'/{quote(message_id, safe=_seg_safe)}'
+            )
         if kind == 'file':
             path = str(locator.get('path') or '')
             if not path:
@@ -80,23 +94,45 @@ class EvidenceRef(BaseModel):
             repo = str(locator.get('repo') or 'workspace')
             start_line = int(locator.get('start_line') or 1)
             end_line = int(locator.get('end_line') or start_line)
-            return f'file://{repo}/{path}#L{start_line}-L{end_line}'
+            # repo is a single segment; path preserves slashes (it is a filesystem path).
+            return f'file://{quote(repo, safe=_seg_safe)}/{path}#L{start_line}-L{end_line}'
         if kind == 'doc_chunk':
             system, document_id, chunk_id = _require(locator, 'system', 'document_id', 'chunk_id')
-            return f'doc://{system}/{document_id}#chunk={chunk_id}'
+            return (
+                f'doc://{quote(system, safe=_seg_safe)}'
+                f'/{quote(document_id, safe=_seg_safe)}'
+                f'#chunk={quote(chunk_id, safe=_seg_safe)}'
+            )
         if kind == 'event_log':
             system, stream, event_id = _require(locator, 'system', 'stream', 'event_id')
-            return f'eventlog://{system}/{stream}/{event_id}'
+            return (
+                f'eventlog://{quote(system, safe=_seg_safe)}'
+                f'/{quote(stream, safe=_seg_safe)}'
+                f'/{quote(event_id, safe=_seg_safe)}'
+            )
         if kind == 'crm_record':
             system, object_type, record_id = _require(locator, 'system', 'object_type', 'record_id')
-            return f'crm://{system}/{object_type}/{record_id}'
+            return (
+                f'crm://{quote(system, safe=_seg_safe)}'
+                f'/{quote(object_type, safe=_seg_safe)}'
+                f'/{quote(record_id, safe=_seg_safe)}'
+            )
         if kind == 'sql_row':
             system, database, table = _require(locator, 'system', 'database', 'table')
             pk_json = quote(_canonical_json(locator.get('pk_json') or {}), safe='')
-            return f'sql://{system}/{database}/{table}#pk={pk_json}'
+            return (
+                f'sql://{quote(system, safe=_seg_safe)}'
+                f'/{quote(database, safe=_seg_safe)}'
+                f'/{quote(table, safe=_seg_safe)}'
+                f'#pk={pk_json}'
+            )
         if kind == 'api_resource':
             system, resource_type, resource_id = _require(locator, 'system', 'resource_type', 'resource_id')
-            return f'api://{system}/{resource_type}/{resource_id}'
+            return (
+                f'api://{quote(system, safe=_seg_safe)}'
+                f'/{quote(resource_type, safe=_seg_safe)}'
+                f'/{quote(resource_id, safe=_seg_safe)}'
+            )
         raise ValueError(f'Unsupported evidence kind: {kind}')
 
     @classmethod
@@ -108,8 +144,21 @@ class EvidenceRef(BaseModel):
             or ref.get('chunk_key')
             or ref.get('start_id')
             or ref.get('end_id')
-            or 'unknown'
+            or ''
         ).strip()
+        if not evidence_id:
+            # No stable ID present — generate a deterministic content hash to
+            # avoid URI collisions when multiple legacy refs lack identifiers.
+            # Using only the stable/structural keys so that metadata-only
+            # differences (e.g. retrieved_at) don't produce different hashes for
+            # the same logical evidence source.
+            _stable_fields = {
+                k: ref[k]
+                for k in ('source_key', 'scope', 'source_family', 'chunk_key', 'start_id', 'end_id', 'evidence_id')
+                if k in ref and ref[k] not in (None, '', [])
+            }
+            _ref_str = json.dumps(_stable_fields, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            evidence_id = 'h' + hashlib.sha256(_ref_str.encode()).hexdigest()[:16]
         locator = {
             'system': system or 'legacy',
             'stream': source_key or system or 'legacy',

@@ -1386,7 +1386,28 @@ def deny_candidate(
     safe_reason = _normalize_reason(reason, fallback="denied")
 
     ledger_event_id = row["ledger_event_id"]
-    if ledger is not None and not ledger_event_id and not hasattr(ledger, "promote_candidate_fact"):
+    if ledger is not None and hasattr(ledger, "promote_candidate_fact"):
+        # New-style ChangeLedger path.
+        # If the candidate was previously promoted, write an 'invalidate' event
+        # so the ledger's append-only audit trail remains complete.
+        # If it was never promoted (no ledger_event_id), nothing entered the
+        # ledger, so no ledger event is needed — the candidates DB row is the
+        # sole audit record for the denial.
+        if ledger_event_id:
+            inv_object_id = ledger.object_id_for_event(ledger_event_id)
+            if inv_object_id:
+                ledger.append_event(
+                    "invalidate",
+                    actor_id=actor_id,
+                    reason=safe_reason,
+                    object_id=inv_object_id,
+                    root_id=ledger.root_id_for_object(inv_object_id),
+                )
+                # Note: ledger_event_id is NOT updated here; it retains
+                # provenance to the original promotion event.  The invalidate
+                # event is now in the ledger for the audit trail.
+    elif ledger is not None and not ledger_event_id:
+        # Old-style ledger (does not have promote_candidate_fact).
         ledger_row = ledger.append_event(
             "DENY",
             actor_id=actor_id,

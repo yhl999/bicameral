@@ -2,34 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    from models.typed_memory import (  # type: ignore
-        EntityRegistry,
-        EntityRegistryEntry,
-        Episode,
-        EvidenceRef,
-        Procedure,
-        StateFact,
-        TypedMemoryObject,
-        coerce_typed_object,
-    )
-except ImportError:  # pragma: no cover - fallback for repo-root imports in tests/tools
-    from mcp_server.src.models.typed_memory import (
-        EntityRegistry,
-        EntityRegistryEntry,
-        Episode,
-        EvidenceRef,
-        Procedure,
-        StateFact,
-        TypedMemoryObject,
-        coerce_typed_object,
-    )
+# Relative import — no try/except needed: this module is always imported as
+# part of the mcp_server.src.services package, never run as a top-level script.
+from ..models.typed_memory import (
+    EntityRegistry,
+    EntityRegistryEntry,
+    Episode,
+    EvidenceRef,
+    Procedure,
+    StateFact,
+    TypedMemoryObject,
+    coerce_typed_object,
+)
 
 CANONICAL_EVENT_TYPES = frozenset(
     {
@@ -108,7 +99,44 @@ class ChangeLedger:
         self.conn.row_factory = sqlite3.Row
         ensure_schema(self.conn)
 
-    def append_event(
+    # ─────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _do_insert(self, row: ChangeEventRow) -> None:
+        """Insert a ChangeEventRow into the DB without committing.
+
+        Callers are responsible for calling conn.commit() when they want to
+        persist.  Use append_event (autocommit=True by default) for the normal
+        single-event path.
+        """
+        self.conn.execute(
+            """
+            INSERT INTO change_events(
+                event_id, event_type, recorded_at, actor_id, reason,
+                object_id, target_object_id, object_type, root_id, parent_id,
+                candidate_id, policy_version, payload_json, metadata_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                row.event_id,
+                row.event_type,
+                row.recorded_at,
+                row.actor_id,
+                row.reason,
+                row.object_id,
+                row.target_object_id,
+                row.object_type,
+                row.root_id,
+                row.parent_id,
+                row.candidate_id,
+                row.policy_version,
+                row.payload_json,
+                row.metadata_json,
+            ),
+        )
+
+    def _build_event_row(
         self,
         event_type: str,
         *,
@@ -125,6 +153,7 @@ class ChangeLedger:
         payload: TypedMemoryObject | dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ChangeEventRow:
+        """Build a ChangeEventRow (no DB interaction)."""
         normalized_type = _normalize_event_type(event_type)
         if normalized_type not in CANONICAL_EVENT_TYPES:
             raise ValueError(
@@ -153,7 +182,7 @@ class ChangeLedger:
             if object_id is None:
                 raise ValueError(f'{normalized_type} requires object_id or target_object_id')
 
-        row = ChangeEventRow(
+        return ChangeEventRow(
             event_id=_new_event_id(),
             event_type=normalized_type,
             recorded_at=recorded_at or _now_iso(),
@@ -169,32 +198,53 @@ class ChangeLedger:
             payload_json=payload_json,
             metadata_json=_canonical_json(metadata) if metadata is not None else None,
         )
-        self.conn.execute(
-            """
-            INSERT INTO change_events(
-                event_id, event_type, recorded_at, actor_id, reason,
-                object_id, target_object_id, object_type, root_id, parent_id,
-                candidate_id, policy_version, payload_json, metadata_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                row.event_id,
-                row.event_type,
-                row.recorded_at,
-                row.actor_id,
-                row.reason,
-                row.object_id,
-                row.target_object_id,
-                row.object_type,
-                row.root_id,
-                row.parent_id,
-                row.candidate_id,
-                row.policy_version,
-                row.payload_json,
-                row.metadata_json,
-            ),
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def append_event(
+        self,
+        event_type: str,
+        *,
+        actor_id: str | None = None,
+        reason: str | None = None,
+        recorded_at: str | None = None,
+        object_type: str | None = None,
+        object_id: str | None = None,
+        target_object_id: str | None = None,
+        root_id: str | None = None,
+        parent_id: str | None = None,
+        candidate_id: str | None = None,
+        policy_version: str | None = None,
+        payload: TypedMemoryObject | dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        _autocommit: bool = True,
+    ) -> ChangeEventRow:
+        """Append a single event to the ledger.
+
+        _autocommit=False is an internal flag used by promote_candidate_fact to
+        batch two inserts into a single atomic transaction.  External callers
+        should always leave it True (the default).
+        """
+        row = self._build_event_row(
+            event_type,
+            actor_id=actor_id,
+            reason=reason,
+            recorded_at=recorded_at,
+            object_type=object_type,
+            object_id=object_id,
+            target_object_id=target_object_id,
+            root_id=root_id,
+            parent_id=parent_id,
+            candidate_id=candidate_id,
+            policy_version=policy_version,
+            payload=payload,
+            metadata=metadata,
         )
-        self.conn.commit()
+        self._do_insert(row)
+        if _autocommit:
+            self.conn.commit()
         return row
 
     def events_for_root(self, root_id: str) -> list[ChangeEventRow]:
@@ -229,6 +279,14 @@ class ChangeLedger:
         if row is None:
             return None
         return str(row['root_id']) if row['root_id'] else None
+
+    def object_id_for_event(self, event_id: str) -> str | None:
+        """Return the object_id recorded for a given event_id, or None."""
+        row = self.conn.execute(
+            "SELECT object_id FROM change_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return str(row['object_id']) if row and row['object_id'] else None
 
     def materialize_lineage(self, root_id: str) -> list[TypedMemoryObject]:
         events = self.events_for_root(root_id)
@@ -296,9 +354,23 @@ class ChangeLedger:
         candidate_id: str,
         fact: dict[str, Any],
         conflict_with_fact_id: str | None = None,
-        seeded_supersede_ok: bool = False,
+        seeded_supersede_ok: bool = False,  # kept for API compat; gate removed — manual approval always supersedes
         recorded_at: str | None = None,
     ) -> CandidatePromotionResult:
+        """Promote a candidate fact into the ledger.
+
+        Atomicity guarantee: the create/supersede event and the promote event
+        are inserted in a single SQLite transaction (_autocommit=False on both
+        append_event calls, followed by a single conn.commit()).  If anything
+        raises between the two inserts, neither event is committed.
+
+        One-current-object rule: when conflict_with_fact_id is provided and the
+        prior object exists in the ledger, this method ALWAYS performs a supersede
+        (regardless of seeded_supersede_ok).  Manual approval by a human actor is
+        explicit authorization to supersede; policy auto-supersede sets
+        seeded_supersede_ok=True in the trace, but the gate has been lifted for
+        both paths to avoid a second "current" fact in the same conflict set.
+        """
         recorded_at = recorded_at or _now_iso()
         typed_object = build_object_from_candidate_fact(
             candidate_id=candidate_id,
@@ -312,7 +384,10 @@ class ChangeLedger:
         parent_id: str | None = None
         root_id = typed_object.root_id
 
-        if conflict_with_fact_id and seeded_supersede_ok:
+        # Always supersede when a conflicting prior fact is explicitly identified
+        # and still exists in the ledger.  This enforces the one-current-object
+        # rule regardless of whether the promotion is automated or manual.
+        if conflict_with_fact_id:
             prior = self.materialize_object(conflict_with_fact_id)
             if prior is not None:
                 creation_type = 'supersede'
@@ -326,7 +401,8 @@ class ChangeLedger:
                     }
                 )
 
-        create_event = self.append_event(
+        # Build both rows first (validation happens here; no DB writes yet).
+        create_row = self._build_event_row(
             creation_type,
             actor_id=actor_id,
             reason=reason,
@@ -336,9 +412,7 @@ class ChangeLedger:
             candidate_id=candidate_id,
             policy_version=policy_version,
         )
-        event_ids.append(create_event.event_id)
-
-        promote_event = self.append_event(
+        promote_row = self._build_event_row(
             'promote',
             actor_id=actor_id,
             reason=reason,
@@ -349,19 +423,43 @@ class ChangeLedger:
             candidate_id=candidate_id,
             policy_version=policy_version,
         )
-        event_ids.append(promote_event.event_id)
+
+        # Atomic: insert both rows then commit once.
+        # If either insert raises, explicitly rollback so the first insert is
+        # not left as an open (uncommitted but visible) write on this connection.
+        try:
+            self._do_insert(create_row)
+            self._do_insert(promote_row)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        event_ids = [create_row.event_id, promote_row.event_id]
 
         return CandidatePromotionResult(
             object_id=typed_object.object_id,
             root_id=root_id,
-            event_id=promote_event.event_id,
+            event_id=promote_row.event_id,
             event_ids=event_ids,
         )
 
 
 def connect(path: str | Path = DB_PATH_DEFAULT) -> sqlite3.Connection:
+    """Open (or create) the change_ledger SQLite DB with canonical pragmas.
+
+    WAL mode: improves concurrent read performance and durability for the
+    append-only ledger workload.
+    foreign_keys: enforced as a matter of correctness hygiene; the ledger
+    schema has no FK constraints today but this is defensive practice for
+    future schema evolution.
+    """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
+    # WAL mode: better concurrency for readers; durable write-ahead log.
+    conn.execute('PRAGMA journal_mode=WAL')
+    # foreign_keys: ON for schema correctness hygiene.
+    conn.execute('PRAGMA foreign_keys=ON')
     ensure_schema(conn)
     return conn
 
@@ -536,8 +634,13 @@ def _stable_object_id(seed: str) -> str:
 
 
 def _new_event_id() -> str:
-    digest = hashlib.sha256(f'event|{_now_iso()}|{datetime.now(timezone.utc).timestamp()}'.encode('utf-8')).hexdigest()
-    return f'evt_{digest[:24]}'
+    """Generate a collision-safe event ID using cryptographic randomness.
+
+    Uses 96 bits (12 bytes) of randomness from os.urandom, giving essentially
+    zero collision probability even under concurrent writes across processes.
+    The PRIMARY KEY constraint on event_id provides a hard DB-level guard.
+    """
+    return f'evt_{secrets.token_hex(12)}'
 
 
 def _now_iso() -> str:

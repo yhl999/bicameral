@@ -3,6 +3,9 @@ from __future__ import annotations
 import sqlite3
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -201,3 +204,172 @@ def test_entity_registry_resolves_aliases_and_external_ids():
         }
     )
     assert manual_registry.matches_name('yuan han') is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue #3 — event ID must be collision-safe under concurrent writes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_event_ids_are_collision_safe():
+    """Rapid generation of event IDs must produce no duplicates.
+
+    The old implementation used sha256(timestamp) which could collide across
+    concurrent writes in the same second.  The new implementation uses
+    secrets.token_hex(12) (96 bits of randomness).
+    """
+    from mcp_server.src.services.change_ledger import _new_event_id
+
+    n = 10_000
+    ids = [_new_event_id() for _ in range(n)]
+    assert len(set(ids)) == n, 'event ID collision detected'
+    for eid in ids:
+        assert eid.startswith('evt_'), f'unexpected event_id format: {eid!r}'
+        # 24 hex chars after the prefix = 96 bits of randomness
+        assert len(eid) == len('evt_') + 24, f'unexpected event_id length: {eid!r}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue #2 — promotion must be atomic (both events or neither)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_promote_candidate_fact_is_atomic():
+    """If the promote event insert fails, the create event must also be rolled back.
+
+    promote_candidate_fact builds both rows and calls _do_insert twice, then
+    does a single conn.commit().  If the second _do_insert raises before the
+    commit, the first insert has not been committed and SQLite rolls back the
+    open transaction when the exception propagates.
+
+    We simulate failure on the second _do_insert to verify zero events are
+    committed after the exception.
+    """
+    ledger = _ledger()
+    fact_payload = {
+        'subject': 'user:principal',
+        'predicate': 'pref.atomicity_test',
+        'scope': 'private',
+        'assertion_type': 'preference',
+        'value': 'vim',
+        'evidence_refs': [{'source_key': 's:1', 'evidence_id': 'e-atomic', 'scope': 's1_sessions_main'}],
+    }
+
+    # patch.object on a class method: mock is looked up on the class and
+    # called without Python's descriptor binding, so side_effect receives
+    # just the positional args (no implicit self).  We capture `ledger` via
+    # closure and call the original unbound method explicitly.
+    original_do_insert = ChangeLedger._do_insert
+    call_count = [0]
+
+    def flaky_second_insert(row):  # no self — mock is NOT a descriptor
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise RuntimeError('simulated disk failure on second insert')
+        return original_do_insert(ledger, row)
+
+    with patch.object(ChangeLedger, '_do_insert', side_effect=flaky_second_insert):
+        with pytest.raises(RuntimeError, match='simulated disk failure'):
+            ledger.promote_candidate_fact(
+                actor_id='test:actor',
+                reason='atomicity test',
+                policy_version='v3',
+                candidate_id='cand-atomic-test',
+                fact=fact_payload,
+            )
+
+    count = ledger.conn.execute('SELECT count(*) FROM change_events').fetchone()[0]
+    assert count == 0, (
+        f'Atomicity broken: {count} event(s) committed before promotion was '
+        'complete.  Both the create and promote events must commit as one unit.'
+    )
+
+
+def test_promote_candidate_fact_success_emits_exactly_two_events():
+    """On success, exactly a create event and a promote event are committed."""
+    ledger = _ledger()
+    fact_payload = {
+        'subject': 'user:principal',
+        'predicate': 'pref.two_event_test',
+        'scope': 'private',
+        'assertion_type': 'preference',
+        'value': 'emacs',
+        'evidence_refs': [{'source_key': 's:1', 'evidence_id': 'e-two', 'scope': 's1_sessions_main'}],
+    }
+
+    result = ledger.promote_candidate_fact(
+        actor_id='test:actor',
+        reason='two-event test',
+        policy_version='v3',
+        candidate_id='cand-two-event',
+        fact=fact_payload,
+    )
+
+    rows = ledger.conn.execute(
+        'SELECT event_type FROM change_events ORDER BY rowid'
+    ).fetchall()
+    event_types = [r['event_type'] for r in rows]
+    assert event_types == ['assert', 'promote'], f'unexpected event sequence: {event_types}'
+    assert len(result.event_ids) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue #5 — EvidenceRef: legacy refs without stable IDs must not collide
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_legacy_ref_without_stable_id_generates_unique_canonical_uris():
+    """Two structurally distinct legacy refs with no evidence_id must not share a URI.
+
+    The old code fell back to 'unknown' as the event_id, producing identical
+    canonical_uris for different refs.  The fix uses a content hash as fallback.
+    """
+    ref_a = {'source_key': 'sessions:s1', 'scope': 's1_sessions_main'}
+    ref_b = {'source_key': 'memory:s1', 'scope': 's1_memory_day1'}
+    # Both have no evidence_id / chunk_key / start_id / end_id
+
+    ev_a = EvidenceRef.from_legacy_ref(ref_a)
+    ev_b = EvidenceRef.from_legacy_ref(ref_b)
+
+    assert ev_a.canonical_uri != ev_b.canonical_uri, (
+        'Two distinct legacy refs without stable IDs produced the same '
+        f'canonical_uri: {ev_a.canonical_uri!r}'
+    )
+    # URIs must be deterministic (same call → same URI)
+    ev_a2 = EvidenceRef.from_legacy_ref(ref_a)
+    assert ev_a.canonical_uri == ev_a2.canonical_uri, 'Legacy ref URI is not deterministic'
+
+
+def test_legacy_ref_with_evidence_id_is_unchanged():
+    """When a stable evidence_id is present, from_legacy_ref must not change it."""
+    ref = {
+        'source_key': 'sessions:s1',
+        'evidence_id': 'stable-id-42',
+        'scope': 's1_sessions_main',
+    }
+    ev = EvidenceRef.from_legacy_ref(ref)
+    assert 'stable-id-42' in ev.canonical_uri
+
+
+def test_canonical_uri_path_segment_with_slash_is_encoded():
+    """A locator component containing a literal slash must be percent-encoded.
+
+    Unencoded slashes in path segments create ambiguous URIs where
+    'a/b' and 'a' + sub-path 'b' are indistinguishable.
+    """
+    # message_id that contains a slash (edge case, e.g. group/thread IDs)
+    ref = EvidenceRef(
+        kind='message',
+        source_system='slack',
+        locator={
+            'system': 'slack',
+            'conversation_id': 'C1234',
+            'message_id': 'p1234567890/123456',  # Slack thread ID format
+        },
+    )
+    # The slash in message_id must be encoded as %2F
+    assert '%2F' in ref.canonical_uri, (
+        f'Slash in message_id was not encoded: {ref.canonical_uri!r}'
+    )
+    # The rest of the URI structure must still be correct
+    assert ref.canonical_uri.startswith('msg://slack/C1234/')
