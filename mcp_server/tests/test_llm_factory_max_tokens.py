@@ -50,6 +50,8 @@ def test_reasoning_factory_passes_configured_max_tokens(monkeypatch):
     config = LLMConfig(
         provider='openai',
         model='gpt-5-mini',
+        reasoning_effort='medium',
+        verbosity='low',
         max_tokens=2048,
         providers=LLMProvidersConfig(
             openai=OpenAIProviderConfig(api_key='dummy-key', api_url='https://example.invalid/v1')
@@ -59,5 +61,5 @@ def test_reasoning_factory_passes_configured_max_tokens(monkeypatch):
     factories.LLMClientFactory.create(config)
 
     assert captured['kwargs']['max_tokens'] == 2048
-    assert captured['kwargs']['reasoning'] == 'minimal'
+    assert captured['kwargs']['reasoning'] == 'medium'
     assert captured['kwargs']['verbosity'] == 'low'
