@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field, model_validator
+
+if __name__ == 'mcp_server.src.models.typed_memory':
+    sys.modules.setdefault('models.typed_memory', sys.modules[__name__])
+elif __name__ == 'models.typed_memory':
+    sys.modules.setdefault('mcp_server.src.models.typed_memory', sys.modules[__name__])
 
 EvidenceKind = Literal[
     'qmd_chunk',

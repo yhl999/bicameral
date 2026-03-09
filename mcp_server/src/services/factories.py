@@ -1,10 +1,17 @@
 """Factory classes for creating LLM, Embedder, and Database clients."""
 
-from config.schema import (
-    DatabaseConfig,
-    EmbedderConfig,
-    LLMConfig,
-)
+try:
+    from ..config.schema import (
+        DatabaseConfig,
+        EmbedderConfig,
+        LLMConfig,
+    )
+except ImportError:  # pragma: no cover - top-level import fallback
+    from config.schema import (
+        DatabaseConfig,
+        EmbedderConfig,
+        LLMConfig,
+    )
 
 # Try to import FalkorDriver if available
 try:

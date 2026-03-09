@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.neo4j_service import Neo4jService
+try:
+    from .neo4j_service import Neo4jService
+except ImportError:  # pragma: no cover - top-level import fallback
+    from services.neo4j_service import Neo4jService
 
 DEFAULT_OM_GROUP_ID = 's1_observational_memory'
 
