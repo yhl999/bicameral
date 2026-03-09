@@ -13,13 +13,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import sys
+from collections import defaultdict
 from typing import Any
 
 from graph_driver import add_backend_args, get_graph_client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+_SESSION_CHUNK_RE = re.compile(r'session chunk:\s*([^\(]+)')
+_SUBCHUNK_SUFFIX_RE = re.compile(r':p\d+$')
+_CHUNK_SUFFIX_RE = re.compile(r':c\d+$')
 
 
 def _time_sort_key(value: Any) -> str:
@@ -41,6 +47,69 @@ def sort_episodes_for_timeline(episodes: list[dict]) -> list[dict]:
     )
 
 
+def infer_episode_stream_key(source_description: str | None) -> str:
+    if not isinstance(source_description, str) or not source_description.strip():
+        return ''
+
+    match = _SESSION_CHUNK_RE.search(source_description)
+    if not match:
+        return ''
+
+    chunk_key = match.group(1).strip()
+    if not chunk_key:
+        return ''
+
+    chunk_key = _SUBCHUNK_SUFFIX_RE.sub('', chunk_key)
+    chunk_key = _CHUNK_SUFFIX_RE.sub('', chunk_key)
+    return chunk_key.strip()
+
+
+def build_timeline_groups(episodes: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = defaultdict(list)
+    ungrouped: list[dict] = []
+
+    for episode in sort_episodes_for_timeline(episodes):
+        saga_ids = sorted(
+            {
+                str(saga_uuid).strip()
+                for saga_uuid in (episode.get('saga_uuids') or [])
+                if str(saga_uuid or '').strip()
+            }
+        )
+        if len(saga_ids) > 1:
+            raise ValueError(
+                f"Refusing to repair timeline: episode {episode.get('uuid')!r} belongs to multiple sagas {saga_ids!r}."
+            )
+
+        timeline_key = ''
+        if saga_ids:
+            timeline_key = f'saga:{saga_ids[0]}'
+        else:
+            stream_key = infer_episode_stream_key(episode.get('source_description'))
+            if stream_key:
+                timeline_key = f'stream:{stream_key}'
+
+        if timeline_key:
+            groups[timeline_key].append(episode)
+        else:
+            ungrouped.append(episode)
+
+    if ungrouped:
+        if groups:
+            raise ValueError(
+                'Refusing to repair timeline: some episodes have no saga or stream identity while other '
+                'episodes do. Repair would be ambiguous and could cross-link unrelated streams.'
+            )
+        if len(ungrouped) > 1:
+            raise ValueError(
+                'Refusing to repair timeline: multiple episodes lack saga/stream identity, so the group '
+                'cannot be proven to be a single linear stream.'
+            )
+        groups['ungrouped'] = ungrouped
+
+    return dict(groups)
+
+
 def build_timeline_pairs(episodes: list[dict], group_id: str) -> list[dict[str, object]]:
     pairs: list[dict[str, object]] = []
     for idx in range(len(episodes) - 1):
@@ -58,11 +127,58 @@ def build_timeline_pairs(episodes: list[dict], group_id: str) -> list[dict[str, 
     return pairs
 
 
+async def _fetch_group_episodes(client, group_id: str) -> list[dict[str, Any]]:
+    query = """
+    MATCH (e:Episodic)
+    WHERE e.group_id = $group_id
+    OPTIONAL MATCH (s:Saga)-[:HAS_EPISODE]->(e)
+    WHERE s.group_id = $group_id
+    RETURN e.uuid,
+           e.valid_at,
+           e.created_at,
+           e.source_description,
+           collect(DISTINCT s.uuid) AS saga_uuids
+    ORDER BY coalesce(e.valid_at, e.created_at) ASC, e.created_at ASC, e.uuid ASC
+    """
+    res = await client.query(query, {'group_id': group_id})
+    return [
+        {
+            'uuid': rec[0],
+            'valid_at': rec[1],
+            'created_at': rec[2],
+            'source_description': rec[3],
+            'saga_uuids': list(rec[4] or []),
+        }
+        for rec in res.result_set
+    ]
+
+
 async def repair_timeline(backend, host, port, group_id):
-    logger.info(f'Connecting to {backend} for group_id={group_id}')
+    logger.info('Connecting to %s for group_id=%s', backend, group_id)
     client = await get_graph_client(backend, group_id=group_id, host=host, port=port)
 
     try:
+        logger.info('Fetching episodes...')
+        episodes = sort_episodes_for_timeline(await _fetch_group_episodes(client, group_id))
+        logger.info('Found %d episodes. Analysing timeline groups...', len(episodes))
+
+        if not episodes:
+            logger.info('No episodes found. Exiting.')
+            return
+
+        timeline_groups = build_timeline_groups(episodes)
+        pairs: list[dict[str, object]] = []
+        for timeline_key, grouped_episodes in sorted(timeline_groups.items()):
+            ordered = sort_episodes_for_timeline(grouped_episodes)
+            group_pairs = build_timeline_pairs(ordered, group_id)
+            pairs.extend(group_pairs)
+            logger.info(
+                'Prepared timeline %s with %d episode(s) and %d link(s).',
+                timeline_key,
+                len(ordered),
+                len(group_pairs),
+            )
+
         logger.info('Deleting existing NEXT_EPISODE edges...')
         await client.query(
             'MATCH (e1:Episodic)-[r:NEXT_EPISODE]->(e2:Episodic) '
@@ -70,29 +186,11 @@ async def repair_timeline(backend, host, port, group_id):
             {'group_id': group_id},
         )
 
-        logger.info('Fetching episodes...')
-        query = """
-        MATCH (e:Episodic)
-        WHERE e.group_id = $group_id
-        RETURN e.uuid, e.valid_at, e.created_at
-        ORDER BY coalesce(e.valid_at, e.created_at) ASC, e.created_at ASC, e.uuid ASC
-        """
-        res = await client.query(query, {'group_id': group_id})
-
-        episodes = sort_episodes_for_timeline(
-            [
-                {'uuid': rec[0], 'valid_at': rec[1], 'created_at': rec[2]}
-                for rec in res.result_set
-            ]
-        )
-        logger.info(f'Found {len(episodes)} episodes. Rebuilding chain...')
-
-        if len(episodes) < 2:
-            logger.info('Not enough episodes to link.')
+        if not pairs:
+            logger.info('No timeline links need rebuilding after safe partitioning.')
             return
 
         batch_size = 500
-        pairs = build_timeline_pairs(episodes, group_id)
         for i in range(0, len(pairs), batch_size):
             chunk = pairs[i : i + batch_size]
 

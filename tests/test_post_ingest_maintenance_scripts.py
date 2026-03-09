@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'scripts'
@@ -88,7 +91,36 @@ def test_bucket_duplicate_records_keeps_bridge_merge_shapes_apart() -> None:
     assert buckets == []
 
 
-def test_build_merged_entity_payload_preserves_typed_metadata() -> None:
+def test_bucket_duplicate_records_refuses_ambiguous_generic_only_merges() -> None:
+    records = [
+        {
+            'uuid': 'generic-1',
+            'created_at': '2026-03-09T10:00:00Z',
+            'labels': ['Entity'],
+        },
+        {
+            'uuid': 'generic-2',
+            'created_at': '2026-03-09T10:01:00Z',
+            'labels': ['Entity'],
+        },
+        {
+            'uuid': 'person-1',
+            'created_at': '2026-03-09T10:02:00Z',
+            'labels': ['Entity', 'Person'],
+        },
+        {
+            'uuid': 'org-1',
+            'created_at': '2026-03-09T10:03:00Z',
+            'labels': ['Entity', 'Organization'],
+        },
+    ]
+
+    buckets = dedupe_nodes.bucket_duplicate_records(records, 's1_sessions_main')
+
+    assert buckets == []
+
+
+def test_build_merged_entity_payload_preserves_typed_metadata_and_conflicts() -> None:
     records = [
         {
             'uuid': 'winner',
@@ -99,8 +131,9 @@ def test_build_merged_entity_payload_preserves_typed_metadata() -> None:
                 'group_id': 's1_sessions_main',
                 'created_at': '2026-03-09T09:00:00Z',
                 'summary': '',
-                'attributes': {'role': 'founder'},
+                'attributes': {'role': 'founder', 'status': 'active'},
                 'aliases': ['Ada'],
+                'custom_score': 41,
                 'name_embedding': None,
             },
         },
@@ -113,7 +146,7 @@ def test_build_merged_entity_payload_preserves_typed_metadata() -> None:
                 'group_id': 's1_sessions_main',
                 'created_at': '2026-03-09T09:05:00Z',
                 'summary': 'Ada founded Example Labs.',
-                'attributes': {'industry': 'AI'},
+                'attributes': {'industry': 'AI', 'status': 'inactive'},
                 'aliases': ['A. Lovelace'],
                 'custom_score': 42,
                 'name_embedding': [0.1, 0.2, 0.3],
@@ -130,13 +163,34 @@ def test_build_merged_entity_payload_preserves_typed_metadata() -> None:
     assert payload['winner_props']['group_id'] == 's1_sessions_main'
     assert payload['winner_props']['created_at'] == '2026-03-09T09:00:00Z'
     assert payload['winner_props']['summary'] == 'Ada founded Example Labs.'
-    assert payload['winner_props']['attributes'] == {'role': 'founder', 'industry': 'AI'}
+    assert payload['winner_props']['attributes'] == {
+        'role': 'founder',
+        'status': 'active',
+        'industry': 'AI',
+    }
     assert payload['winner_props']['aliases'] == ['Ada', 'A. Lovelace']
-    assert payload['winner_props']['custom_score'] == 42
+    assert payload['winner_props']['custom_score'] == 41
     assert payload['name_embedding'] == [0.1, 0.2, 0.3]
 
+    assert payload['winner_props']['_dedupe_conflict_keys'] == ['attributes.status', 'custom_score']
+    conflict_payload = json.loads(payload['winner_props']['_dedupe_conflicts_json'])
+    assert conflict_payload['custom_score'] == [41, 42]
+    assert conflict_payload['attributes.status'] == ['active', 'inactive']
 
-def test_merge_bucket_scopes_destructive_queries_by_group_id() -> None:
+
+def test_find_duplicate_buckets_filters_blank_names() -> None:
+    fake_client = FakeClient(query_results=[[]])
+
+    buckets = asyncio.run(dedupe_nodes._find_duplicate_buckets(fake_client, 'neo4j', 's1_sessions_main'))
+
+    assert buckets == []
+    query, params = fake_client.query_calls[0]
+    assert 'n.name IS NOT NULL' in query
+    assert "trim(toString(n.name)) <> ''" in query
+    assert params == {'group_id': 's1_sessions_main'}
+
+
+def test_merge_bucket_scopes_destructive_queries_by_group_id_and_uses_plain_delete() -> None:
     fake_client = FakeClient(
         query_results=[
             [
@@ -187,6 +241,22 @@ def test_merge_bucket_scopes_destructive_queries_by_group_id() -> None:
     assert 'target.group_id = $group_id' in combined
     assert 'source.group_id = $group_id' in combined
     assert 'loser.uuid IN $loser_uuids' in combined
+    assert 'DELETE loser' in combined
+    assert 'DETACH DELETE loser' not in combined
+
+
+def test_merge_bucket_rejects_blank_uuid() -> None:
+    fake_client = FakeClient()
+    bucket = {
+        'name': 'Ada',
+        'nodes': [
+            {'uuid': 'winner', 'created_at': '2026-03-09T09:00:00Z', 'labels': ['Entity', 'Person']},
+            {'uuid': '', 'created_at': '2026-03-09T09:05:00Z', 'labels': ['Entity', 'Person']},
+        ],
+    }
+
+    with pytest.raises(ValueError, match='blank uuid'):
+        asyncio.run(dedupe_nodes._merge_bucket(fake_client, 'neo4j', 's1_sessions_main', bucket))
 
 
 def test_sort_episodes_for_timeline_prefers_valid_at_with_created_at_fallback() -> None:
@@ -203,6 +273,75 @@ def test_sort_episodes_for_timeline_prefers_valid_at_with_created_at_fallback() 
         'ep-created-only',
         'ep-valid-later',
     ]
+
+
+def test_infer_episode_stream_key_normalizes_chunk_suffixes() -> None:
+    assert (
+        repair_timeline.infer_episode_stream_key('session chunk: sessions:abc:c12:p3 (scope=private)')
+        == 'sessions:abc'
+    )
+
+
+def test_build_timeline_groups_partitions_by_saga_and_stream() -> None:
+    episodes = [
+        {
+            'uuid': 'ep-saga-1',
+            'created_at': '2026-03-09T09:00:00Z',
+            'source_description': '',
+            'saga_uuids': ['saga-1'],
+        },
+        {
+            'uuid': 'ep-saga-2',
+            'created_at': '2026-03-09T09:05:00Z',
+            'source_description': '',
+            'saga_uuids': ['saga-1'],
+        },
+        {
+            'uuid': 'ep-stream-1',
+            'created_at': '2026-03-09T09:10:00Z',
+            'source_description': 'session chunk: sessions:xyz:c0 (scope=private)',
+            'saga_uuids': [],
+        },
+        {
+            'uuid': 'ep-stream-2',
+            'created_at': '2026-03-09T09:15:00Z',
+            'source_description': 'session chunk: sessions:xyz:c1:p0 (scope=private)',
+            'saga_uuids': [],
+        },
+    ]
+
+    groups = repair_timeline.build_timeline_groups(episodes)
+
+    assert sorted(groups) == ['saga:saga-1', 'stream:sessions:xyz']
+    assert [episode['uuid'] for episode in groups['saga:saga-1']] == ['ep-saga-1', 'ep-saga-2']
+    assert [episode['uuid'] for episode in groups['stream:sessions:xyz']] == [
+        'ep-stream-1',
+        'ep-stream-2',
+    ]
+
+
+def test_build_timeline_groups_refuses_multi_stream_without_identity() -> None:
+    episodes = [
+        {'uuid': 'ep-1', 'created_at': '2026-03-09T09:00:00Z', 'source_description': '', 'saga_uuids': []},
+        {'uuid': 'ep-2', 'created_at': '2026-03-09T09:05:00Z', 'source_description': '', 'saga_uuids': []},
+    ]
+
+    with pytest.raises(ValueError, match='cannot be proven to be a single linear stream'):
+        repair_timeline.build_timeline_groups(episodes)
+
+
+def test_build_timeline_groups_refuses_episode_in_multiple_sagas() -> None:
+    episodes = [
+        {
+            'uuid': 'ep-1',
+            'created_at': '2026-03-09T09:00:00Z',
+            'source_description': '',
+            'saga_uuids': ['saga-1', 'saga-2'],
+        }
+    ]
+
+    with pytest.raises(ValueError, match='belongs to multiple sagas'):
+        repair_timeline.build_timeline_groups(episodes)
 
 
 def test_build_timeline_pairs_assigns_group_and_deterministic_uuid() -> None:
@@ -235,11 +374,11 @@ def test_build_timeline_pairs_assigns_group_and_deterministic_uuid() -> None:
 def test_repair_timeline_scopes_falkordb_queries_and_uses_valid_at() -> None:
     fake_client = FakeClient(
         query_results=[
-            [],
             [
-                ['ep-2', '2026-03-09T09:30:00Z', '2026-03-09T09:31:00Z'],
-                ['ep-1', None, '2026-03-09T09:00:00Z'],
+                ['ep-2', '2026-03-09T09:30:00Z', '2026-03-09T09:31:00Z', 'session chunk: s:c1 (scope=private)', []],
+                ['ep-1', None, '2026-03-09T09:00:00Z', 'session chunk: s:c0 (scope=private)', []],
             ],
+            [],
             [],
         ]
     )
@@ -256,17 +395,44 @@ def test_repair_timeline_scopes_falkordb_queries_and_uses_valid_at() -> None:
 
     assert len(fake_client.query_calls) == 3
 
-    delete_query, delete_params = fake_client.query_calls[0]
-    assert 'e1.group_id = $group_id AND e2.group_id = $group_id' in delete_query
-    assert delete_params == {'group_id': 's1_sessions_main'}
-
-    fetch_query, fetch_params = fake_client.query_calls[1]
-    assert 'RETURN e.uuid, e.valid_at, e.created_at' in fetch_query
+    fetch_query, fetch_params = fake_client.query_calls[0]
+    assert 'RETURN e.uuid,' in fetch_query
+    assert 'e.source_description' in fetch_query
+    assert 'collect(DISTINCT s.uuid) AS saga_uuids' in fetch_query
     assert 'coalesce(e.valid_at, e.created_at)' in fetch_query
     assert fetch_params == {'group_id': 's1_sessions_main'}
+
+    delete_query, delete_params = fake_client.query_calls[1]
+    assert 'e1.group_id = $group_id AND e2.group_id = $group_id' in delete_query
+    assert delete_params == {'group_id': 's1_sessions_main'}
 
     link_query, link_params = fake_client.query_calls[2]
     assert 'WHERE a.group_id = $group_id AND b.group_id = $group_id' in link_query
     assert link_params['prev'] == 'ep-1'
     assert link_params['curr'] == 'ep-2'
     assert link_params['group_id'] == 's1_sessions_main'
+
+
+def test_repair_timeline_refuses_ambiguous_groups_before_delete() -> None:
+    fake_client = FakeClient(
+        query_results=[
+            [
+                ['ep-1', None, '2026-03-09T09:00:00Z', '', []],
+                ['ep-2', None, '2026-03-09T09:05:00Z', '', []],
+            ]
+        ]
+    )
+
+    async def fake_get_graph_client(*args, **kwargs):
+        return fake_client
+
+    original = repair_timeline.get_graph_client
+    repair_timeline.get_graph_client = fake_get_graph_client
+    try:
+        with pytest.raises(ValueError, match='cannot be proven to be a single linear stream'):
+            asyncio.run(repair_timeline.repair_timeline('neo4j', 'localhost', 6379, 's1_sessions_main'))
+    finally:
+        repair_timeline.get_graph_client = original
+
+    assert len(fake_client.query_calls) == 1
+    assert fake_client.closed is True

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Post-processing script to deduplicate Entity nodes in a graph database.
-Required after running parallel ingestion ("Speed Run"), which creates duplicate entities due to missing unique constraints.
+Required after running parallel ingestion ("Speed Run"), which creates duplicate
+entities due to missing unique constraints.
 
 Usage:
     python3 scripts/dedupe_nodes.py --group-id s1_sessions_main --confirm-destructive
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -27,7 +29,15 @@ logger = logging.getLogger(__name__)
 
 CORE_ENTITY_LABEL = 'Entity'
 _SAFE_LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-_RESERVED_NODE_KEYS = {'uuid', 'name_embedding'}
+_CONFLICTS_JSON_KEY = '_dedupe_conflicts_json'
+_CONFLICT_KEYS_KEY = '_dedupe_conflict_keys'
+_RESERVED_NODE_KEYS = {
+    'uuid',
+    'name_embedding',
+    _CONFLICTS_JSON_KEY,
+    _CONFLICT_KEYS_KEY,
+}
+_IMMUTABLE_MERGE_KEYS = {'name'}
 
 
 def _created_at_sort_key(value) -> str:
@@ -36,6 +46,10 @@ def _created_at_sort_key(value) -> str:
     if hasattr(value, 'isoformat'):
         return value.isoformat()
     return str(value)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _dynamic_entity_label(group_id: str) -> str:
@@ -64,20 +78,43 @@ def _dedupe_list(values: list[Any]) -> list[Any]:
     return merged
 
 
-def _merge_dict_values(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(existing)
-    for key, value in incoming.items():
-        if key not in merged or _is_missing_value(merged[key]):
-            merged[key] = value
+def _append_conflict_values(conflicts: dict[str, list[Any]], path: str, *values: Any) -> None:
+    if not path:
+        return
+
+    entries = conflicts.setdefault(path, [])
+    seen = {_canonical_json(entry) for entry in entries}
+    for value in values:
+        if _is_missing_value(value):
             continue
-        if _is_missing_value(value) or merged[key] == value:
+        token = _canonical_json(value)
+        if token in seen:
             continue
-        if isinstance(merged[key], list) and isinstance(value, list):
-            merged[key] = _dedupe_list([*merged[key], *value])
-            continue
-        if isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _merge_dict_values(merged[key], value)
-    return merged
+        entries.append(value)
+        seen.add(token)
+
+
+def _merge_values(existing: Any, incoming: Any, path: str, conflicts: dict[str, list[Any]]) -> Any:
+    if _is_missing_value(existing):
+        return incoming
+    if _is_missing_value(incoming) or existing == incoming:
+        return existing
+
+    if isinstance(existing, list) and isinstance(incoming, list):
+        return _dedupe_list([*existing, *incoming])
+
+    if isinstance(existing, dict) and isinstance(incoming, dict):
+        merged = dict(existing)
+        for key, value in incoming.items():
+            child_path = f'{path}.{key}' if path else str(key)
+            if key not in merged:
+                merged[key] = value
+                continue
+            merged[key] = _merge_values(merged[key], value, child_path, conflicts)
+        return merged
+
+    _append_conflict_values(conflicts, path, existing, incoming)
+    return existing
 
 
 def _bucket_sort_key(records: list[dict]) -> tuple[str, str]:
@@ -97,9 +134,14 @@ def bucket_duplicate_records(records: list[dict], group_id: str) -> list[list[di
     Typed lanes add ontology-specific labels to Entity nodes. Exact typed-label
     sets are treated as distinct identities; generic Entity-only nodes may join a
     typed bucket only when there is exactly one typed signature present. This
-    avoids transitive bridge-merges such as Person <- Person,Organization ->
-    Organization.
+    avoids transitive bridge-merges such as Person <- generic -> Organization.
+
+    When multiple typed signatures exist for the same name, generic-only nodes are
+    left untouched even if there are several of them. Merging those generic nodes
+    would be ambiguous and could create a silent bridge between unrelated typed
+    identities.
     """
+
     ordered = sorted(
         records,
         key=lambda record: (
@@ -138,15 +180,10 @@ def bucket_duplicate_records(records: list[dict], group_id: str) -> list[list[di
             for group_records in typed_groups.values():
                 if len(group_records) > 1:
                     buckets.append(group_records)
-            if len(generic_records) > 1:
-                buckets.append(generic_records)
     elif len(generic_records) > 1:
         buckets.append(generic_records)
 
-    return sorted(
-        buckets,
-        key=_bucket_sort_key,
-    )
+    return sorted(buckets, key=_bucket_sort_key)
 
 
 def _safe_labels_for_query(labels: Iterable[str], group_id: str) -> list[str]:
@@ -184,6 +221,25 @@ def _select_name_embedding(records: list[dict]) -> Any:
     return None
 
 
+def _collect_existing_conflicts(records: list[dict]) -> dict[str, list[Any]]:
+    conflicts: dict[str, list[Any]] = {}
+    for record in records:
+        props = dict(record.get('properties') or {})
+        raw = props.get(_CONFLICTS_JSON_KEY)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                for path, values in payload.items():
+                    if isinstance(values, list):
+                        _append_conflict_values(conflicts, str(path), *values)
+                    else:
+                        _append_conflict_values(conflicts, str(path), values)
+    return conflicts
+
+
 def build_merged_entity_payload(records: list[dict], winner_uuid: str, group_id: str) -> dict[str, Any]:
     by_uuid = {str(record['uuid']): record for record in records if record.get('uuid')}
     if winner_uuid not in by_uuid:
@@ -195,37 +251,62 @@ def build_merged_entity_payload(records: list[dict], winner_uuid: str, group_id:
         for key, value in dict(winner_record.get('properties') or {}).items()
         if key not in _RESERVED_NODE_KEYS
     }
+    conflicts = _collect_existing_conflicts(records)
+
+    winner_name = str(winner_props.get('name') or '').strip()
+    if not winner_name:
+        raise ValueError('Refusing to dedupe an entity bucket whose winner has a blank or missing name.')
 
     created_candidates = []
     for record in records:
         props = dict(record.get('properties') or {})
+        record_name = str(props.get('name') or '').strip()
+        if not record_name:
+            raise ValueError('Refusing to merge entity records with blank or missing names.')
+        if record_name != winner_name:
+            raise ValueError(
+                f'Refusing to merge non-identical entity names in one bucket: {winner_name!r} vs {record_name!r}'
+            )
+
+        record_group_id = props.get('group_id')
+        if record_group_id not in (None, '', group_id):
+            raise ValueError(
+                f'Refusing to merge entity {record.get("uuid")!r} across groups: {record_group_id!r} != {group_id!r}'
+            )
+
         created_at = props.get('created_at')
         if created_at is not None:
             created_candidates.append(created_at)
+
         for key, value in props.items():
-            if key in _RESERVED_NODE_KEYS:
+            if key in _RESERVED_NODE_KEYS or key in {'group_id', 'created_at', 'summary'}:
                 continue
-            if key not in winner_props or _is_missing_value(winner_props[key]):
+
+            if key in _IMMUTABLE_MERGE_KEYS:
+                if key not in winner_props or _is_missing_value(winner_props[key]):
+                    winner_props[key] = value
+                    continue
+                if _is_missing_value(value) or winner_props[key] == value:
+                    continue
+                raise ValueError(
+                    f'Refusing to merge entity {winner_uuid!r}: immutable identity field {key!r} conflicts.'
+                )
+
+            if key not in winner_props:
                 winner_props[key] = value
                 continue
-            if _is_missing_value(value) or winner_props[key] == value:
-                continue
-            if isinstance(winner_props[key], list) and isinstance(value, list):
-                winner_props[key] = _dedupe_list([*winner_props[key], *value])
-                continue
-            if isinstance(winner_props[key], dict) and isinstance(value, dict):
-                winner_props[key] = _merge_dict_values(winner_props[key], value)
-                continue
-            logger.warning(
-                'Conflicting property %r while deduping entity %s; keeping winner value.',
-                key,
-                winner_uuid,
-            )
+            winner_props[key] = _merge_values(winner_props[key], value, key, conflicts)
 
     winner_props['group_id'] = group_id
     winner_props['summary'] = _select_summary(records)
     if created_candidates:
         winner_props['created_at'] = min(created_candidates, key=_created_at_sort_key)
+
+    if conflicts:
+        winner_props[_CONFLICT_KEYS_KEY] = sorted(conflicts)
+        winner_props[_CONFLICTS_JSON_KEY] = _canonical_json(
+            {key: conflicts[key] for key in sorted(conflicts)}
+        )
 
     return {
         'winner_props': winner_props,
@@ -238,6 +319,8 @@ async def _find_duplicate_buckets(client, backend: str, group_id: str) -> list[d
     query = """
     MATCH (n:Entity)
     WHERE n.group_id = $group_id
+      AND n.name IS NOT NULL
+      AND trim(toString(n.name)) <> ''
     WITH n.name AS name,
          collect({
              uuid: n.uuid,
@@ -285,11 +368,35 @@ async def _load_merge_records(client, group_id: str, uuids: list[str]) -> list[d
     return records
 
 
+def _validate_merge_bucket(bucket: dict) -> list[dict]:
+    bucket_name = str(bucket.get('name') or '')
+    if not bucket_name.strip():
+        raise ValueError('Refusing to dedupe a blank-name bucket.')
+
+    nodes = list(bucket.get('nodes') or [])
+    if len(nodes) < 2:
+        return nodes
+
+    seen: set[str] = set()
+    for node in nodes:
+        uuid = str(node.get('uuid') or '').strip()
+        if not uuid:
+            raise ValueError(f'Refusing to dedupe {bucket_name!r}: encountered a node with blank uuid.')
+        if uuid in seen:
+            raise ValueError(f'Refusing to dedupe {bucket_name!r}: duplicate uuid {uuid!r} in one bucket.')
+        seen.add(uuid)
+
+    return nodes
+
+
 async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> int:
-    nodes = list(bucket['nodes'])
+    nodes = _validate_merge_bucket(bucket)
+    if len(nodes) < 2:
+        return 0
+
     winner = nodes[0]
     losers = nodes[1:]
-    loser_uuids = [str(node['uuid']) for node in losers if node.get('uuid')]
+    loser_uuids = [str(node['uuid']) for node in losers]
     if not loser_uuids:
         return 0
 
@@ -449,7 +556,7 @@ async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> in
     q_delete = """
     MATCH (loser:Entity)
     WHERE loser.group_id = $group_id AND loser.uuid IN $loser_uuids
-    DETACH DELETE loser
+    DELETE loser
     """
 
     merge_queries.extend(
@@ -462,7 +569,12 @@ async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> in
         ]
     )
 
-    await client.run_in_transaction(merge_queries)
+    try:
+        await client.run_in_transaction(merge_queries)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Refusing to complete dedupe for {bucket['name']!r}; unexpected or unre-written relationships remain on loser nodes."
+        ) from exc
     return len(loser_uuids)
 
 
