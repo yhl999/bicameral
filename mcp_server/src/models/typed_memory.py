@@ -54,6 +54,10 @@ class EvidenceRef(BaseModel):
     kind: EvidenceKind
     source_system: str
     locator: dict[str, Any]
+    # canonical_uri is a reference identifier used for deduplication and
+    # provenance tracking.  It is NOT a dereferenceable URL; it must not be
+    # used to access files, messages, or records directly.  The URI scheme
+    # encodes the evidence kind and locator fields in a stable, sortable form.
     canonical_uri: str | None = None
     title: str | None = None
     snippet: str | None = None
@@ -92,8 +96,10 @@ class EvidenceRef(BaseModel):
             if not path:
                 raise ValueError('locator missing required keys for canonical_uri: [\'path\']')
             repo = str(locator.get('repo') or 'workspace')
-            start_line = int(locator.get('start_line') or 1)
-            end_line = int(locator.get('end_line') or start_line)
+            # Clamp to >=1: negative or zero line numbers are invalid for file
+            # evidence refs and would produce nonsensical canonical URIs.
+            start_line = max(1, int(locator.get('start_line') or 1))
+            end_line = max(start_line, int(locator.get('end_line') or start_line))
             # repo is a single segment; path preserves slashes (it is a filesystem path).
             return f'file://{quote(repo, safe=_seg_safe)}/{path}#L{start_line}-L{end_line}'
         if kind == 'doc_chunk':
@@ -224,7 +230,10 @@ class StateFact(TypedMemoryObjectBase):
 
     @property
     def conflict_set(self) -> str:
-        return f'{self.subject}\n{self.predicate}\n{self.scope}'
+        # Strip each component so accidental leading/trailing whitespace does
+        # not produce phantom conflict sets that are structurally identical but
+        # compare as different, allowing duplicate current facts to slip through.
+        return f'{self.subject.strip()}\n{self.predicate.strip()}\n{self.scope.strip()}'
 
 
 class Episode(TypedMemoryObjectBase):

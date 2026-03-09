@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -512,3 +513,96 @@ def test_canonical_uri_path_segment_with_slash_is_encoded():
     )
     # The rest of the URI structure must still be correct
     assert ref.canonical_uri.startswith('msg://slack/C1234/')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1 Blocker — one-current-object rule enforced under multiple SQLite connections
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_concurrent_connections_cannot_produce_two_current_facts(tmp_path):
+    """Two concurrent SQLite connections racing to promote facts with the same
+    conflict set (subject + predicate + scope) must never yield two
+    is_current=True facts.
+
+    Regression test for the check-then-act race in promote_candidate_fact():
+    without BEGIN IMMEDIATE the conflict-set scan and the write are not
+    serialized, so a second writer can slip in between them and both promotions
+    land as independent 'assert' events — two current facts in one conflict set,
+    a direct violation of the Phase 0 architecture lock.
+
+    The fix: BEGIN IMMEDIATE in promote_candidate_fact() acquires the write
+    reservation before reading current state, forcing all concurrent promotions
+    to serialize at that gate.  With busy_timeout=5000 both promotions
+    eventually succeed (serialized); the second one detects the first as the
+    current occupant and issues a 'supersede' instead of 'assert'.  Final
+    state: exactly one current fact.
+    """
+    from mcp_server.src.services.change_ledger import ChangeLedger
+
+    db_path = tmp_path / 'test_concurrent_current.db'
+
+    # Prime the schema by connecting once from the main thread before the race.
+    ChangeLedger(db_path)
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def _fact_payload(val: str, ev_id: str) -> dict:
+        return {
+            'subject': 'user:principal',
+            'predicate': 'pref.concurrent_current_test',
+            'scope': 'private',
+            'assertion_type': 'preference',
+            'value': val,
+            'evidence_refs': [
+                {'source_key': 's:1', 'evidence_id': ev_id, 'scope': 's1_sessions_main'}
+            ],
+        }
+
+    def _promote(val: str, cand_id: str, ev_id: str) -> None:
+        # Each thread creates its own ChangeLedger (and SQLite connection)
+        # so there are no cross-thread connection ownership issues.
+        ledger = ChangeLedger(db_path)
+        try:
+            barrier.wait()  # synchronize so both threads start together
+            ledger.promote_candidate_fact(
+                actor_id='test:actor',
+                reason='concurrent race test',
+                policy_version='v3',
+                candidate_id=cand_id,
+                fact=_fact_payload(val, ev_id),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_promote, args=('vim', 'cand-race-1', 'ev-race-1'))
+    t2 = threading.Thread(target=_promote, args=('emacs', 'cand-race-2', 'ev-race-2'))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    # Errors must only be SQLITE_BUSY (acceptable if busy_timeout is exceeded).
+    # Any other exception type indicates a logic bug, not a resource contention.
+    for exc in errors:
+        assert isinstance(exc, sqlite3.OperationalError), (
+            f'Unexpected error type in concurrent promotion: '
+            f'{type(exc).__name__}: {exc}'
+        )
+
+    # Read current state through a fresh connection so we see the committed
+    # state of both writers, not the in-memory state of either ledger.
+    ledger3 = ChangeLedger(db_path)
+    all_current = ledger3.current_state_facts()
+    current_for_pred = [
+        f for f in all_current
+        if f.predicate == 'pref.concurrent_current_test'
+    ]
+
+    assert len(current_for_pred) == 1, (
+        f'Expected exactly 1 current fact in conflict set after concurrent '
+        f'promotions (BEGIN IMMEDIATE serialization fix), '
+        f'got {len(current_for_pred)}: '
+        + str([(f.object_id, f.value) for f in current_for_pred])
+    )

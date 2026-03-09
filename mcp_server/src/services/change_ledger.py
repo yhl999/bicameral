@@ -384,75 +384,89 @@ class ChangeLedger:
         parent_id: str | None = None
         root_id = typed_object.root_id
 
-        # ── Central enforcement: one current object per conflict set ─────────
-        # Architecture lock (Phase 0): there must be exactly one is_current=True
-        # object per (subject, predicate, scope) triple at all times.
+        # ── Serialize the read-currentness + write-events critical section ───
         #
-        # The caller's conflict_with_fact_id is unreliable in two ways:
-        #   - missing: caller omitted it entirely (upstream wiring gap)
-        #   - stale:   caller provided an object_id that is no longer the
-        #              current occupant of the conflict set (e.g. an already-
-        #              superseded predecessor)
+        # BEGIN IMMEDIATE acquires the write reservation (RESERVED lock) before
+        # we read current state.  In WAL mode a plain DEFERRED BEGIN allows
+        # another writer to slip in between our conflict-set scan and our commit,
+        # which can yield two is_current=True facts in the same conflict set.
+        # IMMEDIATE prevents that by forcing concurrent promotions to serialize
+        # here.  The busy_timeout pragma (set in connect()) makes the blocked
+        # writer retry for up to 5 s rather than failing immediately.
         #
-        # In either case we must find the *actual* current occupant and use it
-        # as the supersession target.  This scan runs only for StateFact
-        # promotions (conflict sets are defined only on state facts).
-        if isinstance(typed_object, StateFact):
-            _conflict_set = typed_object.conflict_set
-            for _current in self.current_state_facts():
-                if (
-                    _current.conflict_set == _conflict_set
-                    and _current.object_id != typed_object.object_id
-                ):
-                    # Override whatever (or nothing) the caller passed — the
-                    # actual current occupant is the authoritative target.
-                    conflict_with_fact_id = _current.object_id
-                    break
-
-        # Always supersede when a conflicting prior fact is explicitly identified
-        # and still exists in the ledger.  This enforces the one-current-object
-        # rule regardless of whether the promotion is automated or manual.
-        if conflict_with_fact_id:
-            prior = self.materialize_object(conflict_with_fact_id)
-            if prior is not None:
-                creation_type = 'supersede'
-                parent_id = prior.object_id
-                root_id = prior.root_id
-                typed_object = typed_object.model_copy(
-                    update={
-                        'root_id': prior.root_id,
-                        'parent_id': prior.object_id,
-                        'version': prior.version + 1,
-                    }
-                )
-
-        # Build both rows first (validation happens here; no DB writes yet).
-        create_row = self._build_event_row(
-            creation_type,
-            actor_id=actor_id,
-            reason=reason,
-            recorded_at=recorded_at,
-            payload=typed_object,
-            target_object_id=parent_id,
-            candidate_id=candidate_id,
-            policy_version=policy_version,
-        )
-        promote_row = self._build_event_row(
-            'promote',
-            actor_id=actor_id,
-            reason=reason,
-            recorded_at=recorded_at,
-            object_id=typed_object.object_id,
-            object_type=typed_object.object_type,
-            root_id=root_id,
-            candidate_id=candidate_id,
-            policy_version=policy_version,
-        )
-
-        # Atomic: insert both rows then commit once.
-        # If either insert raises, explicitly rollback so the first insert is
-        # not left as an open (uncommitted but visible) write on this connection.
+        # This block also provides the atomicity guarantee: the create/supersede
+        # event and the promote event commit together, or neither commits.
         try:
+            self.conn.execute('BEGIN IMMEDIATE')
+
+            # ── Central enforcement: one current object per conflict set ─────
+            # Architecture lock (Phase 0): there must be exactly one
+            # is_current=True object per (subject, predicate, scope) triple at
+            # all times.
+            #
+            # The caller's conflict_with_fact_id is unreliable in two ways:
+            #   - missing: caller omitted it entirely (upstream wiring gap)
+            #   - stale:   caller provided an object_id that is no longer the
+            #              current occupant of the conflict set (e.g. an
+            #              already-superseded predecessor)
+            #
+            # In either case we find the *actual* current occupant (under the
+            # IMMEDIATE lock, so no new writer can change this between read and
+            # write) and use it as the authoritative supersession target.
+            # This scan runs only for StateFact promotions (conflict sets are
+            # defined only on state facts).
+            if isinstance(typed_object, StateFact):
+                _conflict_set = typed_object.conflict_set
+                for _current in self.current_state_facts():
+                    if (
+                        _current.conflict_set == _conflict_set
+                        and _current.object_id != typed_object.object_id
+                    ):
+                        # Override whatever (or nothing) the caller passed — the
+                        # actual current occupant is the authoritative target.
+                        conflict_with_fact_id = _current.object_id
+                        break
+
+            # Always supersede when a conflicting prior fact is identified and
+            # still exists in the ledger.  This enforces the one-current-object
+            # rule regardless of whether the promotion is automated or manual.
+            if conflict_with_fact_id:
+                prior = self.materialize_object(conflict_with_fact_id)
+                if prior is not None:
+                    creation_type = 'supersede'
+                    parent_id = prior.object_id
+                    root_id = prior.root_id
+                    typed_object = typed_object.model_copy(
+                        update={
+                            'root_id': prior.root_id,
+                            'parent_id': prior.object_id,
+                            'version': prior.version + 1,
+                        }
+                    )
+
+            # Build both rows (validation happens here; no DB writes yet).
+            create_row = self._build_event_row(
+                creation_type,
+                actor_id=actor_id,
+                reason=reason,
+                recorded_at=recorded_at,
+                payload=typed_object,
+                target_object_id=parent_id,
+                candidate_id=candidate_id,
+                policy_version=policy_version,
+            )
+            promote_row = self._build_event_row(
+                'promote',
+                actor_id=actor_id,
+                reason=reason,
+                recorded_at=recorded_at,
+                object_id=typed_object.object_id,
+                object_type=typed_object.object_type,
+                root_id=root_id,
+                candidate_id=candidate_id,
+                policy_version=policy_version,
+            )
+
             self._do_insert(create_row)
             self._do_insert(promote_row)
             self.conn.commit()
@@ -478,6 +492,10 @@ def connect(path: str | Path = DB_PATH_DEFAULT) -> sqlite3.Connection:
     foreign_keys: enforced as a matter of correctness hygiene; the ledger
     schema has no FK constraints today but this is defensive practice for
     future schema evolution.
+    busy_timeout: required for BEGIN IMMEDIATE serialization to work
+    gracefully under concurrent promotions.  Without it, a second writer that
+    races to acquire the RESERVED lock gets SQLITE_BUSY immediately instead of
+    retrying.  5 s is generous for a local file-backed DB; adjust if needed.
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -485,6 +503,8 @@ def connect(path: str | Path = DB_PATH_DEFAULT) -> sqlite3.Connection:
     conn.execute('PRAGMA journal_mode=WAL')
     # foreign_keys: ON for schema correctness hygiene.
     conn.execute('PRAGMA foreign_keys=ON')
+    # busy_timeout: wait up to 5 s before surfacing SQLITE_BUSY on a write lock.
+    conn.execute('PRAGMA busy_timeout=5000')
     ensure_schema(conn)
     return conn
 

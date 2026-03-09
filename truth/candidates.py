@@ -1292,7 +1292,25 @@ def promote_candidate(
     reason: str,
     ledger: Any | None = None,
 ) -> tuple[int, str | None]:
-    """Promote a candidate to the personal fact ledger."""
+    """Promote a candidate to the personal fact ledger.
+
+    Raises:
+        ValueError: if ledger is None.  Allowing promotion without a ledger
+            write creates the forbidden "approved in candidates.db but absent
+            from ledger" split-brain state.  Callers must always supply a
+            ChangeLedger instance.
+    """
+    # Fail closed: a ledger is mandatory.  Silently skipping the ledger write
+    # while flipping the candidate status to 'approved' would produce a state
+    # where candidates.db and the change ledger are out of sync — a direct
+    # violation of the ledger-as-source-of-truth contract.
+    if ledger is None:
+        raise ValueError(
+            f"promote_candidate() requires a ledger; candidate {candidate_id!r} "
+            "cannot be promoted without a corresponding ledger write.  "
+            "Pass ledger=<ChangeLedger instance> to avoid approved-in-DB-but-"
+            "absent-from-ledger split-brain."
+        )
 
     row = conn.execute(
         "SELECT * FROM candidates WHERE candidate_id = ?",
@@ -1325,33 +1343,33 @@ def promote_candidate(
     safe_reason = _normalize_reason(reason, fallback=decision)
 
     ledger_event_id = row["ledger_event_id"]
-    if ledger is not None and not ledger_event_id:
+    if not ledger_event_id:
         fact_payload = _candidate_fact_payload(row)
-        if hasattr(ledger, "promote_candidate_fact"):
-            promotion_result = ledger.promote_candidate_fact(
-                actor_id=actor_id,
-                reason=safe_reason,
-                policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
-                candidate_id=candidate_id,
-                fact=fact_payload,
-                conflict_with_fact_id=row["conflict_with_fact_id"],
-                seeded_supersede_ok=bool(
-                    _coerce_json(row["policy_trace_json"], {}).get("seeded_supersede_ok")
-                ),
-                recorded_at=decided_at,
+        if not hasattr(ledger, "promote_candidate_fact"):
+            # Hard-fail: the old-style ledger interface (uppercase "PROMOTE"
+            # event vocabulary) is dead and contract-drifted.  Any ledger that
+            # does not implement promote_candidate_fact is incompatible with the
+            # Phase 0 locked change-event vocabulary.  Prefer explicit failure
+            # over silently writing malformed events.
+            raise TypeError(
+                f"ledger of type {type(ledger).__name__!r} does not implement "
+                "promote_candidate_fact().  Only ChangeLedger instances are "
+                "supported.  The legacy PROMOTE/DENY uppercase event vocabulary "
+                "is retired; update the caller to pass a ChangeLedger."
             )
-            ledger_event_id = promotion_result.event_id
-        else:
-            ledger_row = ledger.append_event(
-                "PROMOTE",
-                actor_id=actor_id,
-                reason=safe_reason,
-                policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
-                candidate_id=candidate_id,
-                fact=fact_payload,
-                recorded_at=decided_at,
-            )
-            ledger_event_id = ledger_row.event_id
+        promotion_result = ledger.promote_candidate_fact(
+            actor_id=actor_id,
+            reason=safe_reason,
+            policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
+            candidate_id=candidate_id,
+            fact=fact_payload,
+            conflict_with_fact_id=row["conflict_with_fact_id"],
+            seeded_supersede_ok=bool(
+                _coerce_json(row["policy_trace_json"], {}).get("seeded_supersede_ok")
+            ),
+            recorded_at=decided_at,
+        )
+        ledger_event_id = promotion_result.event_id
 
     res = conn.execute(
         """
@@ -1422,17 +1440,18 @@ def deny_candidate(
                 # provenance to the original promotion event.  The invalidate
                 # event is now in the ledger for the audit trail.
     elif ledger is not None and not ledger_event_id:
-        # Old-style ledger (does not have promote_candidate_fact).
-        ledger_row = ledger.append_event(
-            "DENY",
-            actor_id=actor_id,
-            reason=safe_reason,
-            policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
-            candidate_id=candidate_id,
-            fact=_candidate_fact_payload(row),
-            recorded_at=decided_at,
-        )
-        ledger_event_id = ledger_row.event_id
+        # Hard-fail: the old-style ledger interface (uppercase "DENY" event
+        # vocabulary) is dead and contract-drifted.  An old-style ledger that
+        # does not implement promote_candidate_fact reached the deny path
+        # without a previous promotion event, which is an unexpected state.
+        # Prefer explicit failure over silently writing malformed events.
+        if not hasattr(ledger, "promote_candidate_fact"):
+            raise TypeError(
+                f"ledger of type {type(ledger).__name__!r} does not implement "
+                "promote_candidate_fact().  Only ChangeLedger instances are "
+                "supported.  The legacy PROMOTE/DENY uppercase event vocabulary "
+                "is retired; update the caller to pass a ChangeLedger."
+            )
 
     res = conn.execute(
         """
