@@ -1,0 +1,46 @@
+version: 1
+
+defaults:
+  subject: agent:archibald
+  predicate_prefix: learning.self_audit.
+  fact_type: lesson
+  risk_level: medium
+  procedure_enabled: true
+  name_prefix: Procedure
+  trigger_prefix: when handling
+  expected_outcome: >-
+    the remediation is applied and the prior self-audit miss does not recur
+  step_split_pattern: '(?:\n+|;\s*|\.\s+|\s+then\s+|\s+and\s+then\s+)'
+
+prefix_rules:
+  rule:
+    fact_type: operational_rule
+    risk_level: low
+    name_prefix: Operational rule
+    trigger_prefix: when the operating rule matters for
+    expected_outcome: >-
+      the operating rule is followed consistently and the miss does not repeat
+
+  tool:
+    fact_type: lesson
+    risk_level: low
+    name_prefix: Tool fix
+    trigger_prefix: when a tool workflow depends on
+    expected_outcome: >-
+      the tool quirk is handled correctly before execution proceeds
+
+  pref:
+    fact_type: preference
+    risk_level: medium
+    name_prefix: Preference recovery
+    trigger_prefix: when serving Yuan around
+    expected_outcome: >-
+      Yuan's preference is honored without repeating the prior miss
+
+  sec:
+    fact_type: constraint
+    risk_level: high
+    name_prefix: Security procedure
+    trigger_prefix: when security-sensitive work involves
+    expected_outcome: >-
+      the operation stays inside the security policy and avoids the prior gap
