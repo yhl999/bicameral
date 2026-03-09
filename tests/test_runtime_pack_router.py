@@ -18,13 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class _GraphitiStubHandler(BaseHTTPRequestHandler):
     facts_by_query_keyword: dict[str, list[str]] = {}
     facts_by_group_id: dict[str, list[str]] = {}
+    session_id = 'stub-session'
 
-    def do_POST(self) -> None:  # noqa: N802
-        raw = self.rfile.read(int(self.headers.get('Content-Length', '0') or '0'))
-        payload = json.loads(raw.decode('utf-8') or '{}')
-        query = str(payload.get('query') or '')
-        group_ids = payload.get('group_ids') if isinstance(payload.get('group_ids'), list) else []
-
+    def _lookup_facts(self, *, query: str, group_ids: list[str]) -> list[dict[str, str]]:
         facts: list[dict[str, str]] = []
         for group_id in group_ids:
             if not isinstance(group_id, str):
@@ -39,13 +35,90 @@ class _GraphitiStubHandler(BaseHTTPRequestHandler):
                 if keyword in query:
                     facts = [{'fact': value} for value in values]
                     break
+        return facts
 
-        body = json.dumps({'facts': facts}).encode('utf-8')
-        self.send_response(200)
+    def _send_json(self, status: int, payload: object, *, session_id: str | None = None) -> None:
+        body = json.dumps(payload).encode('utf-8')
+        self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
+        if session_id:
+            self.send_header('mcp-session-id', session_id)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse(self, status: int, payload: object, *, session_id: str | None = None) -> None:
+        body = f"event: message\ndata: {json.dumps(payload)}\n\n".encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Length', str(len(body)))
+        if session_id:
+            self.send_header('mcp-session-id', session_id)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get('Content-Length', '0') or '0'))
+        payload = json.loads(raw.decode('utf-8') or '{}')
+        method = str(payload.get('method') or '')
+        params = payload.get('params') if isinstance(payload.get('params'), dict) else {}
+
+        if method == 'initialize':
+            response = {
+                'jsonrpc': '2.0',
+                'id': payload.get('id'),
+                'result': {
+                    'protocolVersion': '2024-11-05',
+                    'capabilities': {'tools': {'listChanged': False}},
+                    'serverInfo': {'name': 'Graphiti Stub', 'version': '0.0.1'},
+                },
+            }
+            self._send_sse(200, response, session_id=self.session_id)
+            return
+
+        if method == 'notifications/initialized':
+            self.send_response(202)
+            self.send_header('Content-Length', '0')
+            self.send_header('mcp-session-id', self.session_id)
+            self.end_headers()
+            return
+
+        if method == 'tools/call':
+            arguments = params.get('arguments') if isinstance(params.get('arguments'), dict) else {}
+            query = str(arguments.get('query') or '')
+            group_ids = arguments.get('group_ids') if isinstance(arguments.get('group_ids'), list) else []
+            facts = self._lookup_facts(query=query, group_ids=group_ids)
+            response = {
+                'jsonrpc': '2.0',
+                'id': payload.get('id'),
+                'result': {
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': json.dumps({'message': 'Facts retrieved successfully', 'facts': facts}),
+                        }
+                    ],
+                    'structuredContent': {
+                        'result': {
+                            'message': 'Facts retrieved successfully',
+                            'facts': facts,
+                        }
+                    },
+                    'isError': False,
+                },
+            }
+            self._send_sse(200, response, session_id=self.session_id)
+            return
+
+        self._send_json(
+            400,
+            {
+                'jsonrpc': '2.0',
+                'id': payload.get('id'),
+                'error': {'code': -32601, 'message': f'Unsupported method: {method}'},
+            },
+            session_id=self.session_id,
+        )
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -643,6 +716,14 @@ class RuntimePackRouterTests(unittest.TestCase):
             self.assertIn('Live writing-sample signals', writing_content)
             self.assertNotIn('STATIC VOICE FALLBACK', voice_content)
             self.assertNotIn('STATIC WRITING FALLBACK', writing_content)
+            self.assertEqual(
+                selected['content_voice_style']['materialization_stats']['dynamic']['transport'],
+                'mcp_http',
+            )
+            self.assertEqual(
+                selected['content_writing_samples']['materialization_stats']['dynamic']['transport'],
+                'mcp_http',
+            )
 
     def test_materialize_content_pack_low_coverage_falls_back_to_static_domain_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -57,10 +57,13 @@ Effective behavior is code-enforced at routing time:
 - `global`: include only if pack retrieval policy allows global
 
 ## Engineering learnings materialization
-When `--materialize` is passed, the router can materialize engineering learnings into injection text.
+When `--materialize` is passed, the router can materialize live pack content into injection text.
+
 Current source contract:
-- `state/engineering/loops/clr_learnings.latest.jsonl`
-- `state/engineering/loops/antfarm_learnings.latest.jsonl`
+- Content packs (`graphiti_content_voice_style`, `graphiti_content_writing_samples`, `graphiti_content_long_form_artifacts`) call Graphiti through the MCP HTTP endpoint (`/mcp`, `initialize` + `tools/call(search_memory_facts)`).
+- Engineering learnings still materialize from loop artifacts:
+  - `state/engineering/loops/clr_learnings.latest.jsonl`
+  - `state/engineering/loops/antfarm_learnings.latest.jsonl`
 
 This allows CLR/Antfarm runtime injection even when engineering learnings are still converging in graph backends.
 
