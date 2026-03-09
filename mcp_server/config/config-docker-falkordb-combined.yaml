@@ -8,7 +8,9 @@ server:
 
 llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq
-  model: "gpt-4o-mini"
+  model: "gpt-5.1-codex-mini"
+  reasoning_effort: "medium"
+  verbosity: "medium"
   max_tokens: 4096
 
   providers:
