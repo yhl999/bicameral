@@ -1007,7 +1007,7 @@ def upsert_candidate(
         conn.commit()
 
         promoted = False
-        if status_suggested == "auto_promoted" and ledger is not None:
+        if status_suggested in {"auto_promoted", "auto_supersede"} and ledger is not None:
             promoted = auto_promote_if_eligible(conn, candidate_id, ledger=ledger)
 
         return UpsertResult(
@@ -1089,7 +1089,7 @@ def upsert_candidate(
     conn.commit()
 
     promoted = False
-    if status_suggested == "auto_promoted" and ledger is not None:
+    if status_suggested in {"auto_promoted", "auto_supersede"} and ledger is not None:
         promoted = auto_promote_if_eligible(conn, candidate_id, ledger=ledger)
 
     return UpsertResult(
@@ -1312,16 +1312,31 @@ def promote_candidate(
     ledger_event_id = row["ledger_event_id"]
     if ledger is not None and not ledger_event_id:
         fact_payload = _candidate_fact_payload(row)
-        ledger_row = ledger.append_event(
-            "PROMOTE",
-            actor_id=actor_id,
-            reason=safe_reason,
-            policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
-            candidate_id=candidate_id,
-            fact=fact_payload,
-            recorded_at=decided_at,
-        )
-        ledger_event_id = ledger_row.event_id
+        if hasattr(ledger, "promote_candidate_fact"):
+            promotion_result = ledger.promote_candidate_fact(
+                actor_id=actor_id,
+                reason=safe_reason,
+                policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
+                candidate_id=candidate_id,
+                fact=fact_payload,
+                conflict_with_fact_id=row["conflict_with_fact_id"],
+                seeded_supersede_ok=bool(
+                    _coerce_json(row["policy_trace_json"], {}).get("seeded_supersede_ok")
+                ),
+                recorded_at=decided_at,
+            )
+            ledger_event_id = promotion_result.event_id
+        else:
+            ledger_row = ledger.append_event(
+                "PROMOTE",
+                actor_id=actor_id,
+                reason=safe_reason,
+                policy_version=row["policy_version"] or POLICY_VERSION_DEFAULT,
+                candidate_id=candidate_id,
+                fact=fact_payload,
+                recorded_at=decided_at,
+            )
+            ledger_event_id = ledger_row.event_id
 
     res = conn.execute(
         """
@@ -1371,7 +1386,7 @@ def deny_candidate(
     safe_reason = _normalize_reason(reason, fallback="denied")
 
     ledger_event_id = row["ledger_event_id"]
-    if ledger is not None and not ledger_event_id:
+    if ledger is not None and not ledger_event_id and not hasattr(ledger, "promote_candidate_fact"):
         ledger_row = ledger.append_event(
             "DENY",
             actor_id=actor_id,
@@ -1422,7 +1437,7 @@ def auto_promote_if_eligible(
     ).fetchone()
     if row is None:
         return False
-    if row["status"] != "auto_promoted":
+    if row["status"] not in {"auto_promoted", "auto_supersede"}:
         return False
 
     actor_id = "policy:v3" if policy_v3_enabled() else "policy:v2"
