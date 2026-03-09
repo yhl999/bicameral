@@ -439,6 +439,15 @@ def _normalize_proof_value(value: Any) -> str | None:
     return _canonical_json(value)
 
 
+def _proof_fields_present(record: dict[str, Any]) -> list[str]:
+    props = dict(record.get('properties') or {})
+    return [
+        key
+        for key in _HOMONYM_PROOF_KEYS
+        if _normalize_proof_value(props.get(key)) is not None
+    ]
+
+
 def _bucket_node_debug(records: list[dict[str, Any]] | list[dict], group_id: str) -> list[dict[str, Any]]:
     debug_rows: list[dict[str, Any]] = []
     for record in records:
@@ -447,10 +456,27 @@ def _bucket_node_debug(records: list[dict[str, Any]] | list[dict], group_id: str
             {
                 'uuid': str(record.get('uuid') or '').strip(),
                 'created_at': props.get('created_at', record.get('created_at')),
+                'labels': sorted({str(label) for label in (record.get('labels') or []) if label}),
                 'typed_labels': sorted(_normalize_typed_labels(record.get('labels'), group_id)),
+                'proof_fields_present': _proof_fields_present(record),
             }
         )
     return debug_rows
+
+
+def _bucket_identity_shape(records: list[dict[str, Any]], group_id: str) -> dict[str, Any]:
+    typed_signatures: set[tuple[str, ...]] = set()
+    generic_count = 0
+    for record in records:
+        typed_labels = tuple(sorted(_normalize_typed_labels(record.get('labels'), group_id)))
+        if typed_labels:
+            typed_signatures.add(typed_labels)
+        else:
+            generic_count += 1
+    return {
+        'generic_count': generic_count,
+        'typed_signatures': [list(signature) for signature in sorted(typed_signatures)],
+    }
 
 
 def _collect_candidate_proof_values(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -487,28 +513,22 @@ def _shared_homonym_proofs(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _require_homonym_merge_proof(records: list[dict[str, Any]], group_id: str, bucket_name: str) -> None:
-    typed_groups: dict[frozenset[str], list[dict[str, Any]]] = defaultdict(list)
-    for record in records:
-        typed_labels = _normalize_typed_labels(record.get('labels'), group_id)
-        if typed_labels:
-            typed_groups[typed_labels].append(record)
+    if len(records) < 2:
+        return
 
-    for typed_labels, group_records in typed_groups.items():
-        if len(group_records) < 2:
-            continue
+    proofs = _shared_homonym_proofs(records)
+    if proofs:
+        return
 
-        proofs = _shared_homonym_proofs(group_records)
-        if proofs:
-            continue
-
-        candidate_values = _collect_candidate_proof_values(group_records)
-        raise ValueError(
-            'Refusing to merge same-name typed entities without stronger identity proof. '
-            f'name={bucket_name!r} group_id={group_id!r} typed_labels={sorted(typed_labels)!r} '
-            f'nodes={_bucket_node_debug(group_records, group_id)!r} '
-            f'candidate_proofs={candidate_values!r}. '
-            'Inspect the listed node UUIDs for shared external IDs, emails, domains, or profile URLs and merge manually only if they are truly the same entity.'
-        )
+    candidate_values = _collect_candidate_proof_values(records)
+    raise ValueError(
+        'Refusing to merge same-name entities without shared identity proof. '
+        f'name={bucket_name!r} group_id={group_id!r} '
+        f'bucket_shape={_bucket_identity_shape(records, group_id)!r} '
+        f'nodes={_bucket_node_debug(records, group_id)!r} '
+        f'candidate_proofs={candidate_values!r}. '
+        'Inspect the listed UUIDs, raw labels, and proof fields. Only merge manually after confirming a shared canonical_id/external_id/email/domain/profile URL across every node in the bucket.'
+    )
 
 
 async def _inspect_remaining_relationships(client, group_id: str, node_uuids: list[str]) -> list[dict[str, Any]]:
