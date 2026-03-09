@@ -37,7 +37,7 @@ _VALID_EXTRACTION_MODES = {"permissive", "constrained_soft"}
 # Hard cap on intent_guidance / extraction_emphasis length before prompt injection.
 # Prevents accidental config bloat from consuming excessive LLM context window tokens.
 # Tighter than runtime truncation — enforced at load time so callers see bounded values.
-_INTENT_GUIDANCE_MAX_CHARS: int = 800
+_INTENT_GUIDANCE_MAX_CHARS: int = 2048
 
 # Non-printable control characters that should never appear in prompt-injected config
 # values.  Keeps standard whitespace (\t, \n, \r) which are valid in multi-line YAML.
