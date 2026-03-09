@@ -725,6 +725,120 @@ class RuntimePackRouterTests(unittest.TestCase):
                 'mcp_http',
             )
 
+    def test_materialize_content_packs_use_pack_specific_queries_not_topic_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'content_voice_style.pack.yaml').write_text(
+                'domain_context: |\n  STATIC VOICE FALLBACK',
+                encoding='utf-8',
+            )
+            (repo / 'workflows' / 'content_writing_samples.pack.yaml').write_text(
+                'domain_context: |\n  STATIC WRITING FALLBACK',
+                encoding='utf-8',
+            )
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'content_voice_style',
+                        'path': 'workflows/content_voice_style.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_writing_samples']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_voice_style',
+                            'min_coverage_items': 1,
+                            'max_items': 2,
+                        },
+                    },
+                    {
+                        'pack_id': 'content_writing_samples',
+                        'path': 'workflows/content_writing_samples.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_writing_samples']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_writing_samples',
+                            'min_coverage_items': 1,
+                            'max_items': 2,
+                        },
+                    },
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_content_long_form',
+                        'workflow_id': 'content_long_form',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'draft an article about bicameral memory',
+                        'injection_text': 'Long-form writing workflow',
+                        'pack_ids': ['content_voice_style', 'content_writing_samples'],
+                        'chatgpt_mode': 'off',
+                        'pack_modes': {
+                            'content_voice_style': 'formal',
+                            'content_writing_samples': 'formal',
+                        },
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            with GraphitiStubServer(
+                facts_by_query_keyword={
+                    'author voice register cadence tone sentence rhythm signature phrases': [
+                        'Voice signal keyed off style query, not topic query.',
+                    ],
+                    'writing samples signature phrases sentence patterns paragraph structure concrete examples': [
+                        'Writing-sample signal keyed off pack-specific query.',
+                    ],
+                }
+            ) as base_url:
+                plan = self._route(
+                    repo,
+                    consumer='main_session_content_long_form',
+                    workflow_id='content_long_form',
+                    step_id='draft',
+                    task='draft an article about bicameral memory',
+                    materialize=True,
+                    scope='private',
+                    env={
+                        'GRAPHITI_BASE_URL': base_url,
+                    },
+                )
+
+            selected = {pack['pack_id']: pack for pack in plan['selected_packs']}
+            self.assertIn('Voice signal keyed off style query, not topic query.', selected['content_voice_style']['content'])
+            self.assertIn('Writing-sample signal keyed off pack-specific query.', selected['content_writing_samples']['content'])
+            self.assertEqual(
+                selected['content_voice_style']['materialization_stats']['dynamic']['retrieval_query'],
+                'author voice register cadence tone sentence rhythm signature phrases',
+            )
+            self.assertEqual(
+                selected['content_writing_samples']['materialization_stats']['dynamic']['retrieval_query'],
+                'writing samples signature phrases sentence patterns paragraph structure concrete examples',
+            )
+
     def test_materialize_content_pack_low_coverage_falls_back_to_static_domain_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / 'repo'

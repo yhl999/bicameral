@@ -101,6 +101,11 @@ GRAPHITI_MCP_SESSION_HEADER = 'mcp-session-id'
 MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE = 'graphiti_content_voice_style'
 MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES = 'graphiti_content_writing_samples'
 MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS = 'graphiti_content_long_form_artifacts'
+MATERIALIZE_QUERY_HINTS = {
+    MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE: 'author voice register cadence tone sentence rhythm signature phrases',
+    MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES: 'writing samples signature phrases sentence patterns paragraph structure concrete examples',
+    MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS: 'rhetorical moves argument structures transition techniques opening strategies engagement signals',
+}
 
 
 class OMIndexMismatchError(ValueError):
@@ -996,6 +1001,14 @@ def _cap_block_by_token_budget(text: str, max_tokens: int) -> tuple[str, bool, i
     return text[:cap_chars].rstrip() + '\n…(truncated)…', True, cap_chars
 
 
+def _materialization_query(source: str, task_query: str) -> str:
+    task = task_query.strip()
+    hint = MATERIALIZE_QUERY_HINTS.get(source, '')
+    if hint:
+        return hint
+    return task
+
+
 def _materialize_content_pack(
     *,
     source: str,
@@ -1011,8 +1024,9 @@ def _materialize_content_pack(
     max_fact_chars = _materialize_max_fact_chars(materialization)
 
     lane_label = ', '.join(group_ids) if group_ids else 'default lane'
+    retrieval_query = _materialization_query(source, query)
     facts, fact_stats = _graphiti_search_facts(
-        query=query,
+        query=retrieval_query,
         group_ids=group_ids,
         max_items=max_items,
         timeout_seconds=timeout_seconds,
@@ -1027,6 +1041,7 @@ def _materialize_content_pack(
         'min_coverage_items': min_coverage,
         'max_block_tokens': max_block_tokens,
         'max_fact_chars': max_fact_chars,
+        'retrieval_query': retrieval_query,
         **fact_stats,
     }
 
