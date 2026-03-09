@@ -1504,6 +1504,36 @@ def _typed_source_message_id(ev: dict[str, Any]) -> str | None:
     return None
 
 
+def _open_existing_change_ledger(db_path: str) -> sqlite3.Connection | None:
+    ledger_path = Path(db_path)
+    if not ledger_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(ledger_path))
+        has_change_events = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='change_events'"
+        ).fetchone()
+        if has_change_events is None:
+            conn.close()
+            return None
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _change_ledger_has_episode(conn: sqlite3.Connection, object_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM change_events
+         WHERE object_id = ?
+           AND event_type IN ('assert', 'supersede', 'refine', 'derive')
+         LIMIT 1
+        """,
+        (object_id,),
+    ).fetchone()
+    return row is not None
+
 
 def _write_typed_episode_bridge(
     *,
@@ -1542,7 +1572,7 @@ def _write_typed_episode_bridge(
         source_lane=args.group_id,
         source_key=chunk_source_key,
         source_episode_id=sub_key,
-        source_message_id=_typed_source_message_id(ev),
+        source_message_id=None if is_subchunk else _typed_source_message_id(ev),
         scope=ev.get('scope'),
         summary=sub_content,
         started_at=started_at,
@@ -1652,60 +1682,72 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
     # Determine whether sub-chunking is active for this group.
     do_subchunk = args.group_id in _SUBCHUNK_GROUP_IDS
     subchunk_size = args.subchunk_size
-    typed_bridge = TypedReplayBridge(args.change_ledger_db) if args.typed_truth_mode != 'off' else None
 
     if args.dry_run:
+        existing_ledger_conn = (
+            _open_existing_change_ledger(args.change_ledger_db)
+            if args.typed_truth_mode != 'off' and not args.force
+            else None
+        )
         print(f'\n🔍 DRY RUN: Would process {len(batch)} evidence chunks')
         if do_subchunk:
             print(f'   Sub-chunking enabled (max {subchunk_size} chars per sub-chunk)')
         skipped = 0
         new = 0
         total_subchunks = 0
-        for ev in batch:
-            content = ev.get('content', '')
+        try:
+            for ev in batch:
+                content = ev.get('content', '')
 
-            chunk_key = ev.get('chunk_key') or ev.get('chunkKey')
-            source_key = ev.get('source_key')
-            chunk_idx = get_chunk_index(ev)
+                chunk_key = ev.get('chunk_key') or ev.get('chunkKey')
+                source_key = ev.get('source_key')
+                chunk_idx = get_chunk_index(ev)
 
-            if not (isinstance(chunk_key, str) and chunk_key):
-                base = source_key or stream_source_key
-                chunk_key = f'{base}:c{chunk_idx}'
+                if not (isinstance(chunk_key, str) and chunk_key):
+                    base = source_key or stream_source_key
+                    chunk_key = f'{base}:c{chunk_idx}'
 
-            chunk_source_key = source_key or (
-                chunk_key.split(':c', 1)[0] if ':c' in str(chunk_key) else stream_source_key
-            )
+                chunk_source_key = source_key or (
+                    chunk_key.split(':c', 1)[0] if ':c' in str(chunk_key) else stream_source_key
+                )
 
-            # Expand sub-chunks for counting
-            if do_subchunk:
-                sub_parts = subchunk_evidence(content, str(chunk_key), subchunk_size)
-            else:
-                sub_parts = [(str(chunk_key), strip_ingestion_noise(content))]
+                # Expand sub-chunks for counting
+                if do_subchunk:
+                    sub_parts = subchunk_evidence(content, str(chunk_key), subchunk_size)
+                else:
+                    sub_parts = [(str(chunk_key), strip_ingestion_noise(content))]
 
-            for sub_key, sub_content in sub_parts:
-                total_subchunks += 1
-                sub_hash = IngestRegistry.compute_content_hash(sub_content)
-                if args.typed_truth_mode == 'only':
-                    chunk_uuid = IngestRegistry.compute_chunk_uuid(
-                        source_key=chunk_source_key,
-                        chunk_key=sub_key,
-                        content_hash=sub_hash,
-                    )
-                    episode_uuid = IngestRegistry.compute_episode_uuid(chunk_uuid)
-                    if not args.force and typed_bridge is not None and typed_bridge.get_episode(episode_uuid):
+                for sub_key, sub_content in sub_parts:
+                    total_subchunks += 1
+                    sub_hash = IngestRegistry.compute_content_hash(sub_content)
+                    if args.typed_truth_mode == 'only':
+                        chunk_uuid = IngestRegistry.compute_chunk_uuid(
+                            source_key=chunk_source_key,
+                            chunk_key=sub_key,
+                            content_hash=sub_hash,
+                        )
+                        episode_uuid = IngestRegistry.compute_episode_uuid(chunk_uuid)
+                        if (
+                            existing_ledger_conn is not None
+                            and _change_ledger_has_episode(existing_ledger_conn, episode_uuid)
+                        ):
+                            skipped += 1
+                        else:
+                            new += 1
+                    elif not args.force and registry is not None and registry.is_chunk_ingested(
+                        chunk_source_key, sub_key, sub_hash
+                    ):
                         skipped += 1
                     else:
                         new += 1
-                elif not args.force and registry is not None and registry.is_chunk_ingested(
-                    chunk_source_key, sub_key, sub_hash
-                ):
-                    skipped += 1
-                else:
-                    new += 1
+        finally:
+            if existing_ledger_conn is not None:
+                existing_ledger_conn.close()
         print(f'   Total episodes (after sub-chunking): {total_subchunks}')
         print(f'   New: {new}, Already ingested: {skipped}')
         return
 
+    typed_bridge = TypedReplayBridge(args.change_ledger_db) if args.typed_truth_mode != 'off' else None
     client = MCPClient(args.mcp_url) if args.typed_truth_mode != 'only' else None
 
     ok = 0
@@ -1744,14 +1786,12 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
 
         for sub_key, sub_content in sub_parts:
             content_hash = IngestRegistry.compute_content_hash(sub_content)
-            if (
+            graphiti_already_ingested = (
                 args.typed_truth_mode != 'only'
                 and not args.force
                 and registry is not None
                 and registry.is_chunk_ingested(chunk_source_key, sub_key, content_hash)
-            ):
-                skipped += 1
-                continue
+            )
 
             ep_name = f'{sub_key}:{evidence_id[:8] or content_hash[:8]}'
             src_desc = f'session chunk: {sub_key} (scope={scope or "unknown"})'
@@ -1787,6 +1827,9 @@ def _run_evidence_mode(args: argparse.Namespace, ap: argparse.ArgumentParser) ->
                     print(f'[{i}/{len(batch)}] ERROR typed bridge {ep_name}: {exc}')
                     errors += 1
                     continue
+            if graphiti_already_ingested:
+                skipped += 1
+                continue
 
             if args.typed_truth_mode != 'only':
                 assert client is not None

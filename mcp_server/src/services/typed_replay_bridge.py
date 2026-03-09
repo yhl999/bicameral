@@ -107,12 +107,17 @@ def build_session_chunk_episode(
     annotations: list[str] | None = None,
     title: str | None = None,
 ) -> Episode:
+    canonical_source_key = canonical_session_identity(source_key) or str(source_key or '')
+    canonical_source_episode_id = canonical_session_identity(source_episode_id) or str(
+        source_episode_id or ''
+    )
+    canonical_chunk_key = canonical_session_identity(chunk_key) or str(chunk_key or '')
     effective_scope = canonical_scope(scope)
     evidence_ref = build_session_chunk_evidence_ref(
-        source_key=source_key,
+        source_key=canonical_source_key,
         source_lane=source_lane,
-        source_episode_id=source_episode_id,
-        chunk_key=chunk_key,
+        source_episode_id=canonical_source_episode_id,
+        chunk_key=canonical_chunk_key,
         evidence_id=evidence_id,
         start_id=start_id,
         end_id=end_id,
@@ -125,9 +130,9 @@ def build_session_chunk_episode(
         'root_id': object_id,
         'object_type': 'episode',
         'source_lane': source_lane,
-        'source_episode_id': source_episode_id,
+        'source_episode_id': canonical_source_episode_id,
         'source_message_id': source_message_id,
-        'source_key': source_key,
+        'source_key': canonical_source_key,
         'policy_scope': effective_scope,
         'visibility_scope': effective_scope,
         'evidence_refs': [evidence_ref],
@@ -219,11 +224,13 @@ def build_bridge_metadata(
     started_at: str | None,
     ended_at: str | None,
 ) -> dict[str, Any]:
+    canonical_source_key = canonical_session_identity(source_key) or str(source_key or '')
+    canonical_chunk_key = canonical_session_identity(chunk_key) or str(chunk_key or '')
     return {
         'bridge': 'typed_replay',
         'group_id': group_id,
-        'source_key': source_key,
-        'chunk_key': chunk_key,
+        'source_key': canonical_source_key,
+        'chunk_key': canonical_chunk_key,
         'message_ids': list(message_ids or []),
         'evidence_id': evidence_id,
         'content_hash': content_hash,
