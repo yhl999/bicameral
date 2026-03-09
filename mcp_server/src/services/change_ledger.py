@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from models.typed_memory import (
+    from ..models.typed_memory import (
         EntityRegistry,
         EntityRegistryEntry,
         Episode,
@@ -20,8 +20,8 @@ try:
         TypedMemoryObject,
         coerce_typed_object,
     )
-except ImportError:  # pragma: no cover - package import path fallback
-    from ..models.typed_memory import (
+except ImportError:  # pragma: no cover - top-level import fallback
+    from models.typed_memory import (
         EntityRegistry,
         EntityRegistryEntry,
         Episode,
@@ -602,22 +602,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
-    root_count = int(conn.execute('SELECT count(*) FROM typed_roots').fetchone()[0])
-    event_root_count = int(
-        conn.execute(
-            """
-            SELECT count(DISTINCT root_id)
-              FROM change_events
-             WHERE payload_json IS NOT NULL
-               AND root_id IS NOT NULL
-            """
-        ).fetchone()[0]
-    )
-    if root_count == event_root_count:
-        return
 
-    conn.execute('DELETE FROM typed_roots')
+def _typed_root_ids_from_events(conn: sqlite3.Connection) -> list[str]:
     root_rows = conn.execute(
         """
         SELECT DISTINCT root_id
@@ -627,10 +613,61 @@ def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
          ORDER BY root_id
         """
     ).fetchall()
+    root_ids: list[str] = []
     for row in root_rows:
         root_id = str(row['root_id']) if isinstance(row, sqlite3.Row) else str(row[0])
         if root_id:
+            root_ids.append(root_id)
+    return root_ids
+
+
+def _typed_root_needs_refresh(conn: sqlite3.Connection, root_id: str) -> bool:
+    snapshot = conn.execute(
+        """
+        SELECT latest_recorded_at, lineage_event_count
+          FROM typed_roots
+         WHERE root_id = ?
+        """,
+        (root_id,),
+    ).fetchone()
+    if snapshot is None:
+        return True
+
+    lineage_stats = conn.execute(
+        """
+        SELECT max(recorded_at) AS latest_recorded_at,
+               count(*) AS lineage_event_count
+          FROM change_events
+         WHERE root_id = ?
+            OR object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+            OR target_object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+        """,
+        (root_id, root_id, root_id),
+    ).fetchone()
+    if lineage_stats is None or lineage_stats['latest_recorded_at'] is None:
+        return True
+
+    return (
+        str(snapshot['latest_recorded_at']) != str(lineage_stats['latest_recorded_at'])
+        or int(snapshot['lineage_event_count'] or 0)
+        != int(lineage_stats['lineage_event_count'] or 0)
+    )
+
+
+def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
+    event_root_ids = _typed_root_ids_from_events(conn)
+    root_count = int(conn.execute('SELECT count(*) FROM typed_roots').fetchone()[0])
+    if root_count != len(event_root_ids):
+        conn.execute('DELETE FROM typed_roots')
+        for root_id in event_root_ids:
             _refresh_typed_root_row(conn, root_id)
+        return
+
+    stale_root_ids = [
+        root_id for root_id in event_root_ids if _typed_root_needs_refresh(conn, root_id)
+    ]
+    for root_id in stale_root_ids:
+        _refresh_typed_root_row(conn, root_id)
 
 
 def _refresh_typed_root_row(conn: sqlite3.Connection, root_id: str) -> None:

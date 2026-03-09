@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 try:
-    from models.typed_memory import EvidenceRef
-except ImportError:  # pragma: no cover - package import path fallback
     from ..models.typed_memory import EvidenceRef
+except ImportError:  # pragma: no cover - top-level import fallback
+    from models.typed_memory import EvidenceRef
 
 logger = logging.getLogger(__name__)
 

@@ -9,17 +9,6 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from models.typed_memory import (
-        Episode,
-        EvidenceRef,
-        Procedure,
-        StateFact,
-        TypedMemoryObject,
-        coerce_typed_object,
-    )
-    from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
-    from services.evidence_callback import EvidenceCallbackRegistry
-except ImportError:  # pragma: no cover - package import path fallback
     from ..models.typed_memory import (
         Episode,
         EvidenceRef,
@@ -30,6 +19,17 @@ except ImportError:  # pragma: no cover - package import path fallback
     )
     from .change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
     from .evidence_callback import EvidenceCallbackRegistry
+except ImportError:  # pragma: no cover - top-level import fallback
+    from models.typed_memory import (
+        Episode,
+        EvidenceRef,
+        Procedure,
+        StateFact,
+        TypedMemoryObject,
+        coerce_typed_object,
+    )
+    from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
+    from services.evidence_callback import EvidenceCallbackRegistry
 
 _OBJECT_TYPE_ALIASES = {
     'state': 'state_fact',
@@ -98,6 +98,14 @@ _MAX_LINEAGE_EVENTS = 256
 _MAX_QUERY_ROOT_TOKENS = 8
 _MIN_QUERY_ROOT_TOKEN_LENGTH = 3
 _MIN_TOKENLESS_EXACT_QUERY_LENGTH = 2
+_CJK_RANGES = (
+    ('\u3400', '\u4dbf'),  # CJK Unified Ideographs Extension A
+    ('\u4e00', '\u9fff'),  # CJK Unified Ideographs
+    ('\uf900', '\ufaff'),  # CJK Compatibility Ideographs
+    ('\u3040', '\u309f'),  # Hiragana
+    ('\u30a0', '\u30ff'),  # Katakana
+    ('\uac00', '\ud7af'),  # Hangul Syllables
+)
 
 
 @dataclass(frozen=True)
@@ -597,9 +605,18 @@ def _tokenize(value: str) -> list[str]:
     return [token for token in _TOKEN_RE.findall(str(value or '').lower()) if token not in _STOPWORDS]
 
 
+def _contains_cjk_character(value: str) -> bool:
+    for char in str(value or ''):
+        if any(start <= char <= end for start, end in _CJK_RANGES):
+            return True
+    return False
+
+
 def _tokenless_exact_query(value: str) -> str | None:
     normalized = ' '.join(str(value or '').strip().lower().split())
     if len(normalized) < _MIN_TOKENLESS_EXACT_QUERY_LENGTH:
+        if len(normalized) == 1 and _contains_cjk_character(normalized):
+            return normalized
         return None
     if any(not char.isascii() and not char.isspace() for char in normalized):
         return normalized

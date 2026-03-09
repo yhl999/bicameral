@@ -197,6 +197,32 @@ def test_search_unicode_tokenless_query_can_hit_exact_match_root_prefilter():
     assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_text_exact'
 
 
+
+def test_search_single_character_cjk_query_can_hit_exact_match_root_prefilter():
+    ledger = _memory_ledger()
+    _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='咖啡'))
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(service.search(query='咖', object_types=['state']))
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'obj_1'
+    assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_text_exact'
+
+
+
+def test_search_single_character_ascii_query_still_fails_closed():
+    ledger = _memory_ledger()
+    _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='coffee'))
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(service.search(query='c', object_types=['state']))
+
+    assert response['counts']['state'] == 0
+    assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_too_weak'
+
+
+
 def test_lineage_over_cap_uses_root_snapshot_instead_of_disappearing():
     ledger = _memory_ledger()
     obj = _state_fact(object_id='obj_1', root_id='root_1', version=42, value='espresso')

@@ -25,23 +25,42 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-from config.schema import GraphitiConfig, ServerConfig
-from models.response_types import (
-    EpisodeSearchResponse,
-    ErrorResponse,
-    FactSearchResponse,
-    NodeResult,
-    NodeSearchResponse,
-    StatusResponse,
-    SuccessResponse,
-)
-from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
-from services.ontology_registry import OntologyRegistry
-from services.queue_service import QueueService, build_om_candidate_rows
-from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
-from services.typed_retrieval import TypedRetrievalService
-from utils.formatting import format_fact_result
-from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
+try:
+    from .config.schema import GraphitiConfig, ServerConfig
+    from .models.response_types import (
+        EpisodeSearchResponse,
+        ErrorResponse,
+        FactSearchResponse,
+        NodeResult,
+        NodeSearchResponse,
+        StatusResponse,
+        SuccessResponse,
+    )
+    from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from .services.ontology_registry import OntologyRegistry
+    from .services.queue_service import QueueService, build_om_candidate_rows
+    from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
+    from .services.typed_retrieval import TypedRetrievalService
+    from .utils.formatting import format_fact_result
+    from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
+except ImportError:  # pragma: no cover - script/top-level import fallback
+    from config.schema import GraphitiConfig, ServerConfig
+    from models.response_types import (
+        EpisodeSearchResponse,
+        ErrorResponse,
+        FactSearchResponse,
+        NodeResult,
+        NodeSearchResponse,
+        StatusResponse,
+        SuccessResponse,
+    )
+    from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from services.ontology_registry import OntologyRegistry
+    from services.queue_service import QueueService, build_om_candidate_rows
+    from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
+    from services.typed_retrieval import TypedRetrievalService
+    from utils.formatting import format_fact_result
+    from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -96,6 +115,9 @@ _MAX_NODES_CAP = 200
 _MAX_FACTS_CAP = 200
 _MAX_TYPED_RESULTS_CAP = 200
 _MAX_TYPED_EVIDENCE_CAP = 200
+_SOURCE_LANE_FILTER_ERROR = (
+    "metadata_filters.source_lane must be a scalar, array, or object with 'eq' or 'in'"
+)
 
 
 def _env_float(
@@ -980,8 +1002,6 @@ class GraphitiService:
 
             # Load optional per-lane extraction ontology registry
             try:
-                from services.ontology_registry import OntologyRegistry
-
                 ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
                 if ontology_path.exists():
                     self.ontology_registry = OntologyRegistry.load(ontology_path)
@@ -1381,16 +1401,19 @@ async def search_nodes(
 
 def _coerce_source_lane_values(raw: Any) -> list[str] | None:
     if isinstance(raw, dict):
-        if 'eq' in raw:
+        keys = set(raw.keys())
+        if keys == {'eq'}:
             value = raw['eq']
+            if isinstance(value, (dict, list, tuple, set)):
+                return None
             return [str(value)] if value not in (None, '') else []
-        if 'in' in raw:
+        if keys == {'in'}:
             values = raw.get('in')
-            if isinstance(values, (list, tuple, set)):
-                return [str(value) for value in values if value not in (None, '')]
             if values in (None, ''):
                 return []
-            return [str(values)]
+            if not isinstance(values, (list, tuple, set)):
+                return None
+            return [str(value) for value in values if value not in (None, '')]
         return None
     if isinstance(raw, (list, tuple, set)):
         return [str(value) for value in raw if value not in (None, '')]
@@ -1406,16 +1429,18 @@ def _intersect_source_lane_filter(
 ) -> dict[str, Any]:
     effective_filters = dict(metadata_filters or {})
     requested_source_lane = effective_filters.get('source_lane')
+    source_lane_values: list[str] | None = None
+    if requested_source_lane is not None:
+        source_lane_values = _coerce_source_lane_values(requested_source_lane)
+        if source_lane_values is None:
+            raise ValueError(_SOURCE_LANE_FILTER_ERROR)
+
     if effective_group_ids == []:
         return effective_filters
 
     # Preserve caller scope when supplied, intersect with trusted scope.
-    if requested_source_lane is None:
-        effective_filters['source_lane'] = {'in': effective_group_ids}
-        return effective_filters
-
-    source_lane_values = _coerce_source_lane_values(requested_source_lane)
     if source_lane_values is None:
+        effective_filters['source_lane'] = {'in': effective_group_ids}
         return effective_filters
 
     allowed_group_set = set(effective_group_ids)
