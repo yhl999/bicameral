@@ -64,7 +64,7 @@ def test_auto_promoted_candidate_materializes_promoted_state_fact():
     assert fact.promotion_status == 'promoted'
     assert fact.source_lane == 's1_sessions_main'
     assert fact.source_key == 'sessions:s1'
-    assert fact.evidence_refs[0].canonical_uri == 'eventlog://sessions/sessions:s1/msg-1'
+    assert fact.evidence_refs[0].canonical_uri == 'eventlog://sessions/session:s1/msg-1'
 
 
 def test_auto_supersede_candidate_reuses_lineage_and_replaces_current_fact():
