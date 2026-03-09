@@ -607,9 +607,10 @@ def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
     event_root_count = int(
         conn.execute(
             """
-            SELECT count(DISTINCT COALESCE(root_id, object_id))
+            SELECT count(DISTINCT root_id)
               FROM change_events
-             WHERE COALESCE(root_id, object_id) IS NOT NULL
+             WHERE payload_json IS NOT NULL
+               AND root_id IS NOT NULL
             """
         ).fetchone()[0]
     )
@@ -619,9 +620,10 @@ def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
     conn.execute('DELETE FROM typed_roots')
     root_rows = conn.execute(
         """
-        SELECT DISTINCT COALESCE(root_id, object_id) AS root_id
+        SELECT DISTINCT root_id
           FROM change_events
-         WHERE COALESCE(root_id, object_id) IS NOT NULL
+         WHERE payload_json IS NOT NULL
+           AND root_id IS NOT NULL
          ORDER BY root_id
         """
     ).fetchall()

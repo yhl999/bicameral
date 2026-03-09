@@ -19,6 +19,7 @@ from mcp_server.src.models.typed_memory import (
     Procedure,
     StateFact,
 )
+from mcp_server.src.services import change_ledger as change_ledger_module
 from mcp_server.src.services.change_ledger import ChangeLedger
 from truth import candidates as candidates_store
 
@@ -171,6 +172,73 @@ def test_change_ledger_projects_state_fact_lifecycle():
     assert second.invalid_at == '2026-03-09T01:00:00Z'
     assert second.is_current is False
     assert ledger.current_object('fact_v1') is None
+
+
+def test_ensure_typed_root_index_does_not_rebuild_for_descendant_events_missing_root_id(monkeypatch):
+    ledger = _ledger()
+    original = StateFact.model_validate(
+        {
+            'object_id': 'fact_v1',
+            'root_id': 'fact_v1',
+            'fact_type': 'preference',
+            'subject': 'user:principal',
+            'predicate': 'pref.family',
+            'value': {'name': '奶奶'},
+            'scope': 'private',
+            'policy_scope': 'private',
+            'visibility_scope': 'private',
+            'evidence_refs': [_message_ref('m1')],
+            'created_at': '2026-03-08T22:00:00Z',
+            'valid_at': '2026-03-08T22:00:00Z',
+        }
+    )
+    updated = StateFact.model_validate(
+        {
+            'object_id': 'fact_v2',
+            'root_id': 'fact_v1',
+            'parent_id': 'fact_v1',
+            'version': 2,
+            'fact_type': 'preference',
+            'subject': 'user:principal',
+            'predicate': 'pref.family',
+            'value': {'name': '奶奶', 'drink': '咖啡'},
+            'scope': 'private',
+            'policy_scope': 'private',
+            'visibility_scope': 'private',
+            'evidence_refs': [_message_ref('m2')],
+            'created_at': '2026-03-09T00:00:00Z',
+            'valid_at': '2026-03-09T00:00:00Z',
+        }
+    )
+
+    ledger.append_event('assert', actor_id='extractor', payload=original, recorded_at='2026-03-08T22:00:00Z')
+    ledger.append_event(
+        'supersede',
+        actor_id='policy:v3',
+        payload=updated,
+        target_object_id='fact_v1',
+        recorded_at='2026-03-09T00:00:00Z',
+    )
+    ledger.append_event(
+        'invalidate',
+        actor_id='policy:v3',
+        object_id='fact_v2',
+        recorded_at='2026-03-09T01:00:00Z',
+    )
+
+    refresh_calls: list[str] = []
+    original_refresh = change_ledger_module._refresh_typed_root_row
+
+    def _recording_refresh(conn, root_id):
+        refresh_calls.append(root_id)
+        return original_refresh(conn, root_id)
+
+    monkeypatch.setattr(change_ledger_module, '_refresh_typed_root_row', _recording_refresh)
+
+    change_ledger_module._ensure_typed_root_index(ledger.conn)
+
+    assert refresh_calls == []
+    assert ledger.conn.execute('SELECT count(*) FROM typed_roots').fetchone()[0] == 1
 
 
 def test_procedure_success_and_failure_update_counters():

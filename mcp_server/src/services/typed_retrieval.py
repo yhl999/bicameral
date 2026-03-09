@@ -97,6 +97,7 @@ _MAX_CANDIDATE_ROOTS = 250
 _MAX_LINEAGE_EVENTS = 256
 _MAX_QUERY_ROOT_TOKENS = 8
 _MIN_QUERY_ROOT_TOKEN_LENGTH = 3
+_MIN_TOKENLESS_EXACT_QUERY_LENGTH = 2
 
 
 @dataclass(frozen=True)
@@ -338,6 +339,23 @@ class TypedRetrievalService:
                 return matched_roots, 'query_tokens'
             return [], 'query_tokens_no_match'
 
+        tokenless_exact_query = _tokenless_exact_query(query)
+        if tokenless_exact_query:
+            where_clause = ' AND '.join([*base_filters, 'instr(search_text, ?) > 0'])
+            rows = self.ledger.conn.execute(
+                f"""
+                SELECT root_id
+                  FROM typed_roots
+                 WHERE {where_clause}
+                 ORDER BY latest_recorded_at DESC, root_id
+                 LIMIT ?
+                """,
+                [*base_params, tokenless_exact_query, max_roots],
+            ).fetchall()
+            matched_roots = [str(row['root_id']) for row in rows if row['root_id']]
+            if matched_roots:
+                return matched_roots, 'query_text_exact'
+
         if query:
             return [], 'query_too_weak'
 
@@ -577,6 +595,15 @@ def _matches_filter_value(actual: Any, expected: Any) -> bool:
 
 def _tokenize(value: str) -> list[str]:
     return [token for token in _TOKEN_RE.findall(str(value or '').lower()) if token not in _STOPWORDS]
+
+
+def _tokenless_exact_query(value: str) -> str | None:
+    normalized = ' '.join(str(value or '').strip().lower().split())
+    if len(normalized) < _MIN_TOKENLESS_EXACT_QUERY_LENGTH:
+        return None
+    if any(not char.isascii() and not char.isspace() for char in normalized):
+        return normalized
+    return None
 
 
 def _searchable_text(obj: TypedMemoryObject) -> str:

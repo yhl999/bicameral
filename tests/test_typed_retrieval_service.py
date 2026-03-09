@@ -185,6 +185,18 @@ def test_search_weak_query_fails_closed_instead_of_falling_back_to_recent_roots(
     assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_too_weak'
 
 
+def test_search_unicode_tokenless_query_can_hit_exact_match_root_prefilter():
+    ledger = _memory_ledger()
+    _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='咖啡'))
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(service.search(query='咖啡', object_types=['state']))
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'obj_1'
+    assert response['limits_applied']['materialization']['root_selection_strategy'] == 'query_text_exact'
+
+
 def test_lineage_over_cap_uses_root_snapshot_instead_of_disappearing():
     ledger = _memory_ledger()
     obj = _state_fact(object_id='obj_1', root_id='root_1', version=42, value='espresso')
