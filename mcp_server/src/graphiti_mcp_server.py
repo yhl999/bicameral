@@ -1379,6 +1379,52 @@ async def search_nodes(
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
+def _coerce_source_lane_values(raw: Any) -> list[str] | None:
+    if isinstance(raw, dict):
+        if 'eq' in raw:
+            value = raw['eq']
+            return [str(value)] if value not in (None, '') else []
+        if 'in' in raw:
+            values = raw.get('in')
+            if isinstance(values, (list, tuple, set)):
+                return [str(value) for value in values if value not in (None, '')]
+            if values in (None, ''):
+                return []
+            return [str(values)]
+        return None
+    if isinstance(raw, (list, tuple, set)):
+        return [str(value) for value in raw if value not in (None, '')]
+    if raw in (None, ''):
+        return []
+    return [str(raw)]
+
+
+def _intersect_source_lane_filter(
+    *,
+    metadata_filters: dict[str, Any] | None,
+    effective_group_ids: list[str],
+) -> dict[str, Any]:
+    effective_filters = dict(metadata_filters or {})
+    requested_source_lane = effective_filters.get('source_lane')
+    if effective_group_ids == []:
+        return effective_filters
+
+    # Preserve caller scope when supplied, intersect with trusted scope.
+    if requested_source_lane is None:
+        effective_filters['source_lane'] = {'in': effective_group_ids}
+        return effective_filters
+
+    source_lane_values = _coerce_source_lane_values(requested_source_lane)
+    if source_lane_values is None:
+        return effective_filters
+
+    allowed_group_set = set(effective_group_ids)
+    filtered_values = [value for value in source_lane_values if value in allowed_group_set]
+    effective_filters['source_lane'] = {'in': _unique_preserve_order(filtered_values)}
+
+    return effective_filters
+
+
 async def _search_typed_memory_contract(
     *,
     query: str,
@@ -1400,9 +1446,10 @@ async def _search_typed_memory_contract(
         return ErrorResponse(error='metadata_filters must be an object/dict when provided')
 
     try:
-        effective_filters = dict(metadata_filters or {})
-        if effective_group_ids:
-            effective_filters['source_lane'] = {'in': effective_group_ids}
+        effective_filters = _intersect_source_lane_filter(
+            metadata_filters=metadata_filters,
+            effective_group_ids=effective_group_ids,
+        )
 
         service = TypedRetrievalService()
         return await service.search(

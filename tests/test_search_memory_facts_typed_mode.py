@@ -95,6 +95,53 @@ def test_search_memory_facts_typed_mode_reuses_lane_scope_and_skips_graphiti_dep
     assert call['max_evidence'] == 7
 
 
+def test_search_memory_facts_typed_mode_intersects_caller_source_lane_filter_with_effective_scope():
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_service_cls = server.TypedRetrievalService
+
+    fake_service = _FakeTypedRetrievalService(
+        {
+            'message': 'Typed memory retrieved successfully',
+            'query_mode': 'all',
+            'state': [],
+            'episodes': [],
+            'procedures': [],
+            'evidence': [],
+            'counts': {'state': 0, 'episodes': 0, 'procedures': 0, 'evidence': 0},
+        }
+    )
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.TypedRetrievalService = lambda: fake_service
+
+        _run(
+            server.search_memory_facts(
+                query='coffee',
+                group_ids=['s1_sessions_main', 's1_observational_memory'],
+                result_format='typed',
+                max_facts=5,
+                object_types=['state'],
+                metadata_filters={
+                    'policy_scope': {'eq': 'private'},
+                    'source_lane': {'eq': 's1_sessions_main'},
+                },
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.TypedRetrievalService = original_service_cls
+
+    assert len(fake_service.calls) == 1
+    call = fake_service.calls[0]
+    assert call['metadata_filters']['policy_scope'] == {'eq': 'private'}
+    assert call['metadata_filters']['source_lane'] == {'in': ['s1_sessions_main']}
+
+
 def test_search_memory_facts_typed_mode_honors_explicit_max_results():
     original_config = server.config
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
