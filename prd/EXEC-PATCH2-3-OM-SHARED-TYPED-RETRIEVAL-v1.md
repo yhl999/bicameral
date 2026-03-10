@@ -34,16 +34,17 @@ Owned Paths:
 - Extend the benchmark harness with a typed-contract mode so OM bakeoffs can target `search_memory_facts(..., result_format="typed")` directly.
 
 DoD checklist
-- [ ] Typed retrieval can surface OM-native canonical lane content through shared typed buckets.
-- [ ] Typed retrieval can surface OM-native experimental-group content through shared typed buckets when explicitly scoped.
-- [ ] OM remains retrieval-projected only; no fake Graphiti storage entities are introduced.
-- [ ] Typed retrieval evidence bucket includes deterministic OM provenance pointers for projected OM results.
-- [ ] Benchmark tooling can exercise Bicameral typed retrieval directly.
-- [ ] Focused regression tests cover typed OM projection behavior and benchmark typed-mode wiring.
+- [x] Typed retrieval can surface OM-native canonical lane content through shared typed buckets.
+- [x] Typed retrieval can surface OM-native experimental-group content through shared typed buckets when explicitly scoped.
+- [x] OM remains retrieval-projected only; no fake Graphiti storage entities are introduced.
+- [x] Typed retrieval evidence bucket includes deterministic OM provenance pointers for projected OM results.
+- [x] Benchmark tooling can exercise Bicameral typed retrieval directly.
+- [x] Focused regression tests cover typed OM projection behavior and benchmark typed-mode wiring.
 
 Validation commands
 ```bash
 cd projects/bicameral
-pytest tests/test_typed_retrieval_service.py tests/test_search_memory_facts_typed_mode.py mcp_server/tests/test_search_om_lane.py tests/test_retrieval_benchmark.py -q
+PYTHONPATH=. pytest tests/test_typed_retrieval_service.py tests/test_search_memory_facts_typed_mode.py tests/test_retrieval_benchmark.py -q
+pytest mcp_server/tests/test_search_om_lane.py -q
 python3 scripts/typed_retrieval_smoke.py
 ```

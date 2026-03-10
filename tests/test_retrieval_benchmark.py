@@ -11,9 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.run_retrieval_benchmark import (
     FIXTURE_QUOTAS,
+    HARNESS_TOOL_ARGUMENT_KEYS,
     _query_scope_group_ids,
     check_recall_gate,
     compute_recall,
+    evaluate_mcp_contract,
+    extract_results_text,
     validate_fixture,
 )
 
@@ -280,6 +283,87 @@ class TestCheckRecallGate(unittest.TestCase):
         self.assertIsNotNone(gate)
         self.assertAlmostEqual(gate['score'], 0.0)
         self.assertFalse(gate['passed'])
+
+
+class TestTypedContractMode(unittest.TestCase):
+    """Tests for typed-contract mode benchmark wiring (Patch 2+3)."""
+
+    def test_harness_tool_keys_include_typed_contract_args(self):
+        """Verify the harness contract surface includes result_format and typed args."""
+        facts_keys = HARNESS_TOOL_ARGUMENT_KEYS.get('search_memory_facts', set())
+        self.assertIn('result_format', facts_keys)
+        self.assertIn('max_results', facts_keys)
+        self.assertIn('max_evidence', facts_keys)
+
+    def test_extract_results_text_handles_typed_response(self):
+        """Typed MCP response text extraction works for typed content payloads."""
+        typed_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({
+                            'message': 'Typed memory retrieved successfully',
+                            'result_format': 'typed',
+                            'state': [{'object_id': 'om_state:s1_observational_memory:rel-1', 'value': 'heap cap 70 percent'}],
+                            'episodes': [{'object_id': 'om_episode:s1_observational_memory:node-1', 'summary': 'Neo4j heap observation'}],
+                            'procedures': [],
+                        }),
+                    }
+                ]
+            }
+        }
+        text = extract_results_text(typed_response)
+        self.assertIn('heap cap', text)
+        self.assertIn('om_state:', text)
+        self.assertIn('om_episode:', text)
+
+    def test_contract_check_validates_typed_args_against_schema(self):
+        """Contract checker detects typed args in the harness surface."""
+        mock_tools_response = {
+            'result': {
+                'tools': [
+                    {
+                        'name': 'search_memory_facts',
+                        'inputSchema': {
+                            'type': 'object',
+                            'properties': {
+                                'query': {'type': 'string'},
+                                'group_ids': {'type': 'array'},
+                                'search_mode': {'type': 'string'},
+                                'max_facts': {'type': 'integer'},
+                                'center_node_uuid': {'type': 'string'},
+                                'result_format': {'type': 'string'},
+                                'max_results': {'type': 'integer'},
+                                'max_evidence': {'type': 'integer'},
+                            },
+                            'required': ['query'],
+                        },
+                    },
+                    {
+                        'name': 'search_nodes',
+                        'inputSchema': {
+                            'type': 'object',
+                            'properties': {
+                                'query': {'type': 'string'},
+                                'group_ids': {'type': 'array'},
+                                'search_mode': {'type': 'string'},
+                                'max_nodes': {'type': 'integer'},
+                                'entity_types': {'type': 'array'},
+                            },
+                            'required': ['query'],
+                        },
+                    },
+                ]
+            }
+        }
+        result = evaluate_mcp_contract(tools_list_response=mock_tools_response)
+        self.assertTrue(result['passed'], f"Contract check failed: {result}")
+        for check in result['checks']:
+            if check['tool'] == 'search_memory_facts':
+                self.assertIn('result_format', check['harness_args'])
+                self.assertIn('max_results', check['harness_args'])
+                self.assertIn('max_evidence', check['harness_args'])
 
 
 if __name__ == '__main__':
