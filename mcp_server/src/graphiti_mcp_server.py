@@ -37,8 +37,11 @@ try:
         SuccessResponse,
     )
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from .services.om_group_scope import (
+        is_om_native_only_scope,
+        requires_strict_om_native_only_scope,
+    )
     from .services.ontology_registry import OntologyRegistry
-    from .services.om_group_scope import is_om_native_only_scope
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
@@ -56,7 +59,10 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         SuccessResponse,
     )
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
-    from services.om_group_scope import is_om_native_only_scope
+    from services.om_group_scope import (
+        is_om_native_only_scope,
+        requires_strict_om_native_only_scope,
+    )
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
@@ -444,8 +450,15 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
     return ordered
 
 
-def _is_observational_memory_only_scope(effective_group_ids: list[str]) -> bool:
+def _is_single_observational_memory_scope(effective_group_ids: list[str]) -> bool:
     return is_om_native_only_scope(
+        effective_group_ids,
+        default_group_id=DEFAULT_OM_GROUP_ID,
+    )
+
+
+def _requires_strict_observational_memory_only_scope(effective_group_ids: list[str]) -> bool:
+    return requires_strict_om_native_only_scope(
         effective_group_ids,
         default_group_id=DEFAULT_OM_GROUP_ID,
     )
@@ -1317,6 +1330,10 @@ async def search_nodes(
             and search_service.includes_observational_memory(effective_group_ids)
         )
         om_nodes: list[dict[str, Any]] = []
+        single_om_scope = _is_single_observational_memory_scope(effective_group_ids)
+        strict_om_only_scope = _requires_strict_observational_memory_only_scope(
+            effective_group_ids
+        )
 
         if use_observational_adapter:
             try:
@@ -1329,17 +1346,18 @@ async def search_nodes(
                 )
             except Exception as om_error:
                 logger.error(f'OM lane retrieval failed closed: {om_error}')
-                if _is_observational_memory_only_scope(effective_group_ids):
+                if strict_om_only_scope:
                     return NodeSearchResponse(message='No relevant nodes found', nodes=[])
                 om_nodes = []
 
-            if _is_observational_memory_only_scope(effective_group_ids):
-                if not om_nodes:
-                    return NodeSearchResponse(message='No relevant nodes found', nodes=[])
+            if single_om_scope and om_nodes:
                 return NodeSearchResponse(
                     message='Nodes retrieved successfully',
                     nodes=om_nodes[:effective_max_nodes],
                 )
+
+            if strict_om_only_scope:
+                return NodeSearchResponse(message='No relevant nodes found', nodes=[])
 
         scope_error = _validate_group_scope_support(effective_group_ids)
         if scope_error:
@@ -1635,6 +1653,10 @@ async def search_memory_facts(
         )
         om_facts: list[dict[str, Any]] = []
         candidate_rows: list[dict[str, Any]] = []
+        single_om_scope = _is_single_observational_memory_scope(effective_group_ids)
+        strict_om_only_scope = _requires_strict_observational_memory_only_scope(
+            effective_group_ids
+        )
 
         if use_observational_adapter:
             try:
@@ -1647,15 +1669,13 @@ async def search_memory_facts(
                 )
             except Exception as om_error:
                 logger.error(f'OM lane fact retrieval failed closed: {om_error}')
-                if _is_observational_memory_only_scope(effective_group_ids):
+                if strict_om_only_scope:
                     return FactSearchResponse(message='No relevant facts found', facts=[])
                 om_facts = []
 
             candidate_rows = build_om_candidate_rows(om_facts)
 
-            if _is_observational_memory_only_scope(effective_group_ids):
-                if not om_facts:
-                    return FactSearchResponse(message='No relevant facts found', facts=[])
+            if single_om_scope and om_facts:
                 response = FactSearchResponse(
                     message='Facts retrieved successfully',
                     facts=om_facts[:max_facts],
@@ -1664,6 +1684,9 @@ async def search_memory_facts(
                     response = dict(response)
                     response['candidate_rows'] = candidate_rows
                 return response
+
+            if strict_om_only_scope:
+                return FactSearchResponse(message='No relevant facts found', facts=[])
 
         scope_error = _validate_group_scope_support(effective_group_ids)
         if scope_error:

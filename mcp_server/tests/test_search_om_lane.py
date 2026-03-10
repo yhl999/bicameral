@@ -141,6 +141,49 @@ async def test_search_nodes_returns_om_primitive_results_for_experimental_om_nat
 
 
 @pytest.mark.asyncio
+async def test_search_nodes_experimental_om_group_without_om_hits_falls_back_to_graphiti(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    graphiti_node = SimpleNamespace(
+        uuid='entity-exp-e-1',
+        name='Observational pattern entity',
+        labels=['Entity'],
+        created_at=datetime(2026, 3, 10, 12, 5, tzinfo=timezone.utc),
+        summary='Experimental OM E group still retrieves through Graphiti Entity shape.',
+        group_id='ontbk15batch_20260310_om_e',
+        attributes={'source': 'graphiti'},
+    )
+
+    fake_client = SimpleNamespace(
+        driver=SimpleNamespace(execute_query=AsyncMock(return_value=([], None, None))),
+        search_=AsyncMock(return_value=SimpleNamespace(nodes=[graphiti_node], edges=[])),
+    )
+    fake_service = SimpleNamespace(
+        config=SimpleNamespace(database=SimpleNamespace(provider='neo4j')),
+        get_client=AsyncMock(return_value=fake_client),
+        get_client_for_group=AsyncMock(return_value=fake_client),
+    )
+
+    monkeypatch.setattr(srv, 'graphiti_service', fake_service)
+
+    response = await srv.search_nodes(
+        query='observational pattern entity',
+        group_ids=['ontbk15batch_20260310_om_e'],
+        max_nodes=5,
+    )
+
+    assert response['message'] == 'Nodes retrieved successfully'
+    assert len(response['nodes']) == 1
+    assert response['nodes'][0]['uuid'] == 'entity-exp-e-1'
+    assert response['nodes'][0]['group_id'] == 'ontbk15batch_20260310_om_e'
+    fake_client.driver.execute_query.assert_awaited_once()
+    fake_client.search_.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, 'config', _base_config())
@@ -234,6 +277,56 @@ async def test_search_memory_facts_returns_om_relation_results_for_experimental_
     fake_client.search_.assert_not_called()
     fake_client.driver.execute_query.assert_awaited_once()
     assert fake_client.driver.execute_query.await_args.kwargs['group_id'] == 'ontbk15batch_20260310_om_f'
+
+
+@pytest.mark.asyncio
+async def test_search_memory_facts_experimental_om_group_without_om_hits_falls_back_to_graphiti(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    class _FakeEdge:
+        def model_dump(self, *, mode: str = 'json', exclude: set[str] | None = None):
+            return {
+                'uuid': 'edge-exp-e-1',
+                'name': 'RELATES_TO',
+                'fact': 'RELATES_TO: pattern -> evidence',
+                'group_id': 'ontbk15batch_20260310_om_e',
+                'source_node_uuid': 'node-source',
+                'target_node_uuid': 'node-target',
+                'created_at': '2026-03-10T13:05:00Z',
+                'valid_at': None,
+                'invalid_at': None,
+                'expired_at': None,
+                'episodes': [],
+                'attributes': {'source': 'graphiti'},
+            }
+
+    fake_client = SimpleNamespace(
+        driver=SimpleNamespace(execute_query=AsyncMock(return_value=([], None, None))),
+        search_=AsyncMock(return_value=SimpleNamespace(nodes=[], edges=[_FakeEdge()])),
+    )
+    fake_service = SimpleNamespace(
+        config=SimpleNamespace(database=SimpleNamespace(provider='neo4j')),
+        get_client=AsyncMock(return_value=fake_client),
+        get_client_for_group=AsyncMock(return_value=fake_client),
+    )
+
+    monkeypatch.setattr(srv, 'graphiti_service', fake_service)
+
+    response = await srv.search_memory_facts(
+        query='pattern evidence',
+        group_ids=['ontbk15batch_20260310_om_e'],
+        max_facts=5,
+    )
+
+    assert response['message'] == 'Facts retrieved successfully'
+    assert len(response['facts']) == 1
+    assert response['facts'][0]['uuid'] == 'edge-exp-e-1'
+    assert response['facts'][0]['group_id'] == 'ontbk15batch_20260310_om_e'
+    fake_client.driver.execute_query.assert_awaited_once()
+    fake_client.search_.assert_awaited_once()
 
 
 @pytest.mark.asyncio

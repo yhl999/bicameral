@@ -198,11 +198,14 @@ bakeoff groups (for example `ontbk15batch_20260310_om_f`).
 ### Scope and safety
 
 - OM results are only returned when lane scope includes
-  `s1_observational_memory`.
+  `s1_observational_memory` or an explicit experimental OM-native group.
 - OM adapter path is gated to Neo4j only.
 - Non-OM lane searches continue through the existing Graphiti search path.
-- OM adapter failures are fail-closed in OM-only scope (returns empty), while
-  mixed/all-lane requests continue to return Graphiti results.
+- Canonical `s1_observational_memory` remains fail-closed on OM adapter misses.
+- Single explicit experimental OM-native scopes probe the OM adapter first, but
+  fall back to Graphiti retrieval when the OM path returns no rows.
+- Mixed/all-lane requests continue to return Graphiti results even if OM
+  adapter lookup fails.
 
 ### Fusion behavior (mixed/all-lane)
 

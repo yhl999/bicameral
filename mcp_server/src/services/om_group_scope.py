@@ -2,6 +2,11 @@
 
 Patch 1 keeps the retrieval adapter architecture but expands activation from the
 canonical OM lane to explicit experimental groups that are still OM-native.
+
+Important distinction:
+- canonical `s1_observational_memory` remains a strict OM-only scope
+- explicit experimental `_om_` groups may probe the OM adapter first, but they
+  can safely fall back to Graphiti retrieval when no OM primitives are found
 """
 
 from __future__ import annotations
@@ -36,11 +41,18 @@ def _looks_like_experimental_om_native_group(group_id: str) -> bool:
     return any(index > 0 and index < len(tokens) - 1 and token == 'om' for index, token in enumerate(tokens))
 
 
+def is_canonical_om_group_id(group_id: str | None, *, default_group_id: str = DEFAULT_OM_GROUP_ID) -> bool:
+    normalized = _normalize_group_id(group_id)
+    if not normalized:
+        return False
+    return normalized == _normalize_group_id(default_group_id)
+
+
 def is_om_native_group_id(group_id: str | None, *, default_group_id: str = DEFAULT_OM_GROUP_ID) -> bool:
     normalized = _normalize_group_id(group_id)
     if not normalized:
         return False
-    if normalized == default_group_id:
+    if is_canonical_om_group_id(normalized, default_group_id=default_group_id):
         return True
     return _looks_like_experimental_om_native_group(normalized)
 
@@ -82,4 +94,27 @@ def om_native_groups_in_scope(group_ids: list[str], *, default_group_id: str = D
 
 
 def is_om_native_only_scope(group_ids: list[str], *, default_group_id: str = DEFAULT_OM_GROUP_ID) -> bool:
+    """Whether the request targets a single OM-native scope.
+
+    This includes both the canonical OM lane and explicit experimental OM-native
+    groups. Use ``requires_strict_om_native_only_scope`` when the caller needs
+    to know whether OM misses should fail closed instead of falling back.
+    """
+
     return len(group_ids) == 1 and is_om_native_group_id(group_ids[0], default_group_id=default_group_id)
+
+
+def requires_strict_om_native_only_scope(
+    group_ids: list[str], *, default_group_id: str = DEFAULT_OM_GROUP_ID
+) -> bool:
+    """Return True only for the canonical OM lane fail-closed scope.
+
+    Experimental OM-native groups are adapter-eligible, but they do not fail
+    closed when the OM path returns zero rows; those scopes may continue to the
+    normal Graphiti retrieval path.
+    """
+
+    return len(group_ids) == 1 and is_canonical_om_group_id(
+        group_ids[0],
+        default_group_id=default_group_id,
+    )

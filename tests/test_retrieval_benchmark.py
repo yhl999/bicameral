@@ -11,10 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.run_retrieval_benchmark import (
     FIXTURE_QUOTAS,
+    _query_scope_group_ids,
     check_recall_gate,
     compute_recall,
     validate_fixture,
-    _query_scope_group_ids,
 )
 
 

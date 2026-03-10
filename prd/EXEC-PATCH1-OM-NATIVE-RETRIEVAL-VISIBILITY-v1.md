@@ -7,7 +7,8 @@ Rescue retrieval visibility for OM-native experimental groups without implementi
 - Keep the existing OM adapter architecture.
 - Expand OM adapter scoping from canonical `s1_observational_memory` to OM-native experimental groups.
 - Let benchmark tooling override fixture scope with direct group IDs / lane aliases for bakeoffs.
-- Preserve canonical OM behavior, mixed-lane fusion, and fail-closed semantics.
+- Preserve canonical OM behavior and mixed-lane fusion.
+- Keep fail-closed semantics only for canonical `s1_observational_memory`; let explicit experimental OM groups fall back to Graphiti retrieval when the OM adapter returns no hits.
 
 ## Non-Goals
 - No OMNode → Entity/Episodic conversion.
@@ -28,12 +29,15 @@ Rescue retrieval visibility for OM-native experimental groups without implementi
 - Add a single OM-native group-scope helper so retrieval-side recognition is centralized.
 - Treat canonical `s1_observational_memory` plus explicit experimental `_om_` groups as OM-native.
 - Preserve all-lanes (`[]`) behavior by probing only the canonical OM lane unless callers explicitly target an experimental OM-native group.
+- Keep canonical OM lane requests fail-closed, but allow single explicit experimental OM groups to fall back to Graphiti retrieval when OM primitive search returns zero rows.
 - Add benchmark CLI scope overrides so bakeoffs can target arbitrary OM-native groups without editing fixture rows.
 
 ## DoD
 - [ ] `search_nodes(... group_ids=["ontbk15batch_20260310_om_f"])` can enter the OM adapter path.
 - [ ] `search_memory_facts(... group_ids=["ontbk15batch_20260310_om_f"])` can enter the OM adapter path.
 - [ ] Canonical `s1_observational_memory` behavior remains unchanged.
+- [ ] Explicit experimental OM groups with OM primitive hits still return through the OM adapter path.
+- [ ] Explicit experimental OM groups without OM primitive hits fall back to Graphiti retrieval instead of failing closed.
 - [ ] Mixed-lane fusion still works.
 - [ ] Benchmark harness supports direct group / alias override for OM bakeoffs.
 - [ ] Focused regression tests pass.
