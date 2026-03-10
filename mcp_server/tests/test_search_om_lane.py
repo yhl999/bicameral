@@ -103,9 +103,16 @@ async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pyte
             'source_node_id': 'om-node-1',
             'target_node_id': 'om-node-2',
             'created_at': '2026-03-01T13:00:00Z',
+            'valid_at': '2026-03-01T13:00:00Z',
+            'invalid_at': '2026-03-02T09:00:00Z',
             'group_id': 's1_observational_memory',
             'source_content': 'Investigate latency spike.',
             'target_content': 'Latency incident closed.',
+            'relation_properties': {
+                'relation_root_id': 'omrelroot:abc123',
+                'lineage_parent_relation_id': 'om-rel-0',
+                'lifecycle_status': 'invalidated',
+            },
             'lexical_score': 2,
         }
     ]
@@ -133,7 +140,14 @@ async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pyte
     assert response['facts'][0]['uuid'] == 'om-rel-1'
     assert response['facts'][0]['name'] == 'RESOLVES'
     assert response['facts'][0]['group_id'] == 's1_observational_memory'
+    assert response['facts'][0]['valid_at'] == '2026-03-01T13:00:00Z'
+    assert response['facts'][0]['invalid_at'] == '2026-03-02T09:00:00Z'
     assert response['facts'][0]['attributes']['source'] == 'om_primitive'
+    assert response['facts'][0]['attributes']['relation_properties'] == {
+        'relation_root_id': 'omrelroot:abc123',
+        'lineage_parent_relation_id': 'om-rel-0',
+        'lifecycle_status': 'invalidated',
+    }
     fake_client.search_.assert_not_called()
     fake_client.driver.execute_query.assert_awaited()
 
