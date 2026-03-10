@@ -235,6 +235,48 @@ bakeoff groups (for example `ontbk15batch_20260310_om_f`).
     `center_node_uuid` is provided; with center node, a bounded neighborhood
     query is used.
 
+### Typed retrieval history semantics
+
+OM typed retrieval is now history-aware across the shared typed contract rather
+than only projecting the narrow linear `SUPERSEDES` happy path.
+
+- **Node history**
+  - Every matched OM node is expanded to its connected `SUPERSEDES` component.
+  - Linear chains preserve ordinary typed lineage fields (`root_id`,
+    `parent_id`, `version`, `superseded_by`, `invalid_at`).
+  - Branching and cyclic components are still projected, but they are marked as
+    ambiguous instead of being flattened into a fake chain.
+  - Episode annotations expose the historical topology and ordering strategy:
+    `history_topology:*`, `history_ordering:*`, predecessor/successor counts,
+    and `history_ambiguous` when the graph is not linear.
+
+- **Closure / currentness**
+  - Incoming `SUPERSEDES` and `RESOLVES` edges are treated as closure evidence
+    for OM episodes.
+  - That means `query_mode=current` can honestly filter superseded or resolved
+    OM nodes instead of returning stale snapshots as if they were live.
+
+- **Relation / state history**
+  - OM relations are projected as typed `StateFact` objects with deterministic
+    provenance back to OM relation IDs and endpoint node IDs.
+  - Historical relation lineages are grouped by relation type plus source/target
+    history anchors.
+  - When a newer relation in the same lineage appears, the prior typed state is
+    marked `superseded`; when an endpoint node is closed/resolved, the relation
+    state is marked `invalidated`.
+  - The derived relation-history basis is carried in `value.om_history` so the
+    projection is explicit about what is inferred versus directly asserted.
+
+- **Query modes**
+  - `history` expands matched OM roots/components and returns historical typed
+    objects for the full lineage/component.
+  - `current` returns only currently-valid OM typed objects.
+  - `all` keeps normal ranked retrieval semantics, but the returned OM objects
+    still carry honest `is_current` / `invalid_at` history state.
+
+This keeps OM native at the storage layer while making supersession-aware typed
+answers operational without lying about branching or malformed topologies.
+
 ---
 
 ## 2. Compressor

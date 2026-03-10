@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from mcp_server.src.models.typed_memory import Episode, EvidenceRef, StateFact
 from mcp_server.src.services.change_ledger import ChangeLedger
+from mcp_server.src.services.om_typed_projection import OMTypedProjectionService
 from mcp_server.src.services.typed_retrieval import ScoredObject, TypedRetrievalService
 
 
@@ -612,3 +613,151 @@ def test_om_projection_experimental_group_surfaces_through_typed_buckets():
 
     assert response['counts']['state'] == 1
     assert response['state'][0]['source_lane'] == 'ontbk15batch_20260310_om_f'
+
+
+class _HistoryAwareSearchService:
+    def __init__(self, *, node_rows=None, fact_rows=None, neighborhood_rows=None):
+        self.node_rows = node_rows or []
+        self.fact_rows = fact_rows or []
+        self.neighborhood_rows = neighborhood_rows or {}
+
+    def includes_observational_memory(self, group_ids):
+        return True
+
+    def _om_groups_in_scope(self, group_ids):
+        return list(group_ids or ['s1_observational_memory'])
+
+    async def search_observational_nodes(self, **_kwargs):
+        return list(self.node_rows)
+
+    async def search_observational_facts(self, *, center_node_uuid=None, **_kwargs):
+        if center_node_uuid is not None:
+            return list(self.neighborhood_rows.get(center_node_uuid, []))
+        return list(self.fact_rows)
+
+
+class _HistoryAwareDriver:
+    def __init__(self, records_by_seed=None):
+        self.records_by_seed = records_by_seed or {}
+
+    async def execute_query(self, _query, **params):
+        return list(self.records_by_seed.get(params.get('seed_node_id'), [])), None, None
+
+
+class _HistoryAwareGraphitiService:
+    class config:
+        class database:
+            provider = 'neo4j'
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    async def get_client(self):
+        return SimpleNamespace(driver=self.driver)
+
+
+def test_real_om_projection_distinguishes_history_current_and_all_modes():
+    search_service = _HistoryAwareSearchService(
+        node_rows=[
+            {
+                'uuid': 'drink_v2',
+                'name': 'Current drink',
+                'summary': 'espresso after training',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-09T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            }
+        ]
+    )
+    driver = _HistoryAwareDriver(
+        records_by_seed={
+            'drink_v2': [
+                {
+                    'node_id': 'drink_v1',
+                    'uuid': 'drink_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'coffee before training',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'drink_v2',
+                    'uuid': 'drink_v2',
+                    'group_id': 's1_observational_memory',
+                    'content': 'espresso after training',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [
+                        {
+                            'target_id': 'drink_v1',
+                            'created_at': '2026-03-09T00:00:00Z',
+                            'relation_uuid': 'rel_drink_v2_v1',
+                        }
+                    ],
+                },
+            ]
+        }
+    )
+    projection = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_HistoryAwareGraphitiService(driver),
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    all_response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='all',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+    current_response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='current',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+    history_response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='history',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert all_response['query_mode'] == 'all'
+    assert [item['object_id'] for item in all_response['episodes']] == [
+        'om_episode:s1_observational_memory:drink_v2',
+    ]
+
+    assert current_response['query_mode'] == 'current'
+    assert [item['object_id'] for item in current_response['episodes']] == [
+        'om_episode:s1_observational_memory:drink_v2',
+    ]
+
+    assert history_response['query_mode'] == 'history'
+    assert [item['object_id'] for item in history_response['episodes']] == [
+        'om_episode:s1_observational_memory:drink_v2',
+        'om_episode:s1_observational_memory:drink_v1',
+    ]
+    assert history_response['episodes'][1]['is_current'] is False
+    assert history_response['episodes'][1]['invalid_at'] == '2026-03-09T00:00:00Z'
+    assert history_response['limits_applied']['materialization']['om_projection']['history_lineages_projected'] == 1
