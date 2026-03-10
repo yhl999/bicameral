@@ -56,6 +56,7 @@ DEAD_LETTER_ATTEMPTS = 3
 DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
 DEFAULT_EMBEDDING_DIM = 768
 DEFAULT_OM_GROUP_ID = "s1_observational_memory"
+_MAX_SUPERSEDES_HOPS = 32
 
 CLAIM_STATUS_PENDING = "pending"
 CLAIM_STATUS_CLAIMED = "claimed"
@@ -2433,6 +2434,179 @@ def _derive_node_timestamps(
     return fmt(min(src_timestamps)), fmt(max(src_timestamps))
 
 
+def _canonical_node_created_at(*, first_observed_at: str | None, fallback_created_at: str) -> str:
+    return first_observed_at or fallback_created_at
+
+
+def _canonical_node_valid_at(*, first_observed_at: str | None, created_at: str) -> str:
+    return first_observed_at or created_at
+
+
+def _relation_uuid(*, group_id: str, relation_type: str, source_node_id: str, target_node_id: str) -> str:
+    digest = sha256_hex(f"{group_id}|{relation_type}|{source_node_id}|{target_node_id}")[:32]
+    return f"omrel:{digest}"
+
+
+def _derive_edge_valid_at(
+    edge: ExtractionEdge,
+    *,
+    node_by_id: dict[str, ExtractionNode],
+    msg_by_id: dict[str, MessageRow],
+    fallback_valid_at: str,
+) -> str:
+    timestamps: list[datetime] = []
+    for node_id in (edge.source_node_id, edge.target_node_id):
+        node = node_by_id.get(node_id)
+        if node is None:
+            continue
+        for message_id in node.source_message_ids:
+            message = msg_by_id.get(message_id)
+            if message is None:
+                continue
+            ts = parse_iso(message.created_at)
+            if ts is not None:
+                timestamps.append(ts)
+
+    if not timestamps:
+        return fallback_valid_at
+
+    return max(timestamps).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _apply_node_supersession_lifecycle(
+    tx: Any,
+    *,
+    older_node_id: str,
+    newer_node_id: str,
+    valid_at: str,
+) -> None:
+    tx.run(
+        """
+        MATCH (older:OMNode {node_id:$older_node_id})
+        MATCH (newer:OMNode {node_id:$newer_node_id})
+        WITH older,
+             newer,
+             coalesce(older.lineage_root_id, older.node_id, $older_node_id) AS lineage_root_id,
+             older.superseded_by_node_id AS prior_successor
+        SET newer.lineage_root_id = lineage_root_id,
+            newer.lineage_parent_id = $older_node_id,
+            newer.valid_at = coalesce(newer.valid_at, newer.first_observed_at, newer.created_at, $valid_at),
+            newer.invalid_at = NULL,
+            newer.superseded_at = NULL,
+            newer.superseded_by_node_id = NULL,
+            newer.lifecycle_status = coalesce(newer.lifecycle_status, 'asserted'),
+            newer.transition_cause = coalesce(newer.transition_cause, 'node_asserted'),
+            newer.lineage_basis = 'native_supersedes_edge',
+            older.lineage_root_id = lineage_root_id,
+            older.invalid_at = CASE
+              WHEN older.invalid_at IS NULL THEN $valid_at
+              WHEN $valid_at < older.invalid_at THEN $valid_at
+              ELSE older.invalid_at
+            END,
+            older.superseded_at = CASE
+              WHEN older.superseded_at IS NULL THEN $valid_at
+              WHEN $valid_at < older.superseded_at THEN $valid_at
+              ELSE older.superseded_at
+            END,
+            older.superseded_by_node_id = CASE
+              WHEN prior_successor IS NULL OR prior_successor = $newer_node_id THEN $newer_node_id
+              ELSE NULL
+            END,
+            older.lifecycle_status = 'superseded',
+            older.transition_cause = 'superseded_by_newer_node',
+            older.lineage_basis = 'native_supersedes_edge',
+            older.supersession_topology = CASE
+              WHEN prior_successor IS NULL OR prior_successor = $newer_node_id THEN 'linear'
+              ELSE 'branching'
+            END,
+            older.lineage_limit_reason = CASE
+              WHEN prior_successor IS NULL OR prior_successor = $newer_node_id THEN older.lineage_limit_reason
+              ELSE 'multiple_successors'
+            END
+        """,
+        {
+            "older_node_id": older_node_id,
+            "newer_node_id": newer_node_id,
+            "valid_at": valid_at,
+        },
+    ).consume()
+
+
+def _apply_relation_supersession_if_supported(
+    tx: Any,
+    *,
+    relation_type: str,
+    group_id: str,
+    source_node_id: str,
+    target_node_id: str,
+    relation_uuid: str,
+    valid_at: str,
+) -> None:
+    rel = _validated_relation_type_for_cypher(relation_type)
+    tx.run(
+        f"""
+        MATCH (new_source:OMNode {{node_id:$source_node_id}})
+        MATCH (new_target:OMNode {{node_id:$target_node_id}})
+        MATCH (new_source)-[new_rel:{rel} {{uuid:$relation_uuid}}]->(new_target)
+        OPTIONAL MATCH (new_source)-[:SUPERSEDES*1..{_MAX_SUPERSEDES_HOPS}]->(old_source:OMNode)-[old_rel:{rel}]->(old_target:OMNode)
+        WHERE coalesce(old_rel.group_id, $group_id) = $group_id
+          AND old_rel.invalid_at IS NULL
+          AND (
+            old_target.node_id = $target_node_id
+            OR EXISTS {{ MATCH (new_target)-[:SUPERSEDES*1..{_MAX_SUPERSEDES_HOPS}]->(old_target) }}
+          )
+        WITH new_rel,
+             collect(DISTINCT old_rel) AS predecessor_rels,
+             collect(DISTINCT coalesce(old_rel.relation_root_id, old_rel.uuid)) AS predecessor_roots
+        WITH new_rel,
+             predecessor_rels,
+             [root_id IN predecessor_roots WHERE root_id IS NOT NULL AND root_id <> ''] AS usable_roots
+        SET new_rel.predecessor_relation_count = size(predecessor_rels),
+            new_rel.relation_root_id = CASE
+              WHEN size(predecessor_rels) = 1 AND size(usable_roots) > 0 THEN usable_roots[0]
+              ELSE coalesce(new_rel.relation_root_id, new_rel.uuid)
+            END,
+            new_rel.lineage_parent_relation_id = CASE
+              WHEN size(predecessor_rels) = 1 THEN predecessor_rels[0].uuid
+              ELSE NULL
+            END,
+            new_rel.lineage_basis = CASE
+              WHEN size(predecessor_rels) = 1 THEN 'endpoint_supersession'
+              WHEN size(predecessor_rels) > 1 THEN 'ambiguous_endpoint_supersession'
+              ELSE coalesce(new_rel.lineage_basis, 'singleton_native')
+            END,
+            new_rel.lineage_topology = CASE
+              WHEN size(predecessor_rels) > 1 THEN 'branching'
+              ELSE coalesce(new_rel.lineage_topology, 'singleton')
+            END,
+            new_rel.lineage_limit_reason = CASE
+              WHEN size(predecessor_rels) > 1 THEN 'ambiguous_predecessor_relations'
+              ELSE new_rel.lineage_limit_reason
+            END
+        FOREACH (old_rel IN CASE WHEN size(predecessor_rels) = 1 THEN predecessor_rels ELSE [] END |
+          SET old_rel.invalid_at = CASE
+                WHEN old_rel.invalid_at IS NULL THEN $valid_at
+                WHEN $valid_at < old_rel.invalid_at THEN $valid_at
+                ELSE old_rel.invalid_at
+              END,
+              old_rel.lifecycle_status = 'superseded',
+              old_rel.superseded_by_relation_id = $relation_uuid,
+              old_rel.transition_cause = 'relation_replaced_by_endpoint_supersession',
+              old_rel.transition_basis = 'native_endpoint_lineage',
+              old_rel.lineage_topology = coalesce(old_rel.lineage_topology, 'linear'),
+              old_rel.lineage_basis = coalesce(old_rel.lineage_basis, 'endpoint_supersession')
+        )
+        """,
+        {
+            "group_id": group_id,
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
+            "relation_uuid": relation_uuid,
+            "valid_at": valid_at,
+        },
+    ).consume()
+
+
 def _process_chunk_tx(
     tx: Any,
     *,
@@ -2451,6 +2625,7 @@ def _process_chunk_tx(
 
     # Build message lookup for timeline derivation (B: timeline semantics fix)
     msg_by_id: dict[str, MessageRow] = {m.message_id: m for m in messages}
+    node_by_id: dict[str, ExtractionNode] = {node.node_id: node for node in ranked_nodes}
 
     node_ids: set[str] = set()
 
@@ -2477,6 +2652,14 @@ def _process_chunk_tx(
 
         # Derive event-time timestamps from source messages (B: timeline semantics)
         first_observed_at, last_observed_at = _derive_node_timestamps(node, msg_by_id)
+        canonical_created_at = _canonical_node_created_at(
+            first_observed_at=first_observed_at,
+            fallback_created_at=now,
+        )
+        canonical_valid_at = _canonical_node_valid_at(
+            first_observed_at=first_observed_at,
+            created_at=canonical_created_at,
+        )
 
         tx.run(
             """
@@ -2494,6 +2677,18 @@ def _process_chunk_tx(
               n.source_session_id = $source_session_id,
               n.source_message_ids = $source_message_ids,
               n.created_at = $created_at,
+              n.valid_at = $valid_at,
+              n.invalid_at = NULL,
+              n.lifecycle_status = 'asserted',
+              n.lineage_root_id = $node_id,
+              n.lineage_parent_id = NULL,
+              n.superseded_by_node_id = NULL,
+              n.superseded_at = NULL,
+              n.closed_at = NULL,
+              n.abandoned_at = NULL,
+              n.reopened_at = NULL,
+              n.transition_cause = 'node_asserted',
+              n.lineage_basis = 'singleton_native',
               n.status_changed_at = $created_at,
               n.first_observed_at = $first_observed_at,
               n.last_observed_at = $last_observed_at,
@@ -2504,6 +2699,19 @@ def _process_chunk_tx(
                 WHEN n.source_message_ids IS NULL THEN $source_message_ids
                 ELSE n.source_message_ids
               END,
+              n.created_at = CASE
+                WHEN n.created_at IS NULL THEN $created_at
+                WHEN $created_at < n.created_at THEN $created_at
+                ELSE n.created_at
+              END,
+              n.valid_at = CASE
+                WHEN n.valid_at IS NULL THEN $valid_at
+                WHEN $valid_at < n.valid_at THEN $valid_at
+                ELSE n.valid_at
+              END,
+              n.lifecycle_status = coalesce(n.lifecycle_status, 'asserted'),
+              n.lineage_root_id = coalesce(n.lineage_root_id, $node_id),
+              n.lineage_basis = coalesce(n.lineage_basis, 'singleton_native'),
               n.first_observed_at = CASE
                 WHEN n.first_observed_at IS NULL THEN $first_observed_at
                 WHEN $first_observed_at IS NOT NULL AND $first_observed_at < n.first_observed_at
@@ -2528,7 +2736,8 @@ def _process_chunk_tx(
                 "status": node.status,
                 "source_session_id": node.source_session_id,
                 "source_message_ids": node.source_message_ids,
-                "created_at": now,
+                "created_at": canonical_created_at,
+                "valid_at": canonical_valid_at,
                 "embedding_model": embedding_model,
                 "embedding_dim": embedding_dim,
                 "first_observed_at": first_observed_at,
@@ -2568,28 +2777,97 @@ def _process_chunk_tx(
             continue
         rel = _validated_relation_type_for_cypher(edge.relation_type)
         rel = _assert_relation_type_safe_for_interpolation(rel, edge)
+        relation_uuid = _relation_uuid(
+            group_id=group_id,
+            relation_type=rel,
+            source_node_id=edge.source_node_id,
+            target_node_id=edge.target_node_id,
+        )
+        edge_valid_at = _derive_edge_valid_at(
+            edge,
+            node_by_id=node_by_id,
+            msg_by_id=msg_by_id,
+            fallback_valid_at=now,
+        )
         tx.run(
             f"""
             MATCH (s:OMNode {{node_id:$source_node_id}})
             MATCH (t:OMNode {{node_id:$target_node_id}})
             MERGE (s)-[r:{rel}]->(t)
             ON CREATE SET
+              r.uuid = $relation_uuid,
+              r.relation_id = $relation_uuid,
+              r.relation_root_id = $relation_uuid,
               r.group_id = $group_id,
+              r.created_at = $valid_at,
+              r.valid_at = $valid_at,
               r.linked_at = $linked_at,
               r.chunk_id = $chunk_id,
-              r.extractor_version = $extractor_version
+              r.extractor_version = $extractor_version,
+              r.lifecycle_status = 'asserted',
+              r.transition_cause = 'relation_asserted',
+              r.transition_basis = 'chunk_assertion',
+              r.lineage_basis = 'singleton_native',
+              r.lineage_topology = 'singleton',
+              r.lineage_limit_reason = NULL,
+              r.lineage_parent_relation_id = NULL,
+              r.superseded_by_relation_id = NULL,
+              r.invalidated_by_node_id = NULL,
+              r.source_lineage_root_id = coalesce(s.lineage_root_id, s.node_id),
+              r.target_lineage_root_id = coalesce(t.lineage_root_id, t.node_id),
+              r.source_node_id = coalesce(s.node_id, $source_node_id),
+              r.target_node_id = coalesce(t.node_id, $target_node_id)
             ON MATCH SET
-              r.group_id = coalesce(r.group_id, $group_id)
+              r.uuid = coalesce(r.uuid, $relation_uuid),
+              r.relation_id = coalesce(r.relation_id, $relation_uuid),
+              r.relation_root_id = coalesce(r.relation_root_id, coalesce(r.uuid, $relation_uuid)),
+              r.group_id = coalesce(r.group_id, $group_id),
+              r.created_at = coalesce(r.created_at, $valid_at),
+              r.valid_at = CASE
+                WHEN r.valid_at IS NULL THEN $valid_at
+                WHEN $valid_at < r.valid_at THEN $valid_at
+                ELSE r.valid_at
+              END,
+              r.lifecycle_status = CASE
+                WHEN r.invalid_at IS NULL THEN coalesce(r.lifecycle_status, 'asserted')
+                ELSE r.lifecycle_status
+              END,
+              r.lineage_basis = coalesce(r.lineage_basis, 'singleton_native'),
+              r.lineage_topology = coalesce(r.lineage_topology, 'singleton'),
+              r.source_lineage_root_id = coalesce(r.source_lineage_root_id, s.lineage_root_id, s.node_id),
+              r.target_lineage_root_id = coalesce(r.target_lineage_root_id, t.lineage_root_id, t.node_id),
+              r.source_node_id = coalesce(r.source_node_id, s.node_id, $source_node_id),
+              r.target_node_id = coalesce(r.target_node_id, t.node_id, $target_node_id)
             """,
             {
                 "source_node_id": edge.source_node_id,
                 "target_node_id": edge.target_node_id,
                 "group_id": group_id,
+                "relation_uuid": relation_uuid,
+                "valid_at": edge_valid_at,
                 "linked_at": now,
                 "chunk_id": chunk_id,
                 "extractor_version": cfg.extractor_version,
             },
         ).consume()
+
+        if rel == 'SUPERSEDES':
+            _apply_node_supersession_lifecycle(
+                tx,
+                older_node_id=edge.target_node_id,
+                newer_node_id=edge.source_node_id,
+                valid_at=edge_valid_at,
+            )
+        else:
+            _apply_relation_supersession_if_supported(
+                tx,
+                relation_type=rel,
+                group_id=group_id,
+                source_node_id=edge.source_node_id,
+                target_node_id=edge.target_node_id,
+                relation_uuid=relation_uuid,
+                valid_at=edge_valid_at,
+            )
 
     for node in ranked_nodes:
         for message_id in node.source_message_ids:

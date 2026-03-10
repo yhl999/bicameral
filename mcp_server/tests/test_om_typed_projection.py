@@ -941,3 +941,229 @@ async def test_non_history_projection_keeps_currentness_semantics_for_current_an
     }
     assert limits['reason'] == 'projected'
     assert limits['history_mode'] is False
+
+
+@pytest.mark.anyio
+async def test_history_projection_prefers_native_node_lifecycle_truth() -> None:
+    search_service = _FakeSearchService(
+        node_rows=[
+            {
+                'uuid': 'issue_1',
+                'name': 'Latency issue',
+                'summary': 'Latency issue',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-01T00:00:00Z',
+                'attributes': {'status': 'closed', 'semantic_domain': 'observational_memory'},
+            }
+        ]
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Latency issue',
+                    'valid_at': '2026-03-01T00:00:00Z',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'invalid_at': '2026-03-07T00:00:00Z',
+                    'lifecycle_status': 'invalidated',
+                    'status': 'closed',
+                    'previous_status': 'monitoring',
+                    'transition_cause': 'closed_by_convergence',
+                    'semantic_domain': 'observational_memory',
+                    'lineage_root_id': 'issue_1',
+                    'lineage_parent_id': '',
+                    'superseded_by_node_id': '',
+                    'supersedes': [],
+                }
+            ]
+        }
+    )
+    service = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_FakeGraphitiService(driver),
+    )
+
+    objects, _, limits = await service.project(
+        query='latency issue',
+        effective_group_ids=['s1_observational_memory'],
+        object_types={'episode'},
+        max_results=5,
+        query_mode='history',
+    )
+
+    assert len(objects) == 1
+    episode = objects[0]
+    assert isinstance(episode, Episode)
+    assert episode.object_id == 'om_episode:s1_observational_memory:issue_1'
+    assert episode.root_id == 'om_episode:s1_observational_memory:issue_1'
+    assert episode.valid_at == '2026-03-01T00:00:00Z'
+    assert episode.invalid_at == '2026-03-07T00:00:00Z'
+    assert episode.is_current is False
+    assert episode.lifecycle_status == 'invalidated'
+    assert episode.history_meta['lineage_basis'] == 'native_node_lifecycle'
+    assert episode.history_meta['transition_reason'] == 'closed_by_convergence'
+    assert limits['history_lineages_projected'] == 1
+
+
+@pytest.mark.anyio
+async def test_history_projection_prefers_native_relation_lineage_truth() -> None:
+    search_service = _FakeSearchService(
+        node_rows=[
+            {
+                'uuid': 'plan_v2',
+                'name': 'Current plan',
+                'summary': 'Ship cache fix with retry guard',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-05T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            }
+        ],
+        fact_rows=[
+            {
+                'uuid': 'rel_old',
+                'name': 'ADDRESSES',
+                'fact': 'ADDRESSES: old plan -> latency issue',
+                'group_id': 's1_observational_memory',
+                'source_node_uuid': 'plan_v1',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-02T00:00:00Z',
+                'valid_at': '2026-03-02T00:00:00Z',
+                'invalid_at': '2026-03-05T00:00:00Z',
+                'attributes': {
+                    'source_content': 'Ship cache fix',
+                    'target_content': 'Latency issue',
+                    'relation_properties': {
+                        'relation_root_id': 'rel_old',
+                        'superseded_by_relation_id': 'rel_new',
+                        'lifecycle_status': 'superseded',
+                        'transition_cause': 'relation_replaced_by_endpoint_supersession',
+                        'transition_basis': 'native_endpoint_lineage',
+                        'lineage_basis': 'endpoint_supersession',
+                        'lineage_topology': 'linear',
+                    },
+                },
+            },
+            {
+                'uuid': 'rel_new',
+                'name': 'ADDRESSES',
+                'fact': 'ADDRESSES: new plan -> latency issue',
+                'group_id': 's1_observational_memory',
+                'source_node_uuid': 'plan_v2',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-05T00:00:00Z',
+                'valid_at': '2026-03-05T00:00:00Z',
+                'attributes': {
+                    'source_content': 'Ship cache fix with retry guard',
+                    'target_content': 'Latency issue',
+                    'relation_properties': {
+                        'relation_root_id': 'rel_old',
+                        'lineage_parent_relation_id': 'rel_old',
+                        'lifecycle_status': 'asserted',
+                        'transition_cause': 'relation_asserted',
+                        'transition_basis': 'chunk_assertion',
+                        'lineage_basis': 'endpoint_supersession',
+                        'lineage_topology': 'linear',
+                    },
+                },
+            },
+        ],
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'plan_v2': [
+                {
+                    'node_id': 'plan_v1',
+                    'uuid': 'plan_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Ship cache fix',
+                    'valid_at': '2026-03-02T00:00:00Z',
+                    'created_at': '2026-03-02T00:00:00Z',
+                    'invalid_at': '2026-03-05T00:00:00Z',
+                    'lifecycle_status': 'superseded',
+                    'status': 'open',
+                    'previous_status': '',
+                    'transition_cause': 'superseded_by_newer_node',
+                    'semantic_domain': 'observational_memory',
+                    'lineage_root_id': 'plan_v1',
+                    'lineage_parent_id': '',
+                    'superseded_by_node_id': 'plan_v2',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'plan_v2',
+                    'uuid': 'plan_v2',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Ship cache fix with retry guard',
+                    'valid_at': '2026-03-05T00:00:00Z',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'invalid_at': None,
+                    'lifecycle_status': 'asserted',
+                    'status': 'open',
+                    'previous_status': '',
+                    'transition_cause': 'node_asserted',
+                    'semantic_domain': 'observational_memory',
+                    'lineage_root_id': 'plan_v1',
+                    'lineage_parent_id': 'plan_v1',
+                    'superseded_by_node_id': '',
+                    'supersedes': [
+                        {
+                            'target_id': 'plan_v1',
+                            'created_at': '2026-03-05T00:00:00Z',
+                            'relation_uuid': 'rel_plan_v2_v1',
+                        }
+                    ],
+                },
+            ],
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Latency issue',
+                    'valid_at': '2026-03-01T00:00:00Z',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'invalid_at': None,
+                    'lifecycle_status': 'asserted',
+                    'status': 'open',
+                    'previous_status': '',
+                    'transition_cause': 'node_asserted',
+                    'semantic_domain': 'observational_memory',
+                    'lineage_root_id': 'issue_1',
+                    'lineage_parent_id': '',
+                    'superseded_by_node_id': '',
+                    'supersedes': [],
+                }
+            ],
+        }
+    )
+    service = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_FakeGraphitiService(driver),
+    )
+
+    objects, _, limits = await service.project(
+        query='cache fix',
+        effective_group_ids=['s1_observational_memory'],
+        object_types={'state_fact'},
+        max_results=5,
+        query_mode='history',
+    )
+
+    assert len(objects) == 2
+    assert all(isinstance(obj, StateFact) for obj in objects)
+    by_id = {obj.object_id: obj for obj in objects}
+    old_state = by_id['om_state:s1_observational_memory:rel_old']
+    new_state = by_id['om_state:s1_observational_memory:rel_new']
+
+    assert old_state.root_id == 'om_state:s1_observational_memory:rel_old'
+    assert old_state.superseded_by == 'om_state:s1_observational_memory:rel_new'
+    assert old_state.lifecycle_status == 'superseded'
+    assert old_state.history_meta['lineage_basis'] == 'endpoint_supersession'
+    assert old_state.history_meta['derivation_level'] == 'native'
+    assert new_state.root_id == 'om_state:s1_observational_memory:rel_old'
+    assert new_state.parent_id == 'om_state:s1_observational_memory:rel_old'
+    assert new_state.is_current is True
+    assert limits['history_relation_lineages_projected'] == 1

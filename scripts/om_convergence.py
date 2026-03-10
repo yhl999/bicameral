@@ -453,6 +453,33 @@ def _has_fresh_addresses(session: Any, node_id: str, since_iso: str, now_utc: st
     return bool(row and row["has_fresh"])
 
 
+def _invalidate_relation_lifecycle_for_closed_node(
+    session: Any,
+    *,
+    node_id: str,
+    now_utc: str,
+    transition_cause: str,
+) -> None:
+    session.run(
+        """
+        MATCH (source:OMNode)-[r:ADDRESSES]->(target:OMNode {node_id:$node_id})
+        WHERE r.invalid_at IS NULL
+        SET r.invalid_at = $now_iso,
+            r.lifecycle_status = CASE
+              WHEN coalesce(r.superseded_by_relation_id, '') <> '' THEN 'superseded'
+              ELSE 'invalidated'
+            END,
+            r.transition_cause = $transition_cause,
+            r.transition_basis = 'node_status_transition',
+            r.invalidated_by_node_id = $node_id,
+            r.relation_root_id = coalesce(r.relation_root_id, r.uuid),
+            r.lineage_basis = coalesce(r.lineage_basis, 'singleton_native'),
+            r.lineage_topology = coalesce(r.lineage_topology, 'singleton')
+        """,
+        {"node_id": node_id, "now_iso": now_utc, "transition_cause": transition_cause},
+    ).consume()
+
+
 def _apply_transition(
     session: Any,
     *,
@@ -465,9 +492,66 @@ def _apply_transition(
         session.run(
             """
             MATCH (n:OMNode {node_id:$node_id})
-            SET n.status = $target_status,
+            SET n.previous_status = n.status,
+                n.previous_status_changed_at = n.status_changed_at,
+                n.status = $target_status,
                 n.status_changed_at = $now_iso,
-                n.monitoring_started_at = $now_iso
+                n.monitoring_started_at = $now_iso,
+                n.invalid_at = NULL,
+                n.lifecycle_status = 'asserted',
+                n.transition_cause = 'entered_monitoring'
+            """,
+            {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
+        ).consume()
+    elif target_status == "reopened":
+        session.run(
+            """
+            MATCH (n:OMNode {node_id:$node_id})
+            SET n.previous_status = n.status,
+                n.previous_status_changed_at = n.status_changed_at,
+                n.status = $target_status,
+                n.status_changed_at = $now_iso,
+                n.reopened_at = $now_iso,
+                n.monitoring_started_at = $now_iso,
+                n.invalid_at = NULL,
+                n.lifecycle_status = 'asserted',
+                n.transition_cause = 'reopened_after_reappearance'
+            """,
+            {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
+        ).consume()
+    elif target_status == "closed":
+        session.run(
+            """
+            MATCH (n:OMNode {node_id:$node_id})
+            SET n.previous_status = n.status,
+                n.previous_status_changed_at = n.status_changed_at,
+                n.status = $target_status,
+                n.status_changed_at = $now_iso,
+                n.closed_at = $now_iso,
+                n.invalid_at = $now_iso,
+                n.lifecycle_status = 'invalidated',
+                n.transition_cause = 'closed_by_convergence'
+            """,
+            {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
+        ).consume()
+        _invalidate_relation_lifecycle_for_closed_node(
+            session,
+            node_id=node_id,
+            now_utc=now_utc,
+            transition_cause='target_node_closed',
+        )
+    elif target_status == "abandoned":
+        session.run(
+            """
+            MATCH (n:OMNode {node_id:$node_id})
+            SET n.previous_status = n.status,
+                n.previous_status_changed_at = n.status_changed_at,
+                n.status = $target_status,
+                n.status_changed_at = $now_iso,
+                n.abandoned_at = $now_iso,
+                n.invalid_at = $now_iso,
+                n.lifecycle_status = 'invalidated',
+                n.transition_cause = 'abandoned_by_convergence'
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
         ).consume()
@@ -475,8 +559,13 @@ def _apply_transition(
         session.run(
             """
             MATCH (n:OMNode {node_id:$node_id})
-            SET n.status = $target_status,
-                n.status_changed_at = $now_iso
+            SET n.previous_status = n.status,
+                n.previous_status_changed_at = n.status_changed_at,
+                n.status = $target_status,
+                n.status_changed_at = $now_iso,
+                n.invalid_at = NULL,
+                n.lifecycle_status = coalesce(n.lifecycle_status, 'asserted'),
+                n.transition_cause = 'status_transition'
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
         ).consume()
@@ -486,7 +575,15 @@ def _apply_transition(
             """
             MATCH (j:Judgment)-[:ADDRESSES]->(n:OMNode {node_id:$node_id})
             MERGE (j)-[r:RESOLVES]->(n)
-            ON CREATE SET r.linked_at = $now_iso
+            ON CREATE SET r.linked_at = $now_iso,
+                          r.created_at = $now_iso,
+                          r.valid_at = $now_iso,
+                          r.lifecycle_status = 'asserted',
+                          r.transition_cause = 'relation_asserted',
+                          r.transition_basis = 'convergence_resolution',
+                          r.invalid_at = NULL
+            ON MATCH SET r.valid_at = coalesce(r.valid_at, $now_iso),
+                         r.lifecycle_status = coalesce(r.lifecycle_status, 'asserted')
             """,
             {"node_id": node_id, "now_iso": now_utc},
         ).consume()
