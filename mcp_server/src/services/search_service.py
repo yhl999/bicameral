@@ -212,6 +212,9 @@ class SearchService:
             source_content = str(row.get('source_content') or '').strip()
             target_content = str(row.get('target_content') or '').strip()
             created_at = row.get('created_at')
+            valid_at = row.get('valid_at')
+            invalid_at = row.get('invalid_at')
+            relation_properties = row.get('relation_properties') if isinstance(row.get('relation_properties'), dict) else {}
 
             facts.append(
                 {
@@ -222,8 +225,8 @@ class SearchService:
                     'source_node_uuid': source_node_id,
                     'target_node_uuid': target_node_id,
                     'created_at': str(created_at) if created_at is not None else None,
-                    'valid_at': None,
-                    'invalid_at': None,
+                    'valid_at': str(valid_at) if valid_at is not None else None,
+                    'invalid_at': str(invalid_at) if invalid_at is not None else None,
                     'expired_at': None,
                     'episodes': [],
                     'attributes': {
@@ -231,6 +234,7 @@ class SearchService:
                         'lexical_score': row.get('lexical_score'),
                         'source_content': source_content,
                         'target_content': target_content,
+                        'relation_properties': relation_properties,
                     },
                 }
             )

@@ -462,7 +462,7 @@ class TypedRetrievalService:
         if not ranked_objects:
             return []
 
-        if query_mode != 'history':
+        if query_mode == 'current':
             return ranked_objects[:max_results]
 
         selected_roots: list[str] = []

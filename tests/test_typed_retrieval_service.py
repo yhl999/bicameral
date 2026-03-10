@@ -746,7 +746,9 @@ def test_real_om_projection_distinguishes_history_current_and_all_modes():
     assert all_response['query_mode'] == 'all'
     assert [item['object_id'] for item in all_response['episodes']] == [
         'om_episode:s1_observational_memory:drink_v2',
+        'om_episode:s1_observational_memory:drink_v1',
     ]
+    assert all_response['episodes'][1]['is_current'] is False
 
     assert current_response['query_mode'] == 'current'
     assert [item['object_id'] for item in current_response['episodes']] == [

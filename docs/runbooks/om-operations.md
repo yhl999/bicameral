@@ -261,18 +261,24 @@ than only projecting the narrow linear `SUPERSEDES` happy path.
     provenance back to OM relation IDs and endpoint node IDs.
   - Historical relation lineages are grouped by relation type plus source/target
     history anchors.
-  - When a newer relation in the same lineage appears, the prior typed state is
-    marked `superseded`; when an endpoint node is closed/resolved, the relation
-    state is marked `invalidated`.
-  - The derived relation-history basis is carried in `value.om_history` so the
-    projection is explicit about what is inferred versus directly asserted.
+  - Relation ordering now prefers native edge timestamps (`valid_at`,
+    `invalid_at`) when available and only falls back to endpoint-history
+    inference when OM does not carry direct lifecycle truth.
+  - Branching / competing successors are exposed explicitly instead of being
+    flattened into fake linear chains. The typed payload keeps ordinary lineage
+    fields when they are honest and records ambiguity in structured history
+    metadata when they are not.
+  - Historical lineage details are carried both in top-level `history_meta` and
+    in `value.om_history`, including lineage basis, topology, version basis,
+    parent/successor candidates, invalidation basis, and transition evidence.
 
 - **Query modes**
   - `history` expands matched OM roots/components and returns historical typed
     objects for the full lineage/component.
   - `current` returns only currently-valid OM typed objects.
-  - `all` keeps normal ranked retrieval semantics, but the returned OM objects
-    still carry honest `is_current` / `invalid_at` history state.
+  - `all` is now symmetric with `history` for OM lineages: once a root/component
+    is selected, the response includes both current and historical typed states
+    with coherent lineage ordering.
 
 This keeps OM native at the storage layer while making supersession-aware typed
 answers operational without lying about branching or malformed topologies.
