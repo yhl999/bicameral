@@ -811,6 +811,20 @@ CRITICAL:
 - Technical detail may be the carrier or evidence of a memory; it is not automatically the memory itself.
 - If there is no durable human-facing implication, emit nothing.
 
+WHAT BELONGS:
+- Durable human context and world-state that would help future assistance.
+- Recurring frictions, constraints, sensitivities, or boundaries.
+- Commitments, active follow-ups, unresolved obligations, or standing preferences.
+- Observational judgments grounded in repeated evidence, not a one-off reaction.
+- Assistive rules derived from behavior, preference, or stable working context.
+- Meaningful changes over time when a newer state supersedes an older one.
+
+WHAT DOES NOT BELONG:
+- Tool syntax, file paths, PRs, commits, infra details, runbooks, or admin doctrine.
+- Step-by-step implementation, debugging, deployment, or system configuration detail.
+- Filler, one-off logistics, or raw technical evidence with no durable human implication.
+- Exception: include technical or operational evidence only when it clearly implies durable human-context memory.
+
 OUTPUT FORMAT: Return a single JSON object with exactly two top-level keys:
   "nodes": array of node objects
   "edges": array of edge objects
@@ -819,7 +833,7 @@ Node object schema (all fields required):
   {
     "node_type": one of ["WorldState", "Judgment", "OperationalRule", "Commitment", "Friction"],
     "semantic_domain": "sessions_main",
-    "content": "<concise durable fact or insight — normalized, no metadata noise>",
+    "content": "<concise durable observational memory — normalized, no metadata noise>",
     "urgency_score": <integer 1-5; 5=critical, 3=default>,
     "source_message_ids": [<message_id strings this node was derived from>]
   }
@@ -831,13 +845,17 @@ Edge object schema (all fields required):
     "relation_type": one of ["MOTIVATES", "GENERATES", "SUPERSEDES", "ADDRESSES", "RESOLVES"]
   }
 
+NODE TYPE GUIDANCE:
+- WorldState: durable facts about situation, environment, relationships, or ongoing reality.
+- Friction: recurring pain points, blockers, constraints, sensitivities, or failure patterns that affect assistance.
+- Commitment: promises, active follow-ups, obligations, decisions in force, or boundaries to respect.
+- Judgment: stable evaluative conclusions grounded in repeated evidence, not a one-off reaction.
+- OperationalRule: assistive rule for how the assistant should act, derived from behavior, preference, or stable context; not a system/admin rule.
+
 ADMISSION TEST:
-- Only extract durable, operationally useful human-context memory. Skip filler and transient logistics.
-- Store what matters for future assistance: preferences, commitments, stable world-state, recurring frictions, durable judgments, and assistive rules.
-- Do not store implementation detail, admin policy, system configuration, tool syntax, deployment procedure, or debugging steps unless they clearly imply durable human context.
+- Only extract durable, operationally useful human-context memory.
 - Normalize and deduplicate: if multiple messages support the same memory, emit one node.
 - Only emit edges where the relationship is clearly evidenced in the transcript.
-- OperationalRule means an assistive rule derived from observed behavior, stated preference, or stable working context; it is not a system/admin rule.
 - relation_type MUST be one of the five allowed values above.
 - source_index and target_index must be valid 0-based indices into the nodes array.
 - Return valid JSON only. No markdown fences, no explanation, no text outside the JSON object.

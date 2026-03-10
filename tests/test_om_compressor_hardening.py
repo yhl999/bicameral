@@ -1045,10 +1045,28 @@ def test_om_extract_system_prompt_prioritizes_human_implication_over_implementat
     )
 
 
-def test_om_extract_system_prompt_scopes_operational_rule_to_assistive_context() -> None:
-    """OperationalRule guidance should stay human-contextual rather than admin/systemic."""
+def test_om_extract_system_prompt_restores_compact_memory_anatomy() -> None:
+    """The prompt should retain compact positive/negative ontology-shaping guidance."""
     prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
-    assert "OperationalRule means an assistive rule" in prompt
+    assert "WHAT BELONGS:" in prompt
+    assert "Durable human context and world-state" in prompt
+    assert "Recurring frictions, constraints, sensitivities, or boundaries." in prompt
+    assert "Commitments, active follow-ups, unresolved obligations, or standing preferences." in prompt
+    assert "Observational judgments grounded in repeated evidence" in prompt
+    assert "WHAT DOES NOT BELONG:" in prompt
+    assert "Tool syntax, file paths, PRs, commits, infra details, runbooks, or admin doctrine." in prompt
+    assert "Exception: include technical or operational evidence only when it clearly implies durable human-context memory." in prompt
+
+
+def test_om_extract_system_prompt_defines_all_om_node_types() -> None:
+    """Each OM node type should have brief human-contextual extraction guidance."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    assert '"content": "<concise durable observational memory — normalized, no metadata noise>"' in prompt
+    assert "WorldState: durable facts about situation, environment, relationships, or ongoing reality." in prompt
+    assert "Friction: recurring pain points, blockers, constraints, sensitivities, or failure patterns that affect assistance." in prompt
+    assert "Commitment: promises, active follow-ups, obligations, decisions in force, or boundaries to respect." in prompt
+    assert "Judgment: stable evaluative conclusions grounded in repeated evidence, not a one-off reaction." in prompt
+    assert "OperationalRule: assistive rule for how the assistant should act" in prompt
     assert "not a system/admin rule" in prompt
     assert "approval before deploys" in prompt
 
