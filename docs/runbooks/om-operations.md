@@ -178,17 +178,18 @@ m.graphiti_extracted_at = NULL
 
 ## OM Retrieval Adapter (MCP search lane behavior)
 
-The MCP server now has an OM retrieval adapter for
-`group_id=s1_observational_memory`.
+The MCP server now has an OM retrieval adapter for the canonical OM lane
+`group_id=s1_observational_memory` and for explicit experimental OM-native
+bakeoff groups (for example `ontbk15batch_20260310_om_f`).
 
 ### What changed
 
-- `search_nodes` detects when the effective lane scope includes
-  `s1_observational_memory` and reads directly from OM primitives (`OMNode`)
-  via Neo4j queries.
-- `search_memory_facts` detects the same lane and reads ontology edges between
-  OM primitives (`MOTIVATES`, `GENERATES`, `SUPERSEDES`, `ADDRESSES`,
-  `RESOLVES`) directly from Neo4j.
+- `search_nodes` detects when the effective lane scope includes an OM-native
+  group (`s1_observational_memory` or an explicit experimental `_om_` group)
+  and reads directly from OM primitives (`OMNode`) via Neo4j queries.
+- `search_memory_facts` detects the same OM-native scope and reads ontology
+  edges between OM primitives (`MOTIVATES`, `GENERATES`, `SUPERSEDES`,
+  `ADDRESSES`, `RESOLVES`) directly from Neo4j.
 - In mixed/all-lane scope, Graphiti results and OM adapter results are fused by
   a deterministic cross-source ranker (RRF + corroboration boosts), not by
   source-order concatenation.

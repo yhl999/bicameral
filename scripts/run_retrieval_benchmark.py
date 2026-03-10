@@ -14,6 +14,12 @@ Usage:
     --fixture tests/fixtures/retrieval_benchmark_queries.json \
     --compare-qmd --qmd-command "qmd query --json" \
     --top-k 10 --output state/retrieval_benchmark_comparison.json
+
+  # Force all fixture queries through an experimental OM-native group:
+  python3 scripts/run_retrieval_benchmark.py \
+    --fixture tests/fixtures/retrieval_benchmark_queries.json \
+    --group-id ontbk15batch_20260310_om_f \
+    --top-k 10 --output state/retrieval_benchmark_om_f.json
 """
 
 from __future__ import annotations
@@ -236,21 +242,44 @@ def _normalize_group_ids(raw_group_ids: Any) -> list[str]:
     return deduped
 
 
-def _query_scope_group_ids(query_item: dict[str, Any]) -> list[str]:
-    """Resolve group_ids for a benchmark query using target_group_ids first."""
+def _lane_aliases_to_group_ids(raw_aliases: Any) -> list[str]:
+    if not isinstance(raw_aliases, list):
+        return []
+
+    group_ids: list[str] = []
+    for alias in raw_aliases:
+        mapped = LANE_ALIAS_TO_GROUP_IDS.get(str(alias).strip(), [])
+        group_ids.extend(mapped)
+    return _normalize_group_ids(group_ids)
+
+
+
+def _query_scope_group_ids(
+    query_item: dict[str, Any],
+    *,
+    group_ids_override: list[str] | None = None,
+    lane_alias_override: list[str] | None = None,
+) -> list[str]:
+    """Resolve group_ids for a benchmark query.
+
+    Precedence mirrors runtime search behavior, but adds harness-level scope
+    override support for bakeoffs:
+    1. explicit CLI `--group-id` override
+    2. explicit CLI `--lane-alias` override
+    3. fixture `target_group_ids`
+    4. fixture `lane_alias`
+    """
+    if group_ids_override is not None:
+        return _normalize_group_ids(group_ids_override)
+
+    if lane_alias_override is not None:
+        return _lane_aliases_to_group_ids(lane_alias_override)
+
     explicit = query_item.get('target_group_ids')
     if explicit is not None:
         return _normalize_group_ids(explicit)
 
-    aliases = query_item.get('lane_alias', [])
-    if not isinstance(aliases, list):
-        return []
-
-    group_ids: list[str] = []
-    for alias in aliases:
-        mapped = LANE_ALIAS_TO_GROUP_IDS.get(str(alias).strip(), [])
-        group_ids.extend(mapped)
-    return _normalize_group_ids(group_ids)
+    return _lane_aliases_to_group_ids(query_item.get('lane_alias', []))
 
 
 def _scope_categories(query_item: dict[str, Any]) -> list[str]:
@@ -636,7 +665,11 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         query_text = q['query']
         expected_facts = q.get('expected_facts', [])
         expected_entities = q.get('expected_entities', [])
-        group_ids = _query_scope_group_ids(q)
+        group_ids = _query_scope_group_ids(
+            q,
+            group_ids_override=args.group_id,
+            lane_alias_override=args.lane_alias,
+        )
 
         print(f'[{qi}/{len(queries)}] {qid}: {query_text[:60]}...')
 
@@ -718,6 +751,10 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         'top_k': top_k,
         'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         'queries_total': len(queries),
+        'scope_override': {
+            'group_ids': _normalize_group_ids(args.group_id),
+            'lane_alias': list(args.lane_alias or []),
+        },
         'bicameral_aggregate': bicameral_agg,
         'query_results': query_results,
     }
@@ -808,6 +845,24 @@ def main():
     ap.add_argument('--fixture', required=True, help='Path to fixture JSON')
     ap.add_argument('--top-k', type=int, default=10, help='Top-k for recall')
     ap.add_argument('--output', required=True, help='Output JSON path')
+    ap.add_argument(
+        '--group-id',
+        action='append',
+        default=None,
+        help=(
+            'Override fixture scope with an explicit group_id. Repeatable. '
+            'Takes precedence over --lane-alias and fixture target_group_ids.'
+        ),
+    )
+    ap.add_argument(
+        '--lane-alias',
+        action='append',
+        default=None,
+        help=(
+            'Override fixture scope with lane alias(es). Repeatable. '
+            'Used only when --group-id is not provided.'
+        ),
+    )
     ap.add_argument(
         '--mcp-url', default=MCP_URL_DEFAULT, help='MCP server URL'
     )

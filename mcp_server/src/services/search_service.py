@@ -6,10 +6,18 @@ from typing import Any
 
 try:
     from .neo4j_service import Neo4jService
+    from .om_group_scope import (
+        DEFAULT_OM_GROUP_ID,
+        includes_om_native_group,
+        om_native_groups_in_scope,
+    )
 except ImportError:  # pragma: no cover - top-level import fallback
     from services.neo4j_service import Neo4jService
-
-DEFAULT_OM_GROUP_ID = 's1_observational_memory'
+    from services.om_group_scope import (
+        DEFAULT_OM_GROUP_ID,
+        includes_om_native_group,
+        om_native_groups_in_scope,
+    )
 
 
 def _provider_name(service: Any) -> str:
@@ -47,13 +55,10 @@ class SearchService:
 
     def includes_observational_memory(self, group_ids: list[str]) -> bool:
         # Empty group scope means "all lanes" in the MCP server contract.
-        return len(group_ids) == 0 or self.om_group_id in group_ids
+        return includes_om_native_group(group_ids, default_group_id=self.om_group_id)
 
     def _om_groups_in_scope(self, group_ids: list[str]) -> list[str]:
-        # For all-lanes scope ([]), route to the canonical OM lane.
-        if len(group_ids) == 0:
-            return [self.om_group_id]
-        return [group_id for group_id in group_ids if group_id == self.om_group_id]
+        return om_native_groups_in_scope(group_ids, default_group_id=self.om_group_id)
 
     async def search_observational_nodes(
         self,

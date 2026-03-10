@@ -92,6 +92,55 @@ async def test_search_nodes_returns_om_primitive_results(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_search_nodes_returns_om_primitive_results_for_experimental_om_native_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    om_node_rows = [
+        {
+            'uuid': 'om-node-exp-1',
+            'content': 'Experimental OM bakeoff lane should stay retrieval-visible.',
+            'created_at': '2026-03-10T12:00:00Z',
+            'group_id': 'ontbk15batch_20260310_om_f',
+            'status': 'active',
+            'semantic_domain': 'observational_memory',
+            'urgency_score': 2,
+            'lexical_score': 5,
+        }
+    ]
+
+    fake_client = SimpleNamespace(
+        driver=SimpleNamespace(execute_query=AsyncMock(return_value=(om_node_rows, None, None))),
+        search_=AsyncMock(),
+    )
+    fake_service = SimpleNamespace(
+        config=SimpleNamespace(database=SimpleNamespace(provider='neo4j')),
+        get_client=AsyncMock(return_value=fake_client),
+        get_client_for_group=AsyncMock(return_value=fake_client),
+    )
+
+    monkeypatch.setattr(srv, 'graphiti_service', fake_service)
+
+    response = await srv.search_nodes(
+        query='experimental om bakeoff',
+        group_ids=['ontbk15batch_20260310_om_f'],
+        max_nodes=5,
+    )
+
+    assert response['message'] == 'Nodes retrieved successfully'
+    assert len(response['nodes']) == 1
+    assert response['nodes'][0]['uuid'] == 'om-node-exp-1'
+    assert response['nodes'][0]['labels'] == ['OMNode']
+    assert response['nodes'][0]['group_id'] == 'ontbk15batch_20260310_om_f'
+    assert response['nodes'][0]['attributes']['source'] == 'om_primitive'
+    fake_client.search_.assert_not_called()
+    fake_client.driver.execute_query.assert_awaited_once()
+    assert fake_client.driver.execute_query.await_args.kwargs['group_id'] == 'ontbk15batch_20260310_om_f'
+
+
+@pytest.mark.asyncio
 async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, 'config', _base_config())
@@ -136,6 +185,55 @@ async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pyte
     assert response['facts'][0]['attributes']['source'] == 'om_primitive'
     fake_client.search_.assert_not_called()
     fake_client.driver.execute_query.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_memory_facts_returns_om_relation_results_for_experimental_om_native_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    om_fact_rows = [
+        {
+            'uuid': 'om-rel-exp-1',
+            'relation_type': 'RESOLVES',
+            'source_node_id': 'om-node-exp-1',
+            'target_node_id': 'om-node-exp-2',
+            'created_at': '2026-03-10T13:00:00Z',
+            'group_id': 'ontbk15batch_20260310_om_f',
+            'source_content': 'Experimental OM-native write landed.',
+            'target_content': 'Experimental OM-native retrieval became visible.',
+            'lexical_score': 4,
+        }
+    ]
+
+    fake_client = SimpleNamespace(
+        driver=SimpleNamespace(execute_query=AsyncMock(return_value=(om_fact_rows, None, None))),
+        search_=AsyncMock(),
+    )
+    fake_service = SimpleNamespace(
+        config=SimpleNamespace(database=SimpleNamespace(provider='neo4j')),
+        get_client=AsyncMock(return_value=fake_client),
+        get_client_for_group=AsyncMock(return_value=fake_client),
+    )
+
+    monkeypatch.setattr(srv, 'graphiti_service', fake_service)
+
+    response = await srv.search_memory_facts(
+        query='experimental om-native retrieval',
+        group_ids=['ontbk15batch_20260310_om_f'],
+        max_facts=5,
+    )
+
+    assert response['message'] == 'Facts retrieved successfully'
+    assert len(response['facts']) == 1
+    assert response['facts'][0]['uuid'] == 'om-rel-exp-1'
+    assert response['facts'][0]['group_id'] == 'ontbk15batch_20260310_om_f'
+    assert response['facts'][0]['attributes']['source'] == 'om_primitive'
+    fake_client.search_.assert_not_called()
+    fake_client.driver.execute_query.assert_awaited_once()
+    assert fake_client.driver.execute_query.await_args.kwargs['group_id'] == 'ontbk15batch_20260310_om_f'
 
 
 @pytest.mark.asyncio

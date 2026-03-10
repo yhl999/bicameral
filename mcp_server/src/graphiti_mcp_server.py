@@ -38,6 +38,7 @@ try:
     )
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from .services.ontology_registry import OntologyRegistry
+    from .services.om_group_scope import is_om_native_only_scope
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
@@ -55,6 +56,7 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         SuccessResponse,
     )
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from services.om_group_scope import is_om_native_only_scope
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
@@ -443,7 +445,10 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
 
 
 def _is_observational_memory_only_scope(effective_group_ids: list[str]) -> bool:
-    return len(effective_group_ids) == 1 and effective_group_ids[0] == DEFAULT_OM_GROUP_ID
+    return is_om_native_only_scope(
+        effective_group_ids,
+        default_group_id=DEFAULT_OM_GROUP_ID,
+    )
 
 
 def _normalize_fusion_text(value: Any) -> str:

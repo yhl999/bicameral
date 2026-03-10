@@ -14,6 +14,7 @@ from scripts.run_retrieval_benchmark import (
     check_recall_gate,
     compute_recall,
     validate_fixture,
+    _query_scope_group_ids,
 )
 
 
@@ -144,6 +145,40 @@ class TestValidateFixture(unittest.TestCase):
                 quota,
                 f'{category}: need >= {quota}, got {counts[category]}',
             )
+
+
+class TestScopeResolutionOverrides(unittest.TestCase):
+    def test_group_id_override_takes_precedence_over_fixture_scope(self):
+        query = {
+            'id': 'om-bakeoff',
+            'target_group_ids': ['s1_observational_memory'],
+            'lane_alias': ['observational_memory'],
+        }
+
+        resolved = _query_scope_group_ids(
+            query,
+            group_ids_override=['ontbk15batch_20260310_om_f'],
+            lane_alias_override=['sessions_main'],
+        )
+
+        self.assertEqual(resolved, ['ontbk15batch_20260310_om_f'])
+
+    def test_lane_alias_override_beats_fixture_target_group_ids_when_no_group_override(self):
+        query = {
+            'id': 'om-bakeoff',
+            'target_group_ids': ['s1_observational_memory'],
+            'lane_alias': ['observational_memory'],
+        }
+
+        resolved = _query_scope_group_ids(
+            query,
+            lane_alias_override=['sessions_main', 'observational_memory'],
+        )
+
+        self.assertEqual(
+            resolved,
+            ['s1_sessions_main', 's1_observational_memory'],
+        )
 
 
 class TestOutputSchema(unittest.TestCase):
