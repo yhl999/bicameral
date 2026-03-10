@@ -377,6 +377,38 @@ def test_om_projection_deduplicates_against_ledger_objects():
     assert response['counts']['state'] == 1
 
 
+def test_om_projection_auto_history_query_skips_projection_until_lineage_exists():
+    """Auto-history queries should not mix current-only OM projections into lineage answers."""
+    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-history')
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:s1_observational_memory:rel-history': 'what changed for latency spike'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='what changed with latency spike',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['query_mode'] == 'history'
+    assert response['counts']['state'] == 0
+    assert response['limits_applied']['materialization']['om_projection'] == {
+        'enabled': False,
+        'reason': 'history_mode_requires_lineage',
+    }
+    assert projection.calls == []
+
+
 def test_om_projection_evidence_includes_om_provenance():
     """OM projected objects carry evidence refs with om source_system."""
     om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-prov')
