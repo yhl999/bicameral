@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from collections import Counter, defaultdict, deque
 from typing import Any
 
 try:
@@ -9,12 +11,22 @@ except ImportError:  # pragma: no cover - top-level import fallback
     from models.typed_memory import Episode, EvidenceRef, StateFact, TypedMemoryObject
     from services.search_service import SearchService
 
-_MAX_HISTORY_LINEAGE_DEPTH = 32
+_MAX_HISTORY_COMPONENT_DEPTH = 256
+_MAX_RELATION_NEIGHBOR_LIMIT = 64
+_ALLOWED_HISTORY_OBJECT_TYPES = {'episode', 'state_fact'}
+_CLOSURE_RELATION_TYPES = {'SUPERSEDES', 'RESOLVES'}
 
 
 def _coerce_timestamp(value: Any) -> str | None:
     text = str(value).strip() if value not in (None, '') else ''
     return text or None
+
+
+def _timestamp_sort_key(value: Any) -> tuple[int, str]:
+    text = _coerce_timestamp(value)
+    if text is None:
+        return (1, '')
+    return (0, text)
 
 
 class OMTypedProjectionService:
@@ -51,110 +63,40 @@ class OMTypedProjectionService:
         if not self.search_service.includes_observational_memory(scope):
             return [], {}, {'enabled': False, 'reason': 'om_not_in_scope'}
 
-        if query_mode == 'history':
-            return await self._project_history(
-                query=query,
-                scope=scope,
-                object_types=object_types,
-                max_results=normalized_max_results,
-            )
+        driver = await self._graphiti_driver()
+        if driver is None:
+            return [], {}, {'enabled': False, 'reason': 'graphiti_driver_unavailable'}
 
-        return await self._project_non_history(
+        return await self._project_history_aware_query(
             query=query,
             scope=scope,
             object_types=object_types,
             max_results=normalized_max_results,
+            query_mode=query_mode,
+            driver=driver,
         )
 
-    async def _project_non_history(
+    async def _project_history_aware_query(
         self,
         *,
         query: str,
         scope: list[str],
         object_types: set[str],
         max_results: int,
-    ) -> tuple[list[TypedMemoryObject], dict[str, str], dict[str, Any]]:
-        objects: list[TypedMemoryObject] = []
-        search_text_overrides: dict[str, str] = {}
-        episode_count = 0
-        state_count = 0
-
-        if not object_types or 'episode' in object_types:
-            node_rows = await self.search_service.search_observational_nodes(
-                graphiti_service=self.graphiti_service,
-                query=query,
-                group_ids=scope,
-                max_nodes=max_results,
-                entity_types=['OMNode'],
-            )
-            for row in node_rows:
-                obj = self._episode_from_node(row)
-                if obj is None:
-                    continue
-                objects.append(obj)
-                episode_count += 1
-                search_text_overrides[obj.object_id] = self._node_search_text(row)
-
-        if not object_types or 'state_fact' in object_types:
-            fact_rows = await self.search_service.search_observational_facts(
-                graphiti_service=self.graphiti_service,
-                query=query,
-                group_ids=scope,
-                max_facts=max_results,
-                center_node_uuid=None,
-            )
-            for row in fact_rows:
-                obj = self._state_fact_from_relation(row)
-                if obj is None:
-                    continue
-                objects.append(obj)
-                state_count += 1
-                search_text_overrides[obj.object_id] = self._fact_search_text(row)
-
-        limits = {
-            'enabled': True,
-            'reason': 'projected',
-            'groups_considered': self.search_service._om_groups_in_scope(scope),
-            'episodes_projected': episode_count,
-            'state_projected': state_count,
-            'max_results': max_results,
-            'history_mode': False,
-        }
-        return objects, search_text_overrides, limits
-
-    async def _project_history(
-        self,
-        *,
-        query: str,
-        scope: list[str],
-        object_types: set[str],
-        max_results: int,
+        query_mode: str,
+        driver: Any,
     ) -> tuple[list[TypedMemoryObject], dict[str, str], dict[str, Any]]:
         groups_considered = self.search_service._om_groups_in_scope(scope)
         requested_object_types = sorted(object_types) if object_types else []
         unsupported_object_types = [
             object_type
             for object_type in requested_object_types
-            if object_type != 'episode'
+            if object_type not in _ALLOWED_HISTORY_OBJECT_TYPES
         ]
+        want_episodes = not object_types or 'episode' in object_types
+        want_state = not object_types or 'state_fact' in object_types
 
-        if object_types and 'episode' not in object_types:
-            return [], {}, {
-                'enabled': True,
-                'reason': 'history_projection_requires_episode_scope',
-                'groups_considered': groups_considered,
-                'episodes_projected': 0,
-                'state_projected': 0,
-                'max_results': max_results,
-                'history_mode': True,
-                'history_candidates': 0,
-                'history_lineages_projected': 0,
-                'history_state_projection_supported': False,
-                'unsupported_object_types': unsupported_object_types,
-                'skipped_candidates': [],
-            }
-
-        node_rows = await self.search_service.search_observational_nodes(
+        node_seed_rows = await self.search_service.search_observational_nodes(
             graphiti_service=self.graphiti_service,
             query=query,
             group_ids=scope,
@@ -162,95 +104,161 @@ class OMTypedProjectionService:
             entity_types=['OMNode'],
         )
 
-        objects: list[TypedMemoryObject] = []
-        search_text_overrides: dict[str, str] = {}
-        skipped_candidates: list[dict[str, str]] = []
-        history_lineages_projected = 0
-        seen_component_nodes: set[tuple[str, str]] = set()
+        direct_fact_rows: list[dict[str, Any]] = []
+        if want_state or query_mode == 'history':
+            direct_fact_rows = await self.search_service.search_observational_facts(
+                graphiti_service=self.graphiti_service,
+                query=query,
+                group_ids=scope,
+                max_facts=max_results,
+                center_node_uuid=None,
+            )
 
-        driver = await self._graphiti_driver()
-        if driver is None:
-            return [], {}, {
-                'enabled': False,
-                'reason': 'graphiti_driver_unavailable',
-                'groups_considered': groups_considered,
-                'episodes_projected': 0,
-                'state_projected': 0,
-                'max_results': max_results,
-                'history_mode': True,
-                'history_candidates': len(node_rows),
-                'history_lineages_projected': 0,
-                'history_state_projection_supported': False,
-                'unsupported_object_types': unsupported_object_types,
-                'skipped_candidates': [],
-            }
-
-        for row in node_rows:
+        seed_keys: list[tuple[str, str]] = []
+        seen_seed_keys: set[tuple[str, str]] = set()
+        for row in node_seed_rows:
             group_id = str(row.get('group_id') or '').strip()
-            seed_node_id = str(row.get('uuid') or '').strip()
-            if not group_id or not seed_node_id:
+            node_id = str(row.get('uuid') or '').strip()
+            if not group_id or not node_id:
                 continue
+            key = (group_id, node_id)
+            if key in seen_seed_keys:
+                continue
+            seen_seed_keys.add(key)
+            seed_keys.append(key)
+        for row in direct_fact_rows:
+            group_id = str(row.get('group_id') or '').strip()
+            for node_id in (
+                str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip(),
+                str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip(),
+            ):
+                if not group_id or not node_id:
+                    continue
+                key = (group_id, node_id)
+                if key in seen_seed_keys:
+                    continue
+                seen_seed_keys.add(key)
+                seed_keys.append(key)
+
+        components: list[dict[str, Any]] = []
+        skipped_candidates: list[dict[str, str]] = []
+        seen_component_nodes: set[tuple[str, str]] = set()
+        for group_id, seed_node_id in seed_keys:
             if (group_id, seed_node_id) in seen_component_nodes:
                 continue
-
-            lineage = await self._load_linear_node_lineage(
+            component = await self._load_node_history_component(
                 driver=driver,
                 group_id=group_id,
                 seed_node_id=seed_node_id,
             )
-            seen_component_nodes.update(lineage['member_keys'])
-            if lineage['status'] != 'ok':
+            seen_component_nodes.update(component['member_keys'])
+            if component['status'] != 'ok':
                 skipped_candidates.append(
                     {
                         'group_id': group_id,
                         'node_id': seed_node_id,
-                        'reason': str(lineage['reason']),
+                        'reason': str(component['reason']),
                     }
                 )
                 continue
+            components.append(component)
 
-            members = lineage['members']
-            if len(members) < 2:
+        relation_rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in direct_fact_rows:
+            self._store_relation_row(relation_rows_by_key, row)
+
+        if components:
+            neighbor_limit = min(_MAX_RELATION_NEIGHBOR_LIMIT, max(16, max_results * 4))
+            for component in components:
+                for member in component['members']:
+                    member_group_id = str(member.get('group_id') or '').strip()
+                    member_node_id = str(member.get('node_id') or '').strip()
+                    if not member_group_id or not member_node_id:
+                        continue
+                    rows = await self.search_service.search_observational_facts(
+                        graphiti_service=self.graphiti_service,
+                        query='',
+                        group_ids=[member_group_id],
+                        max_facts=neighbor_limit,
+                        center_node_uuid=member_node_id,
+                    )
+                    for row in rows:
+                        self._store_relation_row(relation_rows_by_key, row)
+
+        relation_rows = list(relation_rows_by_key.values())
+        closure_rows_by_target = self._closure_rows_by_target_node(relation_rows)
+
+        node_history_index: dict[tuple[str, str], dict[str, Any]] = {}
+        episode_objects: list[Episode] = []
+        search_text_overrides: dict[str, str] = {}
+        topology_counts: Counter[str] = Counter()
+        component_projection_count = 0
+
+        for component in components:
+            projected_episodes = self._project_component_episodes(
+                component=component,
+                closure_rows_by_target=closure_rows_by_target,
+            )
+            if not projected_episodes:
                 skipped_candidates.append(
                     {
-                        'group_id': group_id,
-                        'node_id': seed_node_id,
-                        'reason': 'no_explicit_supersession_lineage',
+                        'group_id': str(component.get('group_id') or ''),
+                        'node_id': str(component.get('seed_node_id') or ''),
+                        'reason': 'component_projection_failed',
                     }
                 )
                 continue
-
-            history_lineages_projected += 1
-            for member in members:
-                obj = self._episode_from_lineage_member(member)
-                if obj is None:
-                    continue
-                objects.append(obj)
-                search_text_overrides[obj.object_id] = self._node_search_text(
-                    {
-                        'name': member.get('title'),
-                        'summary': member.get('summary'),
-                        'group_id': member.get('group_id'),
-                        'attributes': {
-                            'semantic_domain': member.get('semantic_domain'),
-                            'status': member.get('status'),
-                        },
+            component_projection_count += 1
+            topology_counts[str(component.get('topology') or 'unknown')] += 1
+            for episode in projected_episodes:
+                episode_objects.append(episode)
+                search_text_overrides[episode.object_id] = self._episode_search_text(episode)
+                node_key = self._node_key_from_source_key(episode.source_key)
+                if node_key is not None:
+                    node_history_index[node_key] = {
+                        'object_id': episode.object_id,
+                        'root_id': episode.root_id,
+                        'version': int(episode.version),
+                        'is_current': bool(episode.is_current),
+                        'invalid_at': _coerce_timestamp(episode.invalid_at),
+                        'topology': self._annotation_value(episode.annotations, 'history_topology'),
+                        'ordering': self._annotation_value(episode.annotations, 'history_ordering'),
+                        'source_lane': episode.source_lane,
                     }
-                )
 
+        state_objects: list[StateFact] = []
+        relation_lineage_count = 0
+        if want_state and relation_rows:
+            state_objects, relation_lineage_count = self._project_relation_history(
+                relation_rows=relation_rows,
+                node_history_index=node_history_index,
+            )
+            for fact in state_objects:
+                search_text_overrides[fact.object_id] = self._fact_search_text_from_object(fact)
+
+        objects: list[TypedMemoryObject] = []
+        if want_episodes:
+            objects.extend(episode_objects)
+        if want_state:
+            objects.extend(state_objects)
+
+        reason = 'projected_history' if query_mode == 'history' else 'projected'
         limits = {
             'enabled': True,
-            'reason': 'projected_history',
+            'reason': reason,
             'groups_considered': groups_considered,
-            'episodes_projected': len(objects),
-            'state_projected': 0,
+            'episodes_projected': len(episode_objects) if want_episodes else 0,
+            'state_projected': len(state_objects) if want_state else 0,
             'max_results': max_results,
-            'history_mode': True,
-            'history_candidates': len(node_rows),
-            'history_lineages_projected': history_lineages_projected,
-            'history_state_projection_supported': False,
+            'history_mode': query_mode == 'history',
+            'history_candidates': len(seed_keys),
+            'history_lineages_projected': component_projection_count,
+            'history_relation_lineages_projected': relation_lineage_count,
+            'history_state_projection_supported': want_state,
             'unsupported_object_types': unsupported_object_types,
             'skipped_candidates': skipped_candidates,
+            'history_topology_counts': dict(sorted(topology_counts.items())),
+            'history_relation_candidates': len(relation_rows),
         }
         return objects, search_text_overrides, limits
 
@@ -260,35 +268,27 @@ class OMTypedProjectionService:
         client = await self.graphiti_service.get_client()
         return getattr(client, 'driver', None)
 
-    async def _load_linear_node_lineage(
+    async def _load_node_history_component(
         self,
         *,
         driver: Any,
         group_id: str,
         seed_node_id: str,
     ) -> dict[str, Any]:
-        if driver is None:
-            return {
-                'status': 'skip',
-                'reason': 'graphiti_driver_unavailable',
-                'members': [],
-                'member_keys': {(group_id, seed_node_id)},
-            }
-
         records, _, _ = await driver.execute_query(
-            """
+            f"""
             MATCH (seed:OMNode)
             WHERE seed.group_id = $group_id
               AND (
                 seed.node_id = $seed_node_id
                 OR seed.uuid = $seed_node_id
               )
-            CALL {
+            CALL {{
                 WITH seed
-                MATCH path = (seed)-[:SUPERSEDES*0..32]-(member:OMNode)
+                MATCH path = (seed)-[:SUPERSEDES*0..{_MAX_HISTORY_COMPONENT_DEPTH}]-(member:OMNode)
                 WHERE member.group_id = $group_id
                 RETURN collect(DISTINCT member) AS members
-            }
+            }}
             UNWIND members AS member
             OPTIONAL MATCH (member)-[rel:SUPERSEDES]->(older:OMNode)
             WHERE older IN members
@@ -296,17 +296,17 @@ class OMTypedProjectionService:
                    coalesce(member.uuid, member.node_id, '') AS uuid,
                    coalesce(member.group_id, $group_id) AS group_id,
                    coalesce(member.content, '') AS content,
-                   coalesce(member.last_observed_at, member.created_at) AS created_at,
+                   coalesce(member.last_observed_at, member.first_observed_at, member.created_at) AS created_at,
                    coalesce(member.status, 'open') AS status,
                    coalesce(member.semantic_domain, '') AS semantic_domain,
                    collect(
                        DISTINCT CASE
                            WHEN older IS NULL THEN NULL
-                           ELSE {
+                           ELSE {{
                                target_id: coalesce(older.node_id, older.uuid, ''),
-                               created_at: coalesce(rel.created_at, member.last_observed_at, member.created_at),
+                               created_at: coalesce(rel.created_at, member.last_observed_at, member.first_observed_at, member.created_at),
                                relation_uuid: coalesce(rel.uuid, '')
-                           }
+                           }}
                        END
                    ) AS supersedes
             ORDER BY created_at ASC, node_id ASC
@@ -319,13 +319,16 @@ class OMTypedProjectionService:
         if not rows:
             return {
                 'status': 'skip',
-                'reason': 'no_explicit_supersession_lineage',
+                'reason': 'missing_seed_node',
+                'seed_node_id': seed_node_id,
+                'group_id': group_id,
                 'members': [],
                 'member_keys': {(group_id, seed_node_id)},
             }
 
-        members: dict[str, dict[str, Any]] = {}
+        members_by_id: dict[str, dict[str, Any]] = {}
         outgoing: dict[str, list[dict[str, Any]]] = {}
+        incoming: dict[str, list[dict[str, Any]]] = {}
         member_keys: set[tuple[str, str]] = set()
 
         for row in rows:
@@ -334,22 +337,6 @@ class OMTypedProjectionService:
             if not node_id:
                 continue
             member_keys.add((row_group_id, node_id))
-            supersedes = []
-            seen_targets: set[str] = set()
-            for item in row.get('supersedes') or []:
-                if not isinstance(item, dict):
-                    continue
-                target_id = str(item.get('target_id') or '').strip()
-                if not target_id or target_id in seen_targets:
-                    continue
-                seen_targets.add(target_id)
-                supersedes.append(
-                    {
-                        'target_id': target_id,
-                        'created_at': _coerce_timestamp(item.get('created_at')),
-                        'relation_uuid': str(item.get('relation_uuid') or '').strip() or None,
-                    }
-                )
             member = {
                 'node_id': node_id,
                 'uuid': str(row.get('uuid') or node_id).strip() or node_id,
@@ -360,131 +347,682 @@ class OMTypedProjectionService:
                 'status': str(row.get('status') or '').strip() or None,
                 'semantic_domain': str(row.get('semantic_domain') or '').strip() or None,
             }
-            members[node_id] = member
-            outgoing[node_id] = supersedes
+            members_by_id[node_id] = member
+            outgoing[node_id] = []
+            incoming.setdefault(node_id, [])
 
-        if not members:
+        if not members_by_id:
             return {
                 'status': 'skip',
-                'reason': 'no_explicit_supersession_lineage',
+                'reason': 'missing_component_members',
+                'seed_node_id': seed_node_id,
+                'group_id': group_id,
                 'members': [],
                 'member_keys': member_keys or {(group_id, seed_node_id)},
             }
 
-        incoming: dict[str, list[dict[str, Any]]] = {node_id: [] for node_id in members}
-        for node_id, relations in outgoing.items():
-            if len(relations) > 1:
-                return {
-                    'status': 'skip',
-                    'reason': 'ambiguous_supersession_graph',
-                    'members': [],
-                    'member_keys': member_keys,
-                }
-            for relation in relations:
-                target_id = relation['target_id']
-                if target_id not in members:
-                    return {
-                        'status': 'skip',
-                        'reason': 'ambiguous_supersession_graph',
-                        'members': [],
-                        'member_keys': member_keys,
-                    }
-                incoming[target_id].append(
-                    {
-                        'source_id': node_id,
-                        'created_at': relation.get('created_at') or members[node_id].get('created_at'),
-                    }
-                )
-
-        if any(len(relations) > 1 for relations in incoming.values()):
-            return {
-                'status': 'skip',
-                'reason': 'ambiguous_supersession_graph',
-                'members': [],
-                'member_keys': member_keys,
-            }
-
-        current_candidates = [node_id for node_id, relations in incoming.items() if not relations]
-        root_candidates = [node_id for node_id, relations in outgoing.items() if not relations]
-        if len(current_candidates) != 1 or len(root_candidates) != 1:
-            return {
-                'status': 'skip',
-                'reason': 'ambiguous_supersession_graph',
-                'members': [],
-                'member_keys': member_keys,
-            }
-
-        newest_to_oldest: list[str] = []
-        visited: set[str] = set()
-        current_id = current_candidates[0]
-        while True:
-            if current_id in visited:
-                return {
-                    'status': 'skip',
-                    'reason': 'ambiguous_supersession_graph',
-                    'members': [],
-                    'member_keys': member_keys,
-                }
-            visited.add(current_id)
-            newest_to_oldest.append(current_id)
-            relations = outgoing.get(current_id) or []
-            if not relations:
-                break
-            current_id = relations[0]['target_id']
-            if len(newest_to_oldest) > _MAX_HISTORY_LINEAGE_DEPTH:
-                return {
-                    'status': 'skip',
-                    'reason': 'ambiguous_supersession_graph',
-                    'members': [],
-                    'member_keys': member_keys,
-                }
-
-        if len(visited) != len(members):
-            return {
-                'status': 'skip',
-                'reason': 'ambiguous_supersession_graph',
-                'members': [],
-                'member_keys': member_keys,
-            }
-
-        oldest_to_newest = list(reversed(newest_to_oldest))
-        root_object_id = self._episode_object_id(group_id, oldest_to_newest[0])
-        superseded_by_meta: dict[str, dict[str, Any]] = {}
-        for newer_id, relations in outgoing.items():
-            if not relations:
+        for row in rows:
+            node_id = str(row.get('node_id') or row.get('uuid') or '').strip()
+            if not node_id or node_id not in members_by_id:
                 continue
-            relation = relations[0]
-            superseded_by_meta[relation['target_id']] = {
-                'newer_id': newer_id,
-                'invalid_at': relation.get('created_at') or members[newer_id].get('created_at'),
-            }
-
-        projected_members: list[dict[str, Any]] = []
-        total_versions = len(oldest_to_newest)
-        for index, node_id in enumerate(oldest_to_newest, start=1):
-            member = dict(members[node_id])
-            parent_node_id = oldest_to_newest[index - 2] if index > 1 else None
-            superseded = superseded_by_meta.get(node_id) or {}
-            newer_node_id = superseded.get('newer_id')
-            member.update(
-                {
-                    'object_id': self._episode_object_id(group_id, node_id),
-                    'root_id': root_object_id,
-                    'parent_id': self._episode_object_id(group_id, parent_node_id) if parent_node_id else None,
-                    'version': index,
-                    'is_current': index == total_versions,
-                    'superseded_by': self._episode_object_id(group_id, newer_node_id) if newer_node_id else None,
-                    'invalid_at': superseded.get('invalid_at'),
+            seen_targets: set[str] = set()
+            for item in row.get('supersedes') or []:
+                if not isinstance(item, dict):
+                    continue
+                target_id = str(item.get('target_id') or '').strip()
+                if not target_id or target_id not in members_by_id or target_id in seen_targets:
+                    continue
+                seen_targets.add(target_id)
+                edge = {
+                    'source_id': node_id,
+                    'target_id': target_id,
+                    'created_at': _coerce_timestamp(item.get('created_at')) or members_by_id[node_id].get('created_at'),
+                    'relation_uuid': str(item.get('relation_uuid') or '').strip() or None,
                 }
-            )
-            projected_members.append(member)
+                outgoing[node_id].append(edge)
+                incoming.setdefault(target_id, []).append(edge)
 
+        for node_id in members_by_id:
+            outgoing.setdefault(node_id, [])
+            incoming.setdefault(node_id, [])
+
+        ordered_node_ids, topology, ordering = self._ordered_component_node_ids(
+            members_by_id=members_by_id,
+            outgoing=outgoing,
+            incoming=incoming,
+        )
+        anchor_node_id = ordered_node_ids[0]
+        anchor_object_id = self._episode_object_id(group_id, anchor_node_id)
+        root_id = (
+            anchor_object_id
+            if topology in {'singleton', 'linear'}
+            else self._history_component_root_id(group_id=group_id, anchor_node_id=anchor_node_id)
+        )
+
+        members = [members_by_id[node_id] for node_id in ordered_node_ids]
         return {
             'status': 'ok',
-            'reason': 'linear_supersession_lineage',
-            'members': projected_members,
+            'reason': 'projectable_history_component',
+            'seed_node_id': seed_node_id,
+            'group_id': group_id,
+            'members': members,
+            'members_by_id': members_by_id,
+            'outgoing': outgoing,
+            'incoming': incoming,
+            'ordered_node_ids': ordered_node_ids,
+            'topology': topology,
+            'ordering': ordering,
+            'anchor_node_id': anchor_node_id,
+            'root_id': root_id,
             'member_keys': member_keys,
         }
+
+    def _ordered_component_node_ids(
+        self,
+        *,
+        members_by_id: dict[str, dict[str, Any]],
+        outgoing: dict[str, list[dict[str, Any]]],
+        incoming: dict[str, list[dict[str, Any]]],
+    ) -> tuple[list[str], str, str]:
+        if len(members_by_id) == 1 and not any(outgoing.values()) and not any(incoming.values()):
+            return list(members_by_id.keys()), 'singleton', 'singleton'
+
+        older_to_newer: dict[str, list[str]] = {node_id: [] for node_id in members_by_id}
+        indegree: dict[str, int] = {node_id: 0 for node_id in members_by_id}
+        for newer_id, edges in outgoing.items():
+            for edge in edges:
+                older_id = edge['target_id']
+                older_to_newer.setdefault(older_id, []).append(newer_id)
+                indegree[newer_id] = indegree.get(newer_id, 0) + 1
+
+        queue = deque(
+            sorted(
+                (node_id for node_id, degree in indegree.items() if degree == 0),
+                key=lambda node_id: self._member_sort_key(members_by_id[node_id]),
+            )
+        )
+        ordered_node_ids: list[str] = []
+        working_indegree = dict(indegree)
+        while queue:
+            node_id = queue.popleft()
+            ordered_node_ids.append(node_id)
+            neighbors = sorted(
+                older_to_newer.get(node_id, []),
+                key=lambda neighbor_id: self._member_sort_key(members_by_id[neighbor_id]),
+            )
+            for neighbor_id in neighbors:
+                working_indegree[neighbor_id] -= 1
+                if working_indegree[neighbor_id] == 0:
+                    queue.append(neighbor_id)
+
+        if len(ordered_node_ids) != len(members_by_id):
+            ordered_node_ids = sorted(members_by_id.keys(), key=lambda node_id: self._member_sort_key(members_by_id[node_id]))
+            return ordered_node_ids, 'cyclic', 'timestamp_fallback'
+
+        current_candidates = [node_id for node_id, edges in incoming.items() if not edges]
+        oldest_candidates = [node_id for node_id, edges in outgoing.items() if not edges]
+        linear = (
+            len(current_candidates) == 1
+            and len(oldest_candidates) == 1
+            and all(len(edges) <= 1 for edges in outgoing.values())
+            and all(len(edges) <= 1 for edges in incoming.values())
+        )
+        topology = 'linear' if linear else 'branching'
+        return ordered_node_ids, topology, 'topological'
+
+    def _project_component_episodes(
+        self,
+        *,
+        component: dict[str, Any],
+        closure_rows_by_target: dict[tuple[str, str], list[dict[str, Any]]],
+    ) -> list[Episode]:
+        group_id = str(component.get('group_id') or '').strip()
+        root_id = str(component.get('root_id') or '').strip()
+        topology = str(component.get('topology') or 'unknown').strip() or 'unknown'
+        ordering = str(component.get('ordering') or 'unknown').strip() or 'unknown'
+        members_by_id = component.get('members_by_id') or {}
+        outgoing = component.get('outgoing') or {}
+        incoming = component.get('incoming') or {}
+        ordered_node_ids = component.get('ordered_node_ids') or []
+        if not group_id or not root_id or not members_by_id or not ordered_node_ids:
+            return []
+
+        member_version = {node_id: index for index, node_id in enumerate(ordered_node_ids, start=1)}
+        total_versions = len(ordered_node_ids)
+        projected: list[Episode] = []
+
+        for node_id in ordered_node_ids:
+            member = members_by_id[node_id]
+            object_id = self._episode_object_id(group_id, node_id)
+            if object_id is None:
+                continue
+
+            older_edges = sorted(outgoing.get(node_id, []), key=lambda edge: (_timestamp_sort_key(edge.get('created_at')), edge.get('target_id') or ''))
+            newer_edges = sorted(incoming.get(node_id, []), key=lambda edge: (_timestamp_sort_key(edge.get('created_at')), edge.get('source_id') or ''))
+            closure_edges = sorted(
+                list(newer_edges) + list(closure_rows_by_target.get((group_id, node_id), [])),
+                key=lambda edge: (_timestamp_sort_key(edge.get('created_at')), edge.get('relation_type') or '', edge.get('source_id') or ''),
+            )
+            closure_invalid_at = self._first_timestamp(edge.get('created_at') for edge in closure_edges)
+            invalidation_kind = self._episode_invalidation_kind(newer_edges=newer_edges, closure_edges=closure_edges)
+            direct_parent_id = None
+            if len(older_edges) == 1:
+                direct_parent_id = self._episode_object_id(group_id, older_edges[0].get('target_id'))
+            direct_superseded_by = None
+            if len(newer_edges) == 1:
+                direct_superseded_by = self._episode_object_id(group_id, newer_edges[0].get('source_id'))
+
+            lifecycle_status = 'asserted'
+            if invalidation_kind == 'superseded':
+                lifecycle_status = 'superseded'
+            elif invalidation_kind == 'invalidated':
+                lifecycle_status = 'invalidated'
+
+            annotations = [
+                'om_native',
+                str(member.get('semantic_domain') or '').strip(),
+                str(member.get('status') or '').strip(),
+                'history_projected',
+                f'history_topology:{topology}',
+                f'history_ordering:{ordering}',
+                f'history_component_size:{total_versions}',
+                f'history_predecessor_count:{len(older_edges)}',
+                f'history_successor_count:{len(newer_edges)}',
+                f'history_closure_count:{len(closure_edges)}',
+            ]
+            if topology != 'linear':
+                annotations.append('history_ambiguous')
+            if invalidation_kind:
+                annotations.append(f'history_invalidation:{invalidation_kind}')
+            annotations = [item for item in annotations if item]
+
+            evidence_refs = [
+                EvidenceRef(
+                    kind='event_log',
+                    source_system='om',
+                    locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': node_id},
+                    title=str(member.get('title') or node_id),
+                    snippet=str(member.get('summary') or member.get('title') or node_id),
+                    observed_at=_coerce_timestamp(member.get('created_at')),
+                )
+            ]
+            evidence_refs.extend(self._transition_evidence_refs(group_id=group_id, edges=older_edges + newer_edges + closure_rows_by_target.get((group_id, node_id), [])))
+
+            projected.append(
+                Episode(
+                    object_id=object_id,
+                    root_id=root_id,
+                    parent_id=direct_parent_id if topology == 'linear' else direct_parent_id,
+                    version=member_version[node_id],
+                    is_current=closure_invalid_at is None,
+                    source_lane=group_id,
+                    source_key=f'om:{group_id}:node:{node_id}',
+                    policy_scope='private',
+                    visibility_scope='private',
+                    title=str(member.get('title') or node_id),
+                    summary=str(member.get('summary') or member.get('title') or node_id),
+                    annotations=annotations,
+                    created_at=_coerce_timestamp(member.get('created_at')) or '2026-01-01T00:00:00Z',
+                    valid_at=_coerce_timestamp(member.get('created_at')),
+                    invalid_at=closure_invalid_at,
+                    superseded_by=direct_superseded_by if len(newer_edges) == 1 else None,
+                    lifecycle_status=lifecycle_status,
+                    evidence_refs=self._dedupe_evidence_refs(evidence_refs),
+                )
+            )
+
+        return projected
+
+    def _project_relation_history(
+        self,
+        *,
+        relation_rows: list[dict[str, Any]],
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+    ) -> tuple[list[StateFact], int]:
+        grouped_rows: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in relation_rows:
+            group_id = str(row.get('group_id') or '').strip()
+            relation_type = str(row.get('name') or row.get('relation_type') or '').strip().upper()
+            source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
+            target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
+            relation_id = str(row.get('uuid') or '').strip()
+            if not group_id or not relation_type or not source_node_id or not target_node_id or not relation_id:
+                continue
+            source_anchor = self._relation_anchor_id(node_history_index, group_id=group_id, node_id=source_node_id)
+            target_anchor = self._relation_anchor_id(node_history_index, group_id=group_id, node_id=target_node_id)
+            grouped_rows[(group_id, relation_type, source_anchor, target_anchor)].append(row)
+
+        projected: list[StateFact] = []
+        for group_key, rows in grouped_rows.items():
+            group_id, relation_type, source_anchor, target_anchor = group_key
+            ordered_rows = sorted(rows, key=lambda row: self._relation_order_key(row, node_history_index=node_history_index))
+            if not ordered_rows:
+                continue
+            lineage_root_id = self._relation_root_id(
+                group_id=group_id,
+                relation_type=relation_type,
+                source_anchor=source_anchor,
+                target_anchor=target_anchor,
+            )
+            lineage_topology = self._relation_lineage_topology(rows=ordered_rows, node_history_index=node_history_index)
+
+            for index, row in enumerate(ordered_rows, start=1):
+                relation_id = str(row.get('uuid') or '').strip()
+                source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
+                target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
+                created_at = _coerce_timestamp(row.get('created_at'))
+                object_id = f'om_state:{group_id}:{relation_id}'
+                previous_object_id = (
+                    f"om_state:{group_id}:{ordered_rows[index - 2]['uuid']}"
+                    if index > 1 and lineage_topology == 'linear'
+                    else None
+                )
+                next_row = ordered_rows[index] if index < len(ordered_rows) else None
+                next_object_id = (
+                    f"om_state:{group_id}:{next_row['uuid']}"
+                    if next_row is not None and lineage_topology == 'linear'
+                    else None
+                )
+                next_row_at = _coerce_timestamp(next_row.get('created_at')) if next_row is not None else None
+                endpoint_invalid_at, endpoint_reason = self._relation_endpoint_invalid_at(
+                    group_id=group_id,
+                    source_node_id=source_node_id,
+                    target_node_id=target_node_id,
+                    created_at=created_at,
+                    node_history_index=node_history_index,
+                )
+                invalid_at, invalidation_reason = self._relation_invalid_at(
+                    created_at=created_at,
+                    next_row_at=next_row_at,
+                    endpoint_invalid_at=endpoint_invalid_at,
+                    endpoint_reason=endpoint_reason,
+                )
+                lifecycle_status = 'asserted'
+                if invalidation_reason == 'relation_replaced':
+                    lifecycle_status = 'superseded'
+                elif invalid_at is not None:
+                    lifecycle_status = 'invalidated'
+
+                value = {
+                    'fact': str(row.get('fact') or '').strip(),
+                    'source_node_id': source_node_id,
+                    'target_node_id': target_node_id,
+                    'source_content': str((row.get('attributes') or {}).get('source_content') or row.get('source_content') or '').strip(),
+                    'target_content': str((row.get('attributes') or {}).get('target_content') or row.get('target_content') or '').strip(),
+                    'om_history': {
+                        'lineage_basis': 'om_relation_anchor_history',
+                        'topology': lineage_topology,
+                        'source_anchor': source_anchor,
+                        'target_anchor': target_anchor,
+                        'source_version': self._node_version(node_history_index, group_id=group_id, node_id=source_node_id),
+                        'target_version': self._node_version(node_history_index, group_id=group_id, node_id=target_node_id),
+                        'source_is_current': self._node_is_current(node_history_index, group_id=group_id, node_id=source_node_id),
+                        'target_is_current': self._node_is_current(node_history_index, group_id=group_id, node_id=target_node_id),
+                        'ordering': 'relation_sequence' if lineage_topology == 'linear' else 'relation_chronology',
+                        'invalidation_reason': invalidation_reason,
+                    },
+                }
+
+                evidence_refs = [
+                    EvidenceRef(
+                        kind='event_log',
+                        source_system='om',
+                        locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': relation_id},
+                        title=relation_type,
+                        snippet=str(row.get('fact') or '').strip() or f"{value['source_content']} -> {value['target_content']}",
+                        observed_at=created_at,
+                    )
+                ]
+                evidence_refs.extend(
+                    self._endpoint_evidence_refs(
+                        group_id=group_id,
+                        source_node_id=source_node_id,
+                        target_node_id=target_node_id,
+                        source_content=value['source_content'],
+                        target_content=value['target_content'],
+                        created_at=created_at,
+                    )
+                )
+                if invalidation_reason == 'relation_replaced' and next_row is not None:
+                    evidence_refs.append(
+                        EvidenceRef(
+                            kind='event_log',
+                            source_system='om',
+                            locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': str(next_row.get('uuid') or '')},
+                            title=f'{relation_type} successor',
+                            snippet=str(next_row.get('fact') or '').strip(),
+                            observed_at=next_row_at,
+                        )
+                    )
+
+                projected.append(
+                    StateFact(
+                        object_id=object_id,
+                        root_id=lineage_root_id,
+                        parent_id=previous_object_id,
+                        version=index,
+                        is_current=invalid_at is None,
+                        source_lane=group_id,
+                        source_key=f'om:{group_id}:relation:{relation_id}',
+                        policy_scope='private',
+                        visibility_scope='private',
+                        fact_type='relationship',
+                        subject=f'om_node:{source_node_id}',
+                        predicate=f'om_relation:{relation_type.lower()}',
+                        value=value,
+                        scope='private',
+                        created_at=created_at or '2026-01-01T00:00:00Z',
+                        valid_at=created_at,
+                        invalid_at=invalid_at,
+                        superseded_by=next_object_id if invalidation_reason == 'relation_replaced' else None,
+                        lifecycle_status=lifecycle_status,
+                        evidence_refs=self._dedupe_evidence_refs(evidence_refs),
+                    )
+                )
+
+        projected.sort(key=lambda obj: (obj.root_id, obj.version, obj.object_id))
+        return projected, len(grouped_rows)
+
+    def _relation_lineage_topology(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+    ) -> str:
+        if len(rows) <= 1:
+            return 'singleton'
+        if any(
+            self._node_topology(node_history_index, group_id=str(row.get('group_id') or '').strip(), node_id=str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip())
+            not in {None, 'singleton', 'linear'}
+            or self._node_topology(node_history_index, group_id=str(row.get('group_id') or '').strip(), node_id=str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip())
+            not in {None, 'singleton', 'linear'}
+            for row in rows
+        ):
+            return 'branching'
+        return 'linear'
+
+    def _relation_invalid_at(
+        self,
+        *,
+        created_at: str | None,
+        next_row_at: str | None,
+        endpoint_invalid_at: str | None,
+        endpoint_reason: str | None,
+    ) -> tuple[str | None, str | None]:
+        candidates: list[tuple[str, str]] = []
+        if next_row_at is not None and (created_at is None or next_row_at >= created_at):
+            candidates.append((next_row_at, 'relation_replaced'))
+        if endpoint_invalid_at is not None and (created_at is None or endpoint_invalid_at >= created_at):
+            candidates.append((endpoint_invalid_at, endpoint_reason or 'endpoint_invalidated'))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: _timestamp_sort_key(item[0]))
+        return candidates[0]
+
+    def _relation_endpoint_invalid_at(
+        self,
+        *,
+        group_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        created_at: str | None,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        candidates: list[tuple[str, str]] = []
+        for endpoint_node_id, reason_prefix in ((source_node_id, 'source_node'), (target_node_id, 'target_node')):
+            meta = node_history_index.get((group_id, endpoint_node_id))
+            if meta is None:
+                continue
+            invalid_at = _coerce_timestamp(meta.get('invalid_at'))
+            if invalid_at is None:
+                continue
+            if created_at is not None and invalid_at <= created_at:
+                continue
+            candidates.append((invalid_at, f'{reason_prefix}_invalidated'))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: _timestamp_sort_key(item[0]))
+        return candidates[0]
+
+    def _closure_rows_by_target_node(self, relation_rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        closure_rows: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in relation_rows:
+            relation_type = str(row.get('name') or row.get('relation_type') or '').strip().upper()
+            if relation_type not in _CLOSURE_RELATION_TYPES:
+                continue
+            group_id = str(row.get('group_id') or '').strip()
+            target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
+            source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
+            if not group_id or not target_node_id:
+                continue
+            closure_rows[(group_id, target_node_id)].append(
+                {
+                    'source_id': source_node_id,
+                    'target_id': target_node_id,
+                    'created_at': _coerce_timestamp(row.get('created_at')),
+                    'relation_uuid': str(row.get('uuid') or '').strip() or None,
+                    'relation_type': relation_type,
+                }
+            )
+        for key, rows in closure_rows.items():
+            rows.sort(key=lambda edge: (_timestamp_sort_key(edge.get('created_at')), edge.get('relation_type') or '', edge.get('source_id') or ''))
+        return closure_rows
+
+    def _store_relation_row(
+        self,
+        relation_rows_by_key: dict[tuple[str, str], dict[str, Any]],
+        row: dict[str, Any],
+    ) -> None:
+        relation_id = str(row.get('uuid') or '').strip()
+        group_id = str(row.get('group_id') or '').strip()
+        relation_type = str(row.get('name') or row.get('relation_type') or '').strip()
+        source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
+        target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
+        if not relation_id or not group_id or not relation_type or not source_node_id or not target_node_id:
+            return
+        attributes = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
+        normalized = {
+            'uuid': relation_id,
+            'name': relation_type,
+            'relation_type': relation_type,
+            'fact': str(row.get('fact') or '').strip(),
+            'group_id': group_id,
+            'source_node_uuid': source_node_id,
+            'target_node_uuid': target_node_id,
+            'created_at': _coerce_timestamp(row.get('created_at')),
+            'attributes': {
+                'source_content': str(attributes.get('source_content') or row.get('source_content') or '').strip(),
+                'target_content': str(attributes.get('target_content') or row.get('target_content') or '').strip(),
+            },
+        }
+        relation_rows_by_key[(group_id, relation_id)] = normalized
+
+    def _member_sort_key(self, member: dict[str, Any]) -> tuple[Any, ...]:
+        return (_timestamp_sort_key(member.get('created_at')), str(member.get('node_id') or ''))
+
+    def _history_component_root_id(self, *, group_id: str, anchor_node_id: str) -> str:
+        return f'om_episode_component:{group_id}:{anchor_node_id}'
+
+    def _relation_root_id(
+        self,
+        *,
+        group_id: str,
+        relation_type: str,
+        source_anchor: str,
+        target_anchor: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            f'{group_id}|{relation_type}|{source_anchor}|{target_anchor}'.encode()
+        ).hexdigest()[:24]
+        return f'om_state_lineage:{group_id}:{digest}'
+
+    def _relation_anchor_id(
+        self,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+        *,
+        group_id: str,
+        node_id: str,
+    ) -> str:
+        meta = node_history_index.get((group_id, node_id))
+        if meta is not None:
+            return str(meta.get('root_id') or self._episode_object_id(group_id, node_id) or node_id)
+        return str(self._episode_object_id(group_id, node_id) or f'om_episode:{group_id}:{node_id}')
+
+    def _relation_order_key(
+        self,
+        row: dict[str, Any],
+        *,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+    ) -> tuple[Any, ...]:
+        group_id = str(row.get('group_id') or '').strip()
+        source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
+        target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
+        source_version = self._node_version(node_history_index, group_id=group_id, node_id=source_node_id) or 0
+        target_version = self._node_version(node_history_index, group_id=group_id, node_id=target_node_id) or 0
+        return (
+            _timestamp_sort_key(row.get('created_at')),
+            source_version,
+            target_version,
+            str(row.get('uuid') or ''),
+        )
+
+    def _node_version(
+        self,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+        *,
+        group_id: str,
+        node_id: str,
+    ) -> int | None:
+        meta = node_history_index.get((group_id, node_id))
+        if meta is None:
+            return None
+        try:
+            return int(meta.get('version'))
+        except (TypeError, ValueError):
+            return None
+
+    def _node_is_current(
+        self,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+        *,
+        group_id: str,
+        node_id: str,
+    ) -> bool | None:
+        meta = node_history_index.get((group_id, node_id))
+        if meta is None:
+            return None
+        return bool(meta.get('is_current'))
+
+    def _node_topology(
+        self,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+        *,
+        group_id: str,
+        node_id: str,
+    ) -> str | None:
+        meta = node_history_index.get((group_id, node_id))
+        if meta is None:
+            return None
+        topology = str(meta.get('topology') or '').strip()
+        return topology or None
+
+    def _episode_invalidation_kind(
+        self,
+        *,
+        newer_edges: list[dict[str, Any]],
+        closure_edges: list[dict[str, Any]],
+    ) -> str | None:
+        if newer_edges:
+            return 'superseded'
+        if any(str(edge.get('relation_type') or '').upper() == 'RESOLVES' for edge in closure_edges):
+            return 'invalidated'
+        return None
+
+    def _transition_evidence_refs(self, *, group_id: str, edges: list[dict[str, Any]]) -> list[EvidenceRef]:
+        refs: list[EvidenceRef] = []
+        for edge in edges:
+            relation_uuid = str(edge.get('relation_uuid') or '').strip()
+            relation_type = str(edge.get('relation_type') or 'SUPERSEDES').strip().upper() or 'SUPERSEDES'
+            if not relation_uuid:
+                continue
+            refs.append(
+                EvidenceRef(
+                    kind='event_log',
+                    source_system='om',
+                    locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': relation_uuid},
+                    title=relation_type,
+                    snippet=f"{edge.get('source_id') or ''} {relation_type} {edge.get('target_id') or ''}".strip(),
+                    observed_at=_coerce_timestamp(edge.get('created_at')),
+                )
+            )
+        return refs
+
+    def _endpoint_evidence_refs(
+        self,
+        *,
+        group_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        source_content: str,
+        target_content: str,
+        created_at: str | None,
+    ) -> list[EvidenceRef]:
+        refs: list[EvidenceRef] = []
+        refs.append(
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': source_node_id},
+                title=source_node_id,
+                snippet=source_content or source_node_id,
+                observed_at=created_at,
+            )
+        )
+        refs.append(
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': target_node_id},
+                title=target_node_id,
+                snippet=target_content or target_node_id,
+                observed_at=created_at,
+            )
+        )
+        return refs
+
+    def _dedupe_evidence_refs(self, refs: list[EvidenceRef]) -> list[EvidenceRef]:
+        deduped: dict[str, EvidenceRef] = {}
+        for ref in refs:
+            uri = str(ref.canonical_uri or '').strip()
+            if not uri:
+                continue
+            deduped.setdefault(uri, ref)
+        return list(deduped.values())
+
+    def _first_timestamp(self, values: Any) -> str | None:
+        timestamps = [_coerce_timestamp(value) for value in values]
+        normalized = [timestamp for timestamp in timestamps if timestamp is not None]
+        if not normalized:
+            return None
+        normalized.sort(key=_timestamp_sort_key)
+        return normalized[0]
+
+    def _annotation_value(self, annotations: list[str], prefix: str) -> str | None:
+        needle = f'{prefix}:'
+        for item in annotations:
+            if item.startswith(needle):
+                return item[len(needle):]
+        return None
+
+    def _node_key_from_source_key(self, source_key: str | None) -> tuple[str, str] | None:
+        raw = str(source_key or '').strip()
+        prefix = 'om:'
+        if not raw.startswith(prefix):
+            return None
+        parts = raw.split(':')
+        if len(parts) < 4 or parts[2] != 'node':
+            return None
+        return parts[1], ':'.join(parts[3:])
 
     def _episode_object_id(self, group_id: str, node_id: str | None) -> str | None:
         normalized_node_id = str(node_id or '').strip()
@@ -492,164 +1030,28 @@ class OMTypedProjectionService:
             return None
         return f'om_episode:{group_id}:{normalized_node_id}'
 
-    def _episode_from_node(self, row: dict[str, Any]) -> Episode | None:
-        node_id = str(row.get('uuid') or '').strip()
-        group_id = str(row.get('group_id') or '').strip()
-        if not node_id or not group_id:
-            return None
-
-        summary = str(row.get('summary') or '').strip()
-        title = str(row.get('name') or '').strip() or (summary[:120] if summary else node_id)
-        created_at = _coerce_timestamp(row.get('created_at'))
-        attributes = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
-        annotations = [
-            'om_native',
-            str(attributes.get('semantic_domain') or '').strip(),
-            str(attributes.get('status') or '').strip(),
-        ]
-        annotations = [item for item in annotations if item]
-
-        return Episode(
-            object_id=f'om_episode:{group_id}:{node_id}',
-            root_id=f'om_episode:{group_id}:{node_id}',
-            version=1,
-            is_current=True,
-            source_lane=group_id,
-            source_key=f'om:{group_id}:node:{node_id}',
-            policy_scope='private',
-            visibility_scope='private',
-            title=title,
-            summary=summary or title,
-            annotations=annotations,
-            created_at=created_at or '2026-01-01T00:00:00Z',
-            valid_at=created_at,
-            evidence_refs=[
-                EvidenceRef(
-                    kind='event_log',
-                    source_system='om',
-                    locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': node_id},
-                    title=title,
-                    snippet=summary or title,
-                    observed_at=created_at,
-                )
-            ],
-        )
-
-    def _episode_from_lineage_member(self, member: dict[str, Any]) -> Episode | None:
-        group_id = str(member.get('group_id') or '').strip()
-        node_id = str(member.get('node_id') or '').strip()
-        object_id = str(member.get('object_id') or '').strip()
-        root_id = str(member.get('root_id') or '').strip()
-        if not group_id or not node_id or not object_id or not root_id:
-            return None
-
-        title = str(member.get('title') or '').strip() or node_id
-        summary = str(member.get('summary') or '').strip() or title
-        created_at = _coerce_timestamp(member.get('created_at'))
-        annotations = [
-            'om_native',
-            str(member.get('semantic_domain') or '').strip(),
-            str(member.get('status') or '').strip(),
-            'history_lineage',
-        ]
-        annotations = [item for item in annotations if item]
-
-        return Episode(
-            object_id=object_id,
-            root_id=root_id,
-            parent_id=member.get('parent_id'),
-            version=int(member.get('version') or 1),
-            is_current=bool(member.get('is_current')),
-            source_lane=group_id,
-            source_key=f'om:{group_id}:node:{node_id}',
-            policy_scope='private',
-            visibility_scope='private',
-            title=title,
-            summary=summary,
-            annotations=annotations,
-            created_at=created_at or '2026-01-01T00:00:00Z',
-            valid_at=created_at,
-            invalid_at=_coerce_timestamp(member.get('invalid_at')),
-            superseded_by=member.get('superseded_by'),
-            evidence_refs=[
-                EvidenceRef(
-                    kind='event_log',
-                    source_system='om',
-                    locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': node_id},
-                    title=title,
-                    snippet=summary,
-                    observed_at=created_at,
-                )
-            ],
-        )
-
-    def _state_fact_from_relation(self, row: dict[str, Any]) -> StateFact | None:
-        relation_id = str(row.get('uuid') or '').strip()
-        group_id = str(row.get('group_id') or '').strip()
-        relation_type = str(row.get('name') or '').strip()
-        source_node_id = str(row.get('source_node_uuid') or '').strip()
-        target_node_id = str(row.get('target_node_uuid') or '').strip()
-        if not relation_id or not group_id or not relation_type or not source_node_id or not target_node_id:
-            return None
-
-        attributes = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
-        source_content = str(attributes.get('source_content') or '').strip()
-        target_content = str(attributes.get('target_content') or '').strip()
-        fact_text = str(row.get('fact') or '').strip()
-        created_at = _coerce_timestamp(row.get('created_at'))
-
-        return StateFact(
-            object_id=f'om_state:{group_id}:{relation_id}',
-            root_id=f'om_state:{group_id}:{relation_id}',
-            version=1,
-            is_current=True,
-            source_lane=group_id,
-            source_key=f'om:{group_id}:relation:{relation_id}',
-            policy_scope='private',
-            visibility_scope='private',
-            fact_type='relationship',
-            subject=f'om_node:{source_node_id}',
-            predicate=f'om_relation:{relation_type.lower()}',
-            value={
-                'fact': fact_text,
-                'source_node_id': source_node_id,
-                'target_node_id': target_node_id,
-                'source_content': source_content,
-                'target_content': target_content,
-            },
-            scope='private',
-            created_at=created_at or '2026-01-01T00:00:00Z',
-            valid_at=created_at,
-            evidence_refs=[
-                EvidenceRef(
-                    kind='event_log',
-                    source_system='om',
-                    locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': relation_id},
-                    title=relation_type,
-                    snippet=fact_text or f'{source_content} -> {target_content}',
-                    observed_at=created_at,
-                )
-            ],
-        )
-
-    def _node_search_text(self, row: dict[str, Any]) -> str:
-        attributes = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
+    def _episode_search_text(self, episode: Episode) -> str:
         parts = [
-            str(row.get('name') or ''),
-            str(row.get('summary') or ''),
-            str(attributes.get('semantic_domain') or ''),
-            str(attributes.get('status') or ''),
-            str(row.get('group_id') or ''),
+            str(episode.title or ''),
+            str(episode.summary or ''),
+            str(episode.source_lane or ''),
+            ' '.join(episode.annotations),
+            str(episode.lifecycle_status or ''),
         ]
         return ' '.join(part for part in parts if part).strip()
 
-    def _fact_search_text(self, row: dict[str, Any]) -> str:
-        attributes = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
+    def _fact_search_text_from_object(self, fact: StateFact) -> str:
+        value = fact.value if isinstance(fact.value, dict) else {'value': fact.value}
+        history = value.get('om_history') if isinstance(value, dict) else {}
         parts = [
-            str(row.get('name') or ''),
-            str(row.get('fact') or ''),
-            str(attributes.get('source_content') or ''),
-            str(attributes.get('target_content') or ''),
-            str(row.get('group_id') or ''),
+            str(fact.fact_type or ''),
+            str(fact.subject or ''),
+            str(fact.predicate or ''),
+            str(value.get('fact') or ''),
+            str(value.get('source_content') or ''),
+            str(value.get('target_content') or ''),
+            str(history.get('topology') or ''),
+            str(history.get('invalidation_reason') or ''),
+            str(fact.source_lane or ''),
         ]
         return ' '.join(part for part in parts if part).strip()

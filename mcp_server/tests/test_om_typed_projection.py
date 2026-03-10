@@ -7,9 +7,10 @@ from mcp_server.src.services.om_typed_projection import OMTypedProjectionService
 
 
 class _FakeSearchService:
-    def __init__(self, *, node_rows=None, fact_rows=None):
+    def __init__(self, *, node_rows=None, fact_rows=None, neighborhood_rows=None):
         self.node_rows = node_rows or []
         self.fact_rows = fact_rows or []
+        self.neighborhood_rows = neighborhood_rows or {}
 
     def includes_observational_memory(self, group_ids):
         return True
@@ -20,18 +21,21 @@ class _FakeSearchService:
     async def search_observational_nodes(self, **_kwargs):
         return list(self.node_rows)
 
-    async def search_observational_facts(self, **_kwargs):
+    async def search_observational_facts(self, *, center_node_uuid=None, **_kwargs):
+        if center_node_uuid is not None:
+            return list(self.neighborhood_rows.get(center_node_uuid, []))
         return list(self.fact_rows)
 
 
 class _FakeDriver:
-    def __init__(self, records=None):
-        self.records = records or []
+    def __init__(self, records_by_seed=None):
+        self.records_by_seed = records_by_seed or {}
         self.calls = []
 
     async def execute_query(self, query, **params):
         self.calls.append({'query': query, 'params': params})
-        return list(self.records), None, None
+        seed = params.get('seed_node_id')
+        return list(self.records_by_seed.get(seed, [])), None, None
 
 
 class _FakeGraphitiService:
@@ -64,50 +68,52 @@ async def test_history_projection_materializes_linear_supersession_lineage():
         ]
     )
     driver = _FakeDriver(
-        records=[
-            {
-                'node_id': 'node_v1',
-                'uuid': 'node_v1',
-                'group_id': 's1_observational_memory',
-                'content': 'coffee before training',
-                'created_at': '2026-03-01T00:00:00Z',
-                'status': 'open',
-                'semantic_domain': 'observational_memory',
-                'supersedes': [],
-            },
-            {
-                'node_id': 'node_v2',
-                'uuid': 'node_v2',
-                'group_id': 's1_observational_memory',
-                'content': 'americano before training',
-                'created_at': '2026-03-05T00:00:00Z',
-                'status': 'open',
-                'semantic_domain': 'observational_memory',
-                'supersedes': [
-                    {
-                        'target_id': 'node_v1',
-                        'created_at': '2026-03-05T00:00:00Z',
-                        'relation_uuid': 'rel_v2_v1',
-                    }
-                ],
-            },
-            {
-                'node_id': 'node_v3',
-                'uuid': 'node_v3',
-                'group_id': 's1_observational_memory',
-                'content': 'espresso after training',
-                'created_at': '2026-03-09T00:00:00Z',
-                'status': 'active',
-                'semantic_domain': 'observational_memory',
-                'supersedes': [
-                    {
-                        'target_id': 'node_v2',
-                        'created_at': '2026-03-09T00:00:00Z',
-                        'relation_uuid': 'rel_v3_v2',
-                    }
-                ],
-            },
-        ]
+        records_by_seed={
+            'node_v3': [
+                {
+                    'node_id': 'node_v1',
+                    'uuid': 'node_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'coffee before training',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'node_v2',
+                    'uuid': 'node_v2',
+                    'group_id': 's1_observational_memory',
+                    'content': 'americano before training',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [
+                        {
+                            'target_id': 'node_v1',
+                            'created_at': '2026-03-05T00:00:00Z',
+                            'relation_uuid': 'rel_v2_v1',
+                        }
+                    ],
+                },
+                {
+                    'node_id': 'node_v3',
+                    'uuid': 'node_v3',
+                    'group_id': 's1_observational_memory',
+                    'content': 'espresso after training',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [
+                        {
+                            'target_id': 'node_v2',
+                            'created_at': '2026-03-09T00:00:00Z',
+                            'relation_uuid': 'rel_v3_v2',
+                        }
+                    ],
+                },
+            ]
+        }
     )
     service = OMTypedProjectionService(
         search_service=search_service,
@@ -117,7 +123,7 @@ async def test_history_projection_materializes_linear_supersession_lineage():
     objects, search_overrides, limits = await service.project(
         query='what changed about the training drink',
         effective_group_ids=['s1_observational_memory'],
-        object_types=set(),
+        object_types={'episode'},
         max_results=5,
         query_mode='history',
     )
@@ -136,6 +142,8 @@ async def test_history_projection_materializes_linear_supersession_lineage():
     assert by_id[v1_id].is_current is False
     assert by_id[v1_id].superseded_by == v2_id
     assert by_id[v1_id].invalid_at == '2026-03-05T00:00:00Z'
+    assert by_id[v1_id].lifecycle_status == 'superseded'
+    assert 'history_topology:linear' in by_id[v1_id].annotations
 
     assert by_id[v2_id].root_id == v1_id
     assert by_id[v2_id].version == 2
@@ -150,6 +158,7 @@ async def test_history_projection_materializes_linear_supersession_lineage():
     assert by_id[v3_id].is_current is True
     assert by_id[v3_id].superseded_by is None
     assert by_id[v3_id].invalid_at is None
+    assert by_id[v3_id].lifecycle_status == 'asserted'
 
     assert search_overrides[v1_id].startswith('coffee before training')
     assert limits == {
@@ -162,15 +171,220 @@ async def test_history_projection_materializes_linear_supersession_lineage():
         'history_mode': True,
         'history_candidates': 1,
         'history_lineages_projected': 1,
+        'history_relation_lineages_projected': 0,
         'history_state_projection_supported': False,
         'unsupported_object_types': [],
         'skipped_candidates': [],
+        'history_topology_counts': {'linear': 1},
+        'history_relation_candidates': 0,
     }
     assert driver.calls, 'history projection should query Neo4j for supersession lineage'
 
 
 @pytest.mark.anyio
-async def test_history_projection_fails_closed_for_branching_supersession_graph():
+async def test_history_projection_derives_relation_history_and_closure_invalidation():
+    search_service = _FakeSearchService(
+        node_rows=[
+            {
+                'uuid': 'plan_v2',
+                'name': 'Fix plan current',
+                'summary': 'Ship the cache fix',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-05T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            }
+        ],
+        fact_rows=[
+            {
+                'uuid': 'rel_plan_v2_issue',
+                'name': 'ADDRESSES',
+                'fact': 'ADDRESSES: ship cache fix -> latency issue',
+                'group_id': 's1_observational_memory',
+                'source_node_uuid': 'plan_v2',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-05T00:00:00Z',
+                'attributes': {
+                    'source_content': 'Ship cache fix',
+                    'target_content': 'Latency issue',
+                },
+            },
+            {
+                'uuid': 'rel_fix_resolves_issue',
+                'name': 'RESOLVES',
+                'fact': 'RESOLVES: ship cache fix -> latency issue',
+                'group_id': 's1_observational_memory',
+                'source_node_uuid': 'fix_1',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-06T00:00:00Z',
+                'attributes': {
+                    'source_content': 'Ship cache fix',
+                    'target_content': 'Latency issue',
+                },
+            },
+        ],
+        neighborhood_rows={
+            'plan_v1': [
+                {
+                    'uuid': 'rel_plan_v1_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: investigate latency -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Investigate latency spike',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+            'plan_v2': [
+                {
+                    'uuid': 'rel_plan_v2_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: ship cache fix -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v2',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship cache fix',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+            'issue_1': [
+                {
+                    'uuid': 'rel_fix_resolves_issue',
+                    'name': 'RESOLVES',
+                    'fact': 'RESOLVES: ship cache fix -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'fix_1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship cache fix',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+            'fix_1': [
+                {
+                    'uuid': 'rel_fix_resolves_issue',
+                    'name': 'RESOLVES',
+                    'fact': 'RESOLVES: ship cache fix -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'fix_1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship cache fix',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+        },
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'plan_v2': [
+                {
+                    'node_id': 'plan_v1',
+                    'uuid': 'plan_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Investigate latency spike',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'plan_v2',
+                    'uuid': 'plan_v2',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Ship cache fix',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [
+                        {'target_id': 'plan_v1', 'created_at': '2026-03-05T00:00:00Z', 'relation_uuid': 'rel_plan_v2_v1'}
+                    ],
+                },
+            ],
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Latency issue',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+            'fix_1': [
+                {
+                    'node_id': 'fix_1',
+                    'uuid': 'fix_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Ship cache fix',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
+    )
+    service = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_FakeGraphitiService(driver),
+    )
+
+    objects, _search_overrides, limits = await service.project(
+        query='what changed for the latency issue',
+        effective_group_ids=['s1_observational_memory'],
+        object_types={'state_fact'},
+        max_results=5,
+        query_mode='history',
+    )
+
+    assert len(objects) == 3
+    assert all(isinstance(obj, StateFact) for obj in objects)
+
+    by_id = {obj.object_id: obj for obj in objects}
+    addresses_v1 = by_id['om_state:s1_observational_memory:rel_plan_v1_issue']
+    addresses_v2 = by_id['om_state:s1_observational_memory:rel_plan_v2_issue']
+    resolves = by_id['om_state:s1_observational_memory:rel_fix_resolves_issue']
+
+    assert addresses_v1.root_id == addresses_v2.root_id
+    assert addresses_v1.version == 1
+    assert addresses_v1.is_current is False
+    assert addresses_v1.invalid_at == '2026-03-05T00:00:00Z'
+    assert addresses_v1.superseded_by == addresses_v2.object_id
+    assert addresses_v1.lifecycle_status == 'superseded'
+    assert addresses_v1.value['om_history']['lineage_basis'] == 'om_relation_anchor_history'
+    assert addresses_v1.value['om_history']['topology'] == 'linear'
+
+    assert addresses_v2.version == 2
+    assert addresses_v2.is_current is False
+    assert addresses_v2.invalid_at == '2026-03-06T00:00:00Z'
+    assert addresses_v2.superseded_by is None
+    assert addresses_v2.lifecycle_status == 'invalidated'
+    assert addresses_v2.value['om_history']['invalidation_reason'] == 'target_node_invalidated'
+
+    assert resolves.is_current is True
+    assert resolves.invalid_at is None
+    assert resolves.value['om_history']['topology'] == 'singleton'
+
+    assert limits['state_projected'] == 3
+    assert limits['history_relation_lineages_projected'] == 2
+    assert limits['history_state_projection_supported'] is True
+
+
+@pytest.mark.anyio
+async def test_history_projection_surfaces_branching_topology_without_fabrication():
     search_service = _FakeSearchService(
         node_rows=[
             {
@@ -184,69 +398,135 @@ async def test_history_projection_fails_closed_for_branching_supersession_graph(
         ]
     )
     driver = _FakeDriver(
-        records=[
-            {
-                'node_id': 'node_v1',
-                'uuid': 'node_v1',
-                'group_id': 's1_observational_memory',
-                'content': 'original state',
-                'created_at': '2026-03-01T00:00:00Z',
-                'status': 'open',
-                'semantic_domain': 'observational_memory',
-                'supersedes': [],
-            },
-            {
-                'node_id': 'node_v2a',
-                'uuid': 'node_v2a',
-                'group_id': 's1_observational_memory',
-                'content': 'first successor',
-                'created_at': '2026-03-05T00:00:00Z',
-                'status': 'active',
-                'semantic_domain': 'observational_memory',
-                'supersedes': [{'target_id': 'node_v1', 'created_at': '2026-03-05T00:00:00Z'}],
-            },
-            {
-                'node_id': 'node_v2b',
-                'uuid': 'node_v2b',
-                'group_id': 's1_observational_memory',
-                'content': 'second successor',
-                'created_at': '2026-03-06T00:00:00Z',
-                'status': 'active',
-                'semantic_domain': 'observational_memory',
-                'supersedes': [{'target_id': 'node_v1', 'created_at': '2026-03-06T00:00:00Z'}],
-            },
-        ]
+        records_by_seed={
+            'node_v2a': [
+                {
+                    'node_id': 'node_v1',
+                    'uuid': 'node_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'original state',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'node_v2a',
+                    'uuid': 'node_v2a',
+                    'group_id': 's1_observational_memory',
+                    'content': 'first successor',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [{'target_id': 'node_v1', 'created_at': '2026-03-05T00:00:00Z'}],
+                },
+                {
+                    'node_id': 'node_v2b',
+                    'uuid': 'node_v2b',
+                    'group_id': 's1_observational_memory',
+                    'content': 'second successor',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [{'target_id': 'node_v1', 'created_at': '2026-03-06T00:00:00Z'}],
+                },
+            ]
+        }
     )
     service = OMTypedProjectionService(
         search_service=search_service,
         graphiti_service=_FakeGraphitiService(driver),
     )
 
-    objects, search_overrides, limits = await service.project(
+    objects, _search_overrides, limits = await service.project(
         query='what changed',
         effective_group_ids=['s1_observational_memory'],
-        object_types=set(),
+        object_types={'episode'},
         max_results=5,
         query_mode='history',
     )
 
-    assert objects == []
-    assert search_overrides == {}
-    assert limits['enabled'] is True
-    assert limits['reason'] == 'projected_history'
-    assert limits['episodes_projected'] == 0
-    assert limits['history_lineages_projected'] == 0
-    assert limits['skipped_candidates'] == [
-        {
-            'group_id': 's1_observational_memory',
-            'node_id': 'node_v2a',
-            'reason': 'ambiguous_supersession_graph',
-        }
-    ]
+    assert len(objects) == 3
+    by_id = {obj.object_id: obj for obj in objects}
+    root = by_id['om_episode:s1_observational_memory:node_v1']
+    first = by_id['om_episode:s1_observational_memory:node_v2a']
+    second = by_id['om_episode:s1_observational_memory:node_v2b']
+
+    assert root.is_current is False
+    assert root.invalid_at == '2026-03-05T00:00:00Z'
+    assert root.superseded_by is None
+    assert 'history_topology:branching' in root.annotations
+    assert 'history_ambiguous' in root.annotations
+    assert first.is_current is True
+    assert second.is_current is True
+    assert limits['skipped_candidates'] == []
+    assert limits['history_topology_counts'] == {'branching': 1}
 
 
 @pytest.mark.anyio
-async def test_non_history_projection_still_surfaces_episodes_and_state():
+async def test_history_projection_surfaces_cyclic_topology_as_ambiguous_history():
+    search_service = _FakeSearchService(
+        node_rows=[
+            {
+                'uuid': 'cycle_a',
+                'name': 'Cycle A',
+                'summary': 'malformed cycle start',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-02T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            }
+        ]
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'cycle_a': [
+                {
+                    'node_id': 'cycle_a',
+                    'uuid': 'cycle_a',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Cycle A',
+                    'created_at': '2026-03-02T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [{'target_id': 'cycle_b', 'created_at': '2026-03-02T00:00:00Z'}],
+                },
+                {
+                    'node_id': 'cycle_b',
+                    'uuid': 'cycle_b',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Cycle B',
+                    'created_at': '2026-03-03T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [{'target_id': 'cycle_a', 'created_at': '2026-03-03T00:00:00Z'}],
+                },
+            ]
+        }
+    )
+    service = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_FakeGraphitiService(driver),
+    )
+
+    objects, _search_overrides, limits = await service.project(
+        query='history of malformed cycle',
+        effective_group_ids=['s1_observational_memory'],
+        object_types={'episode'},
+        max_results=5,
+        query_mode='history',
+    )
+
+    assert len(objects) == 2
+    assert all(isinstance(obj, Episode) for obj in objects)
+    assert all('history_topology:cyclic' in obj.annotations for obj in objects)
+    assert all('history_ambiguous' in obj.annotations for obj in objects)
+    assert all(obj.is_current is False for obj in objects)
+    assert limits['skipped_candidates'] == []
+    assert limits['history_topology_counts'] == {'cyclic': 1}
+
+
+@pytest.mark.anyio
+async def test_non_history_projection_keeps_currentness_semantics_for_current_and_all_modes():
     search_service = _FakeSearchService(
         node_rows=[
             {
@@ -273,10 +553,70 @@ async def test_non_history_projection_still_surfaces_episodes_and_state():
                 },
             }
         ],
+        neighborhood_rows={
+            'node_current': [
+                {
+                    'uuid': 'rel_current',
+                    'name': 'RESOLVES',
+                    'fact': 'RESOLVES: current observation -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'node_current',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'current observation',
+                        'target_content': 'latency issue',
+                    },
+                }
+            ],
+            'issue_1': [
+                {
+                    'uuid': 'rel_current',
+                    'name': 'RESOLVES',
+                    'fact': 'RESOLVES: current observation -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'node_current',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'current observation',
+                        'target_content': 'latency issue',
+                    },
+                }
+            ],
+        },
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'node_current': [
+                {
+                    'node_id': 'node_current',
+                    'uuid': 'node_current',
+                    'group_id': 's1_observational_memory',
+                    'content': 'current observation',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'latency issue',
+                    'created_at': '2026-03-08T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
     )
     service = OMTypedProjectionService(
         search_service=search_service,
-        graphiti_service=_FakeGraphitiService(_FakeDriver()),
+        graphiti_service=_FakeGraphitiService(driver),
     )
 
     objects, search_overrides, limits = await service.project(
@@ -287,19 +627,20 @@ async def test_non_history_projection_still_surfaces_episodes_and_state():
         query_mode='all',
     )
 
-    assert len(objects) == 2
-    assert any(isinstance(obj, Episode) for obj in objects)
-    assert any(isinstance(obj, StateFact) for obj in objects)
-    assert set(search_overrides) == {
+    assert len(objects) == 3
+    episodes = [obj for obj in objects if isinstance(obj, Episode)]
+    state = [obj for obj in objects if isinstance(obj, StateFact)]
+    issue_episode = next(obj for obj in episodes if obj.object_id.endswith(':issue_1'))
+    resolve_state = next(obj for obj in state if obj.object_id.endswith(':rel_current'))
+
+    assert issue_episode.is_current is False
+    assert issue_episode.invalid_at == '2026-03-09T00:00:00Z'
+    assert issue_episode.lifecycle_status == 'invalidated'
+    assert resolve_state.is_current is True
+    assert set(search_overrides) >= {
         'om_episode:s1_observational_memory:node_current',
+        'om_episode:s1_observational_memory:issue_1',
         'om_state:s1_observational_memory:rel_current',
     }
-    assert limits == {
-        'enabled': True,
-        'reason': 'projected',
-        'groups_considered': ['s1_observational_memory'],
-        'episodes_projected': 1,
-        'state_projected': 1,
-        'max_results': 5,
-        'history_mode': False,
-    }
+    assert limits['reason'] == 'projected'
+    assert limits['history_mode'] is False
