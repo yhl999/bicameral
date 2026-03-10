@@ -9,7 +9,7 @@ server:
 llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq
   model: "gpt-4o-mini"
-  max_tokens: 4096
+  max_tokens: 16384
 
   providers:
     openai:
