@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
+
 from mcp_server.src.services.search_service import SearchService
 
 
