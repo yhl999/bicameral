@@ -214,7 +214,9 @@ class SearchService:
             created_at = row.get('created_at')
             valid_at = row.get('valid_at')
             invalid_at = row.get('invalid_at')
-            relation_properties = row.get('relation_properties') if isinstance(row.get('relation_properties'), dict) else {}
+            relation_properties = row.get('relation_properties')
+            if not isinstance(relation_properties, dict):
+                relation_properties = {}
 
             facts.append(
                 {
