@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -429,23 +430,62 @@ def _has_related_reappearance(node: dict[str, Any], events: list[dict[str, Any]]
     return False
 
 
-def _has_addresses(session: Any, node_id: str) -> bool:
-    row = session.run(
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _relation_root_id(*, group_id: str, relation_type: str, source_node_id: str, target_node_id: str) -> str:
+    digest = _sha256_hex(f"{group_id}|{relation_type}|{source_node_id}|{target_node_id}")[:32]
+    return f"omrelroot:{digest}"
+
+
+def _relation_version_id(*, relation_root_id: str, valid_at: str) -> str:
+    digest = _sha256_hex(f"{relation_root_id}|{valid_at}")[:32]
+    return f"omrel:{digest}"
+
+
+def _judgment_addresses(session: Any, node_id: str) -> list[dict[str, str]]:
+    rows = session.run(
         """
-        MATCH (:Judgment)-[:ADDRESSES]->(n:OMNode {node_id:$node_id})
-        RETURN count(*) > 0 AS has_link
+        MATCH (j)-[r:ADDRESSES]->(n:OMNode {node_id:$node_id})
+        WHERE (
+            j:Judgment
+            OR (j:OMNode AND coalesce(j.node_type, '') = 'Judgment')
+            OR coalesce(j.node_type, '') = 'Judgment'
+        )
+          AND r.invalid_at IS NULL
+        RETURN DISTINCT coalesce(j.node_id, j.uuid, '') AS source_node_id,
+               coalesce(j.group_id, n.group_id, r.group_id, '') AS group_id
+        ORDER BY source_node_id ASC
         """,
         {"node_id": node_id},
-    ).single()
-    return bool(row and row["has_link"])
+    ).data()
+    return [
+        {
+            "source_node_id": str(row.get("source_node_id") or "").strip(),
+            "group_id": str(row.get("group_id") or "").strip(),
+        }
+        for row in rows
+        if str(row.get("source_node_id") or "").strip() and str(row.get("group_id") or "").strip()
+    ]
+
+
+def _has_addresses(session: Any, node_id: str) -> bool:
+    return bool(_judgment_addresses(session, node_id))
 
 
 def _has_fresh_addresses(session: Any, node_id: str, since_iso: str, now_utc: str) -> bool:
     row = session.run(
         """
-        MATCH (:Judgment)-[r:ADDRESSES]->(n:OMNode {node_id:$node_id})
-        WHERE coalesce(r.linked_at, '') > $since_iso
-          AND coalesce(r.linked_at, '') <= $now_iso
+        MATCH (j)-[r:ADDRESSES]->(n:OMNode {node_id:$node_id})
+        WHERE (
+            j:Judgment
+            OR (j:OMNode AND coalesce(j.node_type, '') = 'Judgment')
+            OR coalesce(j.node_type, '') = 'Judgment'
+        )
+          AND r.invalid_at IS NULL
+          AND coalesce(r.valid_at, r.linked_at, r.created_at, '') > $since_iso
+          AND coalesce(r.valid_at, r.linked_at, r.created_at, '') <= $now_iso
         RETURN count(r) > 0 AS has_fresh
         """,
         {"node_id": node_id, "since_iso": since_iso, "now_iso": now_utc},
@@ -453,16 +493,21 @@ def _has_fresh_addresses(session: Any, node_id: str, since_iso: str, now_utc: st
     return bool(row and row["has_fresh"])
 
 
-def _invalidate_relation_lifecycle_for_closed_node(
+def _invalidate_relation_lifecycle_for_target(
     session: Any,
     *,
+    relation_type: str,
     node_id: str,
     now_utc: str,
     transition_cause: str,
 ) -> None:
+    normalized_relation_type = str(relation_type or "").strip().upper()
+    if normalized_relation_type not in {"ADDRESSES", "RESOLVES"}:
+        raise ValueError(f"unsupported convergence relation invalidation type: {relation_type!r}")
+
     session.run(
-        """
-        MATCH (source:OMNode)-[r:ADDRESSES]->(target:OMNode {node_id:$node_id})
+        f"""
+        MATCH (source)-[r:{normalized_relation_type}]->(target:OMNode {{node_id:$node_id}})
         WHERE r.invalid_at IS NULL
         SET r.invalid_at = $now_iso,
             r.lifecycle_status = CASE
@@ -472,12 +517,112 @@ def _invalidate_relation_lifecycle_for_closed_node(
             r.transition_cause = $transition_cause,
             r.transition_basis = 'node_status_transition',
             r.invalidated_by_node_id = $node_id,
+            r.relation_id = coalesce(r.relation_id, r.uuid),
             r.relation_root_id = coalesce(r.relation_root_id, r.uuid),
+            r.group_id = coalesce(r.group_id, source.group_id, target.group_id),
             r.lineage_basis = coalesce(r.lineage_basis, 'singleton_native'),
-            r.lineage_topology = coalesce(r.lineage_topology, 'singleton')
+            r.lineage_topology = coalesce(r.lineage_topology, 'singleton'),
+            r.source_lineage_root_id = coalesce(r.source_lineage_root_id, source.lineage_root_id, source.node_id, source.uuid),
+            r.target_lineage_root_id = coalesce(r.target_lineage_root_id, target.lineage_root_id, target.node_id, target.uuid),
+            r.source_node_id = coalesce(r.source_node_id, source.node_id, source.uuid),
+            r.target_node_id = coalesce(r.target_node_id, target.node_id, target.uuid)
         """,
         {"node_id": node_id, "now_iso": now_utc, "transition_cause": transition_cause},
     ).consume()
+
+
+def _assert_resolves_relations_for_closed_node(
+    session: Any,
+    *,
+    node_id: str,
+    now_utc: str,
+) -> None:
+    for judgment in _judgment_addresses(session, node_id):
+        source_node_id = judgment["source_node_id"]
+        group_id = judgment["group_id"]
+        relation_root_id = _relation_root_id(
+            group_id=group_id,
+            relation_type="RESOLVES",
+            source_node_id=source_node_id,
+            target_node_id=node_id,
+        )
+        relation_uuid = _relation_version_id(relation_root_id=relation_root_id, valid_at=now_utc)
+
+        exists_row = session.run(
+            """
+            MATCH ()-[r:RESOLVES]->(n:OMNode {node_id:$node_id})
+            WHERE coalesce(r.uuid, '') = $relation_uuid
+            RETURN count(r) > 0 AS already_exists
+            """,
+            {"node_id": node_id, "relation_uuid": relation_uuid},
+        ).single()
+        if exists_row and exists_row["already_exists"]:
+            continue
+
+        parent_row = session.run(
+            """
+            MATCH ()-[r:RESOLVES]->(n:OMNode {node_id:$node_id})
+            WHERE coalesce(r.relation_root_id, '') = $relation_root_id
+            RETURN coalesce(r.uuid, r.relation_id, '') AS relation_id
+            ORDER BY coalesce(r.valid_at, r.created_at) DESC, relation_id DESC
+            LIMIT 1
+            """,
+            {"node_id": node_id, "relation_root_id": relation_root_id},
+        ).single()
+        parent_relation_id = str(parent_row["relation_id"] or "").strip() if parent_row else ""
+
+        session.run(
+            """
+            MATCH (j)-[a:ADDRESSES]->(n:OMNode {node_id:$node_id})
+            WHERE (
+                j:Judgment
+                OR (j:OMNode AND coalesce(j.node_type, '') = 'Judgment')
+                OR coalesce(j.node_type, '') = 'Judgment'
+            )
+              AND coalesce(j.node_id, j.uuid, '') = $source_node_id
+              AND a.invalid_at IS NULL
+            CREATE (j)-[r:RESOLVES]->(n)
+            SET r.uuid = $relation_uuid,
+                r.relation_id = $relation_uuid,
+                r.relation_root_id = $relation_root_id,
+                r.group_id = $group_id,
+                r.created_at = $now_iso,
+                r.valid_at = $now_iso,
+                r.linked_at = $now_iso,
+                r.lifecycle_status = 'asserted',
+                r.transition_cause = 'relation_asserted',
+                r.transition_basis = 'convergence_resolution',
+                r.lineage_basis = CASE
+                  WHEN $parent_relation_id = '' THEN 'singleton_native'
+                  ELSE 'native_relation_lineage'
+                END,
+                r.lineage_topology = CASE
+                  WHEN $parent_relation_id = '' THEN 'singleton'
+                  ELSE 'linear'
+                END,
+                r.lineage_limit_reason = NULL,
+                r.lineage_parent_relation_id = CASE
+                  WHEN $parent_relation_id = '' THEN NULL
+                  ELSE $parent_relation_id
+                END,
+                r.superseded_by_relation_id = NULL,
+                r.invalid_at = NULL,
+                r.invalidated_by_node_id = NULL,
+                r.source_lineage_root_id = coalesce(j.lineage_root_id, j.node_id, j.uuid, $source_node_id),
+                r.target_lineage_root_id = coalesce(n.lineage_root_id, n.node_id, n.uuid, $node_id),
+                r.source_node_id = coalesce(j.node_id, j.uuid, $source_node_id),
+                r.target_node_id = coalesce(n.node_id, n.uuid, $node_id)
+            """,
+            {
+                "node_id": node_id,
+                "source_node_id": source_node_id,
+                "group_id": group_id,
+                "relation_uuid": relation_uuid,
+                "relation_root_id": relation_root_id,
+                "parent_relation_id": parent_relation_id,
+                "now_iso": now_utc,
+            },
+        ).consume()
 
 
 def _apply_transition(
@@ -503,6 +648,13 @@ def _apply_transition(
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
         ).consume()
+        _invalidate_relation_lifecycle_for_target(
+            session,
+            relation_type="RESOLVES",
+            node_id=node_id,
+            now_utc=now_utc,
+            transition_cause="target_node_monitoring",
+        )
     elif target_status == "reopened":
         session.run(
             """
@@ -519,6 +671,13 @@ def _apply_transition(
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
         ).consume()
+        _invalidate_relation_lifecycle_for_target(
+            session,
+            relation_type="RESOLVES",
+            node_id=node_id,
+            now_utc=now_utc,
+            transition_cause="target_node_reopened",
+        )
     elif target_status == "closed":
         session.run(
             """
@@ -534,12 +693,19 @@ def _apply_transition(
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
         ).consume()
-        _invalidate_relation_lifecycle_for_closed_node(
+        _invalidate_relation_lifecycle_for_target(
             session,
+            relation_type="ADDRESSES",
             node_id=node_id,
             now_utc=now_utc,
-            transition_cause='target_node_closed',
+            transition_cause="target_node_closed",
         )
+        if node_type in {"Friction", "Commitment"}:
+            _assert_resolves_relations_for_closed_node(
+                session,
+                node_id=node_id,
+                now_utc=now_utc,
+            )
     elif target_status == "abandoned":
         session.run(
             """
@@ -555,6 +721,13 @@ def _apply_transition(
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
         ).consume()
+        _invalidate_relation_lifecycle_for_target(
+            session,
+            relation_type="RESOLVES",
+            node_id=node_id,
+            now_utc=now_utc,
+            transition_cause="target_node_abandoned",
+        )
     else:
         session.run(
             """
@@ -568,24 +741,6 @@ def _apply_transition(
                 n.transition_cause = 'status_transition'
             """,
             {"node_id": node_id, "target_status": target_status, "now_iso": now_utc},
-        ).consume()
-
-    if target_status == "closed" and node_type in {"Friction", "Commitment"}:
-        session.run(
-            """
-            MATCH (j:Judgment)-[:ADDRESSES]->(n:OMNode {node_id:$node_id})
-            MERGE (j)-[r:RESOLVES]->(n)
-            ON CREATE SET r.linked_at = $now_iso,
-                          r.created_at = $now_iso,
-                          r.valid_at = $now_iso,
-                          r.lifecycle_status = 'asserted',
-                          r.transition_cause = 'relation_asserted',
-                          r.transition_basis = 'convergence_resolution',
-                          r.invalid_at = NULL
-            ON MATCH SET r.valid_at = coalesce(r.valid_at, $now_iso),
-                         r.lifecycle_status = coalesce(r.lifecycle_status, 'asserted')
-            """,
-            {"node_id": node_id, "now_iso": now_utc},
         ).consume()
 
 

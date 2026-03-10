@@ -334,94 +334,94 @@ class Neo4jService:
                   )
                 CALL {
                     WITH center
-                    MATCH (center)-[rel:MOTIVATES]->(target:OMNode)
+                    MATCH (center)-[rel:MOTIVATES]->(target)
                     WHERE rel.group_id = $group_id
-                      AND target.group_id = $group_id
+                      AND coalesce(target.group_id, $group_id) = $group_id
                     RETURN center AS source, target AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (center)-[rel:GENERATES]->(target:OMNode)
+                    MATCH (center)-[rel:GENERATES]->(target)
                     WHERE rel.group_id = $group_id
-                      AND target.group_id = $group_id
+                      AND coalesce(target.group_id, $group_id) = $group_id
                     RETURN center AS source, target AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (center)-[rel:SUPERSEDES]->(target:OMNode)
+                    MATCH (center)-[rel:SUPERSEDES]->(target)
                     WHERE rel.group_id = $group_id
-                      AND target.group_id = $group_id
+                      AND coalesce(target.group_id, $group_id) = $group_id
                     RETURN center AS source, target AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (center)-[rel:ADDRESSES]->(target:OMNode)
+                    MATCH (center)-[rel:ADDRESSES]->(target)
                     WHERE rel.group_id = $group_id
-                      AND target.group_id = $group_id
+                      AND coalesce(target.group_id, $group_id) = $group_id
                     RETURN center AS source, target AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (center)-[rel:RESOLVES]->(target:OMNode)
+                    MATCH (center)-[rel:RESOLVES]->(target)
                     WHERE rel.group_id = $group_id
-                      AND target.group_id = $group_id
+                      AND coalesce(target.group_id, $group_id) = $group_id
                     RETURN center AS source, target AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (source:OMNode)-[rel:MOTIVATES]->(center)
+                    MATCH (source)-[rel:MOTIVATES]->(center)
                     WHERE rel.group_id = $group_id
-                      AND source.group_id = $group_id
+                      AND coalesce(source.group_id, $group_id) = $group_id
                     RETURN source AS source, center AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (source:OMNode)-[rel:GENERATES]->(center)
+                    MATCH (source)-[rel:GENERATES]->(center)
                     WHERE rel.group_id = $group_id
-                      AND source.group_id = $group_id
+                      AND coalesce(source.group_id, $group_id) = $group_id
                     RETURN source AS source, center AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (source:OMNode)-[rel:SUPERSEDES]->(center)
+                    MATCH (source)-[rel:SUPERSEDES]->(center)
                     WHERE rel.group_id = $group_id
-                      AND source.group_id = $group_id
+                      AND coalesce(source.group_id, $group_id) = $group_id
                     RETURN source AS source, center AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (source:OMNode)-[rel:ADDRESSES]->(center)
+                    MATCH (source)-[rel:ADDRESSES]->(center)
                     WHERE rel.group_id = $group_id
-                      AND source.group_id = $group_id
+                      AND coalesce(source.group_id, $group_id) = $group_id
                     RETURN source AS source, center AS target, rel
 
                     UNION
 
                     WITH center
-                    MATCH (source:OMNode)-[rel:RESOLVES]->(center)
+                    MATCH (source)-[rel:RESOLVES]->(center)
                     WHERE rel.group_id = $group_id
-                      AND source.group_id = $group_id
+                      AND coalesce(source.group_id, $group_id) = $group_id
                     RETURN source AS source, center AS target, rel
                 }
-                RETURN coalesce(rel.uuid, source.node_id + ':' + type(rel) + ':' + target.node_id) AS uuid,
+                RETURN coalesce(rel.uuid, rel.relation_id, coalesce(rel.source_node_id, source.node_id, source.uuid) + ':' + type(rel) + ':' + coalesce(rel.target_node_id, target.node_id, target.uuid)) AS uuid,
                        type(rel) AS relation_type,
-                       coalesce(source.node_id, '') AS source_node_id,
-                       coalesce(target.node_id, '') AS target_node_id,
+                       coalesce(rel.source_node_id, source.node_id, source.uuid, '') AS source_node_id,
+                       coalesce(rel.target_node_id, target.node_id, target.uuid, '') AS target_node_id,
                        coalesce(rel.created_at, source.created_at, target.created_at) AS created_at,
                        coalesce(rel.valid_at, rel.created_at, source.created_at, target.created_at) AS valid_at,
                        rel.invalid_at AS invalid_at,
                        properties(rel) AS relation_properties,
                        coalesce(rel.group_id, source.group_id, target.group_id, $group_id) AS group_id,
-                       coalesce(source.content, '') AS source_content,
-                       coalesce(target.content, '') AS target_content,
+                       coalesce(source.content, source.name, rel.source_node_id, '') AS source_content,
+                       coalesce(target.content, target.name, rel.target_node_id, '') AS target_content,
                        0 AS lexical_score
                 ORDER BY coalesce(rel.created_at, source.created_at, target.created_at) DESC
                 LIMIT $limit
@@ -445,15 +445,17 @@ class Neo4jService:
               AND matched_node.group_id = $group_id
             CALL {
                 WITH matched_node, matched_score
-                MATCH (matched_node)-[rel:MOTIVATES|GENERATES|SUPERSEDES|ADDRESSES|RESOLVES]-(neighbor:OMNode)
+                MATCH (matched_node)-[rel:MOTIVATES|GENERATES|SUPERSEDES|ADDRESSES|RESOLVES]-(neighbor)
                 WHERE rel.group_id = $group_id
-                  AND neighbor.group_id = $group_id
+                  AND coalesce(neighbor.group_id, $group_id) = $group_id
                   AND (
                       $center_node_uuid IS NULL
                       OR matched_node.node_id = $center_node_uuid
                       OR matched_node.uuid = $center_node_uuid
                       OR neighbor.node_id = $center_node_uuid
                       OR neighbor.uuid = $center_node_uuid
+                      OR rel.source_node_id = $center_node_uuid
+                      OR rel.target_node_id = $center_node_uuid
                   )
                 WITH matched_node, matched_score, rel, neighbor
                 ORDER BY coalesce(rel.created_at, neighbor.created_at, matched_node.created_at) DESC
@@ -470,17 +472,17 @@ class Neo4jService:
                        matched_score AS lexical_score
             }
             WITH source, target, rel, max(lexical_score) AS lexical_score
-            RETURN coalesce(rel.uuid, source.node_id + ':' + type(rel) + ':' + target.node_id) AS uuid,
+            RETURN coalesce(rel.uuid, rel.relation_id, coalesce(rel.source_node_id, source.node_id, source.uuid) + ':' + type(rel) + ':' + coalesce(rel.target_node_id, target.node_id, target.uuid)) AS uuid,
                    type(rel) AS relation_type,
-                   coalesce(source.node_id, '') AS source_node_id,
-                   coalesce(target.node_id, '') AS target_node_id,
+                   coalesce(rel.source_node_id, source.node_id, source.uuid, '') AS source_node_id,
+                   coalesce(rel.target_node_id, target.node_id, target.uuid, '') AS target_node_id,
                    coalesce(rel.created_at, source.created_at, target.created_at) AS created_at,
                    coalesce(rel.valid_at, rel.created_at, source.created_at, target.created_at) AS valid_at,
                    rel.invalid_at AS invalid_at,
                    properties(rel) AS relation_properties,
                    coalesce(rel.group_id, source.group_id, target.group_id, $group_id) AS group_id,
-                   coalesce(source.content, '') AS source_content,
-                   coalesce(target.content, '') AS target_content,
+                   coalesce(source.content, source.name, rel.source_node_id, '') AS source_content,
+                   coalesce(target.content, target.name, rel.target_node_id, '') AS target_content,
                    lexical_score AS lexical_score
             ORDER BY lexical_score DESC, coalesce(rel.created_at, source.created_at, target.created_at) DESC
             LIMIT $limit

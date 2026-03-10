@@ -64,18 +64,18 @@ async def test_search_om_facts_requires_rel_and_node_group_matches():
     assert 'CALL db.index.fulltext.queryNodes' in query_text
     assert 'matched_node.group_id = $group_id' not in query_text
     assert 'rel.group_id = $group_id' in query_text
-    assert 'neighbor.group_id = $group_id' in query_text
+    assert 'coalesce(neighbor.group_id, $group_id) = $group_id' in query_text
     assert '$center_node_uuid IS NULL' in query_text
     assert 'type(rel) IN $relation_types' not in query_text
-    assert 'coalesce(source.node_id, source.uuid' not in query_text
-    assert 'coalesce(target.node_id, target.uuid' not in query_text
+    assert 'coalesce(rel.source_node_id, source.node_id, source.uuid' in query_text
+    assert 'coalesce(rel.target_node_id, target.node_id, target.uuid' in query_text
+    assert 'rel.invalid_at AS invalid_at' in query_text
+    assert 'properties(rel) AS relation_properties' in query_text
+    assert 'neighbor:OMNode' not in query_text
+    assert 'MATCH (source:OMNode)-[rel:RESOLVES]->(center)' not in query_text
     assert '[rel:MOTIVATES|GENERATES|SUPERSEDES|ADDRESSES|RESOLVES]' in query_text
     assert 'reduce(' not in query_text
     assert 'CONTAINS token' not in query_text
-    assert (
-        'coalesce(rel.group_id, source.group_id, target.group_id, $group_id) = $group_id'
-        not in query_text
-    )
     assert (
         driver.execute_query.await_args.kwargs['fulltext_index_name']
         == OM_NODE_CONTENT_FULLTEXT_INDEX
@@ -212,6 +212,10 @@ async def test_search_om_facts_empty_query_with_center_uses_bounded_center_path(
     assert 'type(rel) IN $relation_types' not in query_text
     assert '[rel:MOTIVATES]' in query_text
     assert '[rel:RESOLVES]' in query_text
+    assert 'coalesce(source.group_id, $group_id) = $group_id' in query_text
+    assert 'coalesce(target.group_id, $group_id) = $group_id' in query_text
+    assert 'coalesce(rel.source_node_id, source.node_id, source.uuid' in query_text
+    assert 'properties(rel) AS relation_properties' in query_text
     assert driver.execute_query.await_args.kwargs['center_node_uuid'] == 'om-node-123'
 
 

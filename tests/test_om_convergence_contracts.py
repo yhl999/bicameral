@@ -25,9 +25,11 @@ class _FakeResult:
 class _FakeSession:
     def __init__(self):
         self.queries: list[str] = []
+        self.calls: list[dict[str, object]] = []
 
     def run(self, query: str, params=None):  # noqa: ANN001
         self.queries.append(query)
+        self.calls.append({'query': query, 'params': params or {}})
         normalized = " ".join(query.split())
 
         if 'RETURN count(m) AS eligible_messages' in normalized:
@@ -38,6 +40,14 @@ class _FakeSession:
             return _FakeResult({'eligible_episodes': 4})
         if 'RETURN count(*) AS deleted_episodes' in normalized:
             return _FakeResult({'deleted_episodes': 1})
+        if 'RETURN DISTINCT coalesce(j.node_id, j.uuid, \'\') AS source_node_id' in normalized:
+            return _FakeResult(
+                rows=[{'source_node_id': 'judgment_1', 'group_id': 's1_observational_memory'}]
+            )
+        if 'RETURN count(r) > 0 AS already_exists' in normalized:
+            return _FakeResult({'already_exists': False})
+        if 'WHERE coalesce(r.relation_root_id, \'\') = $relation_root_id' in normalized:
+            return _FakeResult(None)
 
         return _FakeResult({'ok': True})
 
@@ -156,6 +166,66 @@ class OMConvergenceDeterminismTests(unittest.TestCase):
 
         self.assertEqual(target, 'abandoned')
         self.assertEqual(reason, 'reopened_aged_without_mentions_or_addresses')
+
+
+class OMConvergenceLifecycleWriteTests(unittest.TestCase):
+    def test_has_addresses_matches_omnode_judgments_not_just_legacy_label(self) -> None:
+        session = _FakeSession()
+
+        om_convergence._has_addresses(session, 'issue_1')
+
+        joined = '\n'.join(session.queries)
+        self.assertIn('MATCH (j)-[r:ADDRESSES]->(n:OMNode {node_id:$node_id})', joined)
+        self.assertIn("j:OMNode AND coalesce(j.node_type, '') = 'Judgment'", joined)
+        self.assertIn('r.invalid_at IS NULL', joined)
+
+    def test_apply_transition_closed_writes_native_resolves_relation_shape(self) -> None:
+        session = _FakeSession()
+
+        om_convergence._apply_transition(
+            session,
+            node_id='issue_1',
+            node_type='Friction',
+            target_status='closed',
+            now_utc='2026-03-10T00:00:00Z',
+        )
+
+        joined = '\n'.join(session.queries)
+        self.assertIn('n.closed_at = $now_iso', joined)
+        self.assertIn('n.invalid_at = $now_iso', joined)
+        self.assertIn("n.lifecycle_status = 'invalidated'", joined)
+        self.assertIn('MATCH (source)-[r:ADDRESSES]->(target:OMNode {node_id:$node_id})', joined)
+        self.assertIn('r.invalid_at = $now_iso', joined)
+        self.assertIn('MATCH (j)-[a:ADDRESSES]->(n:OMNode {node_id:$node_id})', joined)
+        self.assertIn('CREATE (j)-[r:RESOLVES]->(n)', joined)
+        self.assertIn('r.relation_root_id = $relation_root_id', joined)
+        self.assertIn('r.group_id = $group_id', joined)
+        self.assertIn('r.transition_basis = \'convergence_resolution\'', joined)
+        self.assertIn('r.lineage_parent_relation_id = CASE', joined)
+        self.assertIn('r.source_node_id = coalesce(j.node_id, j.uuid, $source_node_id)', joined)
+        self.assertIn('r.target_node_id = coalesce(n.node_id, n.uuid, $node_id)', joined)
+
+    def test_apply_transition_reopened_invalidates_active_resolves_relations(self) -> None:
+        session = _FakeSession()
+
+        om_convergence._apply_transition(
+            session,
+            node_id='issue_1',
+            node_type='Friction',
+            target_status='reopened',
+            now_utc='2026-03-11T00:00:00Z',
+        )
+
+        joined = '\n'.join(session.queries)
+        self.assertIn('n.previous_status = n.status', joined)
+        self.assertIn('n.reopened_at = $now_iso', joined)
+        self.assertIn('n.invalid_at = NULL', joined)
+        self.assertIn("n.lifecycle_status = 'asserted'", joined)
+        self.assertIn("n.transition_cause = 'reopened_after_reappearance'", joined)
+        self.assertIn('MATCH (source)-[r:RESOLVES]->(target:OMNode {node_id:$node_id})', joined)
+        self.assertIn('r.invalid_at = $now_iso', joined)
+        self.assertIn('r.transition_basis = \'node_status_transition\'', joined)
+        self.assertIn('r.invalidated_by_node_id = $node_id', joined)
 
 
 class OMConvergenceNeo4jFallbackPolicyTests(unittest.TestCase):
