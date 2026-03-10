@@ -260,3 +260,211 @@ def test_lineage_over_cap_uses_root_snapshot_instead_of_disappearing():
     assert response['state'][0]['object_id'] == 'obj_1'
     assert response['limits_applied']['materialization']['snapshot_only_roots_over_event_cap'] == 1
     assert response['limits_applied']['materialization']['skipped_roots_over_event_cap'] == 0
+
+
+# ── OM typed projection merge tests ──────────────────────────────────────────
+
+
+class _FakeOMProjectionService:
+    """Minimal OM projection stub that returns canned typed objects."""
+
+    def __init__(self, objects=None, search_overrides=None, limits=None):
+        self._objects = objects or []
+        self._search_overrides = search_overrides or {}
+        self._limits = limits or {'enabled': True, 'reason': 'projected', 'groups_considered': [], 'episodes_projected': 0, 'state_projected': 0, 'max_results': 10}
+        self.calls = []
+
+    async def project(self, *, query, effective_group_ids, object_types, max_results):
+        self.calls.append({
+            'query': query,
+            'effective_group_ids': effective_group_ids,
+            'object_types': object_types,
+            'max_results': max_results,
+        })
+        return self._objects, self._search_overrides, self._limits
+
+
+def _om_state_fact(*, object_id: str, group_id: str = 's1_observational_memory'):
+    return StateFact(
+        object_id=object_id,
+        root_id=object_id,
+        version=1,
+        is_current=True,
+        source_lane=group_id,
+        source_key=f'om:{group_id}:relation:{object_id}',
+        policy_scope='private',
+        visibility_scope='private',
+        evidence_refs=[
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': object_id},
+                title='OM relation',
+                snippet='om projected fact',
+            )
+        ],
+        fact_type='relationship',
+        subject='om_node:source',
+        predicate='om_relation:resolves',
+        value='om projected',
+        scope='private',
+    )
+
+
+def test_om_projection_merges_objects_into_typed_search():
+    """OM projected objects surface through typed buckets when projection service is wired."""
+    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-1')
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:s1_observational_memory:rel-1': 'resolves latency spike'},
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 0,
+            'state_projected': 1,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='latency spike',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'om_state:s1_observational_memory:rel-1'
+    assert response['state'][0]['source_lane'] == 's1_observational_memory'
+    assert response['limits_applied']['materialization']['om_projection']['enabled'] is True
+    assert projection.calls[0]['effective_group_ids'] == ['s1_observational_memory']
+
+
+def test_om_projection_deduplicates_against_ledger_objects():
+    """OM projected objects with same ID as ledger objects are not duplicated."""
+    ledger_obj = _state_fact(object_id='shared_id', root_id='root_shared', version=1, value='resolves')
+    om_obj = _om_state_fact(object_id='shared_id')
+
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'shared_id': 'resolves latency spike'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([ledger_obj], {'candidate_roots': 1, 'materialized_roots': 1, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'test', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {'shared_id': 'resolves latency spike'})
+
+    response = _run(
+        service.search(
+            query='resolves',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['state'] == 1
+
+
+def test_om_projection_evidence_includes_om_provenance():
+    """OM projected objects carry evidence refs with om source_system."""
+    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-prov')
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:s1_observational_memory:rel-prov': 'resolves latency spike'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(
+            payload=[{
+                'canonical_uri': 'eventlog://om/s1_observational_memory:relation/rel-prov',
+                'kind': 'event_log',
+                'source_system': 'om',
+                'resolver': 'passthrough',
+                'status': 'resolved',
+            }]
+        ),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='resolves latency',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['evidence'] >= 1
+    assert any(e.get('source_system') == 'om' for e in response['evidence'])
+
+
+def test_om_projection_disabled_when_no_service():
+    """Without OM projection service, om_projection limits show disabled."""
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='test',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['limits_applied']['materialization']['om_projection']['enabled'] is False
+    assert response['limits_applied']['materialization']['om_projection']['reason'] == 'no_projection_service'
+
+
+def test_om_projection_experimental_group_surfaces_through_typed_buckets():
+    """Experimental OM-native groups surface when explicitly scoped."""
+    om_obj = _om_state_fact(
+        object_id='om_state:ontbk15batch_20260310_om_f:rel-exp',
+        group_id='ontbk15batch_20260310_om_f',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:ontbk15batch_20260310_om_f:rel-exp': 'experimental bakeoff resolves'},
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['ontbk15batch_20260310_om_f'],
+            'episodes_projected': 0,
+            'state_projected': 1,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='experimental bakeoff',
+            effective_group_ids=['ontbk15batch_20260310_om_f'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['source_lane'] == 'ontbk15batch_20260310_om_f'

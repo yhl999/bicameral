@@ -1,20 +1,55 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-import graphiti_mcp_server as srv
-from config.schema import GraphitiConfig
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_HELPER_PATH = REPO_ROOT / 'tests' / 'helpers_mcp_import.py'
+_HELPER_SPEC = spec_from_file_location('repo_tests_helpers_mcp_import', _HELPER_PATH)
+assert _HELPER_SPEC is not None and _HELPER_SPEC.loader is not None
+_HELPER_MODULE = module_from_spec(_HELPER_SPEC)
+_HELPER_SPEC.loader.exec_module(_HELPER_MODULE)
+load_graphiti_mcp_server = _HELPER_MODULE.load_graphiti_mcp_server
+
+srv = load_graphiti_mcp_server()
 
 
-def _base_config(provider: str = 'neo4j') -> GraphitiConfig:
-    config = GraphitiConfig()
-    config.database.provider = provider
-    config.graphiti.group_id = 's1_sessions_main'
-    return config
+def _base_config(provider: str = 'neo4j'):
+    return SimpleNamespace(
+        database=SimpleNamespace(provider=provider),
+        graphiti=SimpleNamespace(
+            group_id='s1_sessions_main',
+            lane_aliases={
+                'sessions_main': ['s1_sessions_main'],
+                'observational_memory': ['s1_observational_memory'],
+            },
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_graphiti_search_config_builders(monkeypatch: pytest.MonkeyPatch):
+    """Avoid importing heavy graphiti search config deps in unit-test mode."""
+
+    monkeypatch.setattr(
+        srv,
+        '_build_node_search_config',
+        lambda search_mode, max_nodes: SimpleNamespace(search_mode=search_mode, limit=max_nodes),
+    )
+    monkeypatch.setattr(
+        srv,
+        '_build_edge_search_config',
+        lambda search_mode, max_facts, center_node_uuid: SimpleNamespace(
+            search_mode=search_mode,
+            limit=max_facts,
+            center_node_uuid=center_node_uuid,
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -45,7 +80,7 @@ def test_env_float_rejects_non_finite_values_returns_default(monkeypatch, value:
     )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_returns_om_primitive_results(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, 'config', _base_config())
@@ -91,7 +126,7 @@ async def test_search_nodes_returns_om_primitive_results(monkeypatch: pytest.Mon
     fake_client.driver.execute_query.assert_awaited()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_returns_om_primitive_results_for_experimental_om_native_group(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -140,7 +175,7 @@ async def test_search_nodes_returns_om_primitive_results_for_experimental_om_nat
     assert fake_client.driver.execute_query.await_args.kwargs['group_id'] == 'ontbk15batch_20260310_om_f'
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_experimental_om_group_without_om_hits_falls_back_to_graphiti(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -183,7 +218,7 @@ async def test_search_nodes_experimental_om_group_without_om_hits_falls_back_to_
     fake_client.search_.assert_awaited_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, 'config', _base_config())
@@ -230,7 +265,7 @@ async def test_search_memory_facts_returns_om_relation_results(monkeypatch: pyte
     fake_client.driver.execute_query.assert_awaited()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_returns_om_relation_results_for_experimental_om_native_group(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -279,7 +314,7 @@ async def test_search_memory_facts_returns_om_relation_results_for_experimental_
     assert fake_client.driver.execute_query.await_args.kwargs['group_id'] == 'ontbk15batch_20260310_om_f'
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_experimental_om_group_without_om_hits_falls_back_to_graphiti(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -329,7 +364,7 @@ async def test_search_memory_facts_experimental_om_group_without_om_hits_falls_b
     fake_client.search_.assert_awaited_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_all_lanes_scope_merges_om_and_graphiti_results(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -383,7 +418,7 @@ async def test_search_nodes_all_lanes_scope_merges_om_and_graphiti_results(
     fake_client.driver.execute_query.assert_awaited()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_all_lanes_with_om_error_falls_back_to_graphiti(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, 'config', _base_config())
@@ -421,7 +456,7 @@ async def test_search_nodes_all_lanes_with_om_error_falls_back_to_graphiti(monke
     fake_client.driver.execute_query.assert_awaited()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_all_lanes_scope_merges_om_and_graphiti_results(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -483,7 +518,7 @@ async def test_search_memory_facts_all_lanes_scope_merges_om_and_graphiti_result
     fake_client.driver.execute_query.assert_awaited_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_all_lanes_with_om_error_falls_back_to_graphiti(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -530,7 +565,7 @@ async def test_search_memory_facts_all_lanes_with_om_error_falls_back_to_graphit
     fake_client.driver.execute_query.assert_awaited_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_falkordb_all_lanes_uses_graphiti_path(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -571,7 +606,7 @@ async def test_search_nodes_falkordb_all_lanes_uses_graphiti_path(
     fake_service.get_client.assert_not_called()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_falkordb_all_lanes_uses_graphiti_path(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -619,7 +654,7 @@ async def test_search_memory_facts_falkordb_all_lanes_uses_graphiti_path(
     fake_service.get_client.assert_not_called()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_om_adapter_honors_entity_types_filter(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, 'config', _base_config())
@@ -649,7 +684,7 @@ async def test_search_nodes_om_adapter_honors_entity_types_filter(monkeypatch: p
     fake_client.search_.assert_not_called()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_om_adapter_passes_center_node_uuid(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -852,7 +887,7 @@ def test_fuse_node_like_results_enforces_graphiti_floor_when_window_allows(monke
     assert any(item['uuid'] == 'graphiti-1' for item in fused)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_oversized_max_nodes_is_capped_and_adapter_receives_cap_in_om_only_scope(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, '_MAX_NODES_CAP', 2)
@@ -906,7 +941,7 @@ async def test_search_nodes_oversized_max_nodes_is_capped_and_adapter_receives_c
     fake_service.get_client.assert_not_called()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_oversized_max_facts_is_capped_and_adapter_receives_cap_in_om_only_scope(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, '_MAX_FACTS_CAP', 2)
@@ -961,7 +996,7 @@ async def test_search_memory_facts_oversized_max_facts_is_capped_and_adapter_rec
     fake_service.get_client.assert_not_called()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_nodes_mixed_lane_caps_output_and_adapter_limit(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, '_MAX_NODES_CAP', 2)
@@ -1031,7 +1066,7 @@ async def test_search_nodes_mixed_lane_caps_output_and_adapter_limit(monkeypatch
     fake_client.search_.assert_awaited_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_memory_facts_mixed_lane_caps_output_and_adapter_limit(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
     monkeypatch.setattr(srv, '_MAX_FACTS_CAP', 2)
@@ -1110,3 +1145,211 @@ async def test_search_memory_facts_mixed_lane_caps_output_and_adapter_limit(monk
     )
     fake_service.get_client_for_group.assert_awaited_once()
     fake_client.search_.assert_awaited_once()
+
+
+# ── OM typed projection through search_memory_facts typed path ──────────────
+
+
+@pytest.mark.anyio
+async def test_search_memory_facts_typed_mode_surfaces_om_canonical_lane(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Typed retrieval surfaces OM-native canonical lane content through typed buckets."""
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    typed_response = {
+        'message': 'Typed memory retrieved successfully',
+        'result_format': 'typed',
+        'query_mode': 'all',
+        'state': [
+            {
+                'object_id': 'om_state:s1_observational_memory:rel-1',
+                'source_lane': 's1_observational_memory',
+                'fact_type': 'relationship',
+            }
+        ],
+        'episodes': [
+            {
+                'object_id': 'om_episode:s1_observational_memory:node-1',
+                'source_lane': 's1_observational_memory',
+                'title': 'Neo4j heap cap observation',
+            }
+        ],
+        'procedures': [],
+        'evidence': [
+            {
+                'canonical_uri': 'eventlog://om/s1_observational_memory:node/node-1',
+                'kind': 'event_log',
+                'source_system': 'om',
+                'resolver': 'passthrough',
+                'status': 'resolved',
+            }
+        ],
+        'counts': {'state': 1, 'episodes': 1, 'procedures': 0, 'evidence': 1},
+        'filters_applied': {'object_types': [], 'metadata_filters': {}},
+        'limits_applied': {
+            'max_results': {'requested': 10, 'effective': 10},
+            'max_evidence': {'requested': 20, 'effective': 20},
+            'materialization': {
+                'om_projection': {
+                    'enabled': True,
+                    'reason': 'projected',
+                    'groups_considered': ['s1_observational_memory'],
+                    'episodes_projected': 1,
+                    'state_projected': 1,
+                    'max_results': 10,
+                },
+            },
+        },
+    }
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            pass
+
+        async def search(self, **kwargs):
+            return typed_response
+
+    monkeypatch.setattr(srv, 'TypedRetrievalService', lambda **kwargs: _FakeService(**kwargs))
+
+    response = await srv.search_memory_facts(
+        query='heap cap',
+        group_ids=['s1_observational_memory'],
+        result_format='typed',
+        max_facts=10,
+    )
+
+    assert response['result_format'] == 'typed'
+    assert response['counts']['state'] == 1
+    assert response['counts']['episodes'] == 1
+    assert response['state'][0]['source_lane'] == 's1_observational_memory'
+    assert response['episodes'][0]['source_lane'] == 's1_observational_memory'
+    assert any(e['source_system'] == 'om' for e in response['evidence'])
+
+
+@pytest.mark.anyio
+async def test_search_memory_facts_typed_mode_surfaces_om_experimental_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Typed retrieval surfaces OM-native experimental group content when scoped."""
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    typed_response = {
+        'message': 'Typed memory retrieved successfully',
+        'result_format': 'typed',
+        'query_mode': 'all',
+        'state': [
+            {
+                'object_id': 'om_state:ontbk15batch_20260310_om_f:rel-exp-1',
+                'source_lane': 'ontbk15batch_20260310_om_f',
+                'fact_type': 'relationship',
+            }
+        ],
+        'episodes': [],
+        'procedures': [],
+        'evidence': [],
+        'counts': {'state': 1, 'episodes': 0, 'procedures': 0, 'evidence': 0},
+        'filters_applied': {'object_types': [], 'metadata_filters': {}},
+        'limits_applied': {
+            'max_results': {'requested': 10, 'effective': 10},
+            'max_evidence': {'requested': 20, 'effective': 20},
+            'materialization': {
+                'om_projection': {
+                    'enabled': True,
+                    'reason': 'projected',
+                    'groups_considered': ['ontbk15batch_20260310_om_f'],
+                    'episodes_projected': 0,
+                    'state_projected': 1,
+                    'max_results': 10,
+                },
+            },
+        },
+    }
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            pass
+
+        async def search(self, **kwargs):
+            return typed_response
+
+    monkeypatch.setattr(srv, 'TypedRetrievalService', lambda **kwargs: _FakeService(**kwargs))
+
+    response = await srv.search_memory_facts(
+        query='experimental om retrieval',
+        group_ids=['ontbk15batch_20260310_om_f'],
+        result_format='typed',
+        max_facts=10,
+    )
+
+    assert response['result_format'] == 'typed'
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['source_lane'] == 'ontbk15batch_20260310_om_f'
+
+
+@pytest.mark.anyio
+async def test_search_memory_facts_typed_mode_evidence_includes_om_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Typed retrieval evidence bucket includes deterministic OM provenance pointers."""
+    monkeypatch.setattr(srv, '_SEARCH_RATE_LIMIT_ENABLED', False)
+    monkeypatch.setattr(srv, 'config', _base_config())
+
+    typed_response = {
+        'message': 'Typed memory retrieved successfully',
+        'result_format': 'typed',
+        'query_mode': 'all',
+        'state': [
+            {
+                'object_id': 'om_state:s1_observational_memory:rel-prov',
+                'source_lane': 's1_observational_memory',
+            }
+        ],
+        'episodes': [],
+        'procedures': [],
+        'evidence': [
+            {
+                'canonical_uri': 'eventlog://om/s1_observational_memory:relation/rel-prov',
+                'kind': 'event_log',
+                'source_system': 'om',
+                'locator': {
+                    'system': 'om',
+                    'stream': 's1_observational_memory:relation',
+                    'event_id': 'rel-prov',
+                },
+                'resolver': 'passthrough',
+                'status': 'resolved',
+            }
+        ],
+        'counts': {'state': 1, 'episodes': 0, 'procedures': 0, 'evidence': 1},
+        'filters_applied': {'object_types': [], 'metadata_filters': {}},
+        'limits_applied': {
+            'max_results': {'requested': 10, 'effective': 10},
+            'max_evidence': {'requested': 20, 'effective': 20},
+            'materialization': {},
+        },
+    }
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            pass
+
+        async def search(self, **kwargs):
+            return typed_response
+
+    monkeypatch.setattr(srv, 'TypedRetrievalService', lambda **kwargs: _FakeService(**kwargs))
+
+    response = await srv.search_memory_facts(
+        query='provenance test',
+        group_ids=['s1_observational_memory'],
+        result_format='typed',
+        max_facts=10,
+    )
+
+    assert len(response['evidence']) == 1
+    evidence = response['evidence'][0]
+    assert evidence['source_system'] == 'om'
+    assert evidence['kind'] == 'event_log'
+    assert 'eventlog://om/' in evidence['canonical_uri']
