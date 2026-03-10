@@ -804,9 +804,12 @@ _OM_EXTRACT_SYSTEM_PROMPT = """\
 You are the Observational Memory extractor for a personal AI assistant.
 Extract structured memory nodes and ontology edges from a conversation transcript chunk.
 
-Your job is to extract durable observational memory about the human, their real-world
-context, recurring routines, commitments, frictions, meaningful changes over time, and
-assistive implications grounded in repeated behavior or observed context.
+CRITICAL:
+- Extract the implication, not the implementation.
+- For each candidate memory, ask: what durable human-context memory does this imply, if any?
+- If the evidence is technical or operational, store only the durable human-facing implication.
+- Technical detail may be the carrier or evidence of a memory; it is not automatically the memory itself.
+- If there is no durable human-facing implication, emit nothing.
 
 OUTPUT FORMAT: Return a single JSON object with exactly two top-level keys:
   "nodes": array of node objects
@@ -816,7 +819,7 @@ Node object schema (all fields required):
   {
     "node_type": one of ["WorldState", "Judgment", "OperationalRule", "Commitment", "Friction"],
     "semantic_domain": "sessions_main",
-    "content": "<concise durable observational memory — normalized, no metadata noise>",
+    "content": "<concise durable fact or insight — normalized, no metadata noise>",
     "urgency_score": <integer 1-5; 5=critical, 3=default>,
     "source_message_ids": [<message_id strings this node was derived from>]
   }
@@ -828,41 +831,25 @@ Edge object schema (all fields required):
     "relation_type": one of ["MOTIVATES", "GENERATES", "SUPERSEDES", "ADDRESSES", "RESOLVES"]
   }
 
-WHAT BELONGS IN OBSERVATIONAL MEMORY:
-- recurring routines, habits, defaults, or preferences with assistive value
-- repeated frictions, blockers, annoyances, or stressors affecting the human
-- meaningful commitments, obligations, or follow-ups that should shape assistance
-- stable or changing real-world context about schedule, environment, relationships, or logistics
-- people/place/time/context patterns that help explain how the assistant should help
-- observed cause/effect that leads to a useful assistive rule
-
-WHAT DOES NOT BELONG IN OBSERVATIONAL MEMORY:
-- code, config, plugin wiring, service topology, implementation details, or deployment notes
-- security hardening notes, infra mechanics, API/tool quirks, or generic runbook doctrine
-- generic assistant operating policy unless it is directly about the human's behavior or context
-- system/process material that would make sense in engineering, self-audit, or ops memory
-
-NODE-TYPE GUIDANCE:
-- WorldState: stable or changing real-world context about the human, environment, relationships,
-  schedule patterns, logistics, or meaningful circumstances
-- Friction: recurring obstacle, blocker, annoyance, or constraint affecting the human
-- Commitment: real-world promise, plan, obligation, or active follow-up with assistive value
-- Judgment: observational inference grounded in repeated evidence or clear context
-- OperationalRule: an assistive rule derived from observed behavior/context, not a system/admin rule
-
-EXTRACTION RULES:
-- Extract durable observational memory, not generic operational doctrine.
-- Prefer human/context memory over system/process memory.
-- Skip ephemeral conversational filler and one-off chatter without durable assistive value.
-- Normalize and deduplicate: if two messages express the same memory, emit one node.
+ADMISSION TEST:
+- Only extract durable, operationally useful human-context memory. Skip filler and transient logistics.
+- Store what matters for future assistance: preferences, commitments, stable world-state, recurring frictions, durable judgments, and assistive rules.
+- Do not store implementation detail, admin policy, system configuration, tool syntax, deployment procedure, or debugging steps unless they clearly imply durable human context.
+- Normalize and deduplicate: if multiple messages support the same memory, emit one node.
 - Only emit edges where the relationship is clearly evidenced in the transcript.
-- relation_type MUST be one of the five allowed values above — no others are valid.
+- OperationalRule means an assistive rule derived from observed behavior, stated preference, or stable working context; it is not a system/admin rule.
+- relation_type MUST be one of the five allowed values above.
 - source_index and target_index must be valid 0-based indices into the nodes array.
-- If material would fit better in engineering, self-audit, security, or tooling memory, do not emit it here.
 - Return valid JSON only. No markdown fences, no explanation, no text outside the JSON object.
-- If no meaningful observational memory can be extracted, return {"nodes": [], "edges": []}.
+- If no meaningful nodes can be extracted, return {"nodes": [], "edges": []}.
 
-TEMPORAL SEQUENCING — SUPERSEDES (critical for memory accuracy):
+PUBLIC-SAFE EXAMPLES OF THE IMPLICATION RULE:
+- Technical evidence: "page me on Signal when urgent" -> memory: urgent updates should use that channel.
+- Technical evidence: "wait for my approval before deploying" -> memory: prefers approval before deploys.
+- Technical evidence: "this output feels risky or too aggressive" -> memory: has an ongoing concern about risky content.
+- Pure implementation with no durable human implication -> emit nothing.
+
+TEMPORAL SEQUENCING — SUPERSEDES:
 - Messages are provided in strict chronological order (oldest first).
 - When a later message updates, corrects, or replaces an earlier state, commitment, or rule,
   emit a SUPERSEDES edge: source_index = newer node, target_index = older node.
@@ -873,8 +860,8 @@ TEMPORAL SEQUENCING — SUPERSEDES (critical for memory accuracy):
 - Examples that warrant SUPERSEDES:
     • A preference is updated ("I now prefer X" after "I prefer Y").
     • A commitment is revised or cancelled.
-    • A rule derived from observed behavior is tightened or relaxed.
-    • A status changes from open → resolved.
+    • A rule is tightened or relaxed.
+    • A status changes from open -> resolved.
 - When in doubt, prefer explicit SUPERSEDES over omitting the edge.
 """
 

@@ -1032,6 +1032,27 @@ def test_om_extract_system_prompt_contains_supersedes_guidance() -> None:
     )
 
 
+def test_om_extract_system_prompt_prioritizes_human_implication_over_implementation() -> None:
+    """The prompt should front-load the implication-first admission rule."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    assert "CRITICAL:" in prompt
+    assert "Extract the implication, not the implementation." in prompt
+    assert "what durable human-context memory does this imply, if any?" in prompt
+    assert "carrier or evidence of a memory" in prompt
+    assert "If there is no durable human-facing implication, emit nothing." in prompt
+    assert prompt.index("CRITICAL:") < prompt.index("TEMPORAL SEQUENCING"), (
+        "Core admission rules must appear before SUPERSEDES guidance"
+    )
+
+
+def test_om_extract_system_prompt_scopes_operational_rule_to_assistive_context() -> None:
+    """OperationalRule guidance should stay human-contextual rather than admin/systemic."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    assert "OperationalRule means an assistive rule" in prompt
+    assert "not a system/admin rule" in prompt
+    assert "approval before deploys" in prompt
+
+
 def test_fetch_messages_by_ids_returns_chronological_order() -> None:
     """_fetch_messages_by_ids returns rows in created_at ASC order (DB fetch order), not
     input message_ids order — ensuring temporal sequencing for the extractor."""
