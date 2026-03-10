@@ -489,6 +489,7 @@ class OMTypedProjectionService:
 
         member_version = {node_id: index for index, node_id in enumerate(ordered_node_ids, start=1)}
         total_versions = len(ordered_node_ids)
+        version_basis = 'lineage_sequence' if ordering == 'topological' else 'chronology_only'
         projected: list[Episode] = []
 
         for node_id in ordered_node_ids:
@@ -505,12 +506,18 @@ class OMTypedProjectionService:
             )
             closure_invalid_at = self._first_timestamp(edge.get('created_at') for edge in closure_edges)
             invalidation_kind = self._episode_invalidation_kind(newer_edges=newer_edges, closure_edges=closure_edges)
-            direct_parent_id = None
-            if len(older_edges) == 1:
-                direct_parent_id = self._episode_object_id(group_id, older_edges[0].get('target_id'))
-            direct_superseded_by = None
-            if len(newer_edges) == 1:
-                direct_superseded_by = self._episode_object_id(group_id, newer_edges[0].get('source_id'))
+            parent_candidates = [
+                candidate
+                for candidate in (self._episode_object_id(group_id, edge.get('target_id')) for edge in older_edges)
+                if candidate is not None
+            ]
+            successor_candidates = [
+                candidate
+                for candidate in (self._episode_object_id(group_id, edge.get('source_id')) for edge in newer_edges)
+                if candidate is not None
+            ]
+            direct_parent_id = parent_candidates[0] if len(parent_candidates) == 1 else None
+            direct_superseded_by = successor_candidates[0] if len(successor_candidates) == 1 else None
 
             lifecycle_status = 'asserted'
             if invalidation_kind == 'superseded':
@@ -529,6 +536,7 @@ class OMTypedProjectionService:
                 f'history_predecessor_count:{len(older_edges)}',
                 f'history_successor_count:{len(newer_edges)}',
                 f'history_closure_count:{len(closure_edges)}',
+                f'history_version_basis:{version_basis}',
             ]
             if topology != 'linear':
                 annotations.append('history_ambiguous')
@@ -536,6 +544,10 @@ class OMTypedProjectionService:
                 annotations.append(f'history_invalidation:{invalidation_kind}')
             annotations = [item for item in annotations if item]
 
+            transition_refs = self._transition_evidence_refs(
+                group_id=group_id,
+                edges=older_edges + newer_edges + closure_rows_by_target.get((group_id, node_id), []),
+            )
             evidence_refs = [
                 EvidenceRef(
                     kind='event_log',
@@ -546,13 +558,40 @@ class OMTypedProjectionService:
                     observed_at=_coerce_timestamp(member.get('created_at')),
                 )
             ]
-            evidence_refs.extend(self._transition_evidence_refs(group_id=group_id, edges=older_edges + newer_edges + closure_rows_by_target.get((group_id, node_id), [])))
+            evidence_refs.extend(transition_refs)
+
+            history_meta = self._compact_history_meta(
+                {
+                    'lineage_kind': 'om_node',
+                    'lineage_basis': 'om_supersession_component',
+                    'topology': topology,
+                    'ordering': ordering,
+                    'version_basis': version_basis,
+                    'component_size': total_versions,
+                    'predecessor_count': len(parent_candidates),
+                    'successor_count': len(successor_candidates),
+                    'closure_count': len(closure_edges),
+                    'parent_candidates': parent_candidates,
+                    'successor_candidates': successor_candidates,
+                    'root_id': root_id,
+                    'parent_id': direct_parent_id,
+                    'version': member_version[node_id],
+                    'is_current': closure_invalid_at is None,
+                    'superseded_by': direct_superseded_by,
+                    'invalid_at': closure_invalid_at,
+                    'lifecycle_status': lifecycle_status,
+                    'transition_reason': invalidation_kind,
+                    'is_ambiguous': topology != 'linear',
+                    'topology_flags': [flag for flag in [topology, 'competing_successors' if len(successor_candidates) > 1 else None] if flag],
+                    'transition_evidence': self._evidence_payload(transition_refs),
+                }
+            )
 
             projected.append(
                 Episode(
                     object_id=object_id,
                     root_id=root_id,
-                    parent_id=direct_parent_id if topology == 'linear' else direct_parent_id,
+                    parent_id=direct_parent_id,
                     version=member_version[node_id],
                     is_current=closure_invalid_at is None,
                     source_lane=group_id,
@@ -562,10 +601,11 @@ class OMTypedProjectionService:
                     title=str(member.get('title') or node_id),
                     summary=str(member.get('summary') or member.get('title') or node_id),
                     annotations=annotations,
+                    history_meta=history_meta,
                     created_at=_coerce_timestamp(member.get('created_at')) or '2026-01-01T00:00:00Z',
                     valid_at=_coerce_timestamp(member.get('created_at')),
                     invalid_at=closure_invalid_at,
-                    superseded_by=direct_superseded_by if len(newer_edges) == 1 else None,
+                    superseded_by=direct_superseded_by if len(successor_candidates) == 1 else None,
                     lifecycle_status=lifecycle_status,
                     evidence_refs=self._dedupe_evidence_refs(evidence_refs),
                 )
@@ -604,44 +644,107 @@ class OMTypedProjectionService:
                 source_anchor=source_anchor,
                 target_anchor=target_anchor,
             )
-            lineage_topology = self._relation_lineage_topology(rows=ordered_rows, node_history_index=node_history_index)
+            lineage_links = self._relation_lineage_links(rows=ordered_rows, group_id=group_id, node_history_index=node_history_index)
+            lineage_topology = self._relation_lineage_topology(
+                rows=ordered_rows,
+                node_history_index=node_history_index,
+                lineage_links=lineage_links,
+            )
+            version_basis = 'lineage_sequence' if lineage_topology == 'linear' else 'chronology_only'
+            row_by_relation_id = {
+                str(row.get('uuid') or '').strip(): row
+                for row in ordered_rows
+                if str(row.get('uuid') or '').strip()
+            }
 
             for index, row in enumerate(ordered_rows, start=1):
                 relation_id = str(row.get('uuid') or '').strip()
                 source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
                 target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
                 created_at = _coerce_timestamp(row.get('created_at'))
-                object_id = f'om_state:{group_id}:{relation_id}'
-                previous_object_id = (
-                    f"om_state:{group_id}:{ordered_rows[index - 2]['uuid']}"
-                    if index > 1 and lineage_topology == 'linear'
-                    else None
-                )
-                next_row = ordered_rows[index] if index < len(ordered_rows) else None
-                next_object_id = (
-                    f"om_state:{group_id}:{next_row['uuid']}"
-                    if next_row is not None and lineage_topology == 'linear'
-                    else None
-                )
-                next_row_at = _coerce_timestamp(next_row.get('created_at')) if next_row is not None else None
-                endpoint_invalid_at, endpoint_reason = self._relation_endpoint_invalid_at(
+                valid_at = _coerce_timestamp(row.get('valid_at')) or created_at
+                direct_invalid_at = _coerce_timestamp(row.get('invalid_at'))
+                object_id = self._state_object_id(group_id, relation_id)
+                link_meta = lineage_links.get(relation_id, {})
+                parent_candidates = [str(item) for item in (link_meta.get('parent_candidates') or []) if str(item).strip()]
+                successor_candidates = [str(item) for item in (link_meta.get('successor_candidates') or []) if str(item).strip()]
+                parent_id = parent_candidates[0] if lineage_topology == 'linear' and len(parent_candidates) == 1 else None
+                successor_object_id = successor_candidates[0] if lineage_topology == 'linear' and len(successor_candidates) == 1 else None
+                successor_row = None
+                successor_at = None
+                if successor_object_id is not None:
+                    successor_relation_id = successor_object_id.rsplit(':', 1)[-1]
+                    successor_row = row_by_relation_id.get(successor_relation_id)
+                    successor_at = _coerce_timestamp(successor_row.get('created_at')) if successor_row is not None else None
+
+                endpoint_invalidations = self._relation_endpoint_invalidations(
                     group_id=group_id,
                     source_node_id=source_node_id,
                     target_node_id=target_node_id,
                     created_at=created_at,
                     node_history_index=node_history_index,
                 )
-                invalid_at, invalidation_reason = self._relation_invalid_at(
+                invalidation = self._relation_invalidation(
                     created_at=created_at,
-                    next_row_at=next_row_at,
-                    endpoint_invalid_at=endpoint_invalid_at,
-                    endpoint_reason=endpoint_reason,
+                    direct_invalid_at=direct_invalid_at,
+                    successor_at=successor_at,
+                    successor_object_id=successor_object_id,
+                    endpoint_invalidations=endpoint_invalidations,
                 )
+                invalid_at = invalidation.get('invalid_at')
+                invalidation_reason = invalidation.get('reason')
                 lifecycle_status = 'asserted'
                 if invalidation_reason == 'relation_replaced':
                     lifecycle_status = 'superseded'
                 elif invalid_at is not None:
                     lifecycle_status = 'invalidated'
+
+                source_version = self._node_version(node_history_index, group_id=group_id, node_id=source_node_id)
+                target_version = self._node_version(node_history_index, group_id=group_id, node_id=target_node_id)
+                relation_properties = row.get('attributes', {}).get('relation_properties') if isinstance(row.get('attributes'), dict) else {}
+                if not isinstance(relation_properties, dict):
+                    relation_properties = {}
+                om_history = self._compact_history_meta(
+                    {
+                        'lineage_kind': 'om_relation',
+                        'lineage_basis': 'om_relation_anchor_history',
+                        'derivation_level': 'native' if direct_invalid_at is not None else 'hybrid',
+                        'topology': lineage_topology,
+                        'ordering': 'relation_sequence' if lineage_topology == 'linear' else 'relation_chronology',
+                        'version_basis': version_basis,
+                        'source_anchor': source_anchor,
+                        'target_anchor': target_anchor,
+                        'source_version': source_version,
+                        'target_version': target_version,
+                        'source_is_current': self._node_is_current(node_history_index, group_id=group_id, node_id=source_node_id),
+                        'target_is_current': self._node_is_current(node_history_index, group_id=group_id, node_id=target_node_id),
+                        'parent_candidates': parent_candidates,
+                        'successor_candidates': successor_candidates,
+                        'invalidation_reason': invalidation_reason,
+                        'invalidation_basis': invalidation.get('basis'),
+                        'direct_valid_at': valid_at,
+                        'direct_invalid_at': direct_invalid_at,
+                        'root_id': lineage_root_id,
+                        'parent_id': parent_id,
+                        'version': index,
+                        'is_current': invalid_at is None,
+                        'superseded_by': successor_object_id if invalidation_reason == 'relation_replaced' else None,
+                        'invalid_at': invalid_at,
+                        'lifecycle_status': lifecycle_status,
+                        'is_ambiguous': lineage_topology != 'linear',
+                        'topology_flags': [
+                            flag
+                            for flag in [
+                                lineage_topology,
+                                'competing_successors' if len(successor_candidates) > 1 else None,
+                                'competing_predecessors' if len(parent_candidates) > 1 else None,
+                                'missing_endpoint_versions' if link_meta.get('missing_versions') else None,
+                            ]
+                            if flag
+                        ],
+                        'relation_properties': relation_properties,
+                    }
+                )
 
                 value = {
                     'fact': str(row.get('fact') or '').strip(),
@@ -649,18 +752,7 @@ class OMTypedProjectionService:
                     'target_node_id': target_node_id,
                     'source_content': str((row.get('attributes') or {}).get('source_content') or row.get('source_content') or '').strip(),
                     'target_content': str((row.get('attributes') or {}).get('target_content') or row.get('target_content') or '').strip(),
-                    'om_history': {
-                        'lineage_basis': 'om_relation_anchor_history',
-                        'topology': lineage_topology,
-                        'source_anchor': source_anchor,
-                        'target_anchor': target_anchor,
-                        'source_version': self._node_version(node_history_index, group_id=group_id, node_id=source_node_id),
-                        'target_version': self._node_version(node_history_index, group_id=group_id, node_id=target_node_id),
-                        'source_is_current': self._node_is_current(node_history_index, group_id=group_id, node_id=source_node_id),
-                        'target_is_current': self._node_is_current(node_history_index, group_id=group_id, node_id=target_node_id),
-                        'ordering': 'relation_sequence' if lineage_topology == 'linear' else 'relation_chronology',
-                        'invalidation_reason': invalidation_reason,
-                    },
+                    'om_history': om_history,
                 }
 
                 evidence_refs = [
@@ -673,33 +765,50 @@ class OMTypedProjectionService:
                         observed_at=created_at,
                     )
                 ]
-                evidence_refs.extend(
-                    self._endpoint_evidence_refs(
-                        group_id=group_id,
-                        source_node_id=source_node_id,
-                        target_node_id=target_node_id,
-                        source_content=value['source_content'],
-                        target_content=value['target_content'],
-                        created_at=created_at,
-                    )
+                endpoint_refs = self._endpoint_evidence_refs(
+                    group_id=group_id,
+                    source_node_id=source_node_id,
+                    target_node_id=target_node_id,
+                    source_content=value['source_content'],
+                    target_content=value['target_content'],
+                    created_at=created_at,
                 )
-                if invalidation_reason == 'relation_replaced' and next_row is not None:
-                    evidence_refs.append(
-                        EvidenceRef(
-                            kind='event_log',
-                            source_system='om',
-                            locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': str(next_row.get('uuid') or '')},
-                            title=f'{relation_type} successor',
-                            snippet=str(next_row.get('fact') or '').strip(),
-                            observed_at=next_row_at,
-                        )
+                evidence_refs.extend(endpoint_refs)
+                successor_ref = None
+                if invalidation_reason == 'relation_replaced' and successor_row is not None:
+                    successor_ref = EvidenceRef(
+                        kind='event_log',
+                        source_system='om',
+                        locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': str(successor_row.get('uuid') or '')},
+                        title=f'{relation_type} successor',
+                        snippet=str(successor_row.get('fact') or '').strip(),
+                        observed_at=successor_at,
                     )
+                    evidence_refs.append(successor_ref)
+
+                transition_refs = list(endpoint_refs)
+                if successor_ref is not None:
+                    transition_refs.append(successor_ref)
+                history_meta = dict(om_history)
+                history_meta['transition_evidence'] = self._evidence_payload(
+                    transition_refs,
+                    roles_by_uri={
+                        ref.canonical_uri: role
+                        for ref, role in [
+                            (endpoint_refs[0], 'source_endpoint') if len(endpoint_refs) > 0 else (None, None),
+                            (endpoint_refs[1], 'target_endpoint') if len(endpoint_refs) > 1 else (None, None),
+                            (successor_ref, 'successor_relation') if successor_ref is not None else (None, None),
+                        ]
+                        if ref is not None and role is not None
+                    },
+                )
+                history_meta['endpoint_invalidations'] = endpoint_invalidations
 
                 projected.append(
                     StateFact(
                         object_id=object_id,
                         root_id=lineage_root_id,
-                        parent_id=previous_object_id,
+                        parent_id=parent_id,
                         version=index,
                         is_current=invalid_at is None,
                         source_lane=group_id,
@@ -711,23 +820,105 @@ class OMTypedProjectionService:
                         predicate=f'om_relation:{relation_type.lower()}',
                         value=value,
                         scope='private',
+                        history_meta=history_meta,
                         created_at=created_at or '2026-01-01T00:00:00Z',
-                        valid_at=created_at,
+                        valid_at=valid_at,
                         invalid_at=invalid_at,
-                        superseded_by=next_object_id if invalidation_reason == 'relation_replaced' else None,
+                        superseded_by=successor_object_id if invalidation_reason == 'relation_replaced' else None,
                         lifecycle_status=lifecycle_status,
                         evidence_refs=self._dedupe_evidence_refs(evidence_refs),
                     )
                 )
 
-        projected.sort(key=lambda obj: (obj.root_id, obj.version, obj.object_id))
+        projected.sort(key=lambda obj: (obj.root_id, 0 if obj.is_current else 1, -obj.version, obj.object_id))
         return projected, len(grouped_rows)
+
+    def _relation_version_vector(
+        self,
+        row: dict[str, Any],
+        *,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+    ) -> tuple[int | None, int | None]:
+        group_id = str(row.get('group_id') or '').strip()
+        source_node_id = str(row.get('source_node_uuid') or row.get('source_node_id') or '').strip()
+        target_node_id = str(row.get('target_node_uuid') or row.get('target_node_id') or '').strip()
+        return (
+            self._node_version(node_history_index, group_id=group_id, node_id=source_node_id),
+            self._node_version(node_history_index, group_id=group_id, node_id=target_node_id),
+        )
+
+    def _relation_lineage_links(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        group_id: str,
+        node_history_index: dict[tuple[str, str], dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            relation_id = str(row.get('uuid') or '').strip()
+            if not relation_id:
+                continue
+            source_version, target_version = self._relation_version_vector(row, node_history_index=node_history_index)
+            entries.append(
+                {
+                    'relation_id': relation_id,
+                    'object_id': self._state_object_id(group_id, relation_id),
+                    'source_version': source_version,
+                    'target_version': target_version,
+                    'created_at': _coerce_timestamp(row.get('created_at')),
+                }
+            )
+
+        def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
+            if left['source_version'] is None or left['target_version'] is None:
+                return False
+            if right['source_version'] is None or right['target_version'] is None:
+                return False
+            return (
+                left['source_version'] <= right['source_version']
+                and left['target_version'] <= right['target_version']
+                and (
+                    left['source_version'] < right['source_version']
+                    or left['target_version'] < right['target_version']
+                )
+            )
+
+        lineage_links: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            predecessors = [candidate for candidate in entries if candidate['relation_id'] != entry['relation_id'] and dominates(candidate, entry)]
+            maximal_predecessors = [
+                candidate
+                for candidate in predecessors
+                if not any(
+                    dominates(candidate, other)
+                    for other in predecessors
+                    if other['relation_id'] != candidate['relation_id']
+                )
+            ]
+            successors = [candidate for candidate in entries if candidate['relation_id'] != entry['relation_id'] and dominates(entry, candidate)]
+            minimal_successors = [
+                candidate
+                for candidate in successors
+                if not any(
+                    dominates(other, candidate)
+                    for other in successors
+                    if other['relation_id'] != candidate['relation_id']
+                )
+            ]
+            lineage_links[entry['relation_id']] = {
+                'parent_candidates': [candidate['object_id'] for candidate in maximal_predecessors if candidate.get('object_id')],
+                'successor_candidates': [candidate['object_id'] for candidate in minimal_successors if candidate.get('object_id')],
+                'missing_versions': entry['source_version'] is None or entry['target_version'] is None,
+            }
+        return lineage_links
 
     def _relation_lineage_topology(
         self,
         *,
         rows: list[dict[str, Any]],
         node_history_index: dict[tuple[str, str], dict[str, Any]],
+        lineage_links: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         if len(rows) <= 1:
             return 'singleton'
@@ -739,27 +930,87 @@ class OMTypedProjectionService:
             for row in rows
         ):
             return 'branching'
-        return 'linear'
+        lineage_links = lineage_links or self._relation_lineage_links(
+            rows=rows,
+            group_id=str(rows[0].get('group_id') or '').strip(),
+            node_history_index=node_history_index,
+        )
+        version_pairs = [self._relation_version_vector(row, node_history_index=node_history_index) for row in rows]
+        if any(source_version is None or target_version is None for source_version, target_version in version_pairs):
+            return 'branching'
+        if len(set(version_pairs)) != len(version_pairs):
+            return 'branching'
+        roots = 0
+        terminals = 0
+        for row in rows:
+            relation_id = str(row.get('uuid') or '').strip()
+            link_meta = lineage_links.get(relation_id, {})
+            predecessor_count = len(link_meta.get('parent_candidates') or [])
+            successor_count = len(link_meta.get('successor_candidates') or [])
+            if predecessor_count == 0:
+                roots += 1
+            if successor_count == 0:
+                terminals += 1
+            if predecessor_count > 1 or successor_count > 1:
+                return 'branching'
+        if roots == 1 and terminals == 1:
+            return 'linear'
+        return 'branching'
 
-    def _relation_invalid_at(
+    def _relation_invalidation(
         self,
         *,
         created_at: str | None,
-        next_row_at: str | None,
-        endpoint_invalid_at: str | None,
-        endpoint_reason: str | None,
-    ) -> tuple[str | None, str | None]:
-        candidates: list[tuple[str, str]] = []
-        if next_row_at is not None and (created_at is None or next_row_at >= created_at):
-            candidates.append((next_row_at, 'relation_replaced'))
-        if endpoint_invalid_at is not None and (created_at is None or endpoint_invalid_at >= created_at):
-            candidates.append((endpoint_invalid_at, endpoint_reason or 'endpoint_invalidated'))
+        direct_invalid_at: str | None,
+        successor_at: str | None,
+        successor_object_id: str | None,
+        endpoint_invalidations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        if direct_invalid_at is not None and (created_at is None or direct_invalid_at >= created_at):
+            candidates.append(
+                {
+                    'invalid_at': direct_invalid_at,
+                    'reason': 'relation_invalidated',
+                    'basis': 'relation_edge_invalid_at',
+                    'native': True,
+                }
+            )
+        if successor_at is not None and successor_object_id is not None and (created_at is None or successor_at >= created_at):
+            candidates.append(
+                {
+                    'invalid_at': successor_at,
+                    'reason': 'relation_replaced',
+                    'basis': 'relation_successor',
+                    'native': False,
+                    'successor_object_id': successor_object_id,
+                }
+            )
+        for endpoint in endpoint_invalidations:
+            endpoint_at = _coerce_timestamp(endpoint.get('invalid_at'))
+            if endpoint_at is None or (created_at is not None and endpoint_at < created_at):
+                continue
+            candidates.append(
+                {
+                    'invalid_at': endpoint_at,
+                    'reason': str(endpoint.get('reason') or 'endpoint_invalidated'),
+                    'basis': 'endpoint_lineage',
+                    'native': False,
+                    'endpoint_object_id': endpoint.get('object_id'),
+                }
+            )
         if not candidates:
-            return None, None
-        candidates.sort(key=lambda item: _timestamp_sort_key(item[0]))
+            return {}
+        candidates.sort(
+            key=lambda item: (
+                _timestamp_sort_key(item.get('invalid_at')),
+                0 if item.get('native') else 1,
+                str(item.get('reason') or ''),
+            )
+        )
         return candidates[0]
 
-    def _relation_endpoint_invalid_at(
+    def _relation_endpoint_invalidations(
         self,
         *,
         group_id: str,
@@ -767,8 +1018,8 @@ class OMTypedProjectionService:
         target_node_id: str,
         created_at: str | None,
         node_history_index: dict[tuple[str, str], dict[str, Any]],
-    ) -> tuple[str | None, str | None]:
-        candidates: list[tuple[str, str]] = []
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
         for endpoint_node_id, reason_prefix in ((source_node_id, 'source_node'), (target_node_id, 'target_node')):
             meta = node_history_index.get((group_id, endpoint_node_id))
             if meta is None:
@@ -778,11 +1029,16 @@ class OMTypedProjectionService:
                 continue
             if created_at is not None and invalid_at <= created_at:
                 continue
-            candidates.append((invalid_at, f'{reason_prefix}_invalidated'))
-        if not candidates:
-            return None, None
-        candidates.sort(key=lambda item: _timestamp_sort_key(item[0]))
-        return candidates[0]
+            candidates.append(
+                {
+                    'invalid_at': invalid_at,
+                    'reason': f'{reason_prefix}_invalidated',
+                    'node_id': endpoint_node_id,
+                    'object_id': meta.get('object_id'),
+                }
+            )
+        candidates.sort(key=lambda item: (_timestamp_sort_key(item.get('invalid_at')), str(item.get('node_id') or '')))
+        return candidates
 
     def _closure_rows_by_target_node(self, relation_rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
         closure_rows: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -821,6 +1077,7 @@ class OMTypedProjectionService:
         if not relation_id or not group_id or not relation_type or not source_node_id or not target_node_id:
             return
         attributes = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
+        relation_properties = attributes.get('relation_properties') if isinstance(attributes.get('relation_properties'), dict) else {}
         normalized = {
             'uuid': relation_id,
             'name': relation_type,
@@ -830,9 +1087,12 @@ class OMTypedProjectionService:
             'source_node_uuid': source_node_id,
             'target_node_uuid': target_node_id,
             'created_at': _coerce_timestamp(row.get('created_at')),
+            'valid_at': _coerce_timestamp(row.get('valid_at')),
+            'invalid_at': _coerce_timestamp(row.get('invalid_at')),
             'attributes': {
                 'source_content': str(attributes.get('source_content') or row.get('source_content') or '').strip(),
                 'target_content': str(attributes.get('target_content') or row.get('target_content') or '').strip(),
+                'relation_properties': relation_properties,
             },
         }
         relation_rows_by_key[(group_id, relation_id)] = normalized
@@ -885,6 +1145,44 @@ class OMTypedProjectionService:
             target_version,
             str(row.get('uuid') or ''),
         )
+
+    def _state_object_id(self, group_id: str, relation_id: str | None) -> str | None:
+        normalized_relation_id = str(relation_id or '').strip()
+        if not normalized_relation_id:
+            return None
+        return f'om_state:{group_id}:{normalized_relation_id}'
+
+    def _compact_history_meta(self, payload: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        for key, value in payload.items():
+            if value is None or value == '' or value == [] or value == {}:
+                continue
+            compact[key] = value
+        return compact
+
+    def _evidence_payload(
+        self,
+        refs: list[EvidenceRef],
+        *,
+        roles_by_uri: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        roles_by_uri = roles_by_uri or {}
+        for ref in refs:
+            uri = str(ref.canonical_uri or '').strip()
+            payload.append(
+                self._compact_history_meta(
+                    {
+                        'canonical_uri': uri,
+                        'kind': ref.kind,
+                        'source_system': ref.source_system,
+                        'title': ref.title,
+                        'observed_at': ref.observed_at,
+                        'role': roles_by_uri.get(uri),
+                    }
+                )
+            )
+        return payload
 
     def _node_version(
         self,
@@ -1031,18 +1329,23 @@ class OMTypedProjectionService:
         return f'om_episode:{group_id}:{normalized_node_id}'
 
     def _episode_search_text(self, episode: Episode) -> str:
+        history = episode.history_meta if isinstance(episode.history_meta, dict) else {}
         parts = [
             str(episode.title or ''),
             str(episode.summary or ''),
             str(episode.source_lane or ''),
             ' '.join(episode.annotations),
             str(episode.lifecycle_status or ''),
+            str(history.get('topology') or ''),
+            str(history.get('transition_reason') or ''),
+            str(history.get('version_basis') or ''),
         ]
         return ' '.join(part for part in parts if part).strip()
 
     def _fact_search_text_from_object(self, fact: StateFact) -> str:
         value = fact.value if isinstance(fact.value, dict) else {'value': fact.value}
         history = value.get('om_history') if isinstance(value, dict) else {}
+        top_level_history = fact.history_meta if isinstance(fact.history_meta, dict) else {}
         parts = [
             str(fact.fact_type or ''),
             str(fact.subject or ''),
@@ -1052,6 +1355,8 @@ class OMTypedProjectionService:
             str(value.get('target_content') or ''),
             str(history.get('topology') or ''),
             str(history.get('invalidation_reason') or ''),
+            str(top_level_history.get('invalidation_basis') or ''),
+            str(top_level_history.get('version_basis') or ''),
             str(fact.source_lane or ''),
         ]
         return ' '.join(part for part in parts if part).strip()

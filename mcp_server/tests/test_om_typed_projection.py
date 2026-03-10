@@ -384,6 +384,303 @@ async def test_history_projection_derives_relation_history_and_closure_invalidat
 
 
 @pytest.mark.anyio
+async def test_history_projection_surfaces_relation_branching_without_fake_linear_chain():
+    search_service = _FakeSearchService(
+        node_rows=[
+            {
+                'uuid': 'plan_v2a',
+                'name': 'Branching fix plan',
+                'summary': 'two competing fixes exist',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-05T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            }
+        ],
+        neighborhood_rows={
+            'plan_v1': [
+                {
+                    'uuid': 'rel_plan_v1_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: investigate latency -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Investigate latency',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+            'plan_v2a': [
+                {
+                    'uuid': 'rel_plan_v2a_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: ship cache fix -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v2a',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship cache fix',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+            'plan_v2b': [
+                {
+                    'uuid': 'rel_plan_v2b_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: rewrite cache layer -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v2b',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Rewrite cache layer',
+                        'target_content': 'Latency issue',
+                    },
+                }
+            ],
+            'issue_1': [
+                {
+                    'uuid': 'rel_plan_v1_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: investigate latency -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Investigate latency',
+                        'target_content': 'Latency issue',
+                    },
+                },
+                {
+                    'uuid': 'rel_plan_v2a_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: ship cache fix -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v2a',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship cache fix',
+                        'target_content': 'Latency issue',
+                    },
+                },
+                {
+                    'uuid': 'rel_plan_v2b_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: rewrite cache layer -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v2b',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Rewrite cache layer',
+                        'target_content': 'Latency issue',
+                    },
+                },
+            ],
+        },
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'plan_v2a': [
+                {
+                    'node_id': 'plan_v1',
+                    'uuid': 'plan_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Investigate latency',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'plan_v2a',
+                    'uuid': 'plan_v2a',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Ship cache fix',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [{'target_id': 'plan_v1', 'created_at': '2026-03-05T00:00:00Z', 'relation_uuid': 'rel_plan_v2a_v1'}],
+                },
+                {
+                    'node_id': 'plan_v2b',
+                    'uuid': 'plan_v2b',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Rewrite cache layer',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [{'target_id': 'plan_v1', 'created_at': '2026-03-06T00:00:00Z', 'relation_uuid': 'rel_plan_v2b_v1'}],
+                },
+            ],
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Latency issue',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
+    )
+    service = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_FakeGraphitiService(driver),
+    )
+
+    objects, _search_overrides, limits = await service.project(
+        query='what changed for latency',
+        effective_group_ids=['s1_observational_memory'],
+        object_types={'state_fact'},
+        max_results=5,
+        query_mode='history',
+    )
+
+    by_id = {obj.object_id: obj for obj in objects}
+    root = by_id['om_state:s1_observational_memory:rel_plan_v1_issue']
+    first = by_id['om_state:s1_observational_memory:rel_plan_v2a_issue']
+    second = by_id['om_state:s1_observational_memory:rel_plan_v2b_issue']
+
+    assert root.value['om_history']['topology'] == 'branching'
+    assert root.superseded_by is None
+    assert root.history_meta['topology_flags'][0] == 'branching'
+    assert first.history_meta['is_ambiguous'] is True
+    assert second.history_meta['is_ambiguous'] is True
+    assert first.is_current is True
+    assert second.is_current is True
+    assert limits['history_relation_lineages_projected'] == 1
+
+
+@pytest.mark.anyio
+async def test_history_projection_prefers_native_relation_invalid_at_when_available():
+    search_service = _FakeSearchService(
+        node_rows=[
+            {
+                'uuid': 'plan_v1',
+                'name': 'Plan V1',
+                'summary': 'legacy plan',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-01T00:00:00Z',
+                'attributes': {'status': 'open', 'semantic_domain': 'observational_memory'},
+            }
+        ],
+        fact_rows=[
+            {
+                'uuid': 'rel_plan_issue',
+                'name': 'ADDRESSES',
+                'fact': 'ADDRESSES: legacy plan -> latency issue',
+                'group_id': 's1_observational_memory',
+                'source_node_uuid': 'plan_v1',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-01T00:00:00Z',
+                'valid_at': '2026-03-01T00:00:00Z',
+                'invalid_at': '2026-03-04T00:00:00Z',
+                'attributes': {
+                    'source_content': 'Legacy plan',
+                    'target_content': 'Latency issue',
+                    'relation_properties': {'invalid_at': '2026-03-04T00:00:00Z'},
+                },
+            }
+        ],
+        neighborhood_rows={
+            'plan_v1': [
+                {
+                    'uuid': 'rel_plan_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: legacy plan -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'valid_at': '2026-03-01T00:00:00Z',
+                    'invalid_at': '2026-03-04T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Legacy plan',
+                        'target_content': 'Latency issue',
+                        'relation_properties': {'invalid_at': '2026-03-04T00:00:00Z'},
+                    },
+                }
+            ],
+            'issue_1': [
+                {
+                    'uuid': 'rel_plan_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: legacy plan -> latency issue',
+                    'group_id': 's1_observational_memory',
+                    'source_node_uuid': 'plan_v1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'valid_at': '2026-03-01T00:00:00Z',
+                    'invalid_at': '2026-03-04T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Legacy plan',
+                        'target_content': 'Latency issue',
+                        'relation_properties': {'invalid_at': '2026-03-04T00:00:00Z'},
+                    },
+                }
+            ],
+        },
+    )
+    driver = _FakeDriver(
+        records_by_seed={
+            'plan_v1': [
+                {
+                    'node_id': 'plan_v1',
+                    'uuid': 'plan_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Legacy plan',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'Latency issue',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
+    )
+    service = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_FakeGraphitiService(driver),
+    )
+
+    objects, _search_overrides, _limits = await service.project(
+        query='legacy plan',
+        effective_group_ids=['s1_observational_memory'],
+        object_types={'state_fact'},
+        max_results=5,
+        query_mode='history',
+    )
+
+    relation = next(obj for obj in objects if obj.object_id == 'om_state:s1_observational_memory:rel_plan_issue')
+    assert relation.invalid_at == '2026-03-04T00:00:00Z'
+    assert relation.lifecycle_status == 'invalidated'
+    assert relation.history_meta['invalidation_basis'] == 'relation_edge_invalid_at'
+    assert relation.value['om_history']['derivation_level'] == 'native'
+
+
+
+@pytest.mark.anyio
 async def test_history_projection_surfaces_branching_topology_without_fabrication():
     search_service = _FakeSearchService(
         node_rows=[
