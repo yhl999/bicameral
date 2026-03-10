@@ -151,7 +151,7 @@ class LLMConfig(BaseModel):
     temperature: float | None = Field(
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )
-    max_tokens: int = Field(default=4096, description='Max tokens')
+    max_tokens: int = Field(default=16384, description='Max tokens')
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
 
