@@ -15,7 +15,6 @@ from scripts.run_retrieval_benchmark import (
     check_recall_gate,
     compute_recall,
     validate_fixture,
-    _query_scope_group_ids,
 )
 
 
