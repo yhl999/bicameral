@@ -180,31 +180,26 @@ class TypedRetrievalService:
 
         om_limits: dict[str, Any] = {'enabled': False, 'reason': 'no_projection_service'}
         if self.om_projection_service is not None:
-            if query_mode == 'history':
-                om_limits = {
-                    'enabled': False,
-                    'reason': 'history_mode_requires_lineage',
-                }
-            else:
-                try:
-                    om_result = self.om_projection_service.project(
-                        query=query,
-                        effective_group_ids=effective_group_ids,
-                        object_types=normalized_object_types,
-                        max_results=effective_max_results,
-                    )
-                    if inspect.isawaitable(om_result):
-                        om_objects, om_search_overrides, om_limits = await om_result
-                    else:
-                        om_objects, om_search_overrides, om_limits = om_result
-                    seen_ids = {obj.object_id for obj in all_objects}
-                    for om_obj in om_objects:
-                        if om_obj.object_id not in seen_ids:
-                            all_objects.append(om_obj)
-                            seen_ids.add(om_obj.object_id)
-                    search_text_overrides.update(om_search_overrides)
-                except Exception:
-                    om_limits = {'enabled': False, 'reason': 'projection_error'}
+            try:
+                om_result = self.om_projection_service.project(
+                    query=query,
+                    effective_group_ids=effective_group_ids,
+                    object_types=normalized_object_types,
+                    max_results=effective_max_results,
+                    query_mode=query_mode,
+                )
+                if inspect.isawaitable(om_result):
+                    om_objects, om_search_overrides, om_limits = await om_result
+                else:
+                    om_objects, om_search_overrides, om_limits = om_result
+                seen_ids = {obj.object_id for obj in all_objects}
+                for om_obj in om_objects:
+                    if om_obj.object_id not in seen_ids:
+                        all_objects.append(om_obj)
+                        seen_ids.add(om_obj.object_id)
+                search_text_overrides.update(om_search_overrides)
+            except Exception:
+                om_limits = {'enabled': False, 'reason': 'projection_error'}
         materialization_limits['om_projection'] = om_limits
 
         filtered_objects = [

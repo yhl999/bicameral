@@ -3,7 +3,7 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
-from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
+from mcp_server.src.models.typed_memory import Episode, EvidenceRef, StateFact
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.typed_retrieval import ScoredObject, TypedRetrievalService
 
@@ -61,6 +61,33 @@ def _state_fact(*, object_id: str, root_id: str, version: int, value: str, is_cu
 
 def _memory_ledger() -> ChangeLedger:
     return ChangeLedger(sqlite3.connect(':memory:'))
+
+
+def _episode(*, object_id: str, root_id: str, version: int, summary: str, is_current: bool = True, parent_id: str | None = None, superseded_by: str | None = None, invalid_at: str | None = None):
+    return Episode(
+        object_id=object_id,
+        root_id=root_id,
+        parent_id=parent_id,
+        version=version,
+        is_current=is_current,
+        source_lane='s1_observational_memory',
+        source_key=f'om:s1_observational_memory:node:{object_id}',
+        policy_scope='private',
+        visibility_scope='private',
+        title=summary[:40],
+        summary=summary,
+        invalid_at=invalid_at,
+        superseded_by=superseded_by,
+        evidence_refs=[
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': 's1_observational_memory:node', 'event_id': object_id},
+                title='source',
+                snippet=summary,
+            )
+        ],
+    )
 
 
 def _seed_assert(ledger: ChangeLedger, obj: StateFact, *, recorded_at: str = '2026-03-09T05:00:00Z') -> None:
@@ -274,12 +301,13 @@ class _FakeOMProjectionService:
         self._limits = limits or {'enabled': True, 'reason': 'projected', 'groups_considered': [], 'episodes_projected': 0, 'state_projected': 0, 'max_results': 10}
         self.calls = []
 
-    async def project(self, *, query, effective_group_ids, object_types, max_results):
+    async def project(self, *, query, effective_group_ids, object_types, max_results, query_mode):
         self.calls.append({
             'query': query,
             'effective_group_ids': effective_group_ids,
             'object_types': object_types,
             'max_results': max_results,
+            'query_mode': query_mode,
         })
         return self._objects, self._search_overrides, self._limits
 
@@ -377,12 +405,42 @@ def test_om_projection_deduplicates_against_ledger_objects():
     assert response['counts']['state'] == 1
 
 
-def test_om_projection_auto_history_query_skips_projection_until_lineage_exists():
-    """Auto-history queries should not mix current-only OM projections into lineage answers."""
-    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-history')
+def test_om_projection_auto_history_query_merges_lineage_objects():
+    """Auto-history queries should merge explicit OM lineage into typed buckets."""
+    previous = _episode(
+        object_id='om_episode:s1_observational_memory:node-v1',
+        root_id='om_episode:s1_observational_memory:node-v1',
+        version=1,
+        summary='latency issue before the fix',
+        is_current=False,
+        superseded_by='om_episode:s1_observational_memory:node-v2',
+        invalid_at='2026-03-09T00:00:00Z',
+    )
+    current = _episode(
+        object_id='om_episode:s1_observational_memory:node-v2',
+        root_id='om_episode:s1_observational_memory:node-v1',
+        parent_id='om_episode:s1_observational_memory:node-v1',
+        version=2,
+        summary='latency issue after the fix',
+        is_current=True,
+    )
     projection = _FakeOMProjectionService(
-        objects=[om_obj],
-        search_overrides={'om_state:s1_observational_memory:rel-history': 'what changed for latency spike'},
+        objects=[previous, current],
+        search_overrides={'om_episode:s1_observational_memory:node-v2': 'what changed for latency spike'},
+        limits={
+            'enabled': True,
+            'reason': 'projected_history',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 2,
+            'state_projected': 0,
+            'max_results': 10,
+            'history_mode': True,
+            'history_candidates': 1,
+            'history_lineages_projected': 1,
+            'history_state_projection_supported': False,
+            'unsupported_object_types': [],
+            'skipped_candidates': [],
+        },
     )
     service = TypedRetrievalService(
         ledger=_FakeLedger(),
@@ -401,12 +459,66 @@ def test_om_projection_auto_history_query_skips_projection_until_lineage_exists(
     )
 
     assert response['query_mode'] == 'history'
-    assert response['counts']['state'] == 0
-    assert response['limits_applied']['materialization']['om_projection'] == {
-        'enabled': False,
-        'reason': 'history_mode_requires_lineage',
-    }
-    assert projection.calls == []
+    assert response['counts']['episodes'] == 2
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode:s1_observational_memory:node-v2',
+        'om_episode:s1_observational_memory:node-v1',
+    ]
+    assert response['limits_applied']['materialization']['om_projection']['history_lineages_projected'] == 1
+    assert projection.calls[0]['query_mode'] == 'history'
+
+
+def test_om_projection_history_fail_closed_preserves_limits_metadata():
+    """History-mode OM projection should surface fail-closed metadata instead of fabricating lineage."""
+    projection = _FakeOMProjectionService(
+        objects=[],
+        limits={
+            'enabled': True,
+            'reason': 'projected_history',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 0,
+            'state_projected': 0,
+            'max_results': 10,
+            'history_mode': True,
+            'history_candidates': 1,
+            'history_lineages_projected': 0,
+            'history_state_projection_supported': False,
+            'unsupported_object_types': [],
+            'skipped_candidates': [
+                {
+                    'group_id': 's1_observational_memory',
+                    'node_id': 'node-branch',
+                    'reason': 'ambiguous_supersession_graph',
+                }
+            ],
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='what changed with latency spike',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['query_mode'] == 'history'
+    assert response['counts']['episodes'] == 0
+    assert response['limits_applied']['materialization']['om_projection']['skipped_candidates'] == [
+        {
+            'group_id': 's1_observational_memory',
+            'node_id': 'node-branch',
+            'reason': 'ambiguous_supersession_graph',
+        }
+    ]
+    assert projection.calls[0]['query_mode'] == 'history'
 
 
 def test_om_projection_evidence_includes_om_provenance():
