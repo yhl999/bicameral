@@ -251,23 +251,37 @@ than only projecting the narrow linear `SUPERSEDES` happy path.
     and `history_ambiguous` when the graph is not linear.
 
 - **Closure / currentness**
-  - Incoming `SUPERSEDES` and `RESOLVES` edges are treated as closure evidence
-    for OM episodes.
-  - That means `query_mode=current` can honestly filter superseded or resolved
-    OM nodes instead of returning stale snapshots as if they were live.
+  - OM write paths now persist native node lifecycle fields (`valid_at`,
+    `invalid_at`, `lifecycle_status`, `lineage_root_id`,
+    `lineage_parent_id`, `superseded_by_node_id`, `previous_status`,
+    `transition_cause`) instead of forcing typed retrieval to reconstruct all of
+    that from topology alone.
+  - Incoming `SUPERSEDES` and `RESOLVES` edges are still treated as closure
+    evidence, but retrieval now prefers direct node lifecycle truth when it is
+    present and only falls back to graph-structure inference when OM has not
+    written the answer yet.
+  - That means `query_mode=current` can honestly filter superseded, closed,
+    abandoned, or resolved OM nodes without pretending that an absent read-time
+    heuristic is equivalent to stored truth.
 
 - **Relation / state history**
   - OM relations are projected as typed `StateFact` objects with deterministic
     provenance back to OM relation IDs and endpoint node IDs.
-  - Historical relation lineages are grouped by relation type plus source/target
-    history anchors.
+  - Compressor/convergence now persist native relation lifecycle fields on OM
+    edges where supportable: stable relation identity, `relation_root_id`,
+    `lineage_parent_relation_id`, `valid_at`, `invalid_at`,
+    `superseded_by_relation_id`, `lifecycle_status`, and
+    `transition_cause`/`transition_basis`.
+  - Historical relation lineages still use source/target history anchors as the
+    fallback grouping strategy, but typed retrieval now prefers the stored
+    native lineage fields before it attempts endpoint-history inference.
   - Relation ordering now prefers native edge timestamps (`valid_at`,
     `invalid_at`) when available and only falls back to endpoint-history
     inference when OM does not carry direct lifecycle truth.
   - Branching / competing successors are exposed explicitly instead of being
-    flattened into fake linear chains. The typed payload keeps ordinary lineage
-    fields when they are honest and records ambiguity in structured history
-    metadata when they are not.
+    flattened into fake linear chains. When write-time lineage cannot be stated
+    honestly, OM stores the limitation (`lineage_topology`,
+    `lineage_limit_reason`) rather than fabricating certainty.
   - Historical lineage details are carried both in top-level `history_meta` and
     in `value.om_history`, including lineage basis, topology, version basis,
     parent/successor candidates, invalidation basis, and transition evidence.
