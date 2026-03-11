@@ -233,6 +233,7 @@ class TypedMemoryObjectBase(BaseModel):
     policy_scope: str
     visibility_scope: str
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    history_meta: dict[str, Any] = Field(default_factory=dict)
     extractor_version: str | None = None
     created_at: str = Field(default_factory=_now_iso)
     lifecycle_status: LifecycleStatus = 'asserted'
