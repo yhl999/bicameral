@@ -278,6 +278,80 @@ def test_candidate_root_prefilter_finds_provisional_om_episode_by_plain_group_id
     assert strategy == 'query_tokens'
 
 
+def test_episode_only_query_returns_shadow_episode_not_provisional_for_promoted_om_node():
+    """Regression: episode-only typed queries must return the ledger-backed shadow
+    episode for a promoted OM node, not the stale provisional ledger episode.
+
+    Bug: _candidate_root_ids() emitted ``object_type IN ('episode')`` when the caller
+    passed object_types=['episode'].  That SQL filter excluded the promoted state_fact
+    root (object_type='state_fact') from the candidate pool.
+    _derive_ledger_backed_om_history() then received no StateFact objects and returned
+    covered_om_episode_nodes=set(), so the provisional episode was never suppressed and
+    the shadow episode was never created.
+
+    Fix: when 'episode' is in object_types, also include 'state_fact' in the SQL type
+    filter so the promoted state root survives candidate selection.  state_fact objects
+    are removed by _matches_object_type() in the filtered_objects pass and never reach
+    the caller.
+    """
+    group_id = 's1_observational_memory'
+    node_id = 'travel-style'
+
+    # Promoted OM state fact — stored in typed_roots with object_type='state_fact'.
+    # Before the fix this root was filtered out when object_types=['episode'].
+    promoted_fact = _state_fact(
+        object_id='om_state_promoted',
+        root_id='om_state_root',
+        version=1,
+        value='carry-on only',
+        source_lane=group_id,
+        source_key=f'om:{group_id}:node:{node_id}',
+        lifecycle_status='promoted',
+        promotion_status='promoted',
+    )
+    # Provisional episode for the same OM node — stored with object_type='episode'.
+    # This is the stale placeholder that must be suppressed after promotion.
+    provisional_ep = _om_provisional_episode(
+        object_id=f'om_provisional_episode:{group_id}:{node_id}',
+        summary='carry-on only packing preference provisional',
+        group_id=group_id,
+    )
+    # _om_provisional_episode derives source_key as
+    # 'om:<group_id>:node:<last segment of object_id>', which resolves to
+    # 'om:s1_observational_memory:node:travel-style' — same as promoted_fact.source_key.
+
+    ledger = _memory_ledger()
+    _seed_assert(ledger, promoted_fact)
+    _seed_assert(ledger, provisional_ep)
+
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(
+        service.search(
+            query='carry-on',
+            object_types=['episode'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    episode_ids = [ep['object_id'] for ep in response['episodes']]
+
+    assert 'om_episode_shadow:om_state_promoted' in episode_ids, (
+        f'Shadow episode not returned for promoted OM node. Got: {episode_ids}. '
+        'Prefilter bug: state_fact root was excluded from candidate selection '
+        "when object_types=['episode'], so _derive_ledger_backed_om_history() "
+        'received no state facts and could not derive the shadow episode.'
+    )
+    assert f'om_provisional_episode:{group_id}:{node_id}' not in episode_ids, (
+        f'Stale provisional episode not suppressed after promotion. Got: {episode_ids}'
+    )
+    # state_fact objects must not leak into the episodes bucket
+    assert response['counts']['state'] == 0, (
+        f"state_fact objects leaked into state bucket: {response['state']}"
+    )
+
+
 def test_search_does_not_return_recent_unrelated_objects_for_nonmatching_query():
     ledger = _memory_ledger()
     _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='espresso'))

@@ -411,9 +411,17 @@ class TypedRetrievalService:
         base_params: list[Any] = []
 
         if object_types:
-            placeholders = ', '.join('?' for _ in object_types)
+            # When episodes are requested, also include state_fact roots so
+            # that _derive_ledger_backed_om_history() can find promoted OM
+            # state lineage even when the caller only asked for episodes.
+            # The state_fact objects are removed by _matches_object_type() in
+            # the filtered_objects pass and never reach the caller.
+            sql_object_types = set(object_types)
+            if 'episode' in sql_object_types:
+                sql_object_types.add('state_fact')
+            placeholders = ', '.join('?' for _ in sql_object_types)
             base_filters.append(f'object_type IN ({placeholders})')
-            base_params.extend(sorted(object_types))
+            base_params.extend(sorted(sql_object_types))
 
         source_lane_values = _coerce_sql_filter_values(metadata_filters.get('source_lane'))
         if source_lane_values:
