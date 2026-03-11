@@ -445,7 +445,7 @@ def _relation_version_id(*, relation_root_id: str, valid_at: str) -> str:
 
 
 def _judgment_addresses(session: Any, node_id: str) -> list[dict[str, str]]:
-    rows = session.run(
+    result = session.run(
         """
         MATCH (j)-[r:ADDRESSES]->(n:OMNode {node_id:$node_id})
         WHERE (
@@ -459,14 +459,25 @@ def _judgment_addresses(session: Any, node_id: str) -> list[dict[str, str]]:
         ORDER BY source_node_id ASC
         """,
         {"node_id": node_id},
-    ).data()
+    )
+
+    if hasattr(result, "data"):
+        rows = result.data()
+    else:
+        rows = []
+        single_row = result.single() if hasattr(result, "single") else None
+        if isinstance(single_row, dict):
+            rows = [single_row]
+
     return [
         {
             "source_node_id": str(row.get("source_node_id") or "").strip(),
             "group_id": str(row.get("group_id") or "").strip(),
         }
         for row in rows
-        if str(row.get("source_node_id") or "").strip() and str(row.get("group_id") or "").strip()
+        if isinstance(row, dict)
+        and str(row.get("source_node_id") or "").strip()
+        and str(row.get("group_id") or "").strip()
     ]
 
 
