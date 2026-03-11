@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -13,6 +14,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_SCOPE: dict[str, int] = {
     'public': 0,
@@ -95,10 +98,17 @@ MATERIALIZE_MAX_FACT_CHARS = 6000
 MATERIALIZE_DEFAULT_MAX_BLOCK_TOKENS = 320
 MATERIALIZE_MAX_BLOCK_TOKENS = 8000
 GRAPHITI_DEFAULT_BASE_URL = 'http://localhost:8000'
-GRAPHITI_SEARCH_PATH = '/search'
+GRAPHITI_MCP_PATH = '/mcp'
+GRAPHITI_MCP_PROTOCOL_VERSION = '2024-11-05'
+GRAPHITI_MCP_SESSION_HEADER = 'mcp-session-id'
 MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE = 'graphiti_content_voice_style'
 MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES = 'graphiti_content_writing_samples'
 MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS = 'graphiti_content_long_form_artifacts'
+MATERIALIZE_QUERY_HINTS = {
+    MATERIALIZE_SOURCE_CONTENT_VOICE_STYLE: 'author voice register cadence tone sentence rhythm signature phrases',
+    MATERIALIZE_SOURCE_CONTENT_WRITING_SAMPLES: 'writing samples signature phrases sentence patterns paragraph structure concrete examples',
+    MATERIALIZE_SOURCE_CONTENT_LONG_FORM_ARTIFACTS: 'rhetorical moves argument structures transition techniques opening strategies engagement signals',
+}
 
 
 class OMIndexMismatchError(ValueError):
@@ -731,6 +741,152 @@ def _normalize_fact_text(text: str, *, max_fact_chars: int) -> tuple[str, bool]:
     return collapsed[:max_fact_chars].rstrip() + '…', True
 
 
+def _resolve_graphiti_mcp_url() -> str:
+    explicit = str(os.environ.get('GRAPHITI_MCP_URL', '') or '').strip()
+    if explicit:
+        return explicit.rstrip('/')
+
+    base_url = os.environ.get('GRAPHITI_BASE_URL', GRAPHITI_DEFAULT_BASE_URL).rstrip('/')
+    endpoint = str(os.environ.get('GRAPHITI_MCP_PATH', GRAPHITI_MCP_PATH) or '').strip()
+    if not endpoint:
+        endpoint = GRAPHITI_MCP_PATH
+    if not endpoint.startswith('/'):
+        endpoint = f'/{endpoint}'
+    return f'{base_url}{endpoint}'
+
+
+def _graphiti_headers(*, session_id: str | None = None) -> dict[str, str]:
+    headers = {
+        'Accept': 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+    }
+    api_key = os.environ.get('GRAPHITI_API_KEY')
+    auth_header = os.environ.get('GRAPHITI_AUTH_HEADER', 'Authorization')
+    if api_key and auth_header:
+        headers[auth_header] = f'Bearer {api_key}'
+    if session_id:
+        headers[GRAPHITI_MCP_SESSION_HEADER] = session_id
+    return headers
+
+
+def _decode_graphiti_mcp_body(content_type: str, body_text: str, *, allow_empty: bool = False) -> object:
+    payload_text = body_text.strip()
+    if not payload_text:
+        if allow_empty:
+            return {}
+        raise RuntimeError('graphiti_mcp_empty_body')
+
+    if 'text/event-stream' in (content_type or '').lower() or payload_text.startswith('event:'):
+        candidates: list[str] = []
+        current: list[str] = []
+        for raw_line in body_text.splitlines():
+            line = raw_line.rstrip('\r')
+            if line.startswith('data:'):
+                current.append(line[5:].lstrip())
+                continue
+            if not line.strip() and current:
+                candidates.append('\n'.join(current))
+                current = []
+        if current:
+            candidates.append('\n'.join(current))
+
+        for candidate in reversed(candidates):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        raise RuntimeError('graphiti_mcp_invalid_sse')
+
+    try:
+        return json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError('graphiti_invalid_json') from exc
+
+
+def _graphiti_mcp_request(
+    *,
+    url: str,
+    payload: dict[str, object],
+    timeout_seconds: float,
+    session_id: str | None = None,
+    allow_empty: bool = False,
+) -> tuple[object, str | None]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode('utf-8'),
+        headers=_graphiti_headers(session_id=session_id),
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            body_text = response.read().decode('utf-8')
+            next_session_id = response.headers.get(GRAPHITI_MCP_SESSION_HEADER) or session_id
+            decoded = _decode_graphiti_mcp_body(
+                response.headers.get('Content-Type', ''),
+                body_text,
+                allow_empty=allow_empty,
+            )
+            return decoded, next_session_id
+    except urllib.error.HTTPError as exc:
+        if exc.code == 400:
+            body_text = exc.read().decode('utf-8', errors='replace')
+            next_session_id = exc.headers.get(GRAPHITI_MCP_SESSION_HEADER) or session_id
+            if 'Missing session ID' in body_text and next_session_id and not session_id:
+                return _graphiti_mcp_request(
+                    url=url,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                    session_id=next_session_id,
+                    allow_empty=allow_empty,
+                )
+        raise RuntimeError(f'graphiti_http_{exc.code}') from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'graphiti_unreachable:{exc.reason}') from exc
+
+
+def _extract_graphiti_tool_payload(tool_result: object) -> dict[str, object]:
+    """
+    Extract facts from a Graphiti MCP tool result with ordered fallbacks.
+
+    MCP envelope contract:
+    - structuredContent (primary): {"result": {"structuredContent": {"result": {...}}}}
+    - content array (secondary): {"result": {"content": [{"text": "JSON-encoded facts"}]}}
+    - facts direct (fallback): {"result": {"facts": [...]}} — used when no envelope wrapper
+
+    Returns a dict with at minimum a 'facts' key containing the extracted facts list.
+    """
+    if not isinstance(tool_result, dict):
+        raise RuntimeError('graphiti_mcp_invalid_payload')
+
+    structured = tool_result.get('structuredContent')
+    if isinstance(structured, dict):
+        nested = structured.get('result')
+        if isinstance(nested, dict):
+            return nested
+        return structured
+
+    content = tool_result.get('content')
+    if isinstance(content, list):
+        for item in reversed(content):
+            if not isinstance(item, dict):
+                continue
+            text = item.get('text')
+            if not isinstance(text, str) or not text.strip():
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+    if isinstance(tool_result.get('facts'), list):
+        return tool_result
+
+    raise RuntimeError('graphiti_mcp_invalid_facts')
+
+
 def _graphiti_search_facts(
     *,
     query: str,
@@ -739,52 +895,80 @@ def _graphiti_search_facts(
     timeout_seconds: float,
     max_fact_chars: int,
 ) -> tuple[list[str], dict[str, object]]:
-    base_url = os.environ.get('GRAPHITI_BASE_URL', GRAPHITI_DEFAULT_BASE_URL).rstrip('/')
-    endpoint = os.environ.get('GRAPHITI_SEARCH_PATH', GRAPHITI_SEARCH_PATH)
-    if not endpoint.startswith('/'):
-        endpoint = f'/{endpoint}'
+    mcp_url = _resolve_graphiti_mcp_url()
+    requested_max_items = max(1, max_items)
 
-    request_body = {
-        'query': query,
-        'group_ids': group_ids if group_ids else None,
-        'max_facts': max(1, max_items),
+    initialize_payload = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'initialize',
+        'params': {
+            'protocolVersion': GRAPHITI_MCP_PROTOCOL_VERSION,
+            'capabilities': {},
+            'clientInfo': {
+                'name': 'runtime-pack-router',
+                'version': '0.1.0',
+            },
+        },
     }
-    data = json.dumps(request_body).encode('utf-8')
+    _initialize_result, session_id = _graphiti_mcp_request(
+        url=mcp_url,
+        payload=initialize_payload,
+        timeout_seconds=timeout_seconds,
+    )
+    if not session_id:
+        raise RuntimeError('graphiti_mcp_missing_session_id')
 
-    headers = {
-        'Content-Type': 'application/json',
-    }
-    api_key = os.environ.get('GRAPHITI_API_KEY')
-    auth_header = os.environ.get('GRAPHITI_AUTH_HEADER', 'Authorization')
-    if api_key and auth_header:
-        headers[auth_header] = f'Bearer {api_key}'
-
-    req = urllib.request.Request(
-        f'{base_url}{endpoint}',
-        data=data,
-        headers=headers,
-        method='POST',
+    _graphiti_mcp_request(
+        url=mcp_url,
+        payload={
+            'jsonrpc': '2.0',
+            'method': 'notifications/initialized',
+            'params': {},
+        },
+        timeout_seconds=timeout_seconds,
+        session_id=session_id,
+        allow_empty=True,
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            payload_raw = response.read().decode('utf-8')
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f'graphiti_http_{exc.code}') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'graphiti_unreachable:{exc.reason}') from exc
+    tool_result_envelope, _session_id = _graphiti_mcp_request(
+        url=mcp_url,
+        payload={
+            'jsonrpc': '2.0',
+            'id': 2,
+            'method': 'tools/call',
+            'params': {
+                'name': 'search_memory_facts',
+                'arguments': {
+                    'query': query,
+                    'group_ids': group_ids if group_ids else None,
+                    'max_facts': requested_max_items,
+                },
+            },
+        },
+        timeout_seconds=timeout_seconds,
+        session_id=session_id,
+    )
 
-    try:
-        payload = json.loads(payload_raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError('graphiti_invalid_json') from exc
+    if not isinstance(tool_result_envelope, dict):
+        raise RuntimeError('graphiti_mcp_invalid_payload')
+    error = tool_result_envelope.get('error')
+    if isinstance(error, dict):
+        code = error.get('code', 'unknown')
+        message = error.get('message', 'unknown error')
+        raise RuntimeError(f'graphiti_mcp_error_{code}:{message}')
 
-    if not isinstance(payload, dict):
-        raise RuntimeError('graphiti_invalid_payload')
+    tool_result = tool_result_envelope.get('result')
+    if isinstance(tool_result, dict) and tool_result.get('isError'):
+        _content = tool_result.get('content') or []
+        _first = _content[0] if _content else {}
+        _msg = _first.get('text', 'unknown error') if isinstance(_first, dict) else str(_first)
+        raise RuntimeError(f'Graphiti tool error: {_msg}')
+    payload = _extract_graphiti_tool_payload(tool_result)
 
     facts_raw = payload.get('facts')
     if not isinstance(facts_raw, list):
-        raise RuntimeError('graphiti_invalid_facts')
+        raise RuntimeError('graphiti_mcp_invalid_facts')
 
     normalized: list[str] = []
     seen: set[str] = set()
@@ -810,11 +994,13 @@ def _graphiti_search_facts(
             continue
         seen.add(key)
         normalized.append(cleaned)
-        if len(normalized) >= max(1, max_items):
+        if len(normalized) >= requested_max_items:
             break
 
     stats: dict[str, object] = {
-        'requested_max_items': max(1, max_items),
+        'transport': 'mcp_http',
+        'mcp_url': mcp_url,
+        'requested_max_items': requested_max_items,
         'facts_received': len(facts_raw),
         'fact_candidates': fact_candidates,
         'facts_selected': len(normalized),
@@ -833,6 +1019,19 @@ def _cap_block_by_token_budget(text: str, max_tokens: int) -> tuple[str, bool, i
     return text[:cap_chars].rstrip() + '\n…(truncated)…', True, cap_chars
 
 
+def _materialization_query(source: str, task_query: str) -> str:
+    task = task_query.strip()
+    hint = MATERIALIZE_QUERY_HINTS.get(source, '')
+    if hint:
+        return hint
+    if source.startswith('graphiti_') and source not in MATERIALIZE_QUERY_HINTS:
+        logger.warning(
+            'No MATERIALIZE_QUERY_HINTS entry for source=%s; falling back to task query. Consider adding an entry.',
+            source.replace('\n', '\\n').replace('\r', '\\r')[:128],
+        )
+    return task
+
+
 def _materialize_content_pack(
     *,
     source: str,
@@ -848,8 +1047,9 @@ def _materialize_content_pack(
     max_fact_chars = _materialize_max_fact_chars(materialization)
 
     lane_label = ', '.join(group_ids) if group_ids else 'default lane'
+    retrieval_query = _materialization_query(source, query)
     facts, fact_stats = _graphiti_search_facts(
-        query=query,
+        query=retrieval_query,
         group_ids=group_ids,
         max_items=max_items,
         timeout_seconds=timeout_seconds,
@@ -864,6 +1064,7 @@ def _materialize_content_pack(
         'min_coverage_items': min_coverage,
         'max_block_tokens': max_block_tokens,
         'max_fact_chars': max_fact_chars,
+        'retrieval_query': retrieval_query,
         **fact_stats,
     }
 

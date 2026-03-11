@@ -18,13 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class _GraphitiStubHandler(BaseHTTPRequestHandler):
     facts_by_query_keyword: dict[str, list[str]] = {}
     facts_by_group_id: dict[str, list[str]] = {}
+    session_id = 'stub-session'
 
-    def do_POST(self) -> None:  # noqa: N802
-        raw = self.rfile.read(int(self.headers.get('Content-Length', '0') or '0'))
-        payload = json.loads(raw.decode('utf-8') or '{}')
-        query = str(payload.get('query') or '')
-        group_ids = payload.get('group_ids') if isinstance(payload.get('group_ids'), list) else []
-
+    def _lookup_facts(self, *, query: str, group_ids: list[str]) -> list[dict[str, str]]:
         facts: list[dict[str, str]] = []
         for group_id in group_ids:
             if not isinstance(group_id, str):
@@ -39,13 +35,90 @@ class _GraphitiStubHandler(BaseHTTPRequestHandler):
                 if keyword in query:
                     facts = [{'fact': value} for value in values]
                     break
+        return facts
 
-        body = json.dumps({'facts': facts}).encode('utf-8')
-        self.send_response(200)
+    def _send_json(self, status: int, payload: object, *, session_id: str | None = None) -> None:
+        body = json.dumps(payload).encode('utf-8')
+        self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
+        if session_id:
+            self.send_header('mcp-session-id', session_id)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse(self, status: int, payload: object, *, session_id: str | None = None) -> None:
+        body = f"event: message\ndata: {json.dumps(payload)}\n\n".encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Length', str(len(body)))
+        if session_id:
+            self.send_header('mcp-session-id', session_id)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get('Content-Length', '0') or '0'))
+        payload = json.loads(raw.decode('utf-8') or '{}')
+        method = str(payload.get('method') or '')
+        params = payload.get('params') if isinstance(payload.get('params'), dict) else {}
+
+        if method == 'initialize':
+            response = {
+                'jsonrpc': '2.0',
+                'id': payload.get('id'),
+                'result': {
+                    'protocolVersion': '2024-11-05',
+                    'capabilities': {'tools': {'listChanged': False}},
+                    'serverInfo': {'name': 'Graphiti Stub', 'version': '0.0.1'},
+                },
+            }
+            self._send_sse(200, response, session_id=self.session_id)
+            return
+
+        if method == 'notifications/initialized':
+            self.send_response(202)
+            self.send_header('Content-Length', '0')
+            self.send_header('mcp-session-id', self.session_id)
+            self.end_headers()
+            return
+
+        if method == 'tools/call':
+            arguments = params.get('arguments') if isinstance(params.get('arguments'), dict) else {}
+            query = str(arguments.get('query') or '')
+            group_ids = arguments.get('group_ids') if isinstance(arguments.get('group_ids'), list) else []
+            facts = self._lookup_facts(query=query, group_ids=group_ids)
+            response = {
+                'jsonrpc': '2.0',
+                'id': payload.get('id'),
+                'result': {
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': json.dumps({'message': 'Facts retrieved successfully', 'facts': facts}),
+                        }
+                    ],
+                    'structuredContent': {
+                        'result': {
+                            'message': 'Facts retrieved successfully',
+                            'facts': facts,
+                        }
+                    },
+                    'isError': False,
+                },
+            }
+            self._send_sse(200, response, session_id=self.session_id)
+            return
+
+        self._send_json(
+            400,
+            {
+                'jsonrpc': '2.0',
+                'id': payload.get('id'),
+                'error': {'code': -32601, 'message': f'Unsupported method: {method}'},
+            },
+            session_id=self.session_id,
+        )
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -643,6 +716,128 @@ class RuntimePackRouterTests(unittest.TestCase):
             self.assertIn('Live writing-sample signals', writing_content)
             self.assertNotIn('STATIC VOICE FALLBACK', voice_content)
             self.assertNotIn('STATIC WRITING FALLBACK', writing_content)
+            self.assertEqual(
+                selected['content_voice_style']['materialization_stats']['dynamic']['transport'],
+                'mcp_http',
+            )
+            self.assertEqual(
+                selected['content_writing_samples']['materialization_stats']['dynamic']['transport'],
+                'mcp_http',
+            )
+
+    def test_materialize_content_packs_use_pack_specific_queries_not_topic_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir(parents=True)
+            (repo / 'config').mkdir(parents=True)
+            (repo / 'workflows').mkdir(parents=True)
+
+            (repo / 'workflows' / 'content_voice_style.pack.yaml').write_text(
+                'domain_context: |\n  STATIC VOICE FALLBACK',
+                encoding='utf-8',
+            )
+            (repo / 'workflows' / 'content_writing_samples.pack.yaml').write_text(
+                'domain_context: |\n  STATIC WRITING FALLBACK',
+                encoding='utf-8',
+            )
+
+            registry = {
+                'schema_version': 1,
+                'packs': [
+                    {
+                        'pack_id': 'content_voice_style',
+                        'path': 'workflows/content_voice_style.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_writing_samples']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_voice_style',
+                            'min_coverage_items': 1,
+                            'max_items': 2,
+                        },
+                    },
+                    {
+                        'pack_id': 'content_writing_samples',
+                        'path': 'workflows/content_writing_samples.pack.yaml',
+                        'scope': 'private',
+                        'query_template': '${path}',
+                        'retrieval': {
+                            'group_ids_by_mode': {'default': ['s1_writing_samples']},
+                        },
+                        'materialization': {
+                            'source': 'graphiti_content_writing_samples',
+                            'min_coverage_items': 1,
+                            'max_items': 2,
+                        },
+                    },
+                ],
+            }
+            profiles = {
+                'schema_version': 1,
+                'profiles': [
+                    {
+                        'consumer': 'main_session_content_long_form',
+                        'workflow_id': 'content_long_form',
+                        'step_id': 'draft',
+                        'scope': 'private',
+                        'schema_version': 1,
+                        'task': 'draft an article about bicameral memory',
+                        'injection_text': 'Long-form writing workflow',
+                        'pack_ids': ['content_voice_style', 'content_writing_samples'],
+                        'chatgpt_mode': 'off',
+                        'pack_modes': {
+                            'content_voice_style': 'formal',
+                            'content_writing_samples': 'formal',
+                        },
+                    }
+                ],
+            }
+
+            (repo / 'config' / 'runtime_pack_registry.json').write_text(
+                json.dumps(registry, indent=2),
+                encoding='utf-8',
+            )
+            (repo / 'config' / 'runtime_consumer_profiles.json').write_text(
+                json.dumps(profiles, indent=2),
+                encoding='utf-8',
+            )
+
+            with GraphitiStubServer(
+                facts_by_query_keyword={
+                    'author voice register cadence tone sentence rhythm signature phrases': [
+                        'Voice signal keyed off style query, not topic query.',
+                    ],
+                    'writing samples signature phrases sentence patterns paragraph structure concrete examples': [
+                        'Writing-sample signal keyed off pack-specific query.',
+                    ],
+                }
+            ) as base_url:
+                plan = self._route(
+                    repo,
+                    consumer='main_session_content_long_form',
+                    workflow_id='content_long_form',
+                    step_id='draft',
+                    task='draft an article about bicameral memory',
+                    materialize=True,
+                    scope='private',
+                    env={
+                        'GRAPHITI_BASE_URL': base_url,
+                    },
+                )
+
+            selected = {pack['pack_id']: pack for pack in plan['selected_packs']}
+            self.assertIn('Voice signal keyed off style query, not topic query.', selected['content_voice_style']['content'])
+            self.assertIn('Writing-sample signal keyed off pack-specific query.', selected['content_writing_samples']['content'])
+            self.assertEqual(
+                selected['content_voice_style']['materialization_stats']['dynamic']['retrieval_query'],
+                'author voice register cadence tone sentence rhythm signature phrases',
+            )
+            self.assertEqual(
+                selected['content_writing_samples']['materialization_stats']['dynamic']['retrieval_query'],
+                'writing samples signature phrases sentence patterns paragraph structure concrete examples',
+            )
 
     def test_materialize_content_pack_low_coverage_falls_back_to_static_domain_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

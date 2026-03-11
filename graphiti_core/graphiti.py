@@ -132,6 +132,14 @@ PHASE3C_REQUIRED_FIELDS = (
     'when_to_use',
 )
 
+PHASE3C_WRITING_SAMPLES_SHORT_CRAFT_TYPES = {
+    'SignaturePhrase',
+    'RegisterMarker',
+    'VoiceFingerprint',
+    'StructuralPattern',
+    'ToneShift',
+}
+
 PHASE3C_META_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r'\bemploys rhetorical strategies?\b', re.IGNORECASE),
     re.compile(r'\bengage readers\b', re.IGNORECASE),
@@ -161,11 +169,25 @@ def _phase3c_source_chunk_key(source_description: str) -> str:
     return ''
 
 
-def _phase3c_is_meta_or_tautological(text: str) -> bool:
+def _phase3c_allows_short_craft_text(group_id: str, labels: set[str]) -> bool:
+    """
+    Check if short craft nodes should bypass the 4-token minimum gate.
+
+    Assumes craft node content is ingestion-controlled; sanitize at ingest boundary.
+    This gate only exempts nodes with craft-type labels (SignaturePhrase, RegisterMarker,
+    VoiceFingerprint, StructuralPattern, ToneShift). Non-craft nodes in these lanes
+    still enforce the full PHASE3C_REQUIRED_FIELDS validation and 4-token gate.
+    """
+    return group_id in ('s1_writing_samples', 's1_inspiration_short_form', 's1_inspiration_long_form') and bool(
+        labels & PHASE3C_WRITING_SAMPLES_SHORT_CRAFT_TYPES
+    )
+
+
+def _phase3c_is_meta_or_tautological(text: str, *, allow_short_text: bool = False) -> bool:
     normalized = _phase3c_normalize_text(text)
     if not normalized:
         return True
-    if len(normalized.split()) < 4:
+    if len(normalized.split()) < 4 and not allow_short_text:
         return True
     return any(pattern.search(normalized) for pattern in PHASE3C_META_PATTERNS)
 
@@ -657,8 +679,10 @@ class Graphiti:
         kept: list[EntityNode] = []
         for node in extracted_nodes:
             candidate_text = _phase3c_candidate_text_from_node(node)
+            labels = {label for label in (node.labels or []) if label != 'Entity'}
+            allow_short_text = _phase3c_allows_short_craft_text(group_id, labels)
             reasons: list[str] = []
-            if _phase3c_is_meta_or_tautological(candidate_text):
+            if _phase3c_is_meta_or_tautological(candidate_text, allow_short_text=allow_short_text):
                 reasons.append('meta_or_tautological')
 
             if reasons:
@@ -700,19 +724,25 @@ class Graphiti:
             labels = {label for label in (node.labels or []) if label != 'Entity'}
             primary_label = next(iter(labels), '')
             candidate_text = _phase3c_candidate_text_from_node(node)
+            allow_short_text = _phase3c_allows_short_craft_text(group_id, labels)
             reasons: list[str] = []
 
             if primary_label not in anchor_types:
                 attrs = node.attributes if isinstance(node.attributes, dict) else {}
-                for field_name in PHASE3C_REQUIRED_FIELDS:
-                    if not _phase3c_normalize_text(str(attrs.get(field_name, ''))):
-                        reasons.append(f'missing_{field_name}')
+                if not allow_short_text:
+                    for field_name in PHASE3C_REQUIRED_FIELDS:
+                        if not _phase3c_normalize_text(str(attrs.get(field_name, ''))):
+                            reasons.append(f'missing_{field_name}')
 
-                evidence_span = str(attrs.get('evidence_span', ''))
-                if not _phase3c_evidence_supported(evidence_span, episode.content or ''):
-                    reasons.append('weak_or_unverifiable_evidence_span')
+                    evidence_span = str(attrs.get('evidence_span', ''))
+                    if not _phase3c_evidence_supported(evidence_span, episode.content or ''):
+                        reasons.append('weak_or_unverifiable_evidence_span')
+                elif attrs:
+                    evidence_span = str(attrs.get('evidence_span', ''))
+                    if evidence_span and not _phase3c_evidence_supported(evidence_span, episode.content or ''):
+                        reasons.append('weak_or_unverifiable_evidence_span')
 
-                if _phase3c_is_meta_or_tautological(candidate_text):
+                if _phase3c_is_meta_or_tautological(candidate_text, allow_short_text=allow_short_text):
                     reasons.append('meta_or_tautological')
 
             if reasons:
@@ -1177,14 +1207,14 @@ class Graphiti:
             try:
                 from config.tool_result_allowlist import enforce_tool_result_scope
                 enforce_tool_result_scope(tool_name)
-            except ImportError:
+            except ImportError as e:
                 # config package not on path — enforce a closed default: reject
                 # any named tool result rather than silently allowing everything.
                 raise ValueError(
                     f'tool_name={tool_name!r} was supplied but the scope-policy '
                     'allowlist (config.tool_result_allowlist) is not importable. '
                     'Refusing to ingest tool result to fail closed.'
-                )
+                ) from e
 
         start = time()
         now = utc_now()
