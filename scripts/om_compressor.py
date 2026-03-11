@@ -921,6 +921,23 @@ _RESPONSES_API_MODEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_OM_REASONING_EFFORT_BY_MODEL: dict[str, str] = {
+    "gpt-5.1-codex-mini": "medium",
+}
+
+
+def _normalize_model_id_for_reasoning(model_id: str | None) -> str:
+    """Normalize model IDs (strip provider prefixes for model-specific overrides)."""
+    if not model_id:
+        return ""
+    return model_id.strip().lower().rsplit("/", maxsplit=1)[-1]
+
+
+def _reasoning_effort_for_model(model_id: str | None) -> str | None:
+    """Return explicit reasoning effort for models that require non-default effort."""
+    normalized = _normalize_model_id_for_reasoning(model_id)
+    return _OM_REASONING_EFFORT_BY_MODEL.get(normalized)
+
 
 def _model_requires_responses_api(model_id: str) -> bool:
     """Return True if model_id is a Codex/o-series model requiring /v1/responses."""
@@ -1077,6 +1094,10 @@ def _call_llm_extract(messages: list[MessageRow], cfg: ExtractorConfig) -> Extra
             # 2048 is too low for 50-message chunks when ~400-1800 tokens go to reasoning.
             "max_tokens": int(os.environ.get("OM_LLM_MAX_TOKENS", "16384")),
         }
+
+    reasoning_effort = _reasoning_effort_for_model(cfg.model_id)
+    if reasoning_effort is not None:
+        payload["reasoning"] = {"effort": reasoning_effort}
 
     body = json.dumps(payload).encode("utf-8")
     headers: dict[str, str] = {

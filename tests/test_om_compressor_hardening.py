@@ -746,6 +746,7 @@ def _responses_api_response_wrapping(content_str: str) -> dict:
     }
 
 
+
 def test_call_llm_extract_responses_api_path_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
     """_call_llm_extract correctly parses a /v1/responses format response for codex models."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
@@ -776,6 +777,68 @@ def test_call_llm_extract_responses_api_path_parsed(monkeypatch: pytest.MonkeyPa
     assert len(result.nodes) == 1
     assert result.nodes[0].node_type == "OperationalRule"
     assert len(result.edges) == 0
+
+
+def test_call_llm_extract_responses_api_sets_medium_reasoning_for_gpt_5_1_codex_mini(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OM codex model requests include reasoning effort = medium."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+
+    msgs = _make_messages(1)
+    cfg = _make_cfg(model_id="gpt-5.1-codex-mini")
+
+    llm_payload = {
+        "nodes": [],
+        "edges": [],
+    }
+    fake_resp = _make_fake_http_response(
+        _responses_api_response_wrapping(json.dumps(llm_payload))
+    )
+
+    captured_payloads: list[dict] = []
+
+    def _capture_request(req, timeout=None):
+        captured_payloads.append(json.loads(req.data.decode("utf-8")))
+        return fake_resp
+
+    with patch("urllib.request.urlopen", side_effect=_capture_request):
+        om_compressor._call_llm_extract(msgs, cfg)
+
+    assert captured_payloads, "No request was captured"
+    assert captured_payloads[0]["reasoning"] == {"effort": "medium"}
+
+
+def test_call_llm_extract_chat_api_keeps_default_reasoning_absent_for_non_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-codex model requests remain unchanged and do not set reasoning by default."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.setenv("OM_COMPRESSOR_LLM_API_STYLE", "chat")
+
+    msgs = _make_messages(1)
+    cfg = _make_cfg(model_id="gpt-4o")
+
+    llm_payload = {
+        "nodes": [],
+        "edges": [],
+    }
+    fake_resp = _make_fake_http_response(
+        _openai_response_wrapping(json.dumps(llm_payload))
+    )
+
+    captured_payloads: list[dict] = []
+
+    def _capture_request(req, timeout=None):
+        captured_payloads.append(json.loads(req.data.decode("utf-8")))
+        return fake_resp
+
+    with patch("urllib.request.urlopen", side_effect=_capture_request):
+        om_compressor._call_llm_extract(msgs, cfg)
+
+    assert captured_payloads, "No request was captured"
+    assert "reasoning" not in captured_payloads[0]
 
 
 def test_call_llm_extract_responses_api_empty_output_raises(monkeypatch: pytest.MonkeyPatch) -> None:
