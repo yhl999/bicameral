@@ -242,85 +242,96 @@ class OntologyRegistry:
             FileNotFoundError: If the base path does not exist.
             yaml.YAMLError: If the base file does not contain valid YAML.
             ValueError: If the base document is not a mapping.
+            RuntimeError: If a configured overlay path cannot be loaded or if
+                overlays compose into an invalid ontology document.
 
-        Overlay documents are optional. If an overlay path is missing or invalid,
-        this method emits a warning and continues with the remaining overlays,
-        preserving the base ontology behavior.
+        Overlay documents are optional to configure. Once configured, they must
+        load and compose successfully. Missing/unreadable/YAML-invalid overlays,
+        or invalid composed ontology definitions, raise immediately so startup can
+        fail closed instead of silently reverting to base-only behavior.
         """
         base_path = Path(path)
         overlay_paths = [Path(p) for p in (overlay_paths or ())]
         paths = [base_path, *overlay_paths]
         logger.info("Loading extraction ontologies from %s", ", ".join(str(p) for p in paths))
 
-        raw: dict[str, Any] = {}
-        for idx, source_path in enumerate(paths):
+        raw = cls._load_yaml_document(base_path)
+        for source_path in overlay_paths:
             try:
                 source_raw = cls._load_yaml_document(source_path)
             except (FileNotFoundError, OSError, ValueError, yaml.YAMLError) as error:
-                if idx == 0:
-                    raise
-                logger.warning(
-                    "Skipping ontology overlay %s due load failure: %s",
-                    source_path,
-                    error,
-                )
-                continue
+                raise RuntimeError(
+                    f"Configured ontology overlay {source_path} failed to load; "
+                    "refusing to continue with base-only ontology fallback"
+                ) from error
 
             raw = _merge_ontology_documents(raw, source_raw)
 
         profiles: dict[str, OntologyProfile] = {}
-        for group_id, definition in raw.items():
-            if not isinstance(definition, dict):
-                logger.debug("Skipping non-dict ontology key: %s", group_id)
-                continue
-            if "entity_types" not in definition:
-                if group_id not in _KNOWN_METADATA_KEYS:
-                    logger.warning(
-                        "Skipping dict ontology key without entity_types: %s", group_id
-                    )
-                continue
-            entity_types = _build_entity_types(definition.get("entity_types", []))
-            relationship_types = definition.get("relationship_types", [])
-            edge_types = _build_edge_types(relationship_types)
-            # Sanitize string fields before they can reach LLM prompts.
-            # Both fields are treated as UNTRUSTED operator config: bounded length
-            # + control-char scrubbing applied at load time, once.
-            extraction_emphasis_raw = definition.get("extraction_emphasis", "")
-            extraction_emphasis = _sanitize_intent_guidance(
-                extraction_emphasis_raw, "extraction_emphasis", group_id
-            )
-            # intent_guidance is the canonical key for new configs.
-            # Falls back to extraction_emphasis for backward compatibility.
-            intent_guidance_raw = definition.get("intent_guidance", extraction_emphasis_raw)
-            intent_guidance = _sanitize_intent_guidance(
-                intent_guidance_raw, "intent_guidance", group_id
-            )
-            extraction_mode = definition.get("extraction_mode", "permissive")
-            if extraction_mode not in _VALID_EXTRACTION_MODES:
-                logger.warning(
-                    "Invalid extraction_mode %r for %s — falling back to 'permissive'. "
-                    "Valid values: %s",
-                    extraction_mode,
-                    group_id,
-                    _VALID_EXTRACTION_MODES,
+        current_group_id = '<unknown>'
+        try:
+            for group_id, definition in raw.items():
+                current_group_id = str(group_id)
+                if not isinstance(definition, dict):
+                    logger.debug("Skipping non-dict ontology key: %s", group_id)
+                    continue
+                if "entity_types" not in definition:
+                    if group_id not in _KNOWN_METADATA_KEYS:
+                        logger.warning(
+                            "Skipping dict ontology key without entity_types: %s", group_id
+                        )
+                    continue
+                entity_types = _build_entity_types(definition.get("entity_types", []))
+                relationship_types = definition.get("relationship_types", [])
+                edge_types = _build_edge_types(relationship_types)
+                # Sanitize string fields before they can reach LLM prompts.
+                # Both fields are treated as UNTRUSTED operator config: bounded length
+                # + control-char scrubbing applied at load time, once.
+                extraction_emphasis_raw = definition.get("extraction_emphasis", "")
+                extraction_emphasis = _sanitize_intent_guidance(
+                    extraction_emphasis_raw, "extraction_emphasis", group_id
                 )
-                extraction_mode = "permissive"
+                # intent_guidance is the canonical key for new configs.
+                # Falls back to extraction_emphasis for backward compatibility.
+                intent_guidance_raw = definition.get("intent_guidance", extraction_emphasis_raw)
+                intent_guidance = _sanitize_intent_guidance(
+                    intent_guidance_raw, "intent_guidance", group_id
+                )
+                extraction_mode = definition.get("extraction_mode", "permissive")
+                if extraction_mode not in _VALID_EXTRACTION_MODES:
+                    logger.warning(
+                        "Invalid extraction_mode %r for %s — falling back to 'permissive'. "
+                        "Valid values: %s",
+                        extraction_mode,
+                        group_id,
+                        _VALID_EXTRACTION_MODES,
+                    )
+                    extraction_mode = "permissive"
 
-            profiles[group_id] = OntologyProfile(
-                entity_types=entity_types,
-                relationship_types=relationship_types,
-                edge_types=edge_types,
-                extraction_emphasis=extraction_emphasis,
-                intent_guidance=intent_guidance,
-                extraction_mode=extraction_mode,
-            )
-            logger.info(
-                "  Loaded ontology for %s: %d entity types, %d relationship types, mode=%s",
-                group_id,
-                len(entity_types),
-                len(relationship_types),
-                extraction_mode,
-            )
+                profiles[group_id] = OntologyProfile(
+                    entity_types=entity_types,
+                    relationship_types=relationship_types,
+                    edge_types=edge_types,
+                    extraction_emphasis=extraction_emphasis,
+                    intent_guidance=intent_guidance,
+                    extraction_mode=extraction_mode,
+                )
+                logger.info(
+                    "  Loaded ontology for %s: %d entity types, %d relationship types, mode=%s",
+                    group_id,
+                    len(entity_types),
+                    len(relationship_types),
+                    extraction_mode,
+                )
+        except Exception as error:
+            if overlay_paths:
+                raise RuntimeError(
+                    "Configured ontology overlay(s) "
+                    f"{', '.join(str(path) for path in overlay_paths)} produced an invalid "
+                    f"composed ontology while building lane {current_group_id!r}; refusing "
+                    f"to continue with base-only ontology fallback: {error}"
+                ) from error
+            raise
 
         logger.info("Ontology registry loaded: %d lanes configured", len(profiles))
         return cls(profiles)

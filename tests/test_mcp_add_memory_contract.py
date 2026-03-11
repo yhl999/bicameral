@@ -16,6 +16,12 @@ class AddMemoryContractSourceTests(unittest.TestCase):
         self.assertIn('OntologyRegistry.load(', src)
         self.assertIn('overlay_paths=overlay_paths', src)
 
+    def test_configured_overlay_failures_raise_in_initialize(self):
+        src = MCP_SERVER.read_text()
+        self.assertIn('Configured ontology overlay load failed', src)
+        self.assertIn('require base ontology file', src)
+        self.assertIn('logger.exception(', src)
+
 
 if __name__ == '__main__':
     unittest.main()

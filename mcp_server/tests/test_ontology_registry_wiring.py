@@ -15,10 +15,10 @@ Proves:
 
 from __future__ import annotations
 
-import logging
 import os
 import tempfile
 
+import pytest
 import yaml
 
 # ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ class TestEdgeTypes:
 
 
 class TestOverlayComposition:
-    """Base + overlay composition is deterministic and backward compatible."""
+    """Base + overlay composition is deterministic and fail-closed when configured."""
 
     def test_overlay_can_replace_a_lane_block_and_add_new_lane(self):
         import tempfile
@@ -272,7 +272,7 @@ class TestOverlayComposition:
         assert private_lane is not None
         assert set(private_lane.entity_types) == {'PrivateEntity'}
 
-    def test_missing_overlay_path_keeps_base_ontology(self, tmp_path, caplog):
+    def test_missing_overlay_path_fails_closed(self, tmp_path):
         from mcp_server.src.services.ontology_registry import OntologyRegistry
 
         base_content = yaml.dump(
@@ -286,16 +286,10 @@ class TestOverlayComposition:
         base_path = tmp_path / 'base.yaml'
         base_path.write_text(base_content)
 
-        with caplog.at_level(logging.WARNING):
-            registry = OntologyRegistry.load(base_path, overlay_paths=[tmp_path / 'does-not-exist.yaml'])
+        with pytest.raises(RuntimeError, match='Configured ontology overlay .*failed to load'):
+            OntologyRegistry.load(base_path, overlay_paths=[tmp_path / 'does-not-exist.yaml'])
 
-        assert 'Skipping ontology overlay' in caplog.text
-        base_profile = registry.get('base_lane')
-        assert base_profile is not None
-        assert base_profile.entity_types['BaseEntity'].__name__ == 'BaseEntity'
-        assert base_profile.extraction_mode == 'constrained_soft'
-
-    def test_invalid_overlay_file_is_skipped_and_base_is_kept(self, tmp_path, caplog):
+    def test_yaml_invalid_overlay_fails_closed(self, tmp_path):
         from mcp_server.src.services.ontology_registry import OntologyRegistry
 
         base_content = yaml.dump(
@@ -311,13 +305,33 @@ class TestOverlayComposition:
         base_path.write_text(base_content)
         overlay_path.write_text(overlay_content)
 
-        with caplog.at_level(logging.WARNING):
-            registry = OntologyRegistry.load(base_path, overlay_paths=[overlay_path])
+        with pytest.raises(RuntimeError, match='Configured ontology overlay .*failed to load'):
+            OntologyRegistry.load(base_path, overlay_paths=[overlay_path])
 
-        assert 'Skipping ontology overlay' in caplog.text
-        base_profile = registry.get('base_lane')
-        assert base_profile is not None
-        assert set(base_profile.entity_types) == {'BaseEntity'}
+    def test_semantically_invalid_overlay_fails_closed(self, tmp_path):
+        from mcp_server.src.services.ontology_registry import OntologyRegistry
+
+        base_content = yaml.dump(
+            {
+                'base_lane': {
+                    'entity_types': [{'name': 'BaseEntity', 'description': 'base'}],
+                },
+            }
+        )
+        overlay_content = yaml.dump(
+            {
+                'base_lane': {
+                    'entity_types': [{'name': 'invalid_entity', 'description': 'overlay'}],
+                },
+            }
+        )
+        base_path = tmp_path / 'base.yaml'
+        overlay_path = tmp_path / 'overlay.yaml'
+        base_path.write_text(base_content)
+        overlay_path.write_text(overlay_content)
+
+        with pytest.raises(RuntimeError, match=r'Configured ontology overlay\(s\).*invalid composed ontology'):
+            OntologyRegistry.load(base_path, overlay_paths=[overlay_path])
 
     def test_no_overlay_preserves_existing_behavior(self):
         registry = _load_registry(_yaml_lane(extraction_emphasis='Base guidance.'))
