@@ -8,11 +8,15 @@ from scripts import om_compressor, om_convergence
 
 
 class _FakeResult:
-    def __init__(self, single_row=None):  # noqa: ANN001
-        self._single = single_row or {'ok': True}
+    def __init__(self, single_row=None, rows=None):  # noqa: ANN001
+        self._single = {'ok': True} if single_row is None else single_row
+        self._rows = rows or []
 
     def single(self):
         return self._single
+
+    def data(self):
+        return self._rows
 
     def consume(self):
         return None
@@ -33,6 +37,13 @@ class _RecordingSession:
 
     def run(self, query: str, params=None):  # noqa: ANN001
         self.calls.append({'query': query, 'params': params or {}})
+        normalized = ' '.join(query.split())
+        if 'RETURN DISTINCT coalesce(j.node_id, j.uuid,' in normalized and 'AS source_node_id' in normalized:
+            return _FakeResult(rows=[{'source_node_id': 'judgment_1', 'group_id': 's1_observational_memory'}])
+        if 'RETURN count(r) > 0 AS already_exists' in normalized:
+            return _FakeResult({'already_exists': False})
+        if 'WHERE coalesce(r.relation_root_id,' in normalized and '$relation_root_id' in normalized:
+            return _FakeResult({})
         return _FakeResult()
 
 
@@ -209,10 +220,11 @@ def test_apply_transition_closed_invalidates_node_and_active_addresses() -> None
     assert 'n.closed_at = $now_iso' in joined
     assert 'n.invalid_at = $now_iso' in joined
     assert "n.lifecycle_status = 'invalidated'" in joined
-    assert 'MATCH (source:OMNode)-[r:ADDRESSES]->(target:OMNode {node_id:$node_id})' in joined
+    assert 'MATCH (source)-[r:ADDRESSES]->(target:OMNode {node_id:$node_id})' in joined
     assert 'r.invalid_at = $now_iso' in joined
     assert "r.transition_cause = $transition_cause" in joined
-    assert 'MERGE (j)-[r:RESOLVES]->(n)' in joined
+    assert 'MATCH (j)-[a:ADDRESSES]->(n:OMNode {node_id:$node_id})' in joined
+    assert 'CREATE (j)-[r:RESOLVES]->(n)' in joined
     assert 'r.valid_at = $now_iso' in joined
 
 

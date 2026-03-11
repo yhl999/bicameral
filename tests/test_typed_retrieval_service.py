@@ -641,7 +641,11 @@ class _HistoryAwareDriver:
         self.records_by_seed = records_by_seed or {}
 
     async def execute_query(self, _query, **params):
-        return list(self.records_by_seed.get(params.get('seed_node_id'), [])), None, None
+        tuple_key = (params.get('group_id'), params.get('seed_node_id'))
+        rows = self.records_by_seed.get(tuple_key)
+        if rows is None:
+            rows = self.records_by_seed.get(params.get('seed_node_id'), [])
+        return list(rows), None, None
 
 
 class _HistoryAwareGraphitiService:
@@ -763,3 +767,81 @@ def test_real_om_projection_distinguishes_history_current_and_all_modes():
     assert history_response['episodes'][1]['is_current'] is False
     assert history_response['episodes'][1]['invalid_at'] == '2026-03-09T00:00:00Z'
     assert history_response['limits_applied']['materialization']['om_projection']['history_lineages_projected'] == 1
+
+
+def test_real_om_projection_preserves_same_node_uuid_across_multiple_groups():
+    search_service = _HistoryAwareSearchService(
+        node_rows=[
+            {
+                'uuid': 'shared_node',
+                'name': 'Shared node group A',
+                'summary': 'espresso after training in group A',
+                'group_id': 'group_a',
+                'created_at': '2026-03-09T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            },
+            {
+                'uuid': 'shared_node',
+                'name': 'Shared node group B',
+                'summary': 'espresso after training in group B',
+                'group_id': 'group_b',
+                'created_at': '2026-03-09T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            },
+        ]
+    )
+    driver = _HistoryAwareDriver(
+        records_by_seed={
+            ('group_a', 'shared_node'): [
+                {
+                    'node_id': 'shared_node',
+                    'uuid': 'shared_node',
+                    'group_id': 'group_a',
+                    'content': 'espresso after training in group A',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+            ('group_b', 'shared_node'): [
+                {
+                    'node_id': 'shared_node',
+                    'uuid': 'shared_node',
+                    'group_id': 'group_b',
+                    'content': 'espresso after training in group B',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
+    )
+    projection = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_HistoryAwareGraphitiService(driver),
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['group_a', 'group_b'],
+            object_types=['episode'],
+            history_mode='all',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['episodes'] == 2
+    assert {(item['source_lane'], item['object_id']) for item in response['episodes']} == {
+        ('group_a', 'om_episode:group_a:shared_node'),
+        ('group_b', 'om_episode:group_b:shared_node'),
+    }
