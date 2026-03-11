@@ -199,24 +199,41 @@ class TypedRetrievalService:
             search_text_overrides.update(derived_episode_search_overrides)
         materialization_limits['ledger_backed_om_history'] = derived_om_history_limits
 
+        # Phase 2 platonic: provisional episodes written at OM-write time are
+        # already in all_objects from ledger materialization.  Track them for
+        # dedup against projected episodes and against promoted shadow episodes.
+        provisional_episodes_to_remove: set[str] = set()
+        for obj in all_objects:
+            if isinstance(obj, Episode) and 'provisional' in (obj.annotations or []):
+                node_key = _om_node_key_from_source_key(getattr(obj, 'source_key', None))
+                if node_key is not None:
+                    if node_key in covered_om_episode_nodes:
+                        # This provisional episode's node has been promoted and
+                        # has a ledger-backed shadow episode — suppress it.
+                        provisional_episodes_to_remove.add(obj.object_id)
+                    else:
+                        # Not yet promoted: mark as covered so projection
+                        # service doesn't produce a duplicate.
+                        covered_om_episode_nodes.add(node_key)
+        if provisional_episodes_to_remove:
+            all_objects = [
+                obj for obj in all_objects
+                if obj.object_id not in provisional_episodes_to_remove
+            ]
+
         om_limits: dict[str, Any] = {'enabled': False, 'reason': 'no_projection_service'}
-        om_projection_object_types, om_projection_suppression = self._om_projection_request(
-            requested_object_types=normalized_object_types,
-            ledger_objects=all_objects,
-        )
         if self.om_projection_service is not None:
-            if om_projection_object_types is None:
-                om_limits = {
-                    'enabled': False,
-                    'reason': 'ledger_canonical_om_state',
-                    **(om_projection_suppression or {}),
-                }
+            # Projection now only produces provisional episodes for unpromoted
+            # OM nodes. State facts are ledger-canonical only.
+            want_episodes = not normalized_object_types or 'episode' in normalized_object_types
+            if not want_episodes:
+                om_limits = {'enabled': False, 'reason': 'episodes_not_requested'}
             else:
                 try:
                     om_result = self.om_projection_service.project(
                         query=query,
                         effective_group_ids=effective_group_ids,
-                        object_types=om_projection_object_types,
+                        object_types={'episode'},
                         max_results=effective_max_results,
                         query_mode=query_mode,
                     )
@@ -243,12 +260,8 @@ class TypedRetrievalService:
                             'suppressed_projected_episodes': suppressed_projected_episodes,
                             'suppressed_projected_episode_nodes': len(covered_om_episode_nodes),
                         }
-                    if om_projection_suppression:
-                        om_limits = {**om_limits, **om_projection_suppression}
                 except Exception:
                     om_limits = {'enabled': False, 'reason': 'projection_error'}
-                    if om_projection_suppression:
-                        om_limits.update(om_projection_suppression)
         materialization_limits['om_projection'] = om_limits
 
         filtered_objects = [
@@ -398,9 +411,17 @@ class TypedRetrievalService:
         base_params: list[Any] = []
 
         if object_types:
-            placeholders = ', '.join('?' for _ in object_types)
+            # When episodes are requested, also include state_fact roots so
+            # that _derive_ledger_backed_om_history() can find promoted OM
+            # state lineage even when the caller only asked for episodes.
+            # The state_fact objects are removed by _matches_object_type() in
+            # the filtered_objects pass and never reach the caller.
+            sql_object_types = set(object_types)
+            if 'episode' in sql_object_types:
+                sql_object_types.add('state_fact')
+            placeholders = ', '.join('?' for _ in sql_object_types)
             base_filters.append(f'object_type IN ({placeholders})')
-            base_params.extend(sorted(object_types))
+            base_params.extend(sorted(sql_object_types))
 
         source_lane_values = _coerce_sql_filter_values(metadata_filters.get('source_lane'))
         if source_lane_values:
@@ -623,41 +644,6 @@ class TypedRetrievalService:
             return False
         node_key = _om_node_key_from_source_key(getattr(obj, 'source_key', None))
         return node_key in covered_om_episode_nodes
-
-    def _om_projection_request(
-        self,
-        *,
-        requested_object_types: set[str],
-        ledger_objects: list[TypedMemoryObject],
-    ) -> tuple[set[str] | None, dict[str, Any] | None]:
-        ledger_backed_om_state_roots = sorted(
-            {
-                obj.root_id
-                for obj in ledger_objects
-                if obj.object_type == 'state_fact'
-                and is_om_native_group_id(getattr(obj, 'source_lane', None))
-            }
-        )
-        if not ledger_backed_om_state_roots:
-            return requested_object_types, None
-
-        suppress_state_projection = not requested_object_types or 'state_fact' in requested_object_types
-        if not suppress_state_projection:
-            return requested_object_types, None
-
-        suppression = {
-            'suppression_reason': 'ledger_canonical_om_state',
-            'suppressed_object_types': ['state_fact'],
-            'ledger_canonical_om_state_roots': len(ledger_backed_om_state_roots),
-        }
-        if requested_object_types:
-            projected_types = {object_type for object_type in requested_object_types if object_type != 'state_fact'}
-        else:
-            projected_types = {'episode'}
-
-        if projected_types:
-            return projected_types, suppression
-        return None, suppression
 
     def _select_objects(
         self,
