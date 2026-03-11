@@ -68,7 +68,25 @@ Public repo contains the generic switch/status framework and example/default pro
 
 The ingest pipeline processes raw session transcripts, memory files, and conversation data that inherently contain personally identifiable information (PII). This is by design — personal memory is the core use case.
 
-**Key security constraints:**
+**Directories that contain PII at runtime** (all gitignored):
+
+- `evidence/` — parsed evidence documents
+- `state/` — ingest registry DB, queue state
+- `logs/` — worker execution logs
+
+**Input validation:** All user-supplied identifiers (`group_id`, `session_key`,
+`source`) are validated against a strict allowlist pattern
+(`[A-Za-z0-9][A-Za-z0-9._:@-]{0,254}`) before use in subprocess arguments or
+database keys. See `ingest/queue.py:validate_identifier()`.
+
+**Error handling:** Worker error messages use structured tags (`error_type:ClassName`)
+rather than raw exception messages to avoid leaking internal state.
+
+**Subprocess execution:** All subprocess calls use list-form arguments (never
+`shell=True`), preventing shell injection even if an identifier were to bypass
+validation.
+
+**Additional constraints:**
 - The `sanitize_content()` pipeline strips channel metadata, tool routing noise, and wrapper blocks before LLM extraction. It does NOT strip PII — that would defeat the purpose.
 - The `evidence_callback` resolvers never send raw evidence to external services. Resolution is local-only.
 - Group-safe gating prevents private facts from surfacing in group-chat retrieval contexts.
@@ -98,10 +116,37 @@ python3 scripts/om_fast_write.py write \
 
 | Hook | How |
 |---|---|
-| **OpenClaw plugin** | Plugin invokes fast-write on each inbound message |
-| **Standalone** | CLI for manual/test writes |
+| **OpenClaw plugin** | `om_fast_write.py write --payload-file <tmpfile>` on each transcript message |
+| **Cron drain** | `om_fast_write.py write --payload-json '{"source_session_id":...}'` |
+| **Runtime repo state** | `state/om_fast_write_state.json` (gitignored) — read by runtime health checks |
 
 Fast-write creates `Message` and `Episode` nodes directly in Neo4j. Fail-closed: if embedding fails, the write is skipped entirely (no partial state). Dedup: content-hash on (session_id, message content, created_at) prevents double-writes.
+
+### OM Wiring Paths
+
+```
+Transcript message
+        │
+        ├─► [MCP path]   mcp_ingest_sessions.py → Graphiti extraction queue
+        │                (sets graphiti_extracted_at on Message)
+        │
+        └─► [OM path]    om_fast_write.py write  → Neo4j Message/Episode nodes
+                                │
+                                ▼
+                         om_compressor.py        → OMNode extraction
+                                │
+                                ▼
+                         om_convergence.py       → Lifecycle state machine
+                                │
+                                ▼
+                         promotion_policy_v3.py  → CoreMemory (on corroboration)
+```
+
+Both paths are independent and can run concurrently. A `Message` node can be
+processed by both Graphiti (sets `graphiti_extracted_at`) and OM (sets `om_extracted`).
+
+GC eligibility requires **both** `graphiti_extracted_at IS NOT NULL` and `om_extracted = true`,
+so messages on only one path are retained until the other path also completes.
 
 ### Environment Variables
 

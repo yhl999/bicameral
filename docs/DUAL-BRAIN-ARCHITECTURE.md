@@ -173,18 +173,25 @@ The Dual Brain with typed memory unlocks capabilities vanilla Graphiti can't off
 
 ## The Tradeoff
 
-The Dual Brain with typed memory is operationally complex. You maintain two systems, write promotion policies, monitor the candidates queue, and handle conflicts when the system is wrong.
+The Dual Brain with typed memory is operationally complex:
+
+- You maintain **two systems** (Neo4j + SQLite ChangeLedger) that must stay in sync.
+- You write and tune **promotion policies** that determine which observations become truth.
+- You monitor the **candidates queue** and handle conflicts when the system flags contradictions.
+- You run **typed object lifecycle management** — tracking currentness, supersession chains, and procedure evolution.
 
 Vanilla Graphiti is simpler — dump transcripts in and let the LLM figure it out.
 
-But if your AI is managing anything high-stakes, "letting the LLM figure it out" is a recipe for operational failure. We bet the complexity was worth it.
+But if your AI is managing anything high-stakes — calendar, deals, relationships, operational memory — "letting the LLM figure it out" is a recipe for silent data corruption you'll never notice until it causes real harm. We bet the complexity was worth it.
 
 ---
 
 ## See Also
 
 - [Retrieval Trust Scoring](retrieval-trust-scoring.md) — How the trust multiplier works in code
+- [Memory Runtime Wiring](MEMORY-RUNTIME-WIRING.md) — Backend profiles, evidence plane, OM wiring
 - [Custom Ontologies](custom-ontologies.md) — Teaching each graph lane what to extract
 - [Scope Policy](scope-policy.md) — Ingestion scope controls
 - [OM Operations Runbook](runbooks/om-operations.md) — Trigger math, lock ordering, GC, convergence
 - [Dual-Brain Operators Guide](runbooks/dual-brain-operators-guide.md) — Day-to-day operations
+- [Runtime Pack Overlay](runbooks/runtime-pack-overlay.md) — How private packs map to agents
