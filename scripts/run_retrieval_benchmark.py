@@ -20,6 +20,13 @@ Usage:
     --fixture tests/fixtures/retrieval_benchmark_queries.json \
     --group-id ontbk15batch_20260310_om_f \
     --top-k 10 --output state/retrieval_benchmark_om_f.json
+
+  # Exercise the shared typed retrieval contract directly:
+  python3 scripts/run_retrieval_benchmark.py \
+    --fixture tests/fixtures/retrieval_benchmark_queries.json \
+    --group-id ontbk15batch_20260310_om_f \
+    --result-format typed \
+    --top-k 10 --output state/retrieval_benchmark_typed_om_f.json
 """
 
 from __future__ import annotations
@@ -76,6 +83,9 @@ HARNESS_TOOL_ARGUMENT_KEYS: dict[str, set[str]] = {
         'search_mode',
         'max_facts',
         'center_node_uuid',
+        'result_format',
+        'max_results',
+        'max_evidence',
     },
     'search_nodes': {
         'query',
@@ -304,78 +314,70 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return 'rate limit exceeded' in str(exc).lower()
 
 
+def _raise_on_tool_error(response: dict | list, *, query: str, tool_name: str) -> None:
+    if isinstance(response, dict) and 'error' in response:
+        raise RuntimeError(
+            f'MCP returned error for query {query!r} ({tool_name}): '
+            f'{str(response["error"])[:200]}'
+        )
+    if not isinstance(response, (list, dict)):
+        raise RuntimeError(
+            f'MCP returned unexpected type {type(response).__name__} '
+            f'for query {query!r} ({tool_name})'
+        )
+    if isinstance(response, dict) and 'content' in response.get('result', response):
+        _content_check = response.get('result', response)
+        for _item in _content_check.get('content', []):
+            if isinstance(_item, dict):
+                _text = _item.get('text', '')
+                if isinstance(_text, str) and '"error"' in _text:
+                    try:
+                        _parsed = json.loads(_text)
+                        if isinstance(_parsed, dict) and 'error' in _parsed:
+                            raise RuntimeError(
+                                f'MCP tool returned ErrorResponse for query {query!r} '
+                                f'({tool_name}): {str(_parsed["error"])[:200]}'
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
+
+
 def run_bicameral_query(
     client: BenchmarkMCPClient,
     query: str,
     group_ids: list[str] | None,
     search_mode: str,
     top_k: int,
+    *,
+    result_format: str,
 ) -> dict:
     """Run a single Bicameral search query and return results."""
     args: dict[str, Any] = {'query': query, 'group_ids': group_ids, 'max_facts': top_k}
     if search_mode != 'hybrid':
         args['search_mode'] = search_mode
+    if result_format == 'typed':
+        args['result_format'] = 'typed'
+        args['max_results'] = top_k
+        args['max_evidence'] = top_k
 
     facts_resp = client.call_tool('search_memory_facts', args)
-    # Fail hard if MCP returned an error — do not silently score garbage.
-    if isinstance(facts_resp, dict) and 'error' in facts_resp:
-        raise RuntimeError(
-            f'MCP returned error for query {query!r} (search_memory_facts): '
-            f'{str(facts_resp["error"])[:200]}'
-        )
-    if not isinstance(facts_resp, (list, dict)):
-        raise RuntimeError(
-            f'MCP returned unexpected type {type(facts_resp).__name__} '
-            f'for query {query!r} (search_memory_facts)'
-        )
-    # Check for tool-level errors in content (ErrorResponse nested in result.content[].text)
-    if isinstance(facts_resp, dict) and 'content' in facts_resp.get('result', facts_resp):
-        _content_check = facts_resp.get('result', facts_resp)
-        for _item in _content_check.get('content', []):
-            if isinstance(_item, dict):
-                _text = _item.get('text', '')
-                if isinstance(_text, str) and '"error"' in _text:
-                    try:
-                        _parsed = json.loads(_text)
-                        if isinstance(_parsed, dict) and 'error' in _parsed:
-                            raise RuntimeError(
-                                f'MCP tool returned ErrorResponse for query {query!r} '
-                                f'(search_memory_facts): {str(_parsed["error"])[:200]}'
-                            )
-                    except json.JSONDecodeError:
-                        pass
+    _raise_on_tool_error(facts_resp, query=query, tool_name='search_memory_facts')
+
+    if result_format == 'typed':
+        typed_text = extract_results_text(facts_resp)
+        return {
+            'facts_response': facts_resp,
+            'nodes_response': None,
+            'facts_text': typed_text,
+            'nodes_text': '',
+        }
 
     node_args: dict[str, Any] = {'query': query, 'group_ids': group_ids, 'max_nodes': top_k}
     if search_mode != 'hybrid':
         node_args['search_mode'] = search_mode
     nodes_resp = client.call_tool('search_nodes', node_args)
-    # Fail hard if MCP returned an error — do not silently score garbage.
-    if isinstance(nodes_resp, dict) and 'error' in nodes_resp:
-        raise RuntimeError(
-            f'MCP returned error for query {query!r} (search_nodes): '
-            f'{str(nodes_resp["error"])[:200]}'
-        )
-    if not isinstance(nodes_resp, (list, dict)):
-        raise RuntimeError(
-            f'MCP returned unexpected type {type(nodes_resp).__name__} '
-            f'for query {query!r} (search_nodes)'
-        )
-    # Check for tool-level errors in content (ErrorResponse nested in result.content[].text)
-    if isinstance(nodes_resp, dict) and 'content' in nodes_resp.get('result', nodes_resp):
-        _content_check = nodes_resp.get('result', nodes_resp)
-        for _item in _content_check.get('content', []):
-            if isinstance(_item, dict):
-                _text = _item.get('text', '')
-                if isinstance(_text, str) and '"error"' in _text:
-                    try:
-                        _parsed = json.loads(_text)
-                        if isinstance(_parsed, dict) and 'error' in _parsed:
-                            raise RuntimeError(
-                                f'MCP tool returned ErrorResponse for query {query!r} '
-                                f'(search_nodes): {str(_parsed["error"])[:200]}'
-                            )
-                    except json.JSONDecodeError:
-                        pass
+    _raise_on_tool_error(nodes_resp, query=query, tool_name='search_nodes')
 
     return {
         'facts_response': facts_resp,
@@ -392,13 +394,21 @@ def run_bicameral_query_with_retries(
     search_mode: str,
     top_k: int,
     *,
+    result_format: str,
     max_rate_limit_retries: int,
     rate_limit_backoff_s: float,
 ) -> dict:
     attempt = 0
     while True:
         try:
-            return run_bicameral_query(client, query, group_ids, search_mode, top_k)
+            return run_bicameral_query(
+                client,
+                query,
+                group_ids,
+                search_mode,
+                top_k,
+                result_format=result_format,
+            )
         except Exception as exc:
             if not _is_rate_limit_error(exc) or attempt >= max_rate_limit_retries:
                 raise
@@ -673,8 +683,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
         print(f'[{qi}/{len(queries)}] {qid}: {query_text[:60]}...')
 
+        modes_to_run = ['hybrid'] if args.result_format == 'typed' else SEARCH_MODES
         mode_scores = {}
-        for mode in SEARCH_MODES:
+        for mode in modes_to_run:
             try:
                 result = run_bicameral_query_with_retries(
                     client,
@@ -682,6 +693,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                     group_ids,
                     mode,
                     top_k,
+                    result_format=args.result_format,
                     max_rate_limit_retries=args.max_rate_limit_retries,
                     rate_limit_backoff_s=args.rate_limit_backoff_s,
                 )
@@ -748,6 +760,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     output: dict[str, Any] = {
         'fixture_path': str(fixture_path),
+        'result_format': args.result_format,
         'top_k': top_k,
         'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         'queries_total': len(queries),
@@ -845,6 +858,12 @@ def main():
     ap.add_argument('--fixture', required=True, help='Path to fixture JSON')
     ap.add_argument('--top-k', type=int, default=10, help='Top-k for recall')
     ap.add_argument('--output', required=True, help='Output JSON path')
+    ap.add_argument(
+        '--result-format',
+        choices=['facts', 'typed'],
+        default='facts',
+        help='Use legacy facts/nodes benchmark surface or shared typed retrieval contract (default: facts)',
+    )
     ap.add_argument(
         '--group-id',
         action='append',

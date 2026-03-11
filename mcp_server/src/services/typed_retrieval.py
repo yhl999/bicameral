@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import sqlite3
@@ -119,6 +120,7 @@ class TypedRetrievalService:
     ledger: ChangeLedger | None = None
     evidence_registry: EvidenceCallbackRegistry = field(default_factory=EvidenceCallbackRegistry)
     ledger_path: Path | str = DB_PATH_DEFAULT
+    om_projection_service: Any | None = None
 
     def __post_init__(self) -> None:
         if self.ledger is not None:
@@ -138,6 +140,7 @@ class TypedRetrievalService:
         current_only: bool | None = None,
         max_results: int = 10,
         max_evidence: int = 20,
+        effective_group_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         try:
             requested_max_results = int(max_results)
@@ -163,11 +166,42 @@ class TypedRetrievalService:
             current_only=current_only,
         )
 
-        all_objects, materialization_limits, search_text_overrides = self._materialize_candidate_objects(
+        materialized = self._materialize_candidate_objects(
             query=query,
             object_types=normalized_object_types,
             metadata_filters=metadata_filters,
+            max_results=effective_max_results,
+            effective_group_ids=effective_group_ids,
         )
+        if inspect.isawaitable(materialized):
+            all_objects, materialization_limits, search_text_overrides = await materialized
+        else:
+            all_objects, materialization_limits, search_text_overrides = materialized
+
+        om_limits: dict[str, Any] = {'enabled': False, 'reason': 'no_projection_service'}
+        if self.om_projection_service is not None:
+            try:
+                om_result = self.om_projection_service.project(
+                    query=query,
+                    effective_group_ids=effective_group_ids,
+                    object_types=normalized_object_types,
+                    max_results=effective_max_results,
+                    query_mode=query_mode,
+                )
+                if inspect.isawaitable(om_result):
+                    om_objects, om_search_overrides, om_limits = await om_result
+                else:
+                    om_objects, om_search_overrides, om_limits = om_result
+                seen_ids = {obj.object_id for obj in all_objects}
+                for om_obj in om_objects:
+                    if om_obj.object_id not in seen_ids:
+                        all_objects.append(om_obj)
+                        seen_ids.add(om_obj.object_id)
+                search_text_overrides.update(om_search_overrides)
+            except Exception:
+                om_limits = {'enabled': False, 'reason': 'projection_error'}
+        materialization_limits['om_projection'] = om_limits
+
         filtered_objects = [
             obj
             for obj in all_objects
@@ -243,12 +277,14 @@ class TypedRetrievalService:
             'limits_applied': limits_applied,
         }
 
-    def _materialize_candidate_objects(
+    async def _materialize_candidate_objects(
         self,
         *,
         query: str,
         object_types: set[str],
         metadata_filters: dict[str, Any],
+        max_results: int,
+        effective_group_ids: list[str] | None,
     ) -> tuple[list[TypedMemoryObject], dict[str, Any], dict[str, str]]:
         assert self.ledger is not None
         root_ids, root_selection_strategy = self._candidate_root_ids(

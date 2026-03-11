@@ -18,6 +18,7 @@ from mcp_server.src.services.evidence_callback import (
     PassThroughEvidenceCallback,
     QMDEvidenceCallback,
 )
+from mcp_server.src.services.om_typed_projection import OMTypedProjectionService
 from mcp_server.src.services.typed_retrieval import TypedRetrievalService
 
 
@@ -195,6 +196,120 @@ async def _run() -> None:
     print(f"  history chain: {[item['object_id'] for item in history['state']]}")
     print(f"  cross-type buckets: episodes={mixed['counts']['episodes']} procedures={mixed['counts']['procedures']}")
     print(f"  evidence items: {history['counts']['evidence']}")
+
+    # ── OM typed projection smoke ───────────────────────────────────────────
+    await _run_om_projection_smoke()
+
+
+class _FakeOMSearchService:
+    """Minimal stub that returns canned OM node/fact rows."""
+
+    def includes_observational_memory(self, group_ids: list[str]) -> bool:
+        return any('observational_memory' in gid or '_om_' in gid for gid in group_ids)
+
+    def _om_groups_in_scope(self, group_ids: list[str]) -> list[str]:
+        return [gid for gid in group_ids if 'observational_memory' in gid or '_om_' in gid]
+
+    async def search_observational_nodes(self, *, graphiti_service, query, group_ids, max_nodes, entity_types):
+        return [
+            {
+                'uuid': 'om-node-smoke-1',
+                'name': 'Neo4j heap cap observation',
+                'summary': 'Neo4j heap cap should stay below 70 percent.',
+                'created_at': '2026-03-01T12:00:00Z',
+                'group_id': group_ids[0] if group_ids else 's1_observational_memory',
+                'attributes': {
+                    'source': 'om_primitive',
+                    'status': 'open',
+                    'semantic_domain': 'sessions_main',
+                },
+            }
+        ]
+
+    async def search_observational_facts(self, *, graphiti_service, query, group_ids, max_facts, center_node_uuid):
+        return [
+            {
+                'uuid': 'om-rel-smoke-1',
+                'name': 'CONSTRAINS',
+                'fact': 'Neo4j heap cap must stay below 70 percent under load.',
+                'group_id': group_ids[0] if group_ids else 's1_observational_memory',
+                'source_node_uuid': 'om-node-1',
+                'target_node_uuid': 'om-node-2',
+                'created_at': '2026-03-01T13:00:00Z',
+                'attributes': {
+                    'source': 'om_primitive',
+                    'source_content': 'Neo4j heap cap observation.',
+                    'target_content': 'Heap cap threshold enforced.',
+                },
+            }
+        ]
+
+
+async def _run_om_projection_smoke() -> None:
+    """Smoke test: OM projected objects surface through typed buckets."""
+    fake_search = _FakeOMSearchService()
+    fake_graphiti = object()  # projection only needs it for passthrough
+
+    om_projection = OMTypedProjectionService(
+        search_service=fake_search,
+        graphiti_service=fake_graphiti,
+    )
+
+    # Service with OM projection but empty ledger
+    ledger = ChangeLedger(sqlite3.connect(':memory:'))
+    evidence_registry = EvidenceCallbackRegistry(callbacks=[PassThroughEvidenceCallback()])
+    service = TypedRetrievalService(
+        ledger=ledger,
+        evidence_registry=evidence_registry,
+        om_projection_service=om_projection,
+    )
+
+    # Canonical OM lane through typed buckets
+    result = await service.search(
+        query='heap cap',
+        effective_group_ids=['s1_observational_memory'],
+        history_mode='all',
+        max_results=10,
+        max_evidence=10,
+    )
+    assert result['result_format'] == 'typed'
+    assert result['counts']['episodes'] >= 1, f"expected OM episodes, got {result['counts']}"
+    assert result['counts']['state'] >= 1, f"expected OM state facts, got {result['counts']}"
+
+    om_episodes = result['episodes']
+    assert any('om_episode:' in ep['object_id'] for ep in om_episodes), 'expected om_episode: prefix'
+    assert all(ep['source_lane'] == 's1_observational_memory' for ep in om_episodes)
+
+    om_state = result['state']
+    assert any('om_state:' in sf['object_id'] for sf in om_state), 'expected om_state: prefix'
+
+    # Evidence refs point back to OM provenance
+    evidence = result['evidence']
+    om_evidence = [e for e in evidence if e.get('source_system') == 'om']
+    assert len(om_evidence) >= 1, f'expected OM evidence refs, got {len(om_evidence)}'
+
+    # OM projection limits reported
+    om_limits = result['limits_applied']['materialization']['om_projection']
+    assert om_limits['enabled'] is True
+    assert om_limits['episodes_projected'] >= 1
+    assert om_limits['state_projected'] >= 1
+
+    # Experimental OM group through typed buckets
+    result_exp = await service.search(
+        query='heap cap',
+        effective_group_ids=['ontbk15batch_20260310_om_f'],
+        history_mode='all',
+        max_results=10,
+        max_evidence=10,
+    )
+    assert result_exp['counts']['episodes'] >= 1 or result_exp['counts']['state'] >= 1, \
+        f"expected OM content for experimental group, got {result_exp['counts']}"
+
+    print('om typed projection smoke: PASS')
+    print(f"  canonical episodes: {result['counts']['episodes']}")
+    print(f"  canonical state: {result['counts']['state']}")
+    print(f"  canonical evidence: {result['counts']['evidence']}")
+    print(f"  experimental group surfaced: {result_exp['counts']['episodes'] + result_exp['counts']['state']} objects")
 
 
 if __name__ == '__main__':
