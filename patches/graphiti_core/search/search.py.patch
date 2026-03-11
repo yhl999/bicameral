@@ -1,7 +1,16 @@
 diff --git a/graphiti_core/search/search.py b/graphiti_core/search/search.py
-index 973ab51..4cddc1e 100644
+index 7f530b5..4cddc1e 100644
 --- a/graphiti_core/search/search.py
 +++ b/graphiti_core/search/search.py
+@@ -24,7 +24,7 @@ from graphiti_core.edges import EntityEdge
+ from graphiti_core.embedder.client import EMBEDDING_DIM
+ from graphiti_core.errors import SearchRerankerError
+ from graphiti_core.graphiti_types import GraphitiClients
+-from graphiti_core.helpers import semaphore_gather, validate_group_ids
++from graphiti_core.helpers import semaphore_gather
+ from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
+ from graphiti_core.search.search_config import (
+     DEFAULT_SEARCH_LIMIT,
 @@ -54,12 +54,14 @@ from graphiti_core.search.search_utils import (
      get_embeddings_for_communities,
      get_embeddings_for_edges,
@@ -17,7 +26,15 @@ index 973ab51..4cddc1e 100644
  )
  
  logger = logging.getLogger(__name__)
-@@ -108,8 +110,11 @@ async def search(
+@@ -77,7 +79,6 @@ async def search(
+     driver: GraphDriver | None = None,
+ ) -> SearchResults:
+     start = time()
+-    validate_group_ids(group_ids)
+ 
+     driver = driver or clients.driver
+     embedder = clients.embedder
+@@ -109,8 +110,11 @@ async def search(
      else:
          search_vector = [0.0] * EMBEDDING_DIM
  
@@ -31,7 +48,7 @@ index 973ab51..4cddc1e 100644
      (
          (edges, edge_reranker_scores),
          (nodes, node_reranker_scores),
-@@ -128,6 +133,7 @@ async def search(
+@@ -129,6 +133,7 @@ async def search(
              bfs_origin_node_uuids,
              config.limit,
              config.reranker_min_score,
@@ -39,7 +56,7 @@ index 973ab51..4cddc1e 100644
          ),
          node_search(
              driver,
-@@ -141,6 +147,7 @@ async def search(
+@@ -142,6 +147,7 @@ async def search(
              bfs_origin_node_uuids,
              config.limit,
              config.reranker_min_score,
@@ -47,7 +64,7 @@ index 973ab51..4cddc1e 100644
          ),
          episode_search(
              driver,
-@@ -178,7 +185,7 @@ async def search(
+@@ -179,7 +185,7 @@ async def search(
  
      latency = (time() - start) * 1000
  
@@ -56,7 +73,7 @@ index 973ab51..4cddc1e 100644
  
      return results
  
-@@ -195,6 +202,7 @@ async def edge_search(
+@@ -196,6 +202,7 @@ async def edge_search(
      bfs_origin_node_uuids: list[str] | None = None,
      limit=DEFAULT_SEARCH_LIMIT,
      reranker_min_score: float = 0,
@@ -64,7 +81,7 @@ index 973ab51..4cddc1e 100644
  ) -> tuple[list[EntityEdge], list[float]]:
      if config is None:
          return [], []
-@@ -255,7 +263,18 @@ async def edge_search(
+@@ -256,7 +263,18 @@ async def edge_search(
      if config.reranker == EdgeReranker.rrf or config.reranker == EdgeReranker.episode_mentions:
          search_result_uuids = [[edge.uuid for edge in result] for result in search_results]
  
@@ -84,7 +101,7 @@ index 973ab51..4cddc1e 100644
      elif config.reranker == EdgeReranker.mmr:
          search_result_uuids_and_vectors = await get_embeddings_for_edges(
              driver, list(edge_uuid_map.values())
-@@ -318,6 +337,7 @@ async def node_search(
+@@ -319,6 +337,7 @@ async def node_search(
      bfs_origin_node_uuids: list[str] | None = None,
      limit=DEFAULT_SEARCH_LIMIT,
      reranker_min_score: float = 0,
@@ -92,7 +109,7 @@ index 973ab51..4cddc1e 100644
  ) -> tuple[list[EntityNode], list[float]]:
      if config is None:
          return [], []
-@@ -375,7 +395,18 @@ async def node_search(
+@@ -376,7 +395,18 @@ async def node_search(
      reranked_uuids: list[str] = []
      node_scores: list[float] = []
      if config.reranker == NodeReranker.rrf:
