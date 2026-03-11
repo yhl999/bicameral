@@ -1,0 +1,15 @@
+{
+  "_comment": "Define anchor entities for subject-id scoping during candidate import. Omit this file or pass no --anchors-config to run in anchor-less mode.",
+  "anchors": [
+    {
+      "canonical_name": "Alice",
+      "subject_id": "user:principal",
+      "aliases": ["Alice Smith", "Alice S."]
+    },
+    {
+      "canonical_name": "MyAgent",
+      "subject_id": "agent:myagent",
+      "aliases": ["MyAgent"]
+    }
+  ]
+}
