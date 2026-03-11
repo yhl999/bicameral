@@ -18,7 +18,6 @@ from scripts.run_retrieval_benchmark import (
     evaluate_mcp_contract,
     extract_results_text,
     validate_fixture,
-    _query_scope_group_ids,
 )
 
 
