@@ -1,176 +1,178 @@
-"""Packs router — pack CRUD + registry stubs.
-
-Owned by: Exec 3 (list/get/describe/create packs).
-"""
+"""Packs router — list/get/describe/create backed by JSON registry."""
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 try:
-    from ._phase0 import (
-        error_response,
-        phase0_empty_list_response,
-        phase0_not_implemented,
-        require_optional_dict,
-        require_optional_non_empty_string,
-        require_pack_id,
-        validate_schema_object,
-    )
-except ImportError:  # pragma: no cover - script/top-level import fallback
-    from _phase0 import (  # type: ignore[no-redef]
-        error_response,
-        phase0_empty_list_response,
-        phase0_not_implemented,
-        require_optional_dict,
-        require_optional_non_empty_string,
-        require_pack_id,
-        validate_schema_object,
-    )
+    from ..services.pack_registry import PackRegistryService
+except ImportError:  # pragma: no cover - top-level import fallback
+    from services.pack_registry import PackRegistryService  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
+_SEMVER_RE = re.compile(r'^\d+\.\d+\.\d+$')
 
-def register_tools(mcp: Any) -> dict[str, Any]:
-    """Register all pack router tools with the MCP server instance."""
 
-    @mcp.tool()
-    async def list_packs(
-        filter: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """List available context and workflow packs.
+def _matches_filter(pack: dict[str, Any], filters: dict[str, Any] | None) -> bool:
+    if not filters:
+        return True
+    for key in ('scope', 'intent', 'consumer', 'type'):
+        expected = filters.get(key)
+        if expected is None:
+            continue
+        if str(pack.get(key)) != str(expected):
+            return False
+    return True
 
-        Packs bundle curated knowledge (context packs) or step-by-step
-        procedures (workflow packs) for injection into agent prompts.
 
-        Args:
-            filter: Optional filter dict (e.g. {"scope": "private", "intent": "coding"}).
+def _filter_context_items(items: list[Any], task: str | None) -> list[Any]:
+    if not task:
+        return items
+    tokens = {token.lower() for token in str(task).split() if token.strip()}
+    if not tokens:
+        return items
 
-        Returns:
-            Dict with 'packs' key containing list of PackRegistry dicts.
-        """
-        filter_error = require_optional_dict('filter', filter)
-        if filter_error is not None:
-            return filter_error
+    filtered: list[Any] = []
+    for item in items:
+        blob = str(item).lower()
+        if any(token in blob for token in tokens):
+            filtered.append(item)
+    return filtered
 
-        logger.debug('list_packs Phase 0 stub called with filter=%r', filter)
-        return phase0_empty_list_response('list_packs', 'packs')
 
-    @mcp.tool()
-    async def get_context_pack(
-        pack_id: str,
-        task: str | None = None,
-    ) -> dict[str, Any]:
-        """Retrieve a materialized context pack for prompt injection.
+async def list_packs(filter: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        service = PackRegistryService()
+        packs = [pack for pack in service.list_packs() if _matches_filter(pack, filter)]
+        return {
+            'message': f'Found {len(packs)} pack(s)',
+            'packs': [
+                {
+                    'pack_id': pack['pack_id'],
+                    'type': pack.get('type'),
+                    'scope': pack.get('scope'),
+                    'intent': pack.get('intent'),
+                    'consumer': pack.get('consumer'),
+                    'version': pack.get('version'),
+                    'checksum': pack.get('checksum'),
+                    'updated_at': pack.get('updated_at'),
+                }
+                for pack in packs
+            ],
+        }
+    except Exception as e:
+        logger.exception('list_packs failed')
+        return {'error': f'list_packs failed: {e}'}
 
-        Returns the pack's curated facts and knowledge, optionally filtered
-        for relevance to a specific task description.
 
-        Args:
-            pack_id: ID of the context pack to retrieve.
-            task: Optional task description to filter pack content for relevance.
+async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
+    try:
+        service = PackRegistryService()
+        pack = service.get_pack(pack_id)
+        if pack is None:
+            return {'error': f'Pack not found: {pack_id}'}
+        if str(pack.get('type')) != 'context':
+            return {'error': f'Pack {pack_id} is not a context pack'}
 
-        Returns:
-            PackMaterialized dict with 'items' key containing relevant facts,
-            or ErrorResponse dict on failure.
-        """
-        pack_id_error = require_pack_id('pack_id', pack_id)
-        if pack_id_error is not None:
-            return pack_id_error
+        definition = pack.get('definition') or {}
+        items = definition.get('items') or []
+        if not isinstance(items, list):
+            items = [items]
+        materialized = _filter_context_items(items, task)
+        return {
+            'message': f'Context pack {pack_id} loaded',
+            'pack_id': pack_id,
+            'items': materialized,
+            'count': len(materialized),
+        }
+    except Exception as e:
+        logger.exception('get_context_pack failed')
+        return {'error': f'get_context_pack failed: {e}'}
 
-        task_error = require_optional_non_empty_string('task', task)
-        if task_error is not None:
-            return task_error
 
-        logger.debug('get_context_pack Phase 0 stub validated pack_id=%r', pack_id)
-        return phase0_not_implemented('get_context_pack')
+async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
+    try:
+        service = PackRegistryService()
+        pack = service.get_pack(pack_id)
+        if pack is None:
+            return {'error': f'Pack not found: {pack_id}'}
+        if str(pack.get('type')) != 'workflow':
+            return {'error': f'Pack {pack_id} is not a workflow pack'}
 
-    @mcp.tool()
-    async def get_workflow_pack(
-        pack_id: str,
-        task: str | None = None,
-    ) -> dict[str, Any]:
-        """Retrieve a materialized workflow pack with step-by-step procedures.
+        definition = pack.get('definition') or {}
+        steps = definition.get('steps') or []
+        if not isinstance(steps, list):
+            steps = [steps]
+        # v1: task argument is accepted for API parity but does not alter steps.
+        _ = task
+        return {
+            'message': f'Workflow pack {pack_id} loaded',
+            'pack_id': pack_id,
+            'steps': steps,
+            'count': len(steps),
+        }
+    except Exception as e:
+        logger.exception('get_workflow_pack failed')
+        return {'error': f'get_workflow_pack failed: {e}'}
 
-        Returns the pack's procedures and instructions, optionally filtered
-        for relevance to a specific task.
 
-        Args:
-            pack_id: ID of the workflow pack to retrieve.
-            task: Optional task description to filter pack content for relevance.
+async def describe_pack(pack_id: str) -> dict[str, Any]:
+    try:
+        service = PackRegistryService()
+        pack = service.get_pack(pack_id)
+        if pack is None:
+            return {'error': f'Pack not found: {pack_id}'}
+        return {
+            'message': f'Pack {pack_id} definition',
+            'pack': pack,
+        }
+    except Exception as e:
+        logger.exception('describe_pack failed')
+        return {'error': f'describe_pack failed: {e}'}
 
-        Returns:
-            PackMaterialized dict with 'steps' key containing procedure steps,
-            or ErrorResponse dict on failure.
-        """
-        pack_id_error = require_pack_id('pack_id', pack_id)
-        if pack_id_error is not None:
-            return pack_id_error
 
-        task_error = require_optional_non_empty_string('task', task)
-        if task_error is not None:
-            return task_error
+async def create_workflow_pack(definition: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(definition, dict):
+        return {'error': 'definition must be an object/dict'}
 
-        logger.debug('get_workflow_pack Phase 0 stub validated pack_id=%r', pack_id)
-        return phase0_not_implemented('get_workflow_pack')
+    if str(definition.get('type') or 'workflow') != 'workflow':
+        return {'error': 'create_workflow_pack only accepts type="workflow"'}
 
-    @mcp.tool()
-    async def describe_pack(
-        pack_id: str,
-    ) -> dict[str, Any]:
-        """Get the full definition of a pack including schema and metadata.
+    version = str(definition.get('version') or '').strip()
+    if not _SEMVER_RE.match(version):
+        return {'error': 'definition.version must be semver (e.g., 1.2.3)'}
 
-        Returns the pack's full PackDefinition including scope, intent, consumer,
-        version, and the rules/content that make up the pack.
+    steps = definition.get('steps')
+    if not isinstance(steps, list) or not steps:
+        return {'error': 'definition.steps must be a non-empty list'}
 
-        Args:
-            pack_id: ID of the pack to describe.
+    try:
+        service = PackRegistryService()
+        entry = service.create_pack(definition)
+        return {
+            'message': f'Workflow pack created: {entry["pack_id"]}',
+            'pack': {
+                'pack_id': entry['pack_id'],
+                'type': entry['type'],
+                'scope': entry['scope'],
+                'intent': entry['intent'],
+                'consumer': entry['consumer'],
+                'version': entry['version'],
+                'checksum': entry['checksum'],
+                'updated_at': entry['updated_at'],
+            },
+        }
+    except Exception as e:
+        logger.exception('create_workflow_pack failed')
+        return {'error': f'create_workflow_pack failed: {e}'}
 
-        Returns:
-            PackDefinition dict, or ErrorResponse dict if not found.
-        """
-        pack_id_error = require_pack_id('pack_id', pack_id)
-        if pack_id_error is not None:
-            return pack_id_error
 
-        logger.debug('describe_pack Phase 0 stub validated pack_id=%r', pack_id)
-        return phase0_not_implemented('describe_pack')
-
-    @mcp.tool()
-    async def create_workflow_pack(
-        definition: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Create a new workflow pack from a definition.
-
-        Registers a new workflow pack in the pack registry. The definition
-        must include scope, intent, consumer, version, and steps.
-
-        Args:
-            definition: PackDefinition dict describing the new workflow pack.
-
-        Returns:
-            PackRegistry dict with the newly created pack's metadata,
-            or ErrorResponse dict on validation failure.
-        """
-        definition_error = validate_schema_object('definition', definition, 'PackDefinition')
-        if definition_error is not None:
-            return definition_error
-
-        if definition.get('scope') not in {'workflow', 'both'}:
-            return error_response(
-                'validation_error',
-                message='definition.scope must be workflow or both for create_workflow_pack',
-                details={'field': 'definition.scope', 'actual': definition.get('scope')},
-            )
-
-        logger.debug('create_workflow_pack Phase 0 stub validated definition successfully')
-        return phase0_not_implemented('create_workflow_pack')
-
-    return {
-        'list_packs': list_packs,
-        'get_context_pack': get_context_pack,
-        'get_workflow_pack': get_workflow_pack,
-        'describe_pack': describe_pack,
-        'create_workflow_pack': create_workflow_pack,
-    }
+def register_tools(mcp: Any) -> None:
+    mcp.tool()(list_packs)
+    mcp.tool()(get_context_pack)
+    mcp.tool()(get_workflow_pack)
+    mcp.tool()(describe_pack)
+    mcp.tool()(create_workflow_pack)
