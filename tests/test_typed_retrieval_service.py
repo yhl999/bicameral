@@ -328,45 +328,48 @@ class _FakeOMProjectionService:
         return self._objects, self._search_overrides, self._limits
 
 
-def _om_state_fact(*, object_id: str, group_id: str = 's1_observational_memory'):
-    return StateFact(
+def _om_provisional_episode(*, object_id: str, summary: str = 'om provisional observation', group_id: str = 's1_observational_memory'):
+    """Create a provisional OM episode matching the Phase 2 projection contract."""
+    return Episode(
         object_id=object_id,
         root_id=object_id,
         version=1,
         is_current=True,
         source_lane=group_id,
-        source_key=f'om:{group_id}:relation:{object_id}',
+        source_key=f'om:{group_id}:node:{object_id.split(":")[-1]}',
         policy_scope='private',
         visibility_scope='private',
+        title=summary[:40],
+        summary=summary,
+        annotations=['om_native', 'provisional', 'unpromoted'],
+        history_meta={'lineage_kind': 'om_node', 'lineage_basis': 'provisional', 'derivation_level': 'provisional'},
         evidence_refs=[
             EvidenceRef(
                 kind='event_log',
                 source_system='om',
-                locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': object_id},
-                title='OM relation',
-                snippet='om projected fact',
+                locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': object_id.split(':')[-1]},
+                title='OM node',
+                snippet=summary,
             )
         ],
-        fact_type='relationship',
-        subject='om_node:source',
-        predicate='om_relation:resolves',
-        value='om projected',
-        scope='private',
     )
 
 
 def test_om_projection_merges_objects_into_typed_search():
-    """OM projected objects surface through typed buckets when projection service is wired."""
-    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-1')
+    """OM projected provisional episodes surface through typed buckets."""
+    om_obj = _om_provisional_episode(
+        object_id='om_episode:s1_observational_memory:node-1',
+        summary='resolves latency spike',
+    )
     projection = _FakeOMProjectionService(
         objects=[om_obj],
-        search_overrides={'om_state:s1_observational_memory:rel-1': 'resolves latency spike'},
+        search_overrides={'om_episode:s1_observational_memory:node-1': 'resolves latency spike'},
         limits={
             'enabled': True,
-            'reason': 'projected',
+            'reason': 'provisional_projection',
             'groups_considered': ['s1_observational_memory'],
-            'episodes_projected': 0,
-            'state_projected': 1,
+            'episodes_projected': 1,
+            'state_projected': 0,
             'max_results': 10,
         },
     )
@@ -386,28 +389,38 @@ def test_om_projection_merges_objects_into_typed_search():
         )
     )
 
-    assert response['counts']['state'] == 1
-    assert response['state'][0]['object_id'] == 'om_state:s1_observational_memory:rel-1'
-    assert response['state'][0]['source_lane'] == 's1_observational_memory'
+    assert response['counts']['episodes'] == 1
+    assert response['episodes'][0]['object_id'] == 'om_episode:s1_observational_memory:node-1'
+    assert response['episodes'][0]['source_lane'] == 's1_observational_memory'
+    assert 'provisional' in response['episodes'][0]['annotations']
     assert response['limits_applied']['materialization']['om_projection']['enabled'] is True
     assert projection.calls[0]['effective_group_ids'] == ['s1_observational_memory']
+    assert projection.calls[0]['object_types'] == {'episode'}
 
 
 def test_om_projection_deduplicates_against_ledger_objects():
-    """OM projected objects with same ID as ledger objects are not duplicated."""
-    ledger_obj = _state_fact(object_id='shared_id', root_id='root_shared', version=1, value='resolves')
-    om_obj = _om_state_fact(object_id='shared_id')
+    """OM projected episodes with same ID as existing objects are not duplicated."""
+    ledger_episode = _episode(
+        object_id='om_episode:s1_observational_memory:shared',
+        root_id='om_episode:s1_observational_memory:shared',
+        version=1,
+        summary='resolves latency spike',
+    )
+    om_obj = _om_provisional_episode(
+        object_id='om_episode:s1_observational_memory:shared',
+        summary='resolves latency spike',
+    )
 
     projection = _FakeOMProjectionService(
         objects=[om_obj],
-        search_overrides={'shared_id': 'resolves latency spike'},
+        search_overrides={'om_episode:s1_observational_memory:shared': 'resolves latency spike'},
     )
     service = TypedRetrievalService(
         ledger=_FakeLedger(),
         evidence_registry=_FakeEvidenceRegistry(),
         om_projection_service=projection,
     )
-    service._materialize_candidate_objects = lambda **kwargs: ([ledger_obj], {'candidate_roots': 1, 'materialized_roots': 1, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'test', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {'shared_id': 'resolves latency spike'})
+    service._materialize_candidate_objects = lambda **kwargs: ([ledger_episode], {'candidate_roots': 1, 'materialized_roots': 1, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'test', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {'om_episode:s1_observational_memory:shared': 'resolves latency spike'})
 
     response = _run(
         service.search(
@@ -418,11 +431,11 @@ def test_om_projection_deduplicates_against_ledger_objects():
         )
     )
 
-    assert response['counts']['state'] == 1
+    assert response['counts']['episodes'] == 1
 
 
-def test_om_projection_skips_state_projection_when_ledger_already_has_om_state():
-    """Ledger-backed OM facts should be the canonical state path; projection becomes fallback-only."""
+def test_om_projection_skips_when_only_state_facts_requested():
+    """Projection never produces state facts — skip entirely when only state is requested."""
     ledger_obj = _state_fact(
         object_id='ledger_state',
         root_id='ledger_root',
@@ -432,8 +445,11 @@ def test_om_projection_skips_state_projection_when_ledger_already_has_om_state()
         source_key='om:s1_observational_memory:node:travel-style',
     )
     projection = _FakeOMProjectionService(
-        objects=[_om_state_fact(object_id='om_state:s1_observational_memory:rel-shadow')],
-        search_overrides={'om_state:s1_observational_memory:rel-shadow': 'carry-on only'},
+        objects=[_om_provisional_episode(
+            object_id='om_episode:s1_observational_memory:node-shadow',
+            summary='carry-on only',
+        )],
+        search_overrides={'om_episode:s1_observational_memory:node-shadow': 'carry-on only'},
     )
     service = TypedRetrievalService(
         ledger=_FakeLedger(),
@@ -464,16 +480,16 @@ def test_om_projection_skips_state_projection_when_ledger_already_has_om_state()
         )
     )
 
+    # Projection is skipped entirely when only state_fact is requested
     assert projection.calls == []
     assert response['counts']['state'] == 1
     assert response['state'][0]['object_id'] == 'ledger_state'
-    assert response['limits_applied']['materialization']['om_projection']['reason'] == 'ledger_canonical_om_state'
-    assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
+    assert response['limits_applied']['materialization']['om_projection']['reason'] == 'episodes_not_requested'
 
 
 
-def test_om_projection_only_projects_episodes_when_ledger_already_has_om_state():
-    """When OM state is ledger-backed, read-time projection should only fill the episode/history gap."""
+def test_om_projection_always_projects_only_episodes():
+    """Projection always produces only episodes (state is ledger-canonical)."""
     ledger_obj = _state_fact(
         object_id='ledger_state',
         root_id='ledger_root',
@@ -482,41 +498,21 @@ def test_om_projection_only_projects_episodes_when_ledger_already_has_om_state()
         source_lane='s1_observational_memory',
         source_key='om:s1_observational_memory:node:travel-style',
     )
-    om_episode = _episode(
+    om_episode = _om_provisional_episode(
         object_id='om_episode:s1_observational_memory:travel-style-v1',
-        root_id='om_episode:s1_observational_memory:travel-style-v1',
-        version=1,
         summary='travel style before the ledger promotion',
     )
-    class _FilteringProjection(_FakeOMProjectionService):
-        async def project(self, *, query, effective_group_ids, object_types, max_results, query_mode):
-            self.calls.append({
-                'query': query,
-                'effective_group_ids': effective_group_ids,
-                'object_types': object_types,
-                'max_results': max_results,
-                'query_mode': query_mode,
-            })
-            projected = list(self._objects)
-            if object_types:
-                projected = [obj for obj in projected if obj.object_type in object_types]
-            limits = dict(self._limits)
-            limits['episodes_projected'] = sum(1 for obj in projected if obj.object_type == 'episode')
-            limits['state_projected'] = sum(1 for obj in projected if obj.object_type == 'state_fact')
-            return projected, self._search_overrides, limits
-
-    projection = _FilteringProjection(
-        objects=[_om_state_fact(object_id='om_state:s1_observational_memory:rel-shadow'), om_episode],
+    projection = _FakeOMProjectionService(
+        objects=[om_episode],
         search_overrides={
-            'om_state:s1_observational_memory:rel-shadow': 'carry-on only',
             'om_episode:s1_observational_memory:travel-style-v1': 'travel style before the ledger promotion',
         },
         limits={
             'enabled': True,
-            'reason': 'projected',
+            'reason': 'provisional_projection',
             'groups_considered': ['s1_observational_memory'],
             'episodes_projected': 1,
-            'state_projected': 1,
+            'state_projected': 0,
             'max_results': 10,
         },
     )
@@ -556,7 +552,6 @@ def test_om_projection_only_projects_episodes_when_ledger_already_has_om_state()
     assert [item['object_id'] for item in response['episodes']] == [
         'om_episode:s1_observational_memory:travel-style-v1',
     ]
-    assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
 
 
 def test_ledger_backed_om_history_derives_episode_lineage_for_promoted_om_state():
@@ -868,17 +863,20 @@ def test_om_projection_history_fail_closed_preserves_limits_metadata():
 
 
 def test_om_projection_evidence_includes_om_provenance():
-    """OM projected objects carry evidence refs with om source_system."""
-    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-prov')
+    """OM projected provisional episodes carry evidence refs with om source_system."""
+    om_obj = _om_provisional_episode(
+        object_id='om_episode:s1_observational_memory:node-prov',
+        summary='resolves latency spike',
+    )
     projection = _FakeOMProjectionService(
         objects=[om_obj],
-        search_overrides={'om_state:s1_observational_memory:rel-prov': 'resolves latency spike'},
+        search_overrides={'om_episode:s1_observational_memory:node-prov': 'resolves latency spike'},
     )
     service = TypedRetrievalService(
         ledger=_FakeLedger(),
         evidence_registry=_FakeEvidenceRegistry(
             payload=[{
-                'canonical_uri': 'eventlog://om/s1_observational_memory:relation/rel-prov',
+                'canonical_uri': 'eventlog://om/s1_observational_memory:node/node-prov',
                 'kind': 'event_log',
                 'source_system': 'om',
                 'resolver': 'passthrough',
@@ -923,20 +921,21 @@ def test_om_projection_disabled_when_no_service():
 
 
 def test_om_projection_experimental_group_surfaces_through_typed_buckets():
-    """Experimental OM-native groups surface when explicitly scoped."""
-    om_obj = _om_state_fact(
-        object_id='om_state:ontbk15batch_20260310_om_f:rel-exp',
+    """Experimental OM-native groups surface provisional episodes when explicitly scoped."""
+    om_obj = _om_provisional_episode(
+        object_id='om_episode:ontbk15batch_20260310_om_f:node-exp',
+        summary='experimental bakeoff observation',
         group_id='ontbk15batch_20260310_om_f',
     )
     projection = _FakeOMProjectionService(
         objects=[om_obj],
-        search_overrides={'om_state:ontbk15batch_20260310_om_f:rel-exp': 'experimental bakeoff resolves'},
+        search_overrides={'om_episode:ontbk15batch_20260310_om_f:node-exp': 'experimental bakeoff observation'},
         limits={
             'enabled': True,
-            'reason': 'projected',
+            'reason': 'provisional_projection',
             'groups_considered': ['ontbk15batch_20260310_om_f'],
-            'episodes_projected': 0,
-            'state_projected': 1,
+            'episodes_projected': 1,
+            'state_projected': 0,
             'max_results': 10,
         },
     )
@@ -956,8 +955,9 @@ def test_om_projection_experimental_group_surfaces_through_typed_buckets():
         )
     )
 
-    assert response['counts']['state'] == 1
-    assert response['state'][0]['source_lane'] == 'ontbk15batch_20260310_om_f'
+    assert response['counts']['episodes'] == 1
+    assert response['episodes'][0]['source_lane'] == 'ontbk15batch_20260310_om_f'
+    assert 'provisional' in response['episodes'][0]['annotations']
 
 
 class _HistoryAwareSearchService:
@@ -1005,7 +1005,8 @@ class _HistoryAwareGraphitiService:
         return SimpleNamespace(driver=self.driver)
 
 
-def test_real_om_projection_distinguishes_history_current_and_all_modes():
+def test_real_om_projection_surfaces_provisional_episodes_across_modes():
+    """Real OMTypedProjectionService produces provisional episodes that work with all query modes."""
     search_service = _HistoryAwareSearchService(
         node_rows=[
             {
@@ -1018,41 +1019,9 @@ def test_real_om_projection_distinguishes_history_current_and_all_modes():
             }
         ]
     )
-    driver = _HistoryAwareDriver(
-        records_by_seed={
-            'drink_v2': [
-                {
-                    'node_id': 'drink_v1',
-                    'uuid': 'drink_v1',
-                    'group_id': 's1_observational_memory',
-                    'content': 'coffee before training',
-                    'created_at': '2026-03-01T00:00:00Z',
-                    'status': 'open',
-                    'semantic_domain': 'observational_memory',
-                    'supersedes': [],
-                },
-                {
-                    'node_id': 'drink_v2',
-                    'uuid': 'drink_v2',
-                    'group_id': 's1_observational_memory',
-                    'content': 'espresso after training',
-                    'created_at': '2026-03-09T00:00:00Z',
-                    'status': 'active',
-                    'semantic_domain': 'observational_memory',
-                    'supersedes': [
-                        {
-                            'target_id': 'drink_v1',
-                            'created_at': '2026-03-09T00:00:00Z',
-                            'relation_uuid': 'rel_drink_v2_v1',
-                        }
-                    ],
-                },
-            ]
-        }
-    )
     projection = OMTypedProjectionService(
         search_service=search_service,
-        graphiti_service=_HistoryAwareGraphitiService(driver),
+        graphiti_service=_HistoryAwareGraphitiService(_HistoryAwareDriver()),
     )
     service = TypedRetrievalService(
         ledger=_FakeLedger(),
@@ -1081,40 +1050,21 @@ def test_real_om_projection_distinguishes_history_current_and_all_modes():
             max_evidence=10,
         )
     )
-    history_response = _run(
-        service.search(
-            query='espresso',
-            effective_group_ids=['s1_observational_memory'],
-            object_types=['episode'],
-            history_mode='history',
-            max_results=10,
-            max_evidence=10,
-        )
-    )
 
+    # Provisional episodes are flat — each is standalone is_current=True
     assert all_response['query_mode'] == 'all'
-    assert [item['object_id'] for item in all_response['episodes']] == [
-        'om_episode:s1_observational_memory:drink_v2',
-        'om_episode:s1_observational_memory:drink_v1',
-    ]
-    assert all_response['episodes'][1]['is_current'] is False
+    assert all_response['counts']['episodes'] == 1
+    assert all_response['episodes'][0]['object_id'] == 'om_episode:s1_observational_memory:drink_v2'
+    assert 'provisional' in all_response['episodes'][0]['annotations']
 
     assert current_response['query_mode'] == 'current'
-    assert [item['object_id'] for item in current_response['episodes']] == [
-        'om_episode:s1_observational_memory:drink_v2',
-    ]
+    assert current_response['counts']['episodes'] == 1
 
-    assert history_response['query_mode'] == 'history'
-    assert [item['object_id'] for item in history_response['episodes']] == [
-        'om_episode:s1_observational_memory:drink_v2',
-        'om_episode:s1_observational_memory:drink_v1',
-    ]
-    assert history_response['episodes'][1]['is_current'] is False
-    assert history_response['episodes'][1]['invalid_at'] == '2026-03-09T00:00:00Z'
-    assert history_response['limits_applied']['materialization']['om_projection']['history_lineages_projected'] == 1
+    assert all_response['limits_applied']['materialization']['om_projection']['reason'] == 'provisional_projection'
 
 
 def test_real_om_projection_preserves_same_node_uuid_across_multiple_groups():
+    """Same node UUID in different groups produces distinct provisional episodes."""
     search_service = _HistoryAwareSearchService(
         node_rows=[
             {
@@ -1135,37 +1085,9 @@ def test_real_om_projection_preserves_same_node_uuid_across_multiple_groups():
             },
         ]
     )
-    driver = _HistoryAwareDriver(
-        records_by_seed={
-            ('group_a', 'shared_node'): [
-                {
-                    'node_id': 'shared_node',
-                    'uuid': 'shared_node',
-                    'group_id': 'group_a',
-                    'content': 'espresso after training in group A',
-                    'created_at': '2026-03-09T00:00:00Z',
-                    'status': 'active',
-                    'semantic_domain': 'observational_memory',
-                    'supersedes': [],
-                }
-            ],
-            ('group_b', 'shared_node'): [
-                {
-                    'node_id': 'shared_node',
-                    'uuid': 'shared_node',
-                    'group_id': 'group_b',
-                    'content': 'espresso after training in group B',
-                    'created_at': '2026-03-09T00:00:00Z',
-                    'status': 'active',
-                    'semantic_domain': 'observational_memory',
-                    'supersedes': [],
-                }
-            ],
-        }
-    )
     projection = OMTypedProjectionService(
         search_service=search_service,
-        graphiti_service=_HistoryAwareGraphitiService(driver),
+        graphiti_service=_HistoryAwareGraphitiService(_HistoryAwareDriver()),
     )
     service = TypedRetrievalService(
         ledger=_FakeLedger(),

@@ -422,7 +422,7 @@ async def _run_om_projection_smoke() -> None:
         om_projection_service=om_projection,
     )
 
-    # Canonical OM lane through typed buckets
+    # Canonical OM lane through typed buckets — Phase 2: projection only produces episodes
     result = await service.search(
         query='heap cap',
         effective_group_ids=['s1_observational_memory'],
@@ -432,14 +432,15 @@ async def _run_om_projection_smoke() -> None:
     )
     assert result['result_format'] == 'typed'
     assert result['counts']['episodes'] >= 1, f"expected OM episodes, got {result['counts']}"
-    assert result['counts']['state'] >= 1, f"expected OM state facts, got {result['counts']}"
 
     om_episodes = result['episodes']
     assert any('om_episode:' in ep['object_id'] for ep in om_episodes), 'expected om_episode: prefix'
     assert all(ep['source_lane'] == 's1_observational_memory' for ep in om_episodes)
+    assert all('provisional' in ep.get('annotations', []) for ep in om_episodes), \
+        'expected provisional annotation on unpromoted OM episodes'
 
-    om_state = result['state']
-    assert any('om_state:' in sf['object_id'] for sf in om_state), 'expected om_state: prefix'
+    # State facts should NOT come from projection (state is ledger-canonical only)
+    assert result['counts']['state'] == 0, f"projection must not produce state facts, got {result['counts']['state']}"
 
     # Evidence refs point back to OM provenance
     evidence = result['evidence']
@@ -450,7 +451,7 @@ async def _run_om_projection_smoke() -> None:
     om_limits = result['limits_applied']['materialization']['om_projection']
     assert om_limits['enabled'] is True
     assert om_limits['episodes_projected'] >= 1
-    assert om_limits['state_projected'] >= 1
+    assert om_limits['state_projected'] == 0, 'projection must not produce state facts'
 
     # Experimental OM group through typed buckets
     result_exp = await service.search(
@@ -460,12 +461,12 @@ async def _run_om_projection_smoke() -> None:
         max_results=10,
         max_evidence=10,
     )
-    assert result_exp['counts']['episodes'] >= 1 or result_exp['counts']['state'] >= 1, \
-        f"expected OM content for experimental group, got {result_exp['counts']}"
+    assert result_exp['counts']['episodes'] >= 1, \
+        f"expected OM episodes for experimental group, got {result_exp['counts']}"
 
     print('om typed projection smoke: PASS')
     print(f"  canonical episodes: {result['counts']['episodes']}")
-    print(f"  canonical state: {result['counts']['state']}")
+    print(f"  canonical state (ledger-only): {result['counts']['state']}")
     print(f"  canonical evidence: {result['counts']['evidence']}")
     print(f"  experimental group surfaced: {result_exp['counts']['episodes'] + result_exp['counts']['state']} objects")
 
