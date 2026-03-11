@@ -89,7 +89,7 @@ class TestWriteProvisionalLedgerEpisodes:
         assert "om_native" in (ep.annotations or [])
         assert "unpromoted" in (ep.annotations or [])
         assert ep.summary == "Yuan prefers Ethiopian coffee beans"
-        assert ep.source_lane == "om:test_group"
+        assert ep.source_lane == "test_group"
         assert ep.source_key == "om:test_group:node:node_001"
 
     def test_idempotent_skips_duplicate(self, tmp_ledger: ChangeLedger) -> None:

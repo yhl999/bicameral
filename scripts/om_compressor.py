@@ -167,7 +167,7 @@ def _write_provisional_ledger_episodes(
             parent_id=None,
             version=1,
             is_current=True,
-            source_lane=f"om:{node.group_id}",
+            source_lane=node.group_id,
             source_key=node.source_key,
             policy_scope="observational",
             visibility_scope="owner",

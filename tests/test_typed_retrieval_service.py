@@ -205,6 +205,79 @@ def test_candidate_root_prefilter_uses_root_index_and_scope_filters():
     assert executed['params'][:3] == ['state_fact', 'lane_a', 'lane_b']
 
 
+def test_candidate_root_prefilter_finds_provisional_om_episode_by_plain_group_id():
+    """Regression: provisional ledger episodes written by om_compressor must be discoverable
+    via _candidate_root_ids when the scoped source_lane filter uses the plain group id.
+
+    Previously, om_compressor wrote source_lane='om:<group_id>' (e.g. 'om:s1_observational_memory')
+    while scoped typed retrieval filtered by the plain group id ('s1_observational_memory').
+    The filter mismatch caused provisional episodes to be silently dropped from scoped queries.
+
+    After the fix, om_compressor writes source_lane=<group_id> (no prefix), so the filter matches.
+    """
+    group_id = 's1_observational_memory'
+    ep = Episode(
+        object_id='om_provisional_episode:s1_observational_memory:node_fix_test',
+        root_id='om_provisional_root:s1_observational_memory:node_fix_test',
+        version=1,
+        is_current=True,
+        source_lane=group_id,  # canonical: plain group id, NOT "om:s1_observational_memory"
+        source_key=f'om:{group_id}:node:node_fix_test',
+        policy_scope='observational',
+        visibility_scope='owner',
+        title='provisional episode for retrieval regression test',
+        summary='Yuan prefers Ethiopian coffee observed during session replay',
+        annotations=['om_native', 'provisional', 'unpromoted'],
+        history_meta={
+            'lineage_kind': 'om_provisional',
+            'lineage_basis': 'write_time_ledger',
+            'derivation_level': 'provisional',
+            'om_node_id': 'node_fix_test',
+            'om_group_id': group_id,
+            'chunk_id': 'chunk_regression',
+            'promotion_status': 'unpromoted',
+        },
+        evidence_refs=[
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': f'{group_id}:node', 'event_id': 'node_fix_test'},
+                title='OM node',
+                snippet='Yuan prefers Ethiopian coffee observed during session replay',
+            )
+        ],
+        created_at='2026-03-11T00:00:00Z',
+        valid_at='2026-03-11T00:00:00Z',
+    )
+
+    ledger = _memory_ledger()
+    ledger.append_event(
+        'assert',
+        actor_id='om_compressor',
+        reason='provisional_write',
+        recorded_at='2026-03-11T00:00:00Z',
+        root_id=ep.root_id,
+        payload=ep.model_dump(mode='json'),
+    )
+
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    # Scoped filter using the plain group id — must find the provisional episode.
+    root_ids, strategy = service._candidate_root_ids(
+        query='Ethiopian coffee',
+        max_roots=25,
+        object_types=set(),
+        metadata_filters={'source_lane': {'in': [group_id]}},
+    )
+
+    assert ep.root_id in root_ids, (
+        f"Provisional episode root '{ep.root_id}' not found in candidate roots {root_ids}. "
+        "om_compressor must write source_lane=<group_id> (not 'om:<group_id>') so scoped "
+        "typed retrieval can discover provisional ledger episodes."
+    )
+    assert strategy == 'query_tokens'
+
+
 def test_search_does_not_return_recent_unrelated_objects_for_nonmatching_query():
     ledger = _memory_ledger()
     _seed_assert(ledger, _state_fact(object_id='obj_1', root_id='root_1', version=1, value='espresso'))
