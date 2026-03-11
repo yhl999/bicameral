@@ -19,13 +19,12 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[1])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from ingest.contracts import (
+from ingest.contracts import (  # noqa: E402
     INGEST_ADAPTER_CONTRACT_VERSION,
     validate_chunk,
     validate_determinism,
     validate_record,
 )
-
 
 # ---------------------------------------------------------------------------
 # Sample fixtures

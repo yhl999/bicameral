@@ -21,22 +21,22 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 # Add ingest module to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ingest"))
-from registry import (
-    EXTRACTION_STATUS_FAILED,
-    EXTRACTION_STATUS_QUEUED,
-    get_registry,
-)
-
 # Import QUEUE_SCHEMA_DDL from shared module (ingest/queue.py).
 # sys.path already has ingest/ at index 0 (line 28), but ``import queue``
 # would return the cached stdlib module if anything imported it first.
 # Load by explicit file path to guarantee we get our local module.
 import importlib.util as _imputil
+
+from registry import (
+    EXTRACTION_STATUS_FAILED,
+    EXTRACTION_STATUS_QUEUED,
+    get_registry,
+)
 
 _queue_path = str(Path(__file__).resolve().parents[1] / "ingest" / "queue.py")
 _queue_spec = _imputil.spec_from_file_location("ingest_queue", _queue_path)
@@ -407,17 +407,16 @@ def main():
                 f"last_success={last_success} last_error_at={last_error_at} last_error={last_error}"
             )
 
-    if args.verbose:
-        if queue.get("last_runs"):
-            print("\nLast run (full):")
-            for r in queue.get("last_runs") or []:
-                last_success = format_timestamp(r.get("last_success_at"))
-                last_error_at = format_timestamp(r.get("last_error_at"))
-                last_error = r.get("last_error") or ""
-                print(
-                    f"  - {r['job_type']} ({r['source']}) group_id={r['group_id']} lane={r['lane']} "
-                    f"last_success={last_success} last_error_at={last_error_at} last_error={last_error}"
-                )
+    if args.verbose and queue.get("last_runs"):
+        print("\nLast run (full):")
+        for r in queue.get("last_runs") or []:
+            last_success = format_timestamp(r.get("last_success_at"))
+            last_error_at = format_timestamp(r.get("last_error_at"))
+            last_error = r.get("last_error") or ""
+            print(
+                f"  - {r['job_type']} ({r['source']}) group_id={r['group_id']} lane={r['lane']} "
+                f"last_success={last_success} last_error_at={last_error_at} last_error={last_error}"
+            )
 
     # Per-source details
     sources = registry.list_sources(args.sources)

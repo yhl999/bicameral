@@ -32,7 +32,6 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,

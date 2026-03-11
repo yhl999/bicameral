@@ -8,7 +8,6 @@ Security invariants:
   - group_ids=[]    must NOT be silently coerced to None (that would be fail-open)
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,7 +16,6 @@ from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import fulltext_query
-
 
 # ---------------------------------------------------------------------------
 # Helper: minimal mock driver for unit tests
@@ -107,7 +105,6 @@ class TestSearchGroupIdsSemantics:
 
     def _make_search_results_with_edges(self):
         from graphiti_core.edges import EntityEdge
-        from graphiti_core.nodes import EntityNode
         edge = MagicMock(spec=EntityEdge)
         return SearchResults(edges=[edge])
 
@@ -181,7 +178,7 @@ class TestSearchGroupIdsSemantics:
             patch('graphiti_core.search.search.community_search', new_callable=AsyncMock,
                   return_value=empty_results) as mock_community,
         ):
-            result = await search(
+            await search(
                 clients=clients,
                 query='memory leak',
                 group_ids=None,

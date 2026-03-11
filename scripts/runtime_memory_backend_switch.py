@@ -31,7 +31,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 sys.dont_write_bytecode = True
 

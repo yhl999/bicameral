@@ -7,21 +7,19 @@ Usage:
 """
 
 import argparse
-import json
 import sys
-from datetime import timezone
 from pathlib import Path
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from common import (
+    chunk_by_tokens,
+    extract_frontmatter,
+    extract_h1_title,
     generate_evidence_id,
     parse_date_from_filename,
-    extract_frontmatter,
     split_markdown_by_h2,
-    extract_h1_title,
-    chunk_by_tokens,
     write_evidence_batch,
 )
 

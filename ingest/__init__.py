@@ -6,11 +6,11 @@ into normalized evidence documents for Graphiti ingestion.
 """
 
 from .common import (
+    chunk_by_tokens,
+    extract_frontmatter,
     generate_evidence_id,
     parse_date_from_filename,
-    extract_frontmatter,
     split_markdown_by_h2,
-    chunk_by_tokens,
 )
 
 __all__ = [

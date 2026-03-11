@@ -25,7 +25,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # 1. Recall non-regression gate
 # ---------------------------------------------------------------------------
@@ -217,17 +216,18 @@ class TestBenchmarkGateCLIFlags:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
-        with patch.object(sys, 'argv', [
-            'run_retrieval_benchmark.py',
-            '--fixture', 'dummy.json',
-            '--output', '/tmp/out.json',
-            '--recall-gate', '0.75',
-            '--recall-baseline', '/tmp/baseline.json',
-        ]):
-            import argparse
+        with (
+            patch.object(sys, 'argv', [
+                'run_retrieval_benchmark.py',
+                '--fixture', 'dummy.json',
+                '--output', '/tmp/out.json',
+                '--recall-gate', '0.75',
+                '--recall-baseline', '/tmp/baseline.json',
+            ]),
+            pytest.raises(SystemExit),
+        ):
             # Just verify argparse accepts these flags (don't actually run)
-            with pytest.raises(SystemExit):
-                mod.main()  # will exit because fixture doesn't exist; that's fine
+            mod.main()  # will exit because fixture doesn't exist; that's fine
 
     def test_check_recall_gate_importable(self):
         import importlib.util

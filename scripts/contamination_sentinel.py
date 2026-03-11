@@ -36,7 +36,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,8 +178,8 @@ def run_sentinel(
     neo4j_uri: str,
     neo4j_user: str,
     neo4j_password: str,
-    source_group: Optional[str] = None,
-    clean_group: Optional[str] = None,
+    source_group: str | None = None,
+    clean_group: str | None = None,
     sample_limit: int = DEFAULT_SAMPLE_LIMIT,
 ) -> ContaminationResult:
     """Run the contamination sentinel and return results."""

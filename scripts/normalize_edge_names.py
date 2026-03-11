@@ -32,7 +32,6 @@ import argparse
 import logging
 import os
 import sys
-from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,7 +83,7 @@ SET e.name = u.new_name
 """
 
 
-def _scan(session, group_id: Optional[str]) -> list[dict]:
+def _scan(session, group_id: str | None) -> list[dict]:
     result = session.run(_SCAN_QUERY, group_id=group_id)
     return [dict(r) for r in result]
 
@@ -103,7 +102,7 @@ def _apply_updates(session, updates: list[dict]) -> int:
 def run(
     *,
     apply: bool,
-    group_id: Optional[str],
+    group_id: str | None,
     neo4j_uri: str,
     neo4j_user: str,
     neo4j_password: str,

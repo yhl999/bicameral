@@ -29,7 +29,6 @@ from graphiti_core.utils.env_utils import (
     resolve_llm_base_url,
 )
 
-
 # ---------------------------------------------------------------------------
 # 1. Imports
 # ---------------------------------------------------------------------------
@@ -156,19 +155,25 @@ class TestSSRFHardening:
             yield
 
     def test_llm_link_local_always_blocked(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'http://169.254.169.254/v1'}):
-            with pytest.raises(EndpointResolutionError, match='link-local'):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'http://169.254.169.254/v1'}),
+            pytest.raises(EndpointResolutionError, match='link-local'),
+        ):
+            resolve_llm_base_url()
 
     def test_llm_ipv6_link_local_blocked(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'http://[fe80::1]/v1'}):
-            with pytest.raises(EndpointResolutionError, match='link-local'):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'http://[fe80::1]/v1'}),
+            pytest.raises(EndpointResolutionError, match='link-local'),
+        ):
+            resolve_llm_base_url()
 
     def test_llm_localhost_blocked_by_default(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'http://localhost:11434/v1'}):
-            with pytest.raises(EndpointResolutionError, match='private/loopback'):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'http://localhost:11434/v1'}),
+            pytest.raises(EndpointResolutionError, match='private/loopback'),
+        ):
+            resolve_llm_base_url()
 
     def test_llm_localhost_allowed_with_override(self):
         with patch.dict(os.environ, {
@@ -186,29 +191,39 @@ class TestSSRFHardening:
 
     def test_embedder_link_local_blocked(self):
         """Even embedder must block link-local / cloud-metadata."""
-        with patch.dict(os.environ, {'EMBEDDER_BASE_URL': 'http://169.254.169.254/v1'}):
-            with pytest.raises(EndpointResolutionError, match='link-local'):
-                resolve_embedder_base_url()
+        with (
+            patch.dict(os.environ, {'EMBEDDER_BASE_URL': 'http://169.254.169.254/v1'}),
+            pytest.raises(EndpointResolutionError, match='link-local'),
+        ):
+            resolve_embedder_base_url()
 
     def test_invalid_url_scheme_rejected(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'ftp://example.com/v1'}):
-            with pytest.raises(EndpointResolutionError):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'ftp://example.com/v1'}),
+            pytest.raises(EndpointResolutionError),
+        ):
+            resolve_llm_base_url()
 
     def test_credentials_in_url_rejected(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'https://user:pass@example.com/v1'}):
-            with pytest.raises(EndpointResolutionError, match='credentials'):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'https://user:pass@example.com/v1'}),
+            pytest.raises(EndpointResolutionError, match='credentials'),
+        ):
+            resolve_llm_base_url()
 
     def test_query_string_rejected(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'https://example.com/v1?key=secret'}):
-            with pytest.raises(EndpointResolutionError, match='query string'):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'https://example.com/v1?key=secret'}),
+            pytest.raises(EndpointResolutionError, match='query string'),
+        ):
+            resolve_llm_base_url()
 
     def test_private_rfc1918_blocked_for_llm_by_default(self):
-        with patch.dict(os.environ, {'LLM_BASE_URL': 'http://192.168.1.10:8080/v1'}):
-            with pytest.raises(EndpointResolutionError, match='private/loopback'):
-                resolve_llm_base_url()
+        with (
+            patch.dict(os.environ, {'LLM_BASE_URL': 'http://192.168.1.10:8080/v1'}),
+            pytest.raises(EndpointResolutionError, match='private/loopback'),
+        ):
+            resolve_llm_base_url()
 
     def test_private_rfc1918_allowed_for_embedder(self):
         with patch.dict(os.environ, {'EMBEDDER_BASE_URL': 'http://192.168.1.10:11434/v1'}):
@@ -361,12 +376,14 @@ class TestFallbackPathSSRFParity:
 
     def test_llm_fallback_blocks_link_local_always(self):
         """Link-local is blocked even with OM_ALLOW_LOCAL_LLM=1."""
-        with patch.dict(os.environ, {'OM_ALLOW_LOCAL_LLM': '1'}):
-            with pytest.raises(self.Error, match='link-local'):
-                self.validate(
-                    'http://169.254.169.254/v1', 'LLM chat',
-                    allow_private=False, allow_local_override_env='OM_ALLOW_LOCAL_LLM',
-                )
+        with (
+            patch.dict(os.environ, {'OM_ALLOW_LOCAL_LLM': '1'}),
+            pytest.raises(self.Error, match='link-local'),
+        ):
+            self.validate(
+                'http://169.254.169.254/v1', 'LLM chat',
+                allow_private=False, allow_local_override_env='OM_ALLOW_LOCAL_LLM',
+            )
 
     def test_llm_fallback_accepts_public_url(self):
         """LLM path must accept valid public URLs."""
@@ -416,9 +433,11 @@ class TestOmFastWriteFallbackURLParity:
             'graphiti_core.utils': None,
             'graphiti_core.utils.env_utils': None,
         }
-        with patch.dict(_sys.modules, blocked):
-            with patch.dict(os.environ, {'EMBEDDER_BASE_URL': url}, clear=False):
-                return self.mod._validated_embedding_base_url()
+        with (
+            patch.dict(_sys.modules, blocked),
+            patch.dict(os.environ, {'EMBEDDER_BASE_URL': url}, clear=False),
+        ):
+            return self.mod._validated_embedding_base_url()
 
     def test_query_string_rejected(self):
         with pytest.raises(RuntimeError, match='query'):
@@ -496,9 +515,11 @@ class TestImportTranscriptsFallbackURLParity:
             'graphiti_core.utils': None,
             'graphiti_core.utils.env_utils': None,
         }
-        with patch.dict(_sys.modules, blocked):
-            with patch.dict(os.environ, {'EMBEDDER_BASE_URL': url}, clear=False):
-                return self.mod._validated_embedding_base_url()
+        with (
+            patch.dict(_sys.modules, blocked),
+            patch.dict(os.environ, {'EMBEDDER_BASE_URL': url}, clear=False),
+        ):
+            return self.mod._validated_embedding_base_url()
 
     def test_query_string_rejected(self):
         with pytest.raises(RuntimeError, match='query'):

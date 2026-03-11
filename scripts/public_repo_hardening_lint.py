@@ -16,7 +16,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 FORBIDDEN_SUBSTRINGS = (
     'projects/graphiti',
     'projects/clawd-graphiti',

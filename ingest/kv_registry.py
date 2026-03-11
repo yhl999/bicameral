@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any
 
 
 def default_registry_db_path() -> Path:
@@ -72,7 +73,7 @@ class KVRegistry:
         finally:
             conn.close()
 
-    def get(self, key: str) -> Optional[str]:
+    def get(self, key: str) -> str | None:
         with self._conn() as conn:
             row = conn.execute("SELECT key, value, updated_at FROM kv WHERE key=?", (key,)).fetchone()
             return str(row["value"]) if row else None
@@ -113,7 +114,7 @@ class KVRegistry:
                 [(k, v, now) for k, v in pairs],
             )
 
-    def get_json(self, key: str) -> Optional[Any]:
+    def get_json(self, key: str) -> Any | None:
         v = self.get(key)
         if v is None:
             return None

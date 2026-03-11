@@ -15,12 +15,12 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import uuid
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
-
+from typing import Any
 
 DEFAULT_DB_PATH = Path(__file__).parent.parent / "state" / "ingest_registry.db"
 
@@ -45,10 +45,10 @@ class SourceState:
     """State for a single source (chatgpt:conversationId or session:agentId:sessionId)."""
     source_key: str
     source_type: str  # "chatgpt" or "session"
-    watermark: Optional[float]  # timestamp for chatgpt, line_number for sessions
-    watermark_str: Optional[str]  # human-readable representation
+    watermark: float | None  # timestamp for chatgpt, line_number for sessions
+    watermark_str: str | None  # human-readable representation
     overlap_window: int  # messages/lines to re-process for overlap
-    last_ingested_at: Optional[str]
+    last_ingested_at: str | None
     chunk_count: int
 
 
@@ -68,9 +68,9 @@ class CuratedFileState:
     """State for a curated reference file (hash-gated snapshot ingest)."""
 
     path: str
-    last_hash: Optional[str]
-    last_snapshot_ts: Optional[str]
-    last_ingested_at: Optional[str]
+    last_hash: str | None
+    last_snapshot_ts: str | None
+    last_ingested_at: str | None
 
 
 @dataclass
@@ -79,16 +79,16 @@ class ExtractionRecord:
 
     group_id: str
     episode_uuid: str
-    chunk_uuid: Optional[str]
-    source_key: Optional[str]
-    chunk_key: Optional[str]
+    chunk_uuid: str | None
+    source_key: str | None
+    chunk_key: str | None
     status: str
     first_queued_at: str
     last_queued_at: str
-    last_processing_at: Optional[str]
-    last_succeeded_at: Optional[str]
-    last_failed_at: Optional[str]
-    last_failure_reason: Optional[str]
+    last_processing_at: str | None
+    last_succeeded_at: str | None
+    last_failed_at: str | None
+    last_failure_reason: str | None
     queue_count: int
     success_count: int
     failure_count: int
@@ -302,7 +302,7 @@ class IngestRegistry:
     # Source watermark management
     # ─────────────────────────────────────────────────────────────────────────
 
-    def get_source_state(self, source_key: str) -> Optional[SourceState]:
+    def get_source_state(self, source_key: str) -> SourceState | None:
         """Get current state for a source."""
         with self._conn() as conn:
             row = conn.execute(
@@ -348,7 +348,7 @@ class IngestRegistry:
                     last_ingested_at = excluded.last_ingested_at
             """, (source_key, source_type, watermark, watermark_str, overlap_window, now))
 
-    def list_sources(self, source_type: Optional[str] = None) -> list[SourceState]:
+    def list_sources(self, source_type: str | None = None) -> list[SourceState]:
         """List all tracked sources, optionally filtered by type."""
         with self._conn() as conn:
             if source_type:
@@ -390,7 +390,7 @@ class IngestRegistry:
     @staticmethod
     def compute_chunk_uuid(source_key: str, chunk_key: str, content_hash: str) -> str:
         """Compute deterministic chunk UUID (legacy 32-hex format)."""
-        payload = f"{source_key}\n{chunk_key}\n{content_hash}".encode("utf-8")
+        payload = f"{source_key}\n{chunk_key}\n{content_hash}".encode()
         return hashlib.sha256(payload).hexdigest()[:32]
 
     @staticmethod
@@ -446,7 +446,7 @@ class IngestRegistry:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (chunk_uuid, source_key, chunk_key, content_hash, evidence_id, now))
 
-    def get_chunk_count(self, source_key: Optional[str] = None) -> int:
+    def get_chunk_count(self, source_key: str | None = None) -> int:
         """Get total chunk count, optionally filtered by source."""
         with self._conn() as conn:
             if source_key:
@@ -461,7 +461,7 @@ class IngestRegistry:
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _coerce_statuses(statuses: Optional[Sequence[str]]) -> Optional[list[str]]:
+    def _coerce_statuses(statuses: Sequence[str] | None) -> list[str] | None:
         if statuses is None:
             return None
         items = [str(s).strip().lower() for s in statuses if str(s).strip()]
@@ -530,10 +530,10 @@ class IngestRegistry:
         *,
         group_id: str,
         episode_uuid: str,
-        chunk_uuid: Optional[str],
-        source_key: Optional[str],
-        chunk_key: Optional[str],
-        queued_at: Optional[str] = None,
+        chunk_uuid: str | None,
+        source_key: str | None,
+        chunk_key: str | None,
+        queued_at: str | None = None,
     ) -> None:
         """Record that an extraction episode was queued for Graphiti processing."""
 
@@ -582,7 +582,7 @@ class IngestRegistry:
         *,
         group_id: str,
         episode_uuid: str,
-        event_at: Optional[str] = None,
+        event_at: str | None = None,
     ) -> None:
         """Record a queue-service `processing` event for an extraction episode."""
 
@@ -611,7 +611,7 @@ class IngestRegistry:
         *,
         group_id: str,
         episode_uuid: str,
-        event_at: Optional[str] = None,
+        event_at: str | None = None,
     ) -> None:
         """Record a queue-service `succeeded` event for an extraction episode."""
 
@@ -641,8 +641,8 @@ class IngestRegistry:
         *,
         group_id: str,
         episode_uuid: str,
-        failure_reason: Optional[str],
-        event_at: Optional[str] = None,
+        failure_reason: str | None,
+        event_at: str | None = None,
     ) -> None:
         """Record a queue-service `failed` event for an extraction episode."""
 
@@ -675,8 +675,8 @@ class IngestRegistry:
         group_id: str,
         episode_uuid: str,
         event_type: str,
-        event_at: Optional[str] = None,
-        failure_reason: Optional[str] = None,
+        event_at: str | None = None,
+        failure_reason: str | None = None,
     ) -> None:
         """Apply a parsed queue-service event to extraction lifecycle state."""
 
@@ -710,9 +710,9 @@ class IngestRegistry:
     def list_extractions(
         self,
         *,
-        statuses: Optional[Sequence[str]] = None,
-        group_id: Optional[str] = None,
-        limit: Optional[int] = None,
+        statuses: Sequence[str] | None = None,
+        group_id: str | None = None,
+        limit: int | None = None,
     ) -> list[ExtractionRecord]:
         """List extraction lifecycle rows, newest-first."""
 
@@ -747,7 +747,7 @@ class IngestRegistry:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_extraction_record(r) for r in rows]
 
-    def get_extraction_stats(self, *, group_id: Optional[str] = None) -> dict[str, Any]:
+    def get_extraction_stats(self, *, group_id: str | None = None) -> dict[str, Any]:
         """Get extraction lifecycle summary stats."""
 
         where = ""
@@ -805,8 +805,8 @@ class IngestRegistry:
         self,
         *,
         statuses: Sequence[str] = (EXTRACTION_STATUS_FAILED,),
-        group_id: Optional[str] = None,
-        limit: Optional[int] = None,
+        group_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return replay candidates grouped by group_id with chunk/source keys."""
 
@@ -866,7 +866,7 @@ class IngestRegistry:
 
         return out
 
-    def get_sync_cursor(self, cursor_key: str) -> Optional[str]:
+    def get_sync_cursor(self, cursor_key: str) -> str | None:
         """Get stored extraction sync cursor value."""
 
         with self._conn() as conn:
@@ -896,7 +896,7 @@ class IngestRegistry:
     # Curated reference files (hash-gated snapshot ingest)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def get_curated_file_state(self, path: str) -> Optional[CuratedFileState]:
+    def get_curated_file_state(self, path: str) -> CuratedFileState | None:
         """Get current state for a curated file path (absolute path)."""
         with self._conn() as conn:
             row = conn.execute(
@@ -919,7 +919,7 @@ class IngestRegistry:
         *,
         last_hash: str,
         last_snapshot_ts: str,
-        last_ingested_at: Optional[str] = None,
+        last_ingested_at: str | None = None,
     ) -> None:
         """Insert or update curated file state."""
         now = utc_now_iso()
@@ -945,8 +945,8 @@ class IngestRegistry:
         self,
         conversation_id: str,
         reason: str,
-        title: Optional[str] = None,
-        create_time: Optional[float] = None,
+        title: str | None = None,
+        create_time: float | None = None,
     ):
         """Add a conversation to the exclusion list."""
         now = utc_now_iso()
@@ -988,7 +988,7 @@ class IngestRegistry:
         with self._conn() as conn:
             return conn.execute("SELECT COUNT(*) FROM exclusions").fetchone()[0]
 
-    def get_exclusions(self, reason: Optional[str] = None) -> list[dict]:
+    def get_exclusions(self, reason: str | None = None) -> list[dict]:
         """Get all exclusions, optionally filtered by reason."""
         with self._conn() as conn:
             if reason:
@@ -1054,6 +1054,6 @@ class IngestRegistry:
             }
 
 
-def get_registry(db_path: Optional[Path] = None) -> IngestRegistry:
+def get_registry(db_path: Path | None = None) -> IngestRegistry:
     """Get the default registry instance."""
     return IngestRegistry(db_path or DEFAULT_DB_PATH)

@@ -13,7 +13,14 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from migration_sync_lib import ensure_safe_relative, ensure_within_root, now_utc_iso, repo_relative, resolve_repo_root, sha256_file
+from migration_sync_lib import (
+    ensure_safe_relative,
+    ensure_within_root,
+    now_utc_iso,
+    repo_relative,
+    resolve_repo_root,
+    sha256_file,
+)
 
 DEFAULT_INCLUDE_PATHS = [
     'state',

@@ -9,25 +9,24 @@ Usage:
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from common import (
+    clean_message_content,
+    extract_message_id,
     generate_evidence_id,
     parse_telegram_context,
-    extract_message_id,
-    clean_message_content,
     write_evidence_batch,
 )
 
 
 def read_jsonl(file_path: Path) -> Iterator[dict]:
     """Read JSONL file, yielding parsed objects."""
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:

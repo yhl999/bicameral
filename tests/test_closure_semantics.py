@@ -21,10 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, call, patch
-
-import pytest
-
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # 1. Public exports
@@ -299,7 +296,6 @@ class TestClosureScript:
         import importlib.util
         import sys
         from pathlib import Path
-        from unittest.mock import patch
 
         script_path = Path(__file__).parents[1] / 'scripts' / 'apply_closure_semantics.py'
         spec = importlib.util.spec_from_file_location('_apply_closure_args', script_path)

@@ -20,7 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # Shared queue schema + helpers (single source of truth).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -39,7 +39,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _parse_iso_ts(ts: str) -> Optional[float]:
+def _parse_iso_ts(ts: str) -> float | None:
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -62,7 +62,7 @@ def main() -> int:
 
     db_path = Path(args.db_path)
     now_iso = _utc_now_iso()
-    now_ts = time.time()
+    time.time()
     requested_ts_epoch = _parse_iso_ts(args.ts)
 
     # /done jobs are sessions incremental ingest by default.
