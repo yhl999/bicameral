@@ -7,7 +7,6 @@ After the Phase 2 refactor, OMTypedProjectionService:
 """
 
 import pytest
-
 from mcp_server.src.models.typed_memory import Episode
 from mcp_server.src.services.om_typed_projection import OMTypedProjectionService
 

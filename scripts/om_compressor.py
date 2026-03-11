@@ -41,11 +41,14 @@ REPO_ROOT = SCRIPT_PATH.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from mcp_server.src.models.typed_memory import Episode, EvidenceRef  # noqa: E402
+from mcp_server.src.services.change_ledger import (  # noqa: E402
+    DB_PATH_DEFAULT as _LEDGER_DB_DEFAULT,
+)
+from mcp_server.src.services.change_ledger import ChangeLedger  # noqa: E402
 from truth import candidates as candidates_store  # noqa: E402
 
 # Phase 2 platonic: write provisional ledger episodes at OM-write time
-from mcp_server.src.services.change_ledger import ChangeLedger, DB_PATH_DEFAULT as _LEDGER_DB_DEFAULT  # noqa: E402
-from mcp_server.src.models.typed_memory import Episode, EvidenceRef  # noqa: E402
 
 DEFAULT_LOCK_FILENAME = "om_graph_write.lock"
 NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
