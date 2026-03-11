@@ -1095,30 +1095,42 @@ def test_om_extract_system_prompt_contains_supersedes_guidance() -> None:
     )
 
 
-def test_om_extract_system_prompt_prioritizes_human_implication_over_implementation() -> None:
-    """The prompt should front-load the implication-first admission rule."""
+def test_om_extract_system_prompt_prioritizes_human_implication_without_losing_actionability() -> None:
+    """The prompt should front-load implication-first rules while preserving actionable detail."""
     prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
     assert "CRITICAL:" in prompt
     assert "Extract the implication, not the implementation." in prompt
     assert "what durable human-context memory does this imply, if any?" in prompt
+    assert "When operational detail is necessary to preserve a durable assistive rule or future actionability, keep that detail in distilled form." in prompt
+    assert "Preserve meaningful change over time" in prompt
     assert "carrier or evidence of a memory" in prompt
-    assert "If there is no durable human-facing implication, return {\"nodes\": [], \"edges\": []}." in prompt
+    assert 'If there is no durable human-facing implication, return {"nodes": [], "edges": []}.' in prompt
     assert prompt.index("CRITICAL:") < prompt.index("TEMPORAL SEQUENCING"), (
         "Core admission rules must appear before SUPERSEDES guidance"
     )
 
 
-def test_om_extract_system_prompt_restores_compact_memory_anatomy() -> None:
-    """The prompt should retain compact positive/negative ontology-shaping guidance."""
+def test_om_extract_system_prompt_retains_compact_memory_anatomy_with_actionability_guardrail() -> None:
+    """The prompt should keep G's compact ontology framing while preserving actionable detail."""
     prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
     assert "WHAT BELONGS:" in prompt
     assert "Durable human context and world-state" in prompt
     assert "Recurring frictions, constraints, sensitivities, or boundaries." in prompt
     assert "Commitments, active follow-ups, unresolved obligations, or standing preferences." in prompt
     assert "Observational judgments grounded in repeated evidence" in prompt
+    assert "Distilled operational detail when needed to preserve the durable rule or future actionability." in prompt
     assert "WHAT DOES NOT BELONG:" in prompt
     assert "Tool syntax, file paths, PRs, commits, infra details, runbooks, or admin doctrine." in prompt
-    assert "Exception: include technical or operational evidence only when it clearly implies durable human-context memory." in prompt
+    assert "Pure implementation detail that adds no durable human-facing implication or assistive constraint." in prompt
+    assert "Exception: include technical or operational evidence only when it clearly implies durable human-context memory or preserves necessary actionability." in prompt
+
+
+def test_om_extract_system_prompt_keeps_temporal_shift_examples_explicit() -> None:
+    """The prompt should preserve meaningful change-over-time guidance instead of flattening shifts."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    assert "Meaningful shift over time" in prompt
+    assert "newer memory should supersede the older availability" in prompt
+    assert "weekday mornings are a protected no-meeting block" in prompt
 
 
 def test_om_extract_system_prompt_defines_all_om_node_types() -> None:

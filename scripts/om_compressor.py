@@ -807,7 +807,9 @@ Extract structured memory nodes and ontology edges from a conversation transcrip
 CRITICAL:
 - Extract the implication, not the implementation.
 - For each candidate memory, ask: what durable human-context memory does this imply, if any?
-- If the evidence is technical or operational, store only the durable human-facing implication.
+- If the evidence is technical or operational, store the durable human-facing implication.
+- When operational detail is necessary to preserve a durable assistive rule or future actionability, keep that detail in distilled form.
+- Preserve meaningful change over time: if a preference, commitment, priority, or rule shifted, tightened, relaxed, or was superseded, capture that change explicitly rather than flattening it into a static preference.
 - Technical detail may be the carrier or evidence of a memory; it is not automatically the memory itself.
 - If there is no durable human-facing implication, return {"nodes": [], "edges": []}.
 
@@ -817,13 +819,15 @@ WHAT BELONGS:
 - Commitments, active follow-ups, unresolved obligations, or standing preferences.
 - Observational judgments grounded in repeated evidence, not a one-off reaction.
 - Assistive rules derived from behavior, preference, or stable working context.
+- Distilled operational detail when needed to preserve the durable rule or future actionability.
 - Meaningful changes over time when a newer state supersedes an older one.
 
 WHAT DOES NOT BELONG:
 - Tool syntax, file paths, PRs, commits, infra details, runbooks, or admin doctrine.
 - Step-by-step implementation, debugging, deployment, or system configuration detail.
 - Filler, one-off logistics, or raw technical evidence with no durable human implication.
-- Exception: include technical or operational evidence only when it clearly implies durable human-context memory.
+- Pure implementation detail that adds no durable human-facing implication or assistive constraint.
+- Exception: include technical or operational evidence only when it clearly implies durable human-context memory or preserves necessary actionability.
 
 OUTPUT FORMAT: Return a single JSON object with exactly two top-level keys:
   "nodes": array of node objects
@@ -864,7 +868,8 @@ ADMISSION TEST:
 PUBLIC-SAFE EXAMPLES OF THE IMPLICATION RULE:
 - Technical evidence: "page me on Signal when urgent" -> memory: urgent updates should use that channel.
 - Technical evidence: "wait for my approval before deploying" -> memory: prefers approval before deploys.
-- Technical evidence: "this output feels risky or too aggressive" -> memory: has an ongoing concern about risky content.
+- Operational detail that must survive distillation: "keep weekday mornings meeting-free" -> memory: weekday mornings are a protected no-meeting block.
+- Meaningful shift over time: "I used to take Friday calls, now keep Fridays clear" -> newer memory should supersede the older availability.
 - Pure implementation with no durable human implication -> return {"nodes": [], "edges": []}.
 
 TEMPORAL SEQUENCING — SUPERSEDES:
