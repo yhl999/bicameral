@@ -169,3 +169,47 @@ def test_episode_label_on_target_uses_target_name() -> None:
     _, assertion_type, value, _ = result
     assert assertion_type == "episode"
     assert value["name"] == "Q1ReviewEpisode"
+
+
+# ---------------------------------------------------------------------------
+# BOTH-LABELED cases: source must win
+# ---------------------------------------------------------------------------
+
+
+def test_procedure_both_labeled_source_wins() -> None:
+    """When BOTH endpoints carry Procedure label, source_name must be chosen."""
+    result = route_entity_edge(
+        source_name="BootstrapCluster",
+        target_name="ProvisionNode",
+        rel_name="PRECEDES",
+        fact="BootstrapCluster must complete before ProvisionNode.",
+        a_labels=["Procedure", "Entity"],
+        b_labels=["Procedure", "Entity"],
+    )
+    assert result is not None
+    _, assertion_type, value, _ = result
+    assert assertion_type == "procedure"
+    assert value["name"] == "BootstrapCluster", (
+        "source_name must win when both endpoints carry the Procedure label"
+    )
+
+
+def test_episode_both_labeled_source_wins() -> None:
+    """When BOTH endpoints carry an Episode-family label, source_name must be chosen."""
+    result = route_entity_edge(
+        source_name="OutageEpisode",
+        target_name="PostmortemEpisode",
+        rel_name="TRIGGERED",
+        fact="OutageEpisode triggered PostmortemEpisode.",
+        a_labels=["EngineeringIncident"],
+        b_labels=["AuditEpisode"],
+    )
+    assert result is not None
+    _, assertion_type, value, _ = result
+    assert assertion_type == "episode"
+    assert value["name"] == "OutageEpisode", (
+        "source_name must win when both endpoints carry Episode-family labels"
+    )
+    # Both participants still present
+    assert "OutageEpisode" in value["participants"]
+    assert "PostmortemEpisode" in value["participants"]

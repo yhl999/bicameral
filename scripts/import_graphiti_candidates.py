@@ -861,11 +861,11 @@ def import_graph(
             q_params = {"anchor_name": anchor_name, "group_id": graph}
         else:
             q = (
-                "MATCH (a:Entity {name:" + cypher_quote(anchor_name) + "})"
+                "MATCH (a:Entity {name: $anchor_name})"
                 "-[r:RELATES_TO]->(b:Entity) "
                 "RETURN a.name, b.name, r.uuid, r.name, r.fact, r.valid_at, r.created_at, r.episodes, labels(a) AS a_labels, labels(b) AS b_labels"
             )
-            q_params = None
+            q_params = {"anchor_name": anchor_name}
 
         try:
             header, rows, _ = run_graph_query(graph, q, params=q_params)
