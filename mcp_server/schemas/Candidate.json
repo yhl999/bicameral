@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Candidate",
+  "title": "Candidate",
+  "description": "A quarantined fact awaiting promotion review",
+  "type": "object",
+  "required": [
+    "candidate_id",
+    "fact_type",
+    "subject",
+    "predicate",
+    "value"
+  ],
+  "properties": {
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique identifier for this candidate"
+    },
+    "fact_type": {
+      "type": "string",
+      "enum": [
+        "preference",
+        "decision",
+        "commitment",
+        "lesson",
+        "world_state",
+        "operational_rule",
+        "constraint",
+        "relationship"
+      ]
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "value": {},
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "promoted",
+        "rejected"
+      ],
+      "default": "pending"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resolution": {
+      "type": "string",
+      "description": "Reason for promotion or rejection"
+    }
+  },
+  "additionalProperties": true
+}

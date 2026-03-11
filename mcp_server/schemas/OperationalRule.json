@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "OperationalRule",
+  "title": "OperationalRule",
+  "description": "A self-audit rule or operational constraint",
+  "type": "object",
+  "required": [
+    "subject",
+    "predicate",
+    "value"
+  ],
+  "properties": {
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "value": {
+      "description": "The rule content or constraint"
+    },
+    "enforcement": {
+      "type": "string",
+      "enum": [
+        "hard",
+        "soft",
+        "advisory"
+      ],
+      "default": "soft"
+    },
+    "applies_to": {
+      "type": "string",
+      "description": "Scope of agents or roles this rule applies to"
+    }
+  },
+  "additionalProperties": true
+}

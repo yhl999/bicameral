@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Commitment",
+  "title": "Commitment",
+  "description": "An owner commitment or obligation",
+  "type": "object",
+  "required": [
+    "subject",
+    "predicate",
+    "value"
+  ],
+  "properties": {
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "value": {
+      "description": "What was committed to"
+    },
+    "due_date": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "fulfilled",
+        "cancelled"
+      ],
+      "default": "active"
+    },
+    "counterparty": {
+      "type": "string",
+      "description": "Who the commitment was made to"
+    }
+  },
+  "additionalProperties": true
+}

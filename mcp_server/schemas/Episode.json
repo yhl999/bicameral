@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Episode",
+  "title": "Episode",
+  "description": "An episodic memory record",
+  "type": "object",
+  "required": [
+    "object_id",
+    "object_type"
+  ],
+  "properties": {
+    "object_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "object_type": {
+      "type": "string",
+      "const": "episode"
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "annotations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

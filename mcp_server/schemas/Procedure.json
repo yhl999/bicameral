@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Procedure",
+  "title": "Procedure",
+  "description": "A procedural memory record",
+  "type": "object",
+  "required": [
+    "object_id",
+    "object_type",
+    "name",
+    "trigger",
+    "steps",
+    "expected_outcome"
+  ],
+  "properties": {
+    "object_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "object_type": {
+      "type": "string",
+      "const": "procedure"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "trigger": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Condition or event that triggers this procedure"
+    },
+    "preconditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "expected_outcome": {
+      "type": "string",
+      "minLength": 1
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default": "medium"
+    }
+  },
+  "additionalProperties": true
+}

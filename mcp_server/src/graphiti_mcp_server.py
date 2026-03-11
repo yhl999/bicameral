@@ -909,6 +909,257 @@ mcp = FastMCP(
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
 )
 
+# Register router tool modules (Phase 0 skeleton)
+try:
+    from .routers import candidates as _candidates_router
+    from .routers import episodes_procedures as _episodes_procedures_router
+    from .routers import memory as _memory_router
+    from .routers import packs as _packs_router
+except ImportError:  # pragma: no cover - script/top-level import fallback
+    from routers import candidates as _candidates_router
+    from routers import episodes_procedures as _episodes_procedures_router
+    from routers import memory as _memory_router
+    from routers import packs as _packs_router
+
+_memory_router.register_tools(mcp)
+_candidates_router.register_tools(mcp)
+_packs_router.register_tools(mcp)
+_episodes_procedures_router.register_tools(mcp)
+
+# Debug flag: hide low-level tools unless explicitly enabled
+_BICAMERAL_DEBUG_TOOLS: bool = (
+    os.environ.get('BICAMERAL_DEBUG_TOOLS', '').strip() == '1'
+)
+
+# Precompute get_tools() response at module load time (not per-request)
+_GET_TOOLS_RESPONSE: list[dict[str, Any]] = [
+    {
+        'name': 'add_memory',
+        'description': 'Add a memory episode to the graph (raw text ingestion)',
+        'mode_hint': 'facts',
+        'schema': {
+            'inputs': {'text': 'string', 'group_id': 'string | null'},
+            'output': 'SuccessResponse | ErrorResponse',
+        },
+        'examples': [{'text': 'User prefers dark mode', 'group_id': None}],
+    },
+    {
+        'name': 'search_memory_facts',
+        'description': 'Semantic search over memory facts (legacy graph edges or typed ledger)',
+        'mode_hint': 'both',
+        'details': {
+            'facts': (
+                'Search Neo4j/FalkorDB graph edges (legacy). '
+                'Broad recall, lower precision on current state.'
+            ),
+            'typed': (
+                'Ledger-backed retrieval of typed objects '
+                '(Preference, Commitment, OperationalRule). '
+                "Use for 'what is current/active?' queries."
+            ),
+            'om_note': 'OM content projected from Neo4j in both modes.',
+        },
+        'schema': {
+            'inputs': {
+                'query': 'string',
+                'group_ids': 'list[string] | null',
+                'max_facts': 'integer (default 10)',
+                'result_format': '"facts" | "typed" (default "facts")',
+            },
+            'output': 'FactSearchResponse | ErrorResponse',
+        },
+        'examples': [
+            {'query': 'user preferences', 'result_format': 'typed'},
+            {'query': 'recent events', 'result_format': 'facts'},
+        ],
+    },
+    {
+        'name': 'remember_fact',
+        'description': 'Write a typed fact to the memory ledger (ledger-first write)',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'text': 'string — natural-language or structured fact',
+                'hint': 'dict | null — extraction hints (fact_type, subject, etc.)',
+            },
+            'output': 'TypedFact | ConflictDialog | ErrorResponse',
+        },
+        'examples': [
+            {'text': 'I prefer tabs over spaces', 'hint': {'fact_type': 'preference'}},
+        ],
+    },
+    {
+        'name': 'get_current_state',
+        'description': 'Query ledger for the current non-superseded fact(s) for a subject',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'subject': 'string',
+                'predicate': 'string | null',
+            },
+            'output': 'dict with facts: list[TypedFact] | ErrorResponse',
+        },
+        'examples': [{'subject': 'user', 'predicate': 'preferred_editor'}],
+    },
+    {
+        'name': 'get_history',
+        'description': 'Retrieve full change history (all versions) for a subject/predicate',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'subject': 'string',
+                'predicate': 'string | null',
+            },
+            'output': 'dict with history: list[TypedFact] | ErrorResponse',
+        },
+        'examples': [{'subject': 'project-alpha', 'predicate': 'status'}],
+    },
+    {
+        'name': 'list_candidates',
+        'description': 'List quarantined fact candidates awaiting promotion review',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'status': '"pending" | "promoted" | "rejected" | null'},
+            'output': 'dict with candidates: list[Candidate]',
+        },
+        'examples': [{'status': 'pending'}],
+    },
+    {
+        'name': 'promote_candidate',
+        'description': 'Promote a candidate fact to the main memory ledger',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'candidate_id': 'string', 'resolution': 'string'},
+            'output': 'SuccessResponse | ErrorResponse',
+        },
+        'examples': [{'candidate_id': 'cand-001', 'resolution': 'Verified correct'}],
+    },
+    {
+        'name': 'reject_candidate',
+        'description': 'Reject a candidate fact, removing it from the pending queue',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'candidate_id': 'string'},
+            'output': 'SuccessResponse | ErrorResponse',
+        },
+        'examples': [{'candidate_id': 'cand-002'}],
+    },
+    {
+        'name': 'list_packs',
+        'description': 'List available context and workflow packs',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'filter': 'dict | null'},
+            'output': 'dict with packs: list[PackRegistry]',
+        },
+        'examples': [{'filter': {'scope': 'private'}}],
+    },
+    {
+        'name': 'get_context_pack',
+        'description': 'Retrieve a materialized context pack for prompt injection',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'pack_id': 'string', 'task': 'string | null'},
+            'output': 'PackMaterialized | ErrorResponse',
+        },
+        'examples': [{'pack_id': 'coding-defaults', 'task': 'write a Python function'}],
+    },
+    {
+        'name': 'get_workflow_pack',
+        'description': 'Retrieve a materialized workflow pack with step-by-step procedures',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'pack_id': 'string', 'task': 'string | null'},
+            'output': 'PackMaterialized | ErrorResponse',
+        },
+        'examples': [{'pack_id': 'deploy-workflow', 'task': 'deploy to staging'}],
+    },
+    {
+        'name': 'describe_pack',
+        'description': 'Get full definition of a pack including schema and metadata',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'pack_id': 'string'},
+            'output': 'PackDefinition | ErrorResponse',
+        },
+        'examples': [{'pack_id': 'coding-defaults'}],
+    },
+    {
+        'name': 'create_workflow_pack',
+        'description': 'Create a new workflow pack from a definition',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'definition': 'PackDefinition dict'},
+            'output': 'PackRegistry | ErrorResponse',
+        },
+        'examples': [{'definition': {'id': 'my-workflow', 'scope': 'private', 'steps': []}}],
+    },
+    {
+        'name': 'search_episodes',
+        'description': 'Search episodic memory by semantic query and optional time range',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'query': 'string',
+                'time_range': 'dict with start/end ISO timestamps | null',
+            },
+            'output': 'dict with episodes: list[Episode]',
+        },
+        'examples': [{'query': 'last deployment', 'time_range': None}],
+    },
+    {
+        'name': 'get_episode',
+        'description': 'Retrieve a specific episode by ID',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'episode_id': 'string'},
+            'output': 'Episode | ErrorResponse',
+        },
+        'examples': [{'episode_id': 'ep-001'}],
+    },
+    {
+        'name': 'search_procedures',
+        'description': 'Search procedural memory for relevant procedures',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'query': 'string'},
+            'output': 'dict with procedures: list[Procedure]',
+        },
+        'examples': [{'query': 'how to run tests'}],
+    },
+    {
+        'name': 'get_procedure',
+        'description': 'Retrieve a procedure by trigger phrase or ID',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'trigger_or_id': 'string'},
+            'output': 'Procedure | ErrorResponse',
+        },
+        'examples': [{'trigger_or_id': 'deploy to production'}],
+    },
+    {
+        'name': 'get_status',
+        'description': 'Get the status of the Graphiti MCP server and database connection',
+        'mode_hint': 'facts',
+        'schema': {
+            'inputs': {},
+            'output': 'StatusResponse',
+        },
+        'examples': [{}],
+    },
+    {
+        'name': 'get_tools',
+        'description': 'Return all available MCP methods with runtime schema and tooltips',
+        'mode_hint': 'both',
+        'schema': {
+            'inputs': {},
+            'output': 'list[ToolSchema]',
+        },
+        'examples': [{}],
+    },
+]
+
+
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None
@@ -1854,6 +2105,11 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     """
     global graphiti_service
 
+    if not _BICAMERAL_DEBUG_TOOLS:
+        logger.debug('get_entity_edge called without BICAMERAL_DEBUG_TOOLS=1 — returning method_unavailable')
+        return ErrorResponse(error='method_unavailable')
+    logger.debug('get_entity_edge called with BICAMERAL_DEBUG_TOOLS=1 for uuid=%r', uuid)
+
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
@@ -1884,6 +2140,11 @@ async def get_episodes(
         max_episodes: Maximum number of episodes to return (default: 10)
     """
     global graphiti_service
+
+    if not _BICAMERAL_DEBUG_TOOLS:
+        logger.debug('get_episodes called without BICAMERAL_DEBUG_TOOLS=1 — returning method_unavailable')
+        return ErrorResponse(error='method_unavailable')
+    logger.debug('get_episodes called with BICAMERAL_DEBUG_TOOLS=1')
 
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
@@ -2012,6 +2273,52 @@ async def get_status() -> StatusResponse:
             status='error',
             message=f'Graphiti MCP server is running but database connection failed: {error_msg}',
         )
+
+
+@mcp.tool()
+async def get_tools() -> list[dict[str, Any]]:
+    """Return all available MCP methods with runtime schema, tooltips, and mode hints.
+
+    Each tool entry includes:
+    - name: method name
+    - description: human-readable purpose
+    - mode_hint: "typed", "facts", or "both" indicating result_format support
+    - schema: JSON schema summary for inputs/outputs
+    - examples: usage examples
+
+    The mode_hint distinguishes legacy graph-edge methods ("facts") from
+    typed ledger methods ("typed"). Use "typed" methods for current-state
+    and structured queries; use "facts" for broad historical recall.
+
+    Debug-only tools (get_entity_edge, get_episodes) are omitted unless
+    BICAMERAL_DEBUG_TOOLS=1 is set.
+    """
+    tools = list(_GET_TOOLS_RESPONSE)
+    if _BICAMERAL_DEBUG_TOOLS:
+        tools.append({
+            'name': 'get_entity_edge',
+            'description': '[DEBUG] Get a raw entity edge by UUID',
+            'mode_hint': 'facts',
+            'schema': {
+                'inputs': {'uuid': 'string'},
+                'output': 'dict | ErrorResponse',
+            },
+            'examples': [{'uuid': 'some-uuid'}],
+        })
+        tools.append({
+            'name': 'get_episodes',
+            'description': '[DEBUG] Get raw episodes from the graph by group IDs',
+            'mode_hint': 'facts',
+            'schema': {
+                'inputs': {
+                    'group_ids': 'list[string] | null',
+                    'max_episodes': 'integer (default 10)',
+                },
+                'output': 'EpisodeSearchResponse | ErrorResponse',
+            },
+            'examples': [{'group_ids': None, 'max_episodes': 10}],
+        })
+    return tools
 
 
 @mcp.custom_route('/health', methods=['GET'])

@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "PackDefinition",
+  "title": "PackDefinition",
+  "description": "Full pack schema including registry metadata and rules",
+  "type": "object",
+  "required": [
+    "pack_id",
+    "scope",
+    "intent"
+  ],
+  "properties": {
+    "pack_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_-]+$"
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "context",
+        "workflow",
+        "both"
+      ]
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "consumer": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "default": "1.0"
+    },
+    "context_rules": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Rules for what facts to include as context"
+    },
+    "workflow_steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Ordered steps for the workflow"
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Other pack IDs that must be loaded first"
+    }
+  },
+  "additionalProperties": true
+}

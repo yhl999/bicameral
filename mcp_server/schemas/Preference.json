@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Preference",
+  "title": "Preference",
+  "description": "An owner-asserted preference fact",
+  "type": "object",
+  "required": [
+    "subject",
+    "predicate",
+    "value"
+  ],
+  "properties": {
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "The entity that holds this preference"
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "What the preference is about"
+    },
+    "value": {
+      "description": "The preferred value or setting"
+    },
+    "strength": {
+      "type": "string",
+      "enum": [
+        "weak",
+        "moderate",
+        "strong"
+      ],
+      "default": "moderate"
+    },
+    "context": {
+      "type": "string",
+      "description": "Context in which this preference applies"
+    }
+  },
+  "additionalProperties": true,
+  "examples": [
+    {
+      "subject": "user",
+      "predicate": "coding_style",
+      "value": "functional",
+      "strength": "strong"
+    }
+  ]
+}
