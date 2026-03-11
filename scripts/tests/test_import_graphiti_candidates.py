@@ -6,8 +6,6 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 # Mock external runtime dependencies before importing the script under test.
 # graph_driver and truth.candidates require a live Neo4j / SQLite runtime;
 # we only need to exercise the pure Python logic here.
@@ -24,7 +22,6 @@ from scripts.import_graphiti_candidates import (  # noqa: E402
     iter_anchor_aliases,
     load_anchors_from_config,
 )
-
 
 # ---------------------------------------------------------------------------
 # iter_anchor_aliases — Issue #1 fix: canonical_name must be included

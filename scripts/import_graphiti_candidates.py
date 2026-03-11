@@ -30,10 +30,11 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 
 from graph_driver import add_backend_args, get_sync_client
 
@@ -83,7 +84,7 @@ QUERY_STRATEGY_OM_NATIVE = "om_native"
 # Candidate-generating lane contract: every candidate lane must declare a lane
 # kind (OM-native vs Entity), and each lane kind must map to an importer query
 # strategy.
-CANDIDATE_LANE_KIND_BY_GROUP: Dict[str, str] = {
+CANDIDATE_LANE_KIND_BY_GROUP: dict[str, str] = {
     "s1_sessions_main": LANE_KIND_ENTITY,
     "s1_chatgpt_history": LANE_KIND_ENTITY,
     "s1_observational_memory": LANE_KIND_OM_NATIVE,
@@ -91,19 +92,19 @@ CANDIDATE_LANE_KIND_BY_GROUP: Dict[str, str] = {
     "s1_memory_day1": LANE_KIND_ENTITY,
 }
 
-QUERY_STRATEGY_BY_CANDIDATE_LANE_KIND: Dict[str, str] = {
+QUERY_STRATEGY_BY_CANDIDATE_LANE_KIND: dict[str, str] = {
     LANE_KIND_ENTITY: QUERY_STRATEGY_ENTITY_ANCHORED,
     LANE_KIND_OM_NATIVE: QUERY_STRATEGY_OM_NATIVE,
 }
 
-DEFAULT_CANDIDATE_GENERATING_LANES_FALLBACK: List[str] = [
+DEFAULT_CANDIDATE_GENERATING_LANES_FALLBACK: list[str] = [
     "s1_sessions_main",
     "s1_observational_memory",
     "s1_chatgpt_history",
 ]
 
 # OM-native canonical edge types for candidate extraction.
-OM_NATIVE_REL_TYPES: Tuple[str, ...] = (
+OM_NATIVE_REL_TYPES: tuple[str, ...] = (
     "MOTIVATES",
     "GENERATES",
     "SUPERSEDES",
@@ -117,8 +118,8 @@ OM_NATIVE_PAGE_SIZE = 500
 OM_NATIVE_MAX_PAGES = 2000
 
 
-def _ordered_unique(values: Iterable[str]) -> List[str]:
-    out: List[str] = []
+def _ordered_unique(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
     seen: set[str] = set()
     for v in values:
         vv = (v or "").strip()
@@ -131,7 +132,7 @@ def _ordered_unique(values: Iterable[str]) -> List[str]:
 
 def load_candidate_generating_lanes_from_registry(
     registry_path: Path = RUNTIME_PACK_REGISTRY_PATH,
-) -> List[str]:
+) -> list[str]:
     """Load lane_policy.candidate_generating list from runtime registry.
 
     Falls back to a safe static set when registry is missing/malformed.
@@ -150,9 +151,9 @@ def load_candidate_generating_lanes_from_registry(
     return list(DEFAULT_CANDIDATE_GENERATING_LANES_FALLBACK)
 
 
-def missing_candidate_lane_query_paths(candidate_lanes: Iterable[str]) -> List[str]:
+def missing_candidate_lane_query_paths(candidate_lanes: Iterable[str]) -> list[str]:
     """Return candidate lanes that lack an importer query strategy contract."""
-    missing: List[str] = []
+    missing: list[str] = []
     for lane in _ordered_unique(candidate_lanes):
         lane_kind = CANDIDATE_LANE_KIND_BY_GROUP.get(lane)
         if lane_kind is None:
@@ -212,8 +213,8 @@ def cypher_quote(s: str) -> str:
 def run_graph_query(
     graph: str,
     query: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[str], List[List[Any]], List[str]]:
+    params: dict[str, Any] | None = None,
+) -> tuple[list[str], list[list[Any]], list[str]]:
     """Run a Cypher query via the configured graph client."""
     return _graph_client.query(graph, query, params=params)
 
@@ -227,10 +228,10 @@ def run_graph_query(
 class Anchor:
     canonical_name: str
     subject_id: str
-    aliases: Tuple[str, ...]
+    aliases: tuple[str, ...]
 
 
-def load_anchors_from_config(path: str | None) -> List[Anchor]:
+def load_anchors_from_config(path: str | None) -> list[Anchor]:
     """Load anchors from a JSON config file, or return [] for anchor-less mode.
 
     Args:
@@ -256,7 +257,7 @@ def load_anchors_from_config(path: str | None) -> List[Anchor]:
 
 # Content graphs don't reliably emit anchor-sourced edges, so we import
 # RELATES_TO edges in a separate mode using source-entity-derived subjects.
-CONTENT_GRAPH_PREFIXES: Tuple[str, ...] = ("s1_inspiration_", "s1_content_strategy")
+CONTENT_GRAPH_PREFIXES: tuple[str, ...] = ("s1_inspiration_", "s1_content_strategy")
 
 
 def is_content_graph(graph: str) -> bool:
@@ -270,7 +271,7 @@ def to_content_subject_id(source_name: str) -> str:
     return f"content.source:{slug}"
 
 
-def iter_anchor_aliases(anchors: Iterable[Anchor]) -> Iterable[Tuple[str, str]]:
+def iter_anchor_aliases(anchors: Iterable[Anchor]) -> Iterable[tuple[str, str]]:
     """Yield (name, subject_id) pairs for every lookup name of each anchor.
 
     Yields the canonical_name first, then each alias.  Previously only aliases
@@ -291,7 +292,7 @@ def iter_anchor_aliases(anchors: Iterable[Anchor]) -> Iterable[Tuple[str, str]]:
 _INT_RE = re.compile(r"\b(\d{6,})\b")
 
 
-def parse_int_from_fact(fact: str) -> Optional[int]:
+def parse_int_from_fact(fact: str) -> int | None:
     if not fact:
         return None
     m = _INT_RE.search(fact)
@@ -303,7 +304,7 @@ def parse_int_from_fact(fact: str) -> Optional[int]:
         return None
 
 
-def parse_optimizing_for_list(fact: str) -> Optional[List[str]]:
+def parse_optimizing_for_list(fact: str) -> list[str] | None:
     """Heuristic parse for '... optimizing for X and Y ...'."""
     if not fact:
         return None
@@ -317,7 +318,7 @@ def parse_optimizing_for_list(fact: str) -> Optional[List[str]]:
     after = after.rstrip(".!")
 
     # Split on ' and ' / commas.
-    parts: List[str] = []
+    parts: list[str] = []
     for chunk in re.split(r"\band\b|,", after):
         c = chunk.strip()
         if not c:
@@ -326,7 +327,7 @@ def parse_optimizing_for_list(fact: str) -> Optional[List[str]]:
 
     # De-duplicate while preserving order
     seen = set()
-    out: List[str] = []
+    out: list[str] = []
     for p in parts:
         key = p.lower()
         if key in seen:
@@ -344,9 +345,9 @@ def map_relation_to_candidate(
     rel_name: str,
     fact: str,
     is_procedure_edge: bool = False,
-    a_labels: "list[str] | None" = None,
-    b_labels: "list[str] | None" = None,
-) -> Tuple[str, str, Any, float]:
+    a_labels: list[str] | None = None,
+    b_labels: list[str] | None = None,
+) -> tuple[str, str, Any, float]:
     """Return (predicate, assertion_type, value_obj, confidence).
 
     Routing priority:
@@ -451,7 +452,7 @@ def map_om_relation_to_candidate(
     dst_node_type: str,
     dst_content: str,
     dst_domain: str,
-) -> Tuple[str, str, Dict[str, Any], float]:
+) -> tuple[str, str, dict[str, Any], float]:
     """Conservative mapping for OM-native edges.
 
     Returns (predicate, assertion_type, value_obj, confidence).
@@ -470,7 +471,7 @@ def map_om_relation_to_candidate(
         assertion_type = "episode"
         confidence = 0.72
 
-    value: Dict[str, Any] = {
+    value: dict[str, Any] = {
         "source_node_type": (src_node_type or "OMNode"),
         "target_node_id": dst_node_id,
         "target_node_type": (dst_node_type or "OMNode"),
@@ -504,9 +505,9 @@ def import_graph(
     *,
     conn,
     graph: str,
-    anchors: List[Anchor],
+    anchors: list[Anchor],
     dry_run: bool,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     stats = {
         "rows": 0,
         "upserts": 0,
@@ -517,7 +518,7 @@ def import_graph(
 
     strategy = resolve_query_strategy_for_graph(graph)
 
-    def process_entity_rows(rows: List[List[Any]], idx: Dict[str, int], *, anchor_name: str, subject_id: str) -> None:
+    def process_entity_rows(rows: list[list[Any]], idx: dict[str, int], *, anchor_name: str, subject_id: str) -> None:
         for r in rows:
             stats["rows"] += 1
             try:
@@ -549,7 +550,7 @@ def import_graph(
                 if anchor_name == "content_unanchored":
                     effective_subject = to_content_subject_id(source)
 
-                evidence_ref: Dict[str, Any] = {
+                evidence_ref: dict[str, Any] = {
                     "source_key": f"graphiti:{graph}",
                     "chunk_key": f"rel:{rel_uuid}",
                     "evidence_id": rel_uuid,
@@ -596,7 +597,7 @@ def import_graph(
                 stats["errors"] += 1
                 print(f"ERROR row graph={graph} anchor={anchor_name}: {type(e).__name__}: {e}")
 
-    def process_om_rows(rows: List[List[Any]], idx: Dict[str, int]) -> None:
+    def process_om_rows(rows: list[list[Any]], idx: dict[str, int]) -> None:
         for r in rows:
             stats["rows"] += 1
             try:
@@ -653,7 +654,7 @@ def import_graph(
                     dst_domain=dst_domain,
                 )
 
-                evidence_ref: Dict[str, Any] = {
+                evidence_ref: dict[str, Any] = {
                     "source_key": f"graphiti:{graph}",
                     "chunk_key": f"om_rel:{evidence_id}",
                     "evidence_id": evidence_id,
@@ -742,7 +743,7 @@ def import_graph(
                 + om_return
                 + "SKIP $skip LIMIT $limit"
             )
-            base_params: Optional[Dict[str, Any]] = {
+            base_params: dict[str, Any] | None = {
                 "group_id": graph,
                 "rel_types": list(OM_NATIVE_REL_TYPES),
             }
