@@ -37,6 +37,27 @@ For the full architecture deep-dive, see [The Dual-Brain Architecture](docs/DUAL
 - Typed memory objects are first-class: **StateFact** (semantic), **Episode** (episodic), **Procedure** (procedural).
 - Target retrieval contract is explicit typed buckets (`state`, `episodes`, `procedures`, `evidence`) while preserving legacy compatibility during migration.
 
+### Storage & Truth Model (Current, Explicit)
+
+The three storage surfaces are intentionally different and **not redundant**:
+
+| Store | Primary role | Not this |
+|---|---|---|
+| **Neo4j** | Raw/projected memory surface for extraction, graph traversal, and retrieval ranking | Canonical truth history |
+| **`state/candidates.db`** | Staging + governance queue (verification, policy decisions, approvals/rejections) | Replacement for ChangeLedger |
+| **ChangeLedger** (`state/fact_ledger*.db`, typed ledger paths) | Canonical typed memory + event history | Complete log of every Graphiti/Neo4j mutation |
+
+Important nuance: ChangeLedger tracks canonical typed memory/history and selected provisional typed writes in specific flows. It does **not** mirror all graph-level mutations. Neo4j remains the raw/projection/search layer, and `candidates.db` remains the promotion/governance queue.
+
+#### Lane-specific mapping (what goes where)
+
+| Lane / domain | Neo4j | `candidates.db` | ChangeLedger |
+|---|---|---|---|
+| `s1_sessions_main` / `s1_chatgpt_history` | Primary extraction + retrieval surface | Candidate verification + promotion queue | Promoted typed memory/history written as events/objects |
+| `s1_observational_memory` (OM) | OMNode lifecycle + retrieval surface | OM verification + dead-letter/governance queue | Includes specific provisional typed writes and promoted typed outcomes |
+| `learning_self_audit` | Lane is retrievable today | Not in the v3 candidate-generating set | Target path is typed graduation; currently partial/in-progress |
+| `procedures` | Optional derived projection for retrieval/ranking | Procedure candidates can still be staged/governed when applicable | Canonical `Procedure` objects + success/failure lineage/history |
+
 ---
 
 ## How It Works: Three Layers

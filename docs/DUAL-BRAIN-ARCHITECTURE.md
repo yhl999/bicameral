@@ -27,7 +27,7 @@ We built **Brain 2** — the ChangeLedger: a strict, append-only event stream ba
 - Bad at: knowing what's true
 
 ### Brain 2: The ChangeLedger (SQLite)
-- Records every mutation as an immutable, hash-chained event
+- Records canonical typed-memory history as immutable, hash-chained events (**not** every Graphiti/Neo4j mutation)
 - Event types: `assert`, `supersede`, `invalidate`, `refine`, `derive`, `promote`, `procedure_success`, `procedure_failure`
 - Good at: truth governance, audit trails, rollback, conflict resolution
 - Bad at: semantic understanding
@@ -100,6 +100,8 @@ We chose C because the alternative is an AI that eventually believes it's a die-
 4. **Conflict Detection (Brain 2):** Before promotion, the system checks for contradictions with existing promoted facts. Conflicts are flagged, never silently resolved.
 
 5. **ChangeLedger Event (Brain 2):** Promotion writes an immutable `promote` event. Supersession writes a `supersede` event with explicit chain references. The old fact is not deleted — it's marked as superseded with a timestamp and pointer to its replacement.
+
+   **Scope boundary:** ChangeLedger is canonical for typed memory/history and promotion decisions. It is not a mirror of all graph mutations; `candidates.db` remains the staging/governance queue, and Neo4j remains the raw/projection surface.
 
 6. **Trust Sync (Bridge):** After promotion, sync stamps `trust_score = 1.0` on corresponding Brain 1 edges. Unpromoted edges get `0.25` or NULL.
 

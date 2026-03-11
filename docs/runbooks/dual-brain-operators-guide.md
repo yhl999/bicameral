@@ -2,7 +2,7 @@
 
 This runbook explains how to operate the Dual-Brain system in practice: when to approve facts, how to handle conflicts, and how to debug when Brain 1 and Brain 2 disagree.
 
-> **Architecture note:** Brain 2 is the **ChangeLedger** — an append-only, hash-chained event stream that records every assertion, supersession, invalidation, and promotion. The typed memory rescope (in progress) layers StateFact, Episode, and Procedure typed objects on top of the ChangeLedger governance.
+> **Architecture note:** Brain 2 is the **ChangeLedger** — an append-only, hash-chained event stream for canonical typed-memory history (assert/supersede/invalidate/promote/procedure events). It is **not** a log of every Graphiti/Neo4j mutation. `candidates.db` remains the staging/governance queue, and Neo4j remains the raw/projection/search surface.
 >
 > **Operational status:** Runtime retrieval is QMD-primary; Graphiti-primary flip is gated on passing the must-win evaluation suite. See private repo `docs/runbooks/operator-rollout-runbook.md` for the decision flow.
 >
