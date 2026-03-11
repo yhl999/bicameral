@@ -17,9 +17,10 @@ import copy
 import logging
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import yaml
 from pydantic import BaseModel
@@ -202,6 +203,16 @@ class OntologyRegistry:
 
     # ── Factory ────────────────────────────────────────────────
 
+    @staticmethod
+    def _load_yaml_document(source_path: Path) -> dict[str, Any]:
+        """Load a single ontology YAML file into a dict document."""
+        source_raw = yaml.safe_load(source_path.read_text()) or {}
+        if not isinstance(source_raw, dict):
+            raise ValueError(
+                f"Ontology config {source_path} must deserialize to a mapping, got {type(source_raw).__name__}"
+            )
+        return source_raw
+
     @classmethod
     def load(
         cls,
@@ -228,21 +239,33 @@ class OntologyRegistry:
             A populated :class:`OntologyRegistry`.
 
         Raises:
-            FileNotFoundError: If any configured path does not exist.
-            yaml.YAMLError: If any file is not valid YAML.
-            ValueError: If a loaded document is not a mapping.
+            FileNotFoundError: If the base path does not exist.
+            yaml.YAMLError: If the base file does not contain valid YAML.
+            ValueError: If the base document is not a mapping.
+
+        Overlay documents are optional. If an overlay path is missing or invalid,
+        this method emits a warning and continues with the remaining overlays,
+        preserving the base ontology behavior.
         """
         base_path = Path(path)
-        paths = [base_path, *(Path(p) for p in (overlay_paths or ()))]
+        overlay_paths = [Path(p) for p in (overlay_paths or ())]
+        paths = [base_path, *overlay_paths]
         logger.info("Loading extraction ontologies from %s", ", ".join(str(p) for p in paths))
 
         raw: dict[str, Any] = {}
-        for source_path in paths:
-            source_raw = yaml.safe_load(source_path.read_text()) or {}
-            if not isinstance(source_raw, dict):
-                raise ValueError(
-                    f"Ontology config {source_path} must deserialize to a mapping, got {type(source_raw).__name__}"
+        for idx, source_path in enumerate(paths):
+            try:
+                source_raw = cls._load_yaml_document(source_path)
+            except (FileNotFoundError, OSError, ValueError, yaml.YAMLError) as error:
+                if idx == 0:
+                    raise
+                logger.warning(
+                    "Skipping ontology overlay %s due load failure: %s",
+                    source_path,
+                    error,
                 )
+                continue
+
             raw = _merge_ontology_documents(raw, source_raw)
 
         profiles: dict[str, OntologyProfile] = {}
