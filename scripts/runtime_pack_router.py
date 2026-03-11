@@ -957,7 +957,9 @@ def _graphiti_search_facts(
 
     tool_result = tool_result_envelope.get('result')
     if isinstance(tool_result, dict) and tool_result.get('isError'):
-        raise RuntimeError(f'Graphiti tool error: {tool_result.get("error", "unknown error")}')
+        _content = tool_result.get('content', [])
+        _msg = _content[0].get('text', 'unknown error') if _content else 'unknown error'
+        raise RuntimeError(f'Graphiti tool error: {_msg}')
     payload = _extract_graphiti_tool_payload(tool_result)
 
     facts_raw = payload.get('facts')
@@ -1020,7 +1022,8 @@ def _materialization_query(source: str, task_query: str) -> str:
         return hint
     if source.startswith('graphiti_') and source not in MATERIALIZE_QUERY_HINTS:
         logger.warning(
-            f'No MATERIALIZE_QUERY_HINTS entry for source={source}; falling back to task query. Consider adding an entry.'
+            'No MATERIALIZE_QUERY_HINTS entry for source=%s; falling back to task query. Consider adding an entry.',
+            source.replace('\n', '\\n').replace('\r', '\\r')[:128],
         )
     return task
 

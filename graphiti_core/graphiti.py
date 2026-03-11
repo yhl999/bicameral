@@ -170,6 +170,14 @@ def _phase3c_source_chunk_key(source_description: str) -> str:
 
 
 def _phase3c_allows_short_craft_text(group_id: str, labels: set[str]) -> bool:
+    """
+    Check if short craft nodes should bypass the 4-token minimum gate.
+
+    Assumes craft node content is ingestion-controlled; sanitize at ingest boundary.
+    This gate only exempts nodes with craft-type labels (SignaturePhrase, RegisterMarker,
+    VoiceFingerprint, StructuralPattern, ToneShift). Non-craft nodes in these lanes
+    still enforce the full PHASE3C_REQUIRED_FIELDS validation and 4-token gate.
+    """
     return group_id in ('s1_writing_samples', 's1_inspiration_short_form', 's1_inspiration_long_form') and bool(
         labels & PHASE3C_WRITING_SAMPLES_SHORT_CRAFT_TYPES
     )
