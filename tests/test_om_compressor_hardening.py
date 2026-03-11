@@ -778,6 +778,32 @@ def test_call_llm_extract_responses_api_path_parsed(monkeypatch: pytest.MonkeyPa
     assert len(result.edges) == 0
 
 
+
+def test_call_llm_extract_responses_api_input_includes_json_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Responses API requests include a lowercase 'json' token in input for json_object."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("OM_COMPRESSOR_LLM_API_STYLE", raising=False)
+
+    msgs = _make_messages(1)
+    cfg = _make_cfg(model_id="gpt-5.1-codex-mini")
+
+    fake_resp = _make_fake_http_response(
+        _responses_api_response_wrapping(json.dumps({"nodes": [], "edges": []}))
+    )
+
+    with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+        om_compressor._call_llm_extract(msgs, cfg)
+
+    request = mock_urlopen.call_args.args[0]
+    payload = json.loads(request.data.decode("utf-8"))
+    assert "input" in payload
+    assert isinstance(payload["input"], str)
+    assert "json" in payload["input"].lower()
+    assert payload.get("text", {}).get("format", {}).get("type") == "json_object"
+
+
 def test_call_llm_extract_responses_api_empty_output_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """_call_llm_extract raises on responses API shape with no output_text."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")

@@ -1173,6 +1173,22 @@ def _extract_content_from_response(resp_data: Any, api_style: str) -> str:
     return content_str.strip()
 
 
+def _ensure_json_input_prompt(prompt: str) -> str:
+    """Ensure responses API prompts include an explicit lowercase json contract cue.
+
+    gpt-5 responses-style models require the input to contain a json contract cue
+    when requesting json_object output. Keep this helper narrowly scoped so chat
+    model prompts remain unchanged.
+    """
+    if "json" in prompt.lower():
+        return prompt
+    return (
+        "IMPORTANT: Respond with a JSON object. "
+        "Your entire response must be valid JSON with exact key names.\n\n"
+        + prompt
+    )
+
+
 def _call_llm_extract(messages: list[MessageRow], cfg: ExtractorConfig) -> ExtractedChunk:
     """Call the LLM API to extract OM nodes and edges.
 
@@ -1208,7 +1224,7 @@ def _call_llm_extract(messages: list[MessageRow], cfg: ExtractorConfig) -> Extra
         payload: dict[str, Any] = {
             "model": cfg.model_id,
             "instructions": _OM_EXTRACT_SYSTEM_PROMPT,
-            "input": user_prompt,
+            "input": _ensure_json_input_prompt(user_prompt),
             "text": {"format": {"type": "json_object"}},
         }
     else:
