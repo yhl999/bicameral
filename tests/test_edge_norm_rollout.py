@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # 1. Public export
 # ---------------------------------------------------------------------------
@@ -130,7 +129,7 @@ class TestUniversalNormalizationInExtractEdges:
             norm = _normalize_relation_type(edge_data.relation_type)
             edge_data.relation_type = norm
 
-        for edge_data, exp in zip(edges, expected):
+        for edge_data, exp in zip(edges, expected, strict=False):
             assert edge_data.relation_type == exp, (
                 f'Expected {exp!r}, got {edge_data.relation_type!r}'
             )
@@ -251,7 +250,6 @@ class TestCypherQueryModelCorrectness:
     def test_run_dry_run_uses_correct_queries_via_mock(self):
         """run() with mocked Neo4j driver exercises both scan + update paths
         and returns the number of edges that need normalization."""
-        from unittest.mock import MagicMock, call
 
         # Simulate two edges: one canonical, one needing normalization
         fake_edges = [

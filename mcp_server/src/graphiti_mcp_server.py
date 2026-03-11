@@ -41,6 +41,7 @@ try:
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
     )
+    from .services.om_typed_projection import OMTypedProjectionService
     from .services.ontology_registry import OntologyRegistry
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
@@ -63,6 +64,7 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
     )
+    from services.om_typed_projection import OMTypedProjectionService
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
@@ -1499,7 +1501,12 @@ async def _search_typed_memory_contract(
             effective_group_ids=effective_group_ids,
         )
 
-        service = TypedRetrievalService()
+        service = TypedRetrievalService(
+            om_projection_service=OMTypedProjectionService(
+                search_service=search_service,
+                graphiti_service=graphiti_service,
+            )
+        )
         return await service.search(
             query=query,
             object_types=object_types,
@@ -1508,6 +1515,7 @@ async def _search_typed_memory_contract(
             current_only=current_only,
             max_results=max_results,
             max_evidence=max_evidence,
+            effective_group_ids=effective_group_ids,
         )
     except Exception as e:
         error_msg = str(e)

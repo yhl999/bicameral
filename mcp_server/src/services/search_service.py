@@ -46,6 +46,14 @@ def _row_uuid(row: dict[str, Any]) -> str:
     return str(row.get('uuid') or '').strip()
 
 
+def _row_group_id(row: dict[str, Any]) -> str:
+    return str(row.get('group_id') or '').strip()
+
+
+def _combined_om_row_identity(row: dict[str, Any]) -> tuple[str, str]:
+    return (_row_group_id(row), _row_uuid(row))
+
+
 def _row_lexical_score(row: dict[str, Any]) -> float:
     try:
         return float(row.get('lexical_score') or 0.0)
@@ -69,17 +77,17 @@ def _combined_om_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         -_row_lexical_score(row),
         -_row_created_at_timestamp(row),
-        str(row.get('group_id') or ''),
+        _row_group_id(row),
         _row_uuid(row),
     )
 
 
 def _rank_combined_om_rows(rows: list[dict[str, Any]], *, max_items: int) -> list[dict[str, Any]]:
-    deduped: dict[str, dict[str, Any]] = {}
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
 
     for row in rows:
-        row_id = _row_uuid(row)
-        if not row_id:
+        row_id = _combined_om_row_identity(row)
+        if not row_id[1]:
             continue
 
         existing = deduped.get(row_id)
@@ -212,6 +220,11 @@ class SearchService:
             source_content = str(row.get('source_content') or '').strip()
             target_content = str(row.get('target_content') or '').strip()
             created_at = row.get('created_at')
+            valid_at = row.get('valid_at')
+            invalid_at = row.get('invalid_at')
+            relation_properties = row.get('relation_properties')
+            if not isinstance(relation_properties, dict):
+                relation_properties = {}
 
             facts.append(
                 {
@@ -222,8 +235,8 @@ class SearchService:
                     'source_node_uuid': source_node_id,
                     'target_node_uuid': target_node_id,
                     'created_at': str(created_at) if created_at is not None else None,
-                    'valid_at': None,
-                    'invalid_at': None,
+                    'valid_at': str(valid_at) if valid_at is not None else None,
+                    'invalid_at': str(invalid_at) if invalid_at is not None else None,
                     'expired_at': None,
                     'episodes': [],
                     'attributes': {
@@ -231,6 +244,7 @@ class SearchService:
                         'lexical_score': row.get('lexical_score'),
                         'source_content': source_content,
                         'target_content': target_content,
+                        'relation_properties': relation_properties,
                     },
                 }
             )

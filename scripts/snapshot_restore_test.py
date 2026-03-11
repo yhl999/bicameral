@@ -13,7 +13,13 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from migration_sync_lib import ensure_within_root, now_utc_iso, resolve_repo_root, resolve_safe_child, sha256_file
+from migration_sync_lib import (
+    ensure_within_root,
+    now_utc_iso,
+    resolve_repo_root,
+    resolve_safe_child,
+    sha256_file,
+)
 
 
 def _resolve_repo_path(repo_root: Path, candidate: Path, *, context: str) -> Path:

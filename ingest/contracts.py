@@ -76,7 +76,7 @@ def validate_determinism(chunks_a: list[dict], chunks_b: list[dict]) -> list[str
     if len(chunks_a) != len(chunks_b):
         errors.append(f'chunk count differs: {len(chunks_a)} vs {len(chunks_b)}')
         return errors
-    for i, (a, b) in enumerate(zip(chunks_a, chunks_b)):
+    for i, (a, b) in enumerate(zip(chunks_a, chunks_b, strict=False)):
         if a.get('chunk_id') != b.get('chunk_id'):
             errors.append(
                 f'chunk[{i}] chunk_id differs: {a.get("chunk_id")} vs {b.get("chunk_id")}'

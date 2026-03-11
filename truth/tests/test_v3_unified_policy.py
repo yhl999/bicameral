@@ -32,6 +32,8 @@ from typing import Any
 
 import pytest
 
+from mcp_server.src.services.change_ledger import ChangeLedger
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Import module under test
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,6 +56,13 @@ def _in_memory_db() -> sqlite3.Connection:
     conn = candidates.connect(":memory:")
     return conn
 
+
+
+
+def _in_memory_ledger() -> ChangeLedger:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    return ChangeLedger(conn)
 
 def _minimal_candidate(**overrides: Any) -> dict[str, Any]:
     defaults: dict[str, Any] = {
@@ -709,12 +718,14 @@ class TestPromotionPolicyV3GateIntegration:
         try:
             from tests.test_promotion_policy_v3_runtime import _FakeDriver
             driver = _FakeDriver(nodes_created=1)
+            ledger = _in_memory_ledger()
             result = ppv3.promote_candidate(
                 candidate_id=candidate_id,
                 verification=self._corroborated_verification(candidate_id),
                 hard_block_check=self._no_block,
                 neo4j_driver=driver,
                 candidates_conn=conn,
+                ledger=ledger,
             )
             assert result["promoted"] is True, (
                 f"Expected promoted=True, got reason={result.get('reason')!r}"
@@ -761,12 +772,14 @@ class TestPromotionPolicyV3GateIntegration:
 
             from tests.test_promotion_policy_v3_runtime import _FakeDriver
             driver = _FakeDriver(nodes_created=1)
+            ledger = _in_memory_ledger()
             result = ppv3.promote_candidate(
                 candidate_id=candidate_id,
                 verification=self._corroborated_verification(candidate_id),
                 hard_block_check=self._no_block,
                 neo4j_driver=driver,
                 candidates_conn=conn,
+                ledger=ledger,
             )
             # Gate was skipped; verification passed; hard_block passed → promoted
             assert result["promoted"] is True, (
@@ -895,12 +908,14 @@ class TestPromotionPolicyV3GateIntegration:
 
             from tests.test_promotion_policy_v3_runtime import _FakeDriver
             driver = _FakeDriver(nodes_created=1)
+            ledger = _in_memory_ledger()
             result = ppv3.promote_candidate(
                 candidate_id=r.candidate_id,
                 verification=self._corroborated_verification(r.candidate_id),
                 hard_block_check=self._no_block,
                 neo4j_driver=driver,
                 candidates_conn=conn,
+                ledger=ledger,
             )
             assert result["promoted"] is True, (
                 f"Supersede gate should allow. reason={result.get('reason')!r}"

@@ -54,7 +54,7 @@ def test_search_memory_facts_typed_mode_reuses_lane_scope_and_skips_graphiti_dep
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
         server.graphiti_service = None
-        server.TypedRetrievalService = lambda: fake_service
+        server.TypedRetrievalService = lambda **kwargs: fake_service
 
         response = _run(
             server.search_memory_facts(
@@ -115,7 +115,7 @@ def test_search_memory_facts_typed_mode_intersects_caller_source_lane_filter_wit
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.TypedRetrievalService = lambda: fake_service
+        server.TypedRetrievalService = lambda **kwargs: fake_service
 
         _run(
             server.search_memory_facts(
@@ -162,7 +162,7 @@ def test_search_memory_facts_typed_mode_honors_explicit_max_results():
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.TypedRetrievalService = lambda: fake_service
+        server.TypedRetrievalService = lambda **kwargs: fake_service
 
         _run(
             server.search_memory_facts(
@@ -202,7 +202,7 @@ def test_search_memory_facts_typed_mode_rejects_malformed_source_lane_filter_fai
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.TypedRetrievalService = lambda: fake_service
+        server.TypedRetrievalService = lambda **kwargs: fake_service
 
         response = _run(
             server.search_memory_facts(
@@ -290,7 +290,7 @@ def test_search_memory_facts_typed_mode_caps_requested_limits_before_service_cal
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.TypedRetrievalService = lambda: fake_service
+        server.TypedRetrievalService = lambda **kwargs: fake_service
 
         _run(
             server.search_memory_facts(
@@ -308,6 +308,106 @@ def test_search_memory_facts_typed_mode_caps_requested_limits_before_service_cal
 
     assert fake_service.calls[0]['max_results'] == 200
     assert fake_service.calls[0]['max_evidence'] == 200
+
+
+def test_search_memory_facts_typed_mode_wires_om_projection_service():
+    """Verify that the typed path creates TypedRetrievalService with OM projection wired."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_service_cls = server.TypedRetrievalService
+    original_projection_cls = server.OMTypedProjectionService
+
+    captured_kwargs = {}
+
+    class _CapturingService:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        async def search(self, **kwargs):
+            return {
+                'message': 'Typed memory retrieved successfully',
+                'query_mode': 'all',
+                'state': [],
+                'episodes': [],
+                'procedures': [],
+                'evidence': [],
+                'counts': {'state': 0, 'episodes': 0, 'procedures': 0, 'evidence': 0},
+            }
+
+    class _FakeProjection:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.TypedRetrievalService = lambda **kwargs: _CapturingService(**kwargs)
+        server.OMTypedProjectionService = lambda **kwargs: _FakeProjection(**kwargs)
+
+        _run(
+            server.search_memory_facts(
+                query='heap cap',
+                group_ids=['s1_observational_memory'],
+                result_format='typed',
+                max_facts=5,
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.TypedRetrievalService = original_service_cls
+        server.OMTypedProjectionService = original_projection_cls
+
+    assert 'om_projection_service' in captured_kwargs
+    assert isinstance(captured_kwargs['om_projection_service'], _FakeProjection)
+
+
+def test_search_memory_facts_typed_mode_passes_effective_group_ids_to_service():
+    """Verify effective_group_ids flow through to typed retrieval service search."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_service_cls = server.TypedRetrievalService
+
+    search_calls = []
+
+    class _TrackingService:
+        def __init__(self, **kwargs):
+            pass
+
+        async def search(self, **kwargs):
+            search_calls.append(kwargs)
+            return {
+                'message': 'Typed memory retrieved successfully',
+                'query_mode': 'all',
+                'state': [],
+                'episodes': [],
+                'procedures': [],
+                'evidence': [],
+                'counts': {'state': 0, 'episodes': 0, 'procedures': 0, 'evidence': 0},
+            }
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.TypedRetrievalService = lambda **kwargs: _TrackingService(**kwargs)
+
+        _run(
+            server.search_memory_facts(
+                query='heap cap',
+                group_ids=['s1_observational_memory'],
+                result_format='typed',
+                max_facts=5,
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.TypedRetrievalService = original_service_cls
+
+    assert len(search_calls) == 1
+    assert search_calls[0]['effective_group_ids'] == ['s1_observational_memory']
 
 
 def test_search_memory_facts_rejects_unknown_result_format():

@@ -10,7 +10,6 @@ from graphiti_core.utils.content_chunking import (
     ChunkBoundary,
     SmartCutterConfig,
     chunk_conversation_semantic,
-    estimate_tokens,
     graphiti_lane_merge,
     om_lane_split,
 )
@@ -87,7 +86,7 @@ class TestChunkConversationSemantic(unittest.TestCase):
         r1 = chunk_conversation_semantic(msgs)
         r2 = chunk_conversation_semantic(msgs)
         self.assertEqual(len(r1), len(r2))
-        for a, b in zip(r1, r2):
+        for a, b in zip(r1, r2, strict=False):
             self.assertEqual(a.chunk_id, b.chunk_id)
             self.assertEqual(a.message_ids, b.message_ids)
 
@@ -97,7 +96,7 @@ class TestChunkConversationSemantic(unittest.TestCase):
         self.assertEqual(len(result), 1)
         chunk = result[0]
         expected_id = hashlib.sha256(
-            f'smartcut|msg_0000|msg_0002|3'.encode('utf-8')
+            b'smartcut|msg_0000|msg_0002|3'
         ).hexdigest()
         self.assertEqual(chunk.chunk_id, expected_id)
 

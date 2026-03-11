@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Optional
-
 
 _QUEUE_SERVICE_LINE_RE = re.compile(
     r"^(?:[^|]+\|\s*)?"
@@ -33,22 +32,19 @@ class QueueServiceEvent:
     timestamp: str  # ISO-8601 Z, second precision
     event_type: str  # processing | succeeded | failed
     group_id: str
-    episode_uuid: Optional[str]
-    failure_reason: Optional[str]
+    episode_uuid: str | None
+    failure_reason: str | None
     raw_line: str
 
 
 def _normalize_ts(ts_text: str) -> str:
     raw = str(ts_text or "").strip().replace(" ", "T")
     dt = datetime.fromisoformat(raw)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
+    dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _normalize_episode(token: Optional[str]) -> Optional[str]:
+def _normalize_episode(token: str | None) -> str | None:
     t = str(token or "").strip()
     if not t:
         return None
@@ -57,7 +53,7 @@ def _normalize_episode(token: Optional[str]) -> Optional[str]:
     return t
 
 
-def parse_queue_service_line(line: str) -> Optional[QueueServiceEvent]:
+def parse_queue_service_line(line: str) -> QueueServiceEvent | None:
     """Parse one queue-service line.
 
     Returns None for non-queue-service lines or unsupported message formats.

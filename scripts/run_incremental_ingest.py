@@ -23,7 +23,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # Shared queue schema + helpers (single source of truth).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -56,7 +56,7 @@ def _utc_iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _parse_iso(s: str) -> Optional[datetime]:
+def _parse_iso(s: str) -> datetime | None:
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -166,7 +166,7 @@ def _compute_backoff_seconds(attempt: int) -> float:
     return max(1.0, float(seconds))
 
 
-def _error_tag(exc: BaseException, *, exit_code: Optional[int] = None) -> str:
+def _error_tag(exc: BaseException, *, exit_code: int | None = None) -> str:
     # Avoid storing raw exception messages; keep stable + safe tags.
     name = type(exc).__name__
     if exit_code is None:
@@ -202,7 +202,7 @@ def _requeue_stale_running(conn: sqlite3.Connection, now_iso: str, cutoff_iso: s
     return int(cur.rowcount or 0)
 
 
-def _claim_next_runnable(conn: sqlite3.Connection, now_iso: str) -> Optional[dict[str, Any]]:
+def _claim_next_runnable(conn: sqlite3.Connection, now_iso: str) -> dict[str, Any] | None:
     """Atomically claim the next runnable job.
 
     IMPORTANT: `BEGIN IMMEDIATE` must happen before the SELECT to avoid TOCTOU races
@@ -306,7 +306,7 @@ def _mark_failed(
     attempts: int,
     max_attempts: int,
     error_tag: str,
-    exit_code: Optional[int],
+    exit_code: int | None,
     duration_s: float,
 ) -> None:
     if attempts >= max_attempts:
@@ -437,7 +437,7 @@ def _build_command(
     job: dict[str, Any],
     *,
     dry_run: bool,
-    sessions_evidence_path: Optional[Path] = None,
+    sessions_evidence_path: Path | None = None,
 ) -> list[str]:
     job_type = str(job.get("job_type") or "")
     payload_json = str(job.get("payload_json") or "{}")
@@ -500,9 +500,9 @@ def _execute_job(
     force_refresh_sessions_evidence: bool,
     sessions_dir: Path,
     evidence_out: Path,
-) -> tuple[bool, Optional[int]]:
+) -> tuple[bool, int | None]:
     job_type = str(job.get("job_type") or "")
-    sessions_evidence_path: Optional[Path] = None
+    sessions_evidence_path: Path | None = None
 
     if job_type == "sessions_incremental":
         sessions_evidence_path = _sessions_evidence_path(evidence_out)
@@ -593,8 +593,8 @@ def _run_once(
 
     started = time.monotonic()
     ok = False
-    exit_code: Optional[int] = None
-    err_tag: Optional[str] = None
+    exit_code: int | None = None
+    err_tag: str | None = None
 
     try:
         ok, exit_code = _execute_job(

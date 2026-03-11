@@ -29,6 +29,9 @@ def test_contract_check_passes_when_harness_keys_match_schema():
                 'search_mode',
                 'max_facts',
                 'center_node_uuid',
+                'result_format',
+                'max_results',
+                'max_evidence',
             ],
             'search_nodes': [
                 'query',
@@ -73,6 +76,12 @@ def test_contract_check_fails_closed_on_unsupported_harness_arg():
 
     contract = evaluate_mcp_contract(tools_list_response=response)
     assert contract['passed'] is False
-    assert contract['unsupported_args']['search_memory_facts'] == ['center_node_uuid', 'search_mode']
+    assert contract['unsupported_args']['search_memory_facts'] == [
+        'center_node_uuid',
+        'max_evidence',
+        'max_results',
+        'result_format',
+        'search_mode',
+    ]
     assert contract['unsupported_args']['search_nodes'] == ['entity_types', 'search_mode']
     assert contract['missing_required_args'] == {}

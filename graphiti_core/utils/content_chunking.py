@@ -14,25 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
 import math
+import os as _os
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from itertools import combinations
 from math import comb
-from typing import TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from graphiti_core.helpers import (
-    CHUNK_DENSITY_THRESHOLD,
-    CHUNK_MIN_TOKENS,
-    CHUNK_OVERLAP_TOKENS,
-    CHUNK_TOKEN_SIZE,
-)
-from graphiti_core.nodes import EpisodeType
+# Chunking configuration constants — defined locally to avoid pulling in the
+# heavy ``graphiti_core.helpers`` module (which transitively imports numpy).
+# The authoritative defaults mirror those in ``helpers.py``; runtime values
+# are still read from the environment so operator overrides keep working.
+CHUNK_TOKEN_SIZE = int(_os.getenv('CHUNK_TOKEN_SIZE', 3000))
+CHUNK_OVERLAP_TOKENS = int(_os.getenv('CHUNK_OVERLAP_TOKENS', 200))
+CHUNK_MIN_TOKENS = int(_os.getenv('CHUNK_MIN_TOKENS', 1000))
+CHUNK_DENSITY_THRESHOLD = float(_os.getenv('CHUNK_DENSITY_THRESHOLD', 0.15))
+
+if TYPE_CHECKING:
+    from graphiti_core.nodes import EpisodeType
+
+_EpisodeTypeRuntime: Any
+try:
+    from graphiti_core.nodes import EpisodeType as _EpisodeTypeRuntime
+except ImportError:  # pragma: no cover - allows lightweight constant-only imports
+    _EpisodeTypeRuntime = type('_EpisodeTypeRuntime', (), {'json': 'json'})
+
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +115,7 @@ def _estimate_high_density(content: str, episode_type: EpisodeType, tokens: int)
     Returns:
         True if content appears to have high entity density
     """
-    if episode_type == EpisodeType.json:
+    if episode_type == _EpisodeTypeRuntime.json:
         return _json_likely_dense(content, tokens)
     else:
         return _text_likely_dense(content, tokens)

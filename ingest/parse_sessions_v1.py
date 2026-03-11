@@ -26,16 +26,16 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from common import extract_message_id, write_evidence_batch
-
 
 WINDOW_EVENTS = 200
 OVERLAP_EVENTS = 50
@@ -49,13 +49,13 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _iso_or_none(dt: Optional[datetime]) -> Optional[str]:
+def _iso_or_none(dt: datetime | None) -> str | None:
     if not dt:
         return None
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _parse_iso(ts: str | None) -> Optional[datetime]:
+def _parse_iso(ts: str | None) -> datetime | None:
     if not ts:
         return None
     try:
@@ -65,7 +65,7 @@ def _parse_iso(ts: str | None) -> Optional[datetime]:
 
 
 def read_jsonl(file_path: Path) -> Iterator[dict[str, Any]]:
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -130,13 +130,13 @@ _TELEGRAM_UTC_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+UTC")
 @dataclass(frozen=True)
 class MsgEvent:
     event_id: str
-    timestamp: Optional[datetime]
+    timestamp: datetime | None
     role: str  # user|assistant
     speaker_id: str  # tg:<id>|assistant:archibald|unknown
     speaker_label: str
     text: str
-    tg_message_id: Optional[str] = None
-    telegram_chat_id: Optional[int] = None
+    tg_message_id: str | None = None
+    telegram_chat_id: int | None = None
 
 
 def _split_telegram_blocks(text: str) -> list[str]:
@@ -163,7 +163,7 @@ def _parse_telegram_header(block: str) -> tuple[dict[str, Any], str]:
     body = (m.group("body") or "").strip()
 
     ts_match = _TELEGRAM_UTC_TS_RE.search(block)
-    header_ts: Optional[datetime] = None
+    header_ts: datetime | None = None
     if ts_match:
         try:
             header_ts = datetime.strptime(
@@ -185,7 +185,7 @@ def _parse_telegram_header(block: str) -> tuple[dict[str, Any], str]:
     )
 
 
-def _infer_scope_from_chat(chat_id: Optional[int], chat_type: Optional[str]) -> Optional[str]:
+def _infer_scope_from_chat(chat_id: int | None, chat_type: str | None) -> str | None:
     if chat_id is None and not chat_type:
         return None
 
@@ -207,7 +207,7 @@ def _infer_scope_from_chat(chat_id: Optional[int], chat_type: Optional[str]) -> 
 
 def _parse_user_block_as_telegram(
     block: str,
-) -> list[tuple[str, str, Optional[int], Optional[str], str, Optional[datetime]]]:
+) -> list[tuple[str, str, int | None, str | None, str, datetime | None]]:
     """Parse a single Telegram message block starting with a [Telegram ...] header.
 
     Returns list of:
@@ -215,9 +215,9 @@ def _parse_user_block_as_telegram(
     """
 
     meta, body = _parse_telegram_header(block)
-    chat_id: Optional[int] = meta.get("chat_id")
-    chat_type: Optional[str] = meta.get("chat_type")
-    ts: Optional[datetime] = meta.get("header_timestamp")
+    chat_id: int | None = meta.get("chat_id")
+    chat_type: str | None = meta.get("chat_type")
+    ts: datetime | None = meta.get("header_timestamp")
 
     # Remove trailing Telegram message_id marker, if present.
     body = re.sub(r"\s*\[message_id:\s*\d+\]\s*$", "", body).strip()

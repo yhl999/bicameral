@@ -21,8 +21,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
-
+from typing import Any
 
 sys.dont_write_bytecode = True
 
@@ -72,7 +71,7 @@ def _resolve_case_path(path: Path) -> Path:
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
     resolved = _resolve_case_path(path)
-    with open(resolved, "r", encoding="utf-8") as f:
+    with open(resolved, encoding="utf-8") as f:
         data = json.load(f)
 
     if isinstance(data, dict) and isinstance(data.get("cases"), list):
@@ -110,9 +109,7 @@ def _has_provenance(item: dict[str, Any]) -> bool:
     if isinstance(refs, list) and len(refs) > 0:
         return True
     source_key = item.get("source_key")
-    if source_key:
-        return True
-    return False
+    return bool(source_key)
 
 
 def _is_scope_violation(item_scope: str, requested_scope: str) -> bool:
@@ -419,7 +416,7 @@ def main() -> int:
     cases = load_cases(cases_path)
 
     # Extract version from cases file metadata
-    with open(_resolve_case_path(cases_path), "r", encoding="utf-8") as f:
+    with open(_resolve_case_path(cases_path), encoding="utf-8") as f:
         raw_data = json.load(f)
     version = str(raw_data.get("version", "1.0")) if isinstance(raw_data, dict) else "1.0"
 

@@ -51,7 +51,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +144,7 @@ SET e.invalid_at = $invalid_at
 async def apply_closure_semantics(
     driver,
     *,
-    group_id: Optional[str] = None,
+    group_id: str | None = None,
     dry_run: bool = False,
 ) -> ClosureResult:
     """Run a single closure semantics pass over the graph.

@@ -1,7 +1,6 @@
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MCP_SERVER = ROOT / 'mcp_server' / 'src' / 'graphiti_mcp_server.py'
 

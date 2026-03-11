@@ -8,9 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+if TYPE_CHECKING:
+    from scripts.om_compressor import MessageRow
+
 
 
 class TestOMCompressorArgs(unittest.TestCase):
@@ -985,7 +990,7 @@ class TestOMCompressorSmartCutterIntegration(unittest.TestCase):
     to fixed-size slicing when embeddings are missing.
     """
 
-    def _make_row(self, i: int, *, has_embedding: bool = True) -> 'MessageRow':
+    def _make_row(self, i: int, *, has_embedding: bool = True) -> MessageRow:
         from scripts.om_compressor import MessageRow
 
         return MessageRow(
@@ -1046,7 +1051,6 @@ class TestOMCompressorSmartCutterIntegration(unittest.TestCase):
         from unittest.mock import MagicMock, patch
 
         from scripts.om_compressor import (
-            MessageRow,
             _select_next_steady_chunk,
         )
 

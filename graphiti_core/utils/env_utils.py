@@ -46,7 +46,6 @@ from __future__ import annotations
 import ipaddress
 import os
 import urllib.parse
-from typing import Optional
 
 __all__ = [
     'resolve_llm_base_url',
@@ -99,7 +98,7 @@ def _validate_base_url(
     label: str,
     *,
     allow_private: bool = True,
-    allow_local_override_env: Optional[str] = None,
+    allow_local_override_env: str | None = None,
 ) -> str:
     """Validate an HTTP(S) base URL and return it stripped of trailing slash.
 

@@ -3,8 +3,9 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
-from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
+from mcp_server.src.models.typed_memory import Episode, EvidenceRef, StateFact
 from mcp_server.src.services.change_ledger import ChangeLedger
+from mcp_server.src.services.om_typed_projection import OMTypedProjectionService
 from mcp_server.src.services.typed_retrieval import ScoredObject, TypedRetrievalService
 
 
@@ -32,14 +33,26 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _state_fact(*, object_id: str, root_id: str, version: int, value: str, is_current: bool = True):
+def _state_fact(
+    *,
+    object_id: str,
+    root_id: str,
+    version: int,
+    value: str,
+    is_current: bool = True,
+    source_lane: str = 's1_sessions_main',
+    source_key: str = 'session:1',
+    invalid_at: str | None = None,
+    lifecycle_status: str = 'asserted',
+    promotion_status: str = 'proposed',
+):
     return StateFact(
         object_id=object_id,
         root_id=root_id,
         version=version,
         is_current=is_current,
-        source_lane='s1_sessions_main',
-        source_key='session:1',
+        source_lane=source_lane,
+        source_key=source_key,
         policy_scope='private',
         visibility_scope='private',
         evidence_refs=[
@@ -56,11 +69,41 @@ def _state_fact(*, object_id: str, root_id: str, version: int, value: str, is_cu
         predicate='likes',
         value=value,
         scope='private',
+        invalid_at=invalid_at,
+        lifecycle_status=lifecycle_status,
+        promotion_status=promotion_status,
     )
 
 
 def _memory_ledger() -> ChangeLedger:
     return ChangeLedger(sqlite3.connect(':memory:'))
+
+
+def _episode(*, object_id: str, root_id: str, version: int, summary: str, is_current: bool = True, parent_id: str | None = None, superseded_by: str | None = None, invalid_at: str | None = None, source_key: str | None = None):
+    return Episode(
+        object_id=object_id,
+        root_id=root_id,
+        parent_id=parent_id,
+        version=version,
+        is_current=is_current,
+        source_lane='s1_observational_memory',
+        source_key=source_key or f'om:s1_observational_memory:node:{object_id}',
+        policy_scope='private',
+        visibility_scope='private',
+        title=summary[:40],
+        summary=summary,
+        invalid_at=invalid_at,
+        superseded_by=superseded_by,
+        evidence_refs=[
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': 's1_observational_memory:node', 'event_id': object_id},
+                title='source',
+                snippet=summary,
+            )
+        ],
+    )
 
 
 def _seed_assert(ledger: ChangeLedger, obj: StateFact, *, recorded_at: str = '2026-03-09T05:00:00Z') -> None:
@@ -260,3 +303,890 @@ def test_lineage_over_cap_uses_root_snapshot_instead_of_disappearing():
     assert response['state'][0]['object_id'] == 'obj_1'
     assert response['limits_applied']['materialization']['snapshot_only_roots_over_event_cap'] == 1
     assert response['limits_applied']['materialization']['skipped_roots_over_event_cap'] == 0
+
+
+# ── OM typed projection merge tests ──────────────────────────────────────────
+
+
+class _FakeOMProjectionService:
+    """Minimal OM projection stub that returns canned typed objects."""
+
+    def __init__(self, objects=None, search_overrides=None, limits=None):
+        self._objects = objects or []
+        self._search_overrides = search_overrides or {}
+        self._limits = limits or {'enabled': True, 'reason': 'projected', 'groups_considered': [], 'episodes_projected': 0, 'state_projected': 0, 'max_results': 10}
+        self.calls = []
+
+    async def project(self, *, query, effective_group_ids, object_types, max_results, query_mode):
+        self.calls.append({
+            'query': query,
+            'effective_group_ids': effective_group_ids,
+            'object_types': object_types,
+            'max_results': max_results,
+            'query_mode': query_mode,
+        })
+        return self._objects, self._search_overrides, self._limits
+
+
+def _om_state_fact(*, object_id: str, group_id: str = 's1_observational_memory'):
+    return StateFact(
+        object_id=object_id,
+        root_id=object_id,
+        version=1,
+        is_current=True,
+        source_lane=group_id,
+        source_key=f'om:{group_id}:relation:{object_id}',
+        policy_scope='private',
+        visibility_scope='private',
+        evidence_refs=[
+            EvidenceRef(
+                kind='event_log',
+                source_system='om',
+                locator={'system': 'om', 'stream': f'{group_id}:relation', 'event_id': object_id},
+                title='OM relation',
+                snippet='om projected fact',
+            )
+        ],
+        fact_type='relationship',
+        subject='om_node:source',
+        predicate='om_relation:resolves',
+        value='om projected',
+        scope='private',
+    )
+
+
+def test_om_projection_merges_objects_into_typed_search():
+    """OM projected objects surface through typed buckets when projection service is wired."""
+    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-1')
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:s1_observational_memory:rel-1': 'resolves latency spike'},
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 0,
+            'state_projected': 1,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='latency spike',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'om_state:s1_observational_memory:rel-1'
+    assert response['state'][0]['source_lane'] == 's1_observational_memory'
+    assert response['limits_applied']['materialization']['om_projection']['enabled'] is True
+    assert projection.calls[0]['effective_group_ids'] == ['s1_observational_memory']
+
+
+def test_om_projection_deduplicates_against_ledger_objects():
+    """OM projected objects with same ID as ledger objects are not duplicated."""
+    ledger_obj = _state_fact(object_id='shared_id', root_id='root_shared', version=1, value='resolves')
+    om_obj = _om_state_fact(object_id='shared_id')
+
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'shared_id': 'resolves latency spike'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([ledger_obj], {'candidate_roots': 1, 'materialized_roots': 1, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'test', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {'shared_id': 'resolves latency spike'})
+
+    response = _run(
+        service.search(
+            query='resolves',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['state'] == 1
+
+
+def test_om_projection_skips_state_projection_when_ledger_already_has_om_state():
+    """Ledger-backed OM facts should be the canonical state path; projection becomes fallback-only."""
+    ledger_obj = _state_fact(
+        object_id='ledger_state',
+        root_id='ledger_root',
+        version=1,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[_om_state_fact(object_id='om_state:s1_observational_memory:rel-shadow')],
+        search_overrides={'om_state:s1_observational_memory:rel-shadow': 'carry-on only'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [ledger_obj],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {'ledger_state': 'carry-on only'},
+    )
+
+    response = _run(
+        service.search(
+            query='carry-on',
+            object_types=['state'],
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert projection.calls == []
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'ledger_state'
+    assert response['limits_applied']['materialization']['om_projection']['reason'] == 'ledger_canonical_om_state'
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
+
+
+
+def test_om_projection_only_projects_episodes_when_ledger_already_has_om_state():
+    """When OM state is ledger-backed, read-time projection should only fill the episode/history gap."""
+    ledger_obj = _state_fact(
+        object_id='ledger_state',
+        root_id='ledger_root',
+        version=1,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style',
+    )
+    om_episode = _episode(
+        object_id='om_episode:s1_observational_memory:travel-style-v1',
+        root_id='om_episode:s1_observational_memory:travel-style-v1',
+        version=1,
+        summary='travel style before the ledger promotion',
+    )
+    class _FilteringProjection(_FakeOMProjectionService):
+        async def project(self, *, query, effective_group_ids, object_types, max_results, query_mode):
+            self.calls.append({
+                'query': query,
+                'effective_group_ids': effective_group_ids,
+                'object_types': object_types,
+                'max_results': max_results,
+                'query_mode': query_mode,
+            })
+            projected = list(self._objects)
+            if object_types:
+                projected = [obj for obj in projected if obj.object_type in object_types]
+            limits = dict(self._limits)
+            limits['episodes_projected'] = sum(1 for obj in projected if obj.object_type == 'episode')
+            limits['state_projected'] = sum(1 for obj in projected if obj.object_type == 'state_fact')
+            return projected, self._search_overrides, limits
+
+    projection = _FilteringProjection(
+        objects=[_om_state_fact(object_id='om_state:s1_observational_memory:rel-shadow'), om_episode],
+        search_overrides={
+            'om_state:s1_observational_memory:rel-shadow': 'carry-on only',
+            'om_episode:s1_observational_memory:travel-style-v1': 'travel style before the ledger promotion',
+        },
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 1,
+            'state_projected': 1,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [ledger_obj],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {'ledger_state': 'carry-on only'},
+    )
+
+    response = _run(
+        service.search(
+            query='carry-on travel style',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert len(projection.calls) == 1
+    assert projection.calls[0]['object_types'] == {'episode'}
+    assert response['counts']['state'] == 1
+    assert response['counts']['episodes'] == 1
+    assert [item['object_id'] for item in response['state']] == ['ledger_state']
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode:s1_observational_memory:travel-style-v1',
+    ]
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
+
+
+def test_ledger_backed_om_history_derives_episode_lineage_for_promoted_om_state():
+    previous = _state_fact(
+        object_id='ledger_state_v1',
+        root_id='ledger_root',
+        version=1,
+        value='checked bag only',
+        is_current=False,
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style-v1',
+        invalid_at='2026-03-09T00:00:00Z',
+        lifecycle_status='superseded',
+        promotion_status='promoted',
+    )
+    current = _state_fact(
+        object_id='ledger_state_v2',
+        root_id='ledger_root',
+        version=2,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style-v2',
+        lifecycle_status='promoted',
+        promotion_status='promoted',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[
+            _episode(
+                object_id='om_episode:s1_observational_memory:travel-style-v1',
+                root_id='om_episode:s1_observational_memory:travel-style-v1',
+                version=1,
+                summary='checked bag only',
+                is_current=False,
+                invalid_at='2026-03-09T00:00:00Z',
+                superseded_by='om_episode:s1_observational_memory:travel-style-v2',
+                source_key='om:s1_observational_memory:node:travel-style-v1',
+            ),
+            _episode(
+                object_id='om_episode:s1_observational_memory:travel-style-v2',
+                root_id='om_episode:s1_observational_memory:travel-style-v1',
+                version=2,
+                summary='carry-on only',
+                parent_id='om_episode:s1_observational_memory:travel-style-v1',
+                source_key='om:s1_observational_memory:node:travel-style-v2',
+            ),
+        ],
+        search_overrides={
+            'om_episode:s1_observational_memory:travel-style-v1': 'checked bag only before change',
+            'om_episode:s1_observational_memory:travel-style-v2': 'carry-on only now',
+        },
+        limits={
+            'enabled': True,
+            'reason': 'projected_history',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 2,
+            'state_projected': 0,
+            'max_results': 10,
+            'history_mode': True,
+            'history_candidates': 1,
+            'history_lineages_projected': 1,
+            'history_state_projection_supported': False,
+            'unsupported_object_types': [],
+            'skipped_candidates': [],
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [previous, current],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {
+            'ledger_state_v1': 'checked bag only before change',
+            'ledger_state_v2': 'carry-on only now',
+        },
+    )
+
+    response = _run(
+        service.search(
+            query='what changed with travel style carry-on',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='history',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert len(projection.calls) == 1
+    assert projection.calls[0]['object_types'] == {'episode'}
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode_shadow:ledger_state_v2',
+        'om_episode_shadow:ledger_state_v1',
+    ]
+    assert response['episodes'][0]['root_id'] == 'ledger_root'
+    assert response['episodes'][0]['parent_id'] == 'om_episode_shadow:ledger_state_v1'
+    assert response['episodes'][1]['superseded_by'] == 'om_episode_shadow:ledger_state_v2'
+    assert response['limits_applied']['materialization']['ledger_backed_om_history'] == {
+        'enabled': True,
+        'reason': 'ledger_promoted_om_state_history',
+        'episodes_derived': 2,
+        'roots_covered': 1,
+        'source_nodes_covered': 2,
+    }
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_projected_episodes'] == 2
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_projected_episode_nodes'] == 2
+
+
+def test_ledger_backed_om_history_keeps_uncovered_projected_episodes():
+    ledger_obj = _state_fact(
+        object_id='ledger_state',
+        root_id='ledger_root',
+        version=1,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style',
+        lifecycle_status='promoted',
+        promotion_status='promoted',
+    )
+    covered_episode = _episode(
+        object_id='om_episode:s1_observational_memory:travel-style',
+        root_id='om_episode:s1_observational_memory:travel-style',
+        version=1,
+        summary='travel style before promotion',
+        source_key='om:s1_observational_memory:node:travel-style',
+    )
+    uncovered_episode = _episode(
+        object_id='om_episode:s1_observational_memory:packing-habit',
+        root_id='om_episode:s1_observational_memory:packing-habit',
+        version=1,
+        summary='packs a charger in every bag',
+        source_key='om:s1_observational_memory:node:packing-habit',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[covered_episode, uncovered_episode],
+        search_overrides={
+            'om_episode:s1_observational_memory:travel-style': 'carry-on only travel style',
+            'om_episode:s1_observational_memory:packing-habit': 'carry-on only and always packs charger',
+        },
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 2,
+            'state_projected': 0,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [ledger_obj],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {'ledger_state': 'carry-on only'},
+    )
+
+    response = _run(
+        service.search(
+            query='carry-on',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode_shadow:ledger_state',
+        'om_episode:s1_observational_memory:packing-habit',
+    ]
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_projected_episodes'] == 1
+
+
+def test_om_projection_auto_history_query_merges_lineage_objects():
+    """Auto-history queries should merge explicit OM lineage into typed buckets."""
+    previous = _episode(
+        object_id='om_episode:s1_observational_memory:node-v1',
+        root_id='om_episode:s1_observational_memory:node-v1',
+        version=1,
+        summary='latency issue before the fix',
+        is_current=False,
+        superseded_by='om_episode:s1_observational_memory:node-v2',
+        invalid_at='2026-03-09T00:00:00Z',
+    )
+    current = _episode(
+        object_id='om_episode:s1_observational_memory:node-v2',
+        root_id='om_episode:s1_observational_memory:node-v1',
+        parent_id='om_episode:s1_observational_memory:node-v1',
+        version=2,
+        summary='latency issue after the fix',
+        is_current=True,
+    )
+    projection = _FakeOMProjectionService(
+        objects=[previous, current],
+        search_overrides={'om_episode:s1_observational_memory:node-v2': 'what changed for latency spike'},
+        limits={
+            'enabled': True,
+            'reason': 'projected_history',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 2,
+            'state_projected': 0,
+            'max_results': 10,
+            'history_mode': True,
+            'history_candidates': 1,
+            'history_lineages_projected': 1,
+            'history_state_projection_supported': False,
+            'unsupported_object_types': [],
+            'skipped_candidates': [],
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='what changed with latency spike',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['query_mode'] == 'history'
+    assert response['counts']['episodes'] == 2
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode:s1_observational_memory:node-v2',
+        'om_episode:s1_observational_memory:node-v1',
+    ]
+    assert response['limits_applied']['materialization']['om_projection']['history_lineages_projected'] == 1
+    assert projection.calls[0]['query_mode'] == 'history'
+
+
+def test_om_projection_history_fail_closed_preserves_limits_metadata():
+    """History-mode OM projection should surface fail-closed metadata instead of fabricating lineage."""
+    projection = _FakeOMProjectionService(
+        objects=[],
+        limits={
+            'enabled': True,
+            'reason': 'projected_history',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 0,
+            'state_projected': 0,
+            'max_results': 10,
+            'history_mode': True,
+            'history_candidates': 1,
+            'history_lineages_projected': 0,
+            'history_state_projection_supported': False,
+            'unsupported_object_types': [],
+            'skipped_candidates': [
+                {
+                    'group_id': 's1_observational_memory',
+                    'node_id': 'node-branch',
+                    'reason': 'ambiguous_supersession_graph',
+                }
+            ],
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='what changed with latency spike',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['query_mode'] == 'history'
+    assert response['counts']['episodes'] == 0
+    assert response['limits_applied']['materialization']['om_projection']['skipped_candidates'] == [
+        {
+            'group_id': 's1_observational_memory',
+            'node_id': 'node-branch',
+            'reason': 'ambiguous_supersession_graph',
+        }
+    ]
+    assert projection.calls[0]['query_mode'] == 'history'
+
+
+def test_om_projection_evidence_includes_om_provenance():
+    """OM projected objects carry evidence refs with om source_system."""
+    om_obj = _om_state_fact(object_id='om_state:s1_observational_memory:rel-prov')
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:s1_observational_memory:rel-prov': 'resolves latency spike'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(
+            payload=[{
+                'canonical_uri': 'eventlog://om/s1_observational_memory:relation/rel-prov',
+                'kind': 'event_log',
+                'source_system': 'om',
+                'resolver': 'passthrough',
+                'status': 'resolved',
+            }]
+        ),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='resolves latency',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['evidence'] >= 1
+    assert any(e.get('source_system') == 'om' for e in response['evidence'])
+
+
+def test_om_projection_disabled_when_no_service():
+    """Without OM projection service, om_projection limits show disabled."""
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='test',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['limits_applied']['materialization']['om_projection']['enabled'] is False
+    assert response['limits_applied']['materialization']['om_projection']['reason'] == 'no_projection_service'
+
+
+def test_om_projection_experimental_group_surfaces_through_typed_buckets():
+    """Experimental OM-native groups surface when explicitly scoped."""
+    om_obj = _om_state_fact(
+        object_id='om_state:ontbk15batch_20260310_om_f:rel-exp',
+        group_id='ontbk15batch_20260310_om_f',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[om_obj],
+        search_overrides={'om_state:ontbk15batch_20260310_om_f:rel-exp': 'experimental bakeoff resolves'},
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['ontbk15batch_20260310_om_f'],
+            'episodes_projected': 0,
+            'state_projected': 1,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='experimental bakeoff',
+            effective_group_ids=['ontbk15batch_20260310_om_f'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['source_lane'] == 'ontbk15batch_20260310_om_f'
+
+
+class _HistoryAwareSearchService:
+    def __init__(self, *, node_rows=None, fact_rows=None, neighborhood_rows=None):
+        self.node_rows = node_rows or []
+        self.fact_rows = fact_rows or []
+        self.neighborhood_rows = neighborhood_rows or {}
+
+    def includes_observational_memory(self, group_ids):
+        return True
+
+    def _om_groups_in_scope(self, group_ids):
+        return list(group_ids or ['s1_observational_memory'])
+
+    async def search_observational_nodes(self, **_kwargs):
+        return list(self.node_rows)
+
+    async def search_observational_facts(self, *, center_node_uuid=None, **_kwargs):
+        if center_node_uuid is not None:
+            return list(self.neighborhood_rows.get(center_node_uuid, []))
+        return list(self.fact_rows)
+
+
+class _HistoryAwareDriver:
+    def __init__(self, records_by_seed=None):
+        self.records_by_seed = records_by_seed or {}
+
+    async def execute_query(self, _query, **params):
+        tuple_key = (params.get('group_id'), params.get('seed_node_id'))
+        rows = self.records_by_seed.get(tuple_key)
+        if rows is None:
+            rows = self.records_by_seed.get(params.get('seed_node_id'), [])
+        return list(rows), None, None
+
+
+class _HistoryAwareGraphitiService:
+    class config:
+        class database:
+            provider = 'neo4j'
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    async def get_client(self):
+        return SimpleNamespace(driver=self.driver)
+
+
+def test_real_om_projection_distinguishes_history_current_and_all_modes():
+    search_service = _HistoryAwareSearchService(
+        node_rows=[
+            {
+                'uuid': 'drink_v2',
+                'name': 'Current drink',
+                'summary': 'espresso after training',
+                'group_id': 's1_observational_memory',
+                'created_at': '2026-03-09T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            }
+        ]
+    )
+    driver = _HistoryAwareDriver(
+        records_by_seed={
+            'drink_v2': [
+                {
+                    'node_id': 'drink_v1',
+                    'uuid': 'drink_v1',
+                    'group_id': 's1_observational_memory',
+                    'content': 'coffee before training',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'drink_v2',
+                    'uuid': 'drink_v2',
+                    'group_id': 's1_observational_memory',
+                    'content': 'espresso after training',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [
+                        {
+                            'target_id': 'drink_v1',
+                            'created_at': '2026-03-09T00:00:00Z',
+                            'relation_uuid': 'rel_drink_v2_v1',
+                        }
+                    ],
+                },
+            ]
+        }
+    )
+    projection = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_HistoryAwareGraphitiService(driver),
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    all_response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='all',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+    current_response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='current',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+    history_response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='history',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert all_response['query_mode'] == 'all'
+    assert [item['object_id'] for item in all_response['episodes']] == [
+        'om_episode:s1_observational_memory:drink_v2',
+        'om_episode:s1_observational_memory:drink_v1',
+    ]
+    assert all_response['episodes'][1]['is_current'] is False
+
+    assert current_response['query_mode'] == 'current'
+    assert [item['object_id'] for item in current_response['episodes']] == [
+        'om_episode:s1_observational_memory:drink_v2',
+    ]
+
+    assert history_response['query_mode'] == 'history'
+    assert [item['object_id'] for item in history_response['episodes']] == [
+        'om_episode:s1_observational_memory:drink_v2',
+        'om_episode:s1_observational_memory:drink_v1',
+    ]
+    assert history_response['episodes'][1]['is_current'] is False
+    assert history_response['episodes'][1]['invalid_at'] == '2026-03-09T00:00:00Z'
+    assert history_response['limits_applied']['materialization']['om_projection']['history_lineages_projected'] == 1
+
+
+def test_real_om_projection_preserves_same_node_uuid_across_multiple_groups():
+    search_service = _HistoryAwareSearchService(
+        node_rows=[
+            {
+                'uuid': 'shared_node',
+                'name': 'Shared node group A',
+                'summary': 'espresso after training in group A',
+                'group_id': 'group_a',
+                'created_at': '2026-03-09T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            },
+            {
+                'uuid': 'shared_node',
+                'name': 'Shared node group B',
+                'summary': 'espresso after training in group B',
+                'group_id': 'group_b',
+                'created_at': '2026-03-09T00:00:00Z',
+                'attributes': {'status': 'active', 'semantic_domain': 'observational_memory'},
+            },
+        ]
+    )
+    driver = _HistoryAwareDriver(
+        records_by_seed={
+            ('group_a', 'shared_node'): [
+                {
+                    'node_id': 'shared_node',
+                    'uuid': 'shared_node',
+                    'group_id': 'group_a',
+                    'content': 'espresso after training in group A',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+            ('group_b', 'shared_node'): [
+                {
+                    'node_id': 'shared_node',
+                    'uuid': 'shared_node',
+                    'group_id': 'group_b',
+                    'content': 'espresso after training in group B',
+                    'created_at': '2026-03-09T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
+    )
+    projection = OMTypedProjectionService(
+        search_service=search_service,
+        graphiti_service=_HistoryAwareGraphitiService(driver),
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: ([], {'candidate_roots': 0, 'materialized_roots': 0, 'snapshot_only_roots_over_event_cap': 0, 'skipped_roots_over_event_cap': 0, 'root_selection_strategy': 'empty', 'max_candidate_roots': 250, 'max_lineage_events': 256}, {})
+
+    response = _run(
+        service.search(
+            query='espresso',
+            effective_group_ids=['group_a', 'group_b'],
+            object_types=['episode'],
+            history_mode='all',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert response['counts']['episodes'] == 2
+    assert {(item['source_lane'], item['object_id']) for item in response['episodes']} == {
+        ('group_a', 'om_episode:group_a:shared_node'),
+        ('group_b', 'om_episode:group_b:shared_node'),
+    }
