@@ -46,6 +46,14 @@ def _row_uuid(row: dict[str, Any]) -> str:
     return str(row.get('uuid') or '').strip()
 
 
+def _row_group_id(row: dict[str, Any]) -> str:
+    return str(row.get('group_id') or '').strip()
+
+
+def _combined_om_row_identity(row: dict[str, Any]) -> tuple[str, str]:
+    return (_row_group_id(row), _row_uuid(row))
+
+
 def _row_lexical_score(row: dict[str, Any]) -> float:
     try:
         return float(row.get('lexical_score') or 0.0)
@@ -69,17 +77,17 @@ def _combined_om_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         -_row_lexical_score(row),
         -_row_created_at_timestamp(row),
-        str(row.get('group_id') or ''),
+        _row_group_id(row),
         _row_uuid(row),
     )
 
 
 def _rank_combined_om_rows(rows: list[dict[str, Any]], *, max_items: int) -> list[dict[str, Any]]:
-    deduped: dict[str, dict[str, Any]] = {}
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
 
     for row in rows:
-        row_id = _row_uuid(row)
-        if not row_id:
+        row_id = _combined_om_row_identity(row)
+        if not row_id[1]:
             continue
 
         existing = deduped.get(row_id)
