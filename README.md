@@ -1,8 +1,8 @@
-# Bicameral - Dual-Brain Memory Runtime for Agents
+# Bicameral — Dual-Brain Typed Memory Runtime for Agents
 
-This repository is a **production delta layer** on top of [upstream Graphiti](https://github.com/getzep/graphiti). It turns Graphiti from a graph-memory library into a **dual-brain, policy-governed memory runtime** for OpenClaw agents.
+Bicameral is a **ledger-first, typed memory system** built as a production delta layer on top of [upstream Graphiti](https://github.com/getzep/graphiti). It turns Graphiti from a graph-memory library into a **dual-brain, policy-governed memory runtime** with first-class semantic, episodic, and procedural memory.
 
-The key insight: **A single LLM-powered brain can't be trusted with your memories.** We added a second brain-a strict, append-only Fact Ledger-that acts as a thermostat to keep the semantic engine honest.
+The key insight: **A single LLM-powered brain can't be trusted with your memories.** We added a second brain — a strict, append-only **ChangeLedger** — that acts as a thermostat to keep the semantic engine honest. On top of this dual-brain substrate, we layer **typed memory objects** that give agents currentness, supersession, temporal precision, and governed truth.
 
 If you're looking for the core Graphiti framework docs:
 - Upstream repo: <https://github.com/getzep/graphiti>
@@ -10,303 +10,228 @@ If you're looking for the core Graphiti framework docs:
 
 ---
 
-## Why This Exists: The Dual-Brain Philosophy
+## Why This Exists
 
-Plain vector search (RAG) is good at recall ("find documents about X") but terrible at **truth management**. And even Graphiti-a breakthrough temporal knowledge graph-relies 100% on an LLM to decide what's true. We call this "Brain 1 only."
+Plain vector search (RAG) is good at recall ("find documents about X") but terrible at **truth management**. Even Graphiti — a breakthrough temporal knowledge graph — relies 100% on an LLM to decide what's true. When your AI manages your calendar, drafts your deals, and handles your relationships, "let the LLM figure it out" is a recipe for operational failure.
 
-**Brain 1 alone is unreliable for high-stakes decisions.** When your AI manages your calendar, drafts your deals, and handles your relationships, you can't trust an LLM to silently invalidate facts or decide what supersedes what. There's no audit trail. There's no rollback. If the LLM hallucinates over your metadata, you'll never know.
+Bicameral solves three problems vanilla Graphiti can't:
 
-**We built Brain 2: A Fact Ledger.**
+- **No silent truth mutations.** Every promotion, supersession, and invalidation is recorded in the ChangeLedger with full provenance.
+- **No LLM hallucinations becoming doctrine.** Unverified claims stay quarantined until approved through a governed promotion policy.
+- **Agents that learn and remember correctly.** Typed memory objects track what is *current*, what *changed*, and what *procedure* to follow — not just what was mentioned once.
 
-Brain 1 (Neo4j) holds all the semantic richness-messy, probabilistic, non-deterministic. Brain 2 (SQLite) holds deterministic truth-append-only, auditable, hash-chained. At retrieval time, a trust multiplier combines them: `final_score = semantic_relevance + (trust_score × trust_weight)`.
+---
 
-Promoted facts get a `trust_score = 1.0`. Hallucinations don't. You get deterministic truth out of a non-deterministic graph.
+## Architecture Overview
 
-This architecture solves three problems vanilla Graphiti can't:
+### The Dual Brain
 
-- **No silent truth mutations.** Every promotion, supersession, and invalidation is logged in Brain 2 with full provenance.
-- **No LLM hallucinations becoming doctrine.** Strangers' claims stay quarantined until you approve them.
-- **Agents that learn.** After every coding run, learnings are extracted and promoted to Brain 2 with `trust_score = 1.0`. The next run gets them injected as context. Knowledge compounds instead of evaporating.
+| | Brain 1 — Semantic Engine (Neo4j) | Brain 2 — ChangeLedger (SQLite) |
+|---|---|---|
+| **Purpose** | Semantic richness, relationships, embeddings | Deterministic truth, mutation history, governance |
+| **Characteristics** | Non-deterministic, LLM-extracted, fast retrieval | Append-only, hash-chained, auditable |
+| **Source of truth?** | No. Derived. | **Yes. Canonical.** |
+
+Brain 1 holds all the messy, probabilistic semantic richness. Brain 2 holds deterministic truth — every assertion, supersession, and invalidation is recorded as an immutable ledger event. If the two disagree, **Brain 2 wins**.
+
+The bridge between them is a **trust multiplier**: promoted facts get `trust_score = 1.0` in Brain 1, which biases retrieval ranking toward verified truth. The formula: `final_score = rrf_score + (trust_score × trust_weight)`.
 
 For the full architecture deep-dive, see [The Dual-Brain Architecture](docs/DUAL-BRAIN-ARCHITECTURE.md).
 
----
-
-## How It Works: Three Layers
-
-This fork solves these problems by adding three layers on top of Graphiti's graph engine:
-
-### The Three-Layer Architecture
+### The Four-Layer Stack
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  L3 - Workflow Packs                                         │
-│  Multi-step orchestration (e.g., "Draft VC Memo", "Book      │
-│  Dinner"). Declares which context packs it needs, what       │
-│  tools it can use, and what approvals are required.          │
+│  L4 - Retrieval / Answer Assembly                            │
+│  Typed retrieval contract returning state + episodes +       │
+│  procedures + evidence. Mixed-mode routing for               │
+│  currentness queries vs raw evidence recall.                 │
 ├──────────────────────────────────────────────────────────────┤
-│  L2 - Context Packs                                          │
-│  Scoped read-assembly bundles. Each pack queries specific    │
-│  graph lanes, applies retrieval policy, and formats output   │
-│  for the consumer agent. Supports private vs group-safe      │
-│  scoping, token budgets, and provenance tagging.             │
+│  L3 - Derived Read Models / Projections                      │
+│  Current-state view. Supersession history. Episode timeline. │
+│  Procedure registry. Graph projection. Search indexes.       │
+│  Context/workflow packs for scoped assembly.                 │
 ├──────────────────────────────────────────────────────────────┤
-│  L1 - Truth Substrate (Graphiti + Fact Ledger)               │
-│  Append-only Fact Ledger is the canonical truth.             │
-│  The graph DB (Neo4j default, FalkorDB legacy) is a derived  │
-│  Markdown exports are derived audit views.                   │
-│  If canonical and derived disagree, canonical wins.          │
+│  L2 - Typed Memory Objects                                   │
+│  StateFact (preferences, decisions, lessons, rules…)         │
+│  Episode (time-bounded events with evidence links)           │
+│  Procedure (trigger → steps → outcome, versioned)            │
+│  Entity registry. EvidenceRef pointers.                      │
+├──────────────────────────────────────────────────────────────┤
+│  L1 - ChangeLedger + Semantic Engine                         │
+│  Append-only event stream (assert, supersede, invalidate,    │
+│  refine, derive, promote, procedure_success/failure).        │
+│  Neo4j graph as derived semantic index.                      │
+│  Pluggable evidence plane (QMD as current adapter).          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
+### Layer 0 — Raw Evidence Plane
+
+Immutable source references (transcripts, notes, docs, artifacts, structured records) accessed through a **pluggable evidence plane**. This is not the canonical memory plane — it's the evidence plane. QMD is the current file/log adapter. Every surfaced memory object carries `EvidenceRef` pointers back to raw source material.
+
 ---
 
-## Core Concepts
+## Typed Memory Objects
 
-### The Fact Ledger (Canonical Truth)
+Bicameral organizes memory into three first-class typed object families, all governed by the ChangeLedger and sharing a common base contract:
 
-The graph database is **not** the source of truth. The **Fact Ledger** is - an append-only, hash-chained log that records every promotion, supersession, and invalidation with full provenance. The graph and markdown exports are both derived and rebuildable from the ledger.
+### StateFact — Semantic Memory
 
-Each domain has its own ledger:
-- **Personal truth** (`state/fact_ledger.db`) - preferences, identity, relationships, style
-- **Engineering learnings** (`state/fact_ledger_engineering.db`) - tool behaviors, failure patterns, architecture decisions
-- **Operational learnings** (`state/fact_ledger_learning.db`) - self-audit findings, preference misses
+State-bearing truth about the world: preferences, decisions, commitments, lessons, operational rules, constraints, relationships, world-state observations.
 
-Facts enter via a quarantine queue (`candidates.db`) and must pass through a **Promotion Policy** before being written to the ledger. This means you can audit every fact back to its source evidence, replay history, or roll back to any prior state.
+Each StateFact has a **subtype** that determines its promotion policy and risk tier. Subtypes: `preference`, `decision`, `commitment`, `lesson`, `world_state`, `operational_rule`, `constraint`, `relationship`.
 
-### Promotion Policy (Truth Firewall) - v3 Unified
+**Currentness model:** One current object per conflict set. When a preference changes, the old StateFact is explicitly `supersede`d — not silently overwritten.
 
-Not everything ingested becomes truth. The Promotion Policy governs how candidate facts move from "observed" to "promoted".
+### Episode — Episodic Memory
 
-**v2/v3 convergence state:** Policy v3 is now the **unified default** across both OM-derived candidates and graph-lane candidates (`POLICY_VERSION_DEFAULT = "promotion-v3"` in `truth/candidates.py`). Prior to EXEC-UNIFIED-V3-AFTERNOON, graph-lane candidates used v2 and OM used v3 - that split is resolved. Both code paths now call the same v3 decision evaluator.
+Time-bounded events with evidence links. Episodes are derived from session transcripts and carry immutable core fields (time span, participants, source refs) plus editable annotations/labels.
 
+Episodes serve as the **evidence anchor** for StateFacts and Procedures. A promoted fact always traces back to the episode(s) that sourced it.
+
+### Procedure — Procedural Memory
+
+Reusable action plans with trigger conditions, preconditions, ordered steps, expected outcomes, success/failure counters, version lineage, and `is_current` status.
+
+Procedures evolve through feedback: successful executions increment counters and may trigger auto-promotion of candidates; failures trigger version evolution or warnings.
+
+**Promotion gate:** `ProcedureCandidate` objects promote to active `Procedure` via human approval or a conservative repeated-success threshold (low-risk: 3 successes across 2 distinct episodes; medium-risk: 5 across 3; high-risk: never auto-promotes).
+
+### Shared Base Contract
+
+All typed objects carry:
+```
+object_id, object_type
+root_id, parent_id, version, is_current
+source_lane, source_episode_id, source_message_id, source_key
+valid_at, invalid_at, superseded_by
+policy_scope, visibility_scope
+evidence_refs[]
+extractor_version, created_at
+```
+
+---
+
+## The ChangeLedger
+
+The ChangeLedger is an append-only, hash-chained event stream that records every mutation to Bicameral's typed memory objects. It is the **canonical source of truth** — the graph database and all read models are derived from it.
+
+### Event Vocabulary (v1)
+
+| Event | When |
+|---|---|
+| `assert` | New object introduced or new state-bearing claim made |
+| `supersede` | Current object replaced by a newer one in the same conflict set |
+| `invalidate` | Object marked no longer valid without replacement |
+| `refine` | Object improved/tightened without changing essential identity |
+| `derive` | Object synthesized from other evidence or objects |
+| `promote` | Object moves from candidate/proposed to authoritative status |
+| `procedure_success` | Procedure executed successfully (increments counters) |
+| `procedure_failure` | Procedure execution failed (triggers evolution/warning) |
+
+Each event is immutable, hash-chained, and carries full provenance (actor, timestamp, source evidence, reasoning).
+
+---
+
+## Promotion Policy
+
+Not everything ingested becomes truth. The Promotion Policy governs how candidates move from "observed" to "promoted."
+
+### Key Rules
 
 - **Trust boundary:** Only owner-authored evidence is eligible for auto-promotion. Non-owner content can create entities but facts stay quarantined.
-- **Assertion gating:** Questions, hypotheticals, and quotes are blocked. Only decisions, preferences, and factual assertions can promote.
-- **Risk tiers:** Low-risk facts (preferences) can auto-promote at high confidence (>0.90). Medium and high-risk facts require human approval.
+- **Assertion gating:** Only decisions, preferences, and factual assertions can promote. Questions, hypotheticals, and quotes are blocked.
+- **Risk tiers:** Low-risk facts (preferences) auto-promote at high confidence (>0.90). Medium-risk requires stricter evidence. High-risk always requires human approval.
 - **Conflict detection:** Contradictions are flagged. The system never silently overwrites existing truth.
-- **Corroboration:** Independent evidence from multiple sources carries more weight than repeated mentions from the same source. Same-lineage evidence (e.g., a curated summary derived from a session) gets bounded boost caps to prevent confidence inflation.
+- **Corroboration:** Independent evidence from multiple sources carries more weight. Same-lineage evidence gets bounded boost caps to prevent confidence inflation.
 
-### Candidate Generation Policy
+### Policy v3 (Unified Default)
 
-Not all graph groups generate promotion candidates. Groups are classified by their role in the truth pipeline.
-
-**Lane Matrix (v3 - canonical as of EXEC-UNIFIED-V3-AFTERNOON):**
-
-| Lane (`group_id`) | Retrieval | Candidate-Generating | Notes |
-|---|---|---|---|
-| `s1_sessions_main` | ✅ Global | ✅ Yes | Primary conversational memory - retrieval + candidate pipeline |
-| `s1_observational_memory` | ✅ Global | ✅ Yes | OM synthesis nodes - globally retrieval-eligible, feeds promotion evaluator |
-| `s1_chatgpt_history` | ✅ Global | ✅ Yes | Globally retrievable; still generates candidates |
-| `s1_memory_day1` | ❌ Corroboration-only | ✅ Yes | Not surfaced directly in retrieval; still candidate-generating so its facts participate in promotion evaluator |
-| `s1_curated_refs` | ✅ Global | ❌ No | Globally retrievable reference snapshots; not a candidate-generating source |
-| `s1_inspiration_*`, `s1_writing_samples`, `s1_content_strategy` | ❌ Pack injection | ❌ No | Custom ontologies extract craft patterns (RhetoricalMove, HookPattern, VoiceQuality), not personal facts. Injected via content packs, never candidate-generating. |
-| `engineering_learnings`, `learning_self_audit` | ❌ Separate domain | ❌ (own pipeline) | Own ledger pipelines (`fact_ledger_engineering.db`, `fact_ledger_learning.db`). Different trust semantics. |
-
-**Key distinction:** Retrieval eligibility and candidate-generating status are independent controls. `s1_memory_day1` is corroboration-only for retrieval (not surfaced directly) but still candidate-generating so its promoted facts participate in the truth evaluator. `s1_curated_refs` is globally retrievable but excluded from candidate generation.
-
-The lane matrix is codified in `truth/candidates.py` (constants: `LANE_RETRIEVAL_ELIGIBLE_GLOBAL`, `LANE_CORROBORATION_ONLY`, `LANE_CANDIDATES_ELIGIBLE`) and mirrored in `config/runtime_pack_registry.json` under `lane_policy`. Note: `LANE_RETRIEVAL_ELIGIBLE_VC_SCOPED` was removed in PR121 — all retrieval-eligible lanes are now globally retrievable.
-
-### Trust-Aware Retrieval
-
-Promotion status feeds back into retrieval quality. Entities and relationships in the graph carry an optional `trust_score` property that biases search result ranking:
-
-| Status | `trust_score` | Effect |
-|---|---|---|
-| Promoted core truth (in fact ledger) | 1.0 | Strongest boost - surfaces verified facts when relevance is comparable |
-| Corroborated candidate (multiple independent sources) | 0.6 | Moderate boost - rewards evidence convergence |
-| Standard candidate (single source) | 0.25 | Minimal boost - "we've seen this" signal |
-| Not in candidates pipeline | NULL | **Neutral baseline - no boost, no penalty.** Content packs, engineering entities, and other non-candidate nodes rank purely on relevance. |
-
-The boost is **post-RRF additive**: `final_score = rrf_score + (trust_score × trust_weight)`. Default `trust_weight` is 0.15, configurable via `GRAPHITI_TRUST_WEIGHT` env var. Setting it to 0 disables trust boosting entirely (identical to vanilla RRF).
-
-For implementation details, see [Retrieval Trust Scoring](docs/retrieval-trust-scoring.md).
-
-### Dual-Lane Retrieval
-
-Memory retrieval and fact verification are separate concerns:
-
-- **Lane A (Runtime Retrieval):** Fast graph queries to answer user requests in real-time. Sources: sessions, curated references, ChatGPT history (query-gated). Trust-boosted reranking surfaces promoted facts.
-- **Lane B (Corroboration):** Background verification that checks new candidate facts against the ledger and historical evidence before promotion. Sources: everything including derived memory logs.
-
-The lanes never cross: runtime retrieval is never used for promotion decisions, and corroboration is never used for real-time answers.
-
-### Content & Workflow Pack Injection
-
-Content and workflow packs inject **parallel** to normal retrieval, not through it. The OpenClaw Pack Injector plugin fires on `before_agent_start`, detects intent, resolves which packs to load, and injects assembled context as `<pack-context>` blocks into the agent's prompt. Normal retrieval (agent-initiated MCP search) still runs separately.
-
-Pack retrieval queries the same MCP search endpoints, but since content pack entities have NULL `trust_score`, trust boosting has zero effect on pack results - they rank purely on relevance. This is correct by design: content packs should surface the most relevant craft patterns, not filter by personal truth approval status.
-
-### Graph Lanes & Custom Ontologies
-
-Each domain of knowledge lives in its own isolated graph (identified by `group_id`). Data never leaks between lanes - entities, relationships, and episodes are fully isolated per graph.
-
-Each lane can define its own **extraction ontology** - domain-specific entity types and relationship types that tell the LLM extractor what to look for. A content-inspiration lane extracts `RhetoricalMove`, `HookPattern`, and `VoiceQuality` entities; an engineering lane extracts `FailurePattern`, `ToolApiBehavior`, and `ArchitectureDecision`.
-
-Ontologies are defined in YAML config (`config/extraction_ontologies.yaml`). Adding a new lane requires only a YAML block - zero code changes. Unconfigured lanes fall through to Graphiti's generic extraction.
-
-For the full schema and examples, see [Custom Ontologies](docs/custom-ontologies.md).
-
-### Content & Workflow Packs
-
-A **Content Pack** (L2) is a bundle that defines:
-- Which graph lanes to query (retrieval matrix by mode: `default`, `short`, `long`, `casual`, `formal`)
-- ChatGPT history inclusion policy (`off`, `scoped`, `global`)
-- Token budget tier (A: 600 tokens/10 items, B: 1200/20 default, C: 2400/40)
-- Scope policy (`private` in DMs, `group_safe` in group chats - auto-selected by channel context)
-- Provenance requirements
-
-A **Workflow Pack** (L3) is a multi-step orchestration that:
-- Declares which content packs it depends on
-- Defines tool steps with explicit permission boundaries
-- Supports two execution modes: `draft_only` (output only) or `execute_with_approval` (external writes after approval gate)
-- Includes self-check and provenance output sections
-- Ingestion supports **dual-lane** mode: some content enters as both **artifacts** (few-shot examples, retrieval-eligible) and **extracted claims** (policy-gated, may promote to truth)
-
-Packs are defined declaratively in YAML/JSON config. The **Runtime Pack Router** (`scripts/runtime_pack_router.py`) resolves which packs are active for a given agent + intent, applies policy, and returns formatted context for the agent's context window.
-
----
-
-## How Packs Work with Agents (OpenClaw Integration)
-
-Agents don't query the graph directly. They use the **Runtime Pack Router** as a high-level hook.
-
-### The Routing Flow
-
-```
-Agent receives task (e.g., "draft a deal brief for Acme")
-    │
-    ▼
-Intent Classification
-    │  "vc_deal_brief" matched via keyword/entity boost rules
-    ▼
-Consumer Profile Lookup (config/runtime_consumer_profiles.json)
-    │  Maps agent + intent → pack_ids, modes, chatgpt_mode, scope
-    ▼
-Pack Resolution (config/runtime_pack_registry.json)
-    │  Resolves each pack_id → retrieval matrix, query template
-    ▼
-Graph Query (per graph lane in retrieval matrix)
-    │  Queries s1_sessions_main, s1_curated_refs, etc.
-    ▼
-Policy Enforcement
-    │  Applies scope (private vs group_safe), ChatGPT lane gating
-    ▼
-Context Assembly
-    │  Formats retrieved facts + provenance into injection text
-    ▼
-Agent receives structured context in its context window
-```
-
-### Materialization
-
-For engineering learnings, the router supports `--materialize` which reads the latest structured JSONL artifacts directly (bypassing graph query) when the engineering graph is still being populated. This allows CLR/Antfarm agents to benefit from learnings even during the graph bootstrap period.
+Policy v3 is the unified default for all code paths (`POLICY_VERSION_DEFAULT = "promotion-v3"`). Both OM-derived candidates and graph-lane candidates use the same v3 decision evaluator.
 
 ---
 
 ## Observational Memory (OM)
 
-OM is the runtime synthesis/control ("metabolism") loop for the Dual Brain stack.
-It is not a separate sovereign brain or truth authority. Instead, it coordinates
-high-throughput transcript intake in Brain 1 with governed promotion pathways into
-Brain 2.
-
-### The Problem OM Solves
-
-The Dual Brain governs *what to trust*. But the MCP server's ingestion pipeline has
-non-trivial latency (LLM extraction per episode). In a high-throughput agent runtime,
-messages accumulate faster than the pipeline can drain. OM closes this gap with a
-lightweight control loop that runs in parallel with Graphiti.
-
-### How OM Works
+OM is the runtime synthesis/control ("metabolism") loop for the Dual Brain stack. It closes the velocity gap between raw transcript intake and the full MCP extraction pipeline.
 
 ```
-Live transcript
-      │
-      ▼
-om_fast_write.py          ← Embeds message content + writes Message/Episode to Neo4j
-      │                      Fail-closed (no embedding = no write)
-      ▼
-om_compressor.py          ← Background: drains Message backlog into OMNode observations
-      │                      Trigger: backlog ≥ 50 OR oldest ≥ 48h
-      │                      Chunks: N = min(50, backlog), max 10 chunks/run
-      ▼
-om_convergence.py         ← Drives OMNode lifecycle state machine
-      │                      States: OPEN → MONITORING → CLOSED / ABANDONED / REOPENED
-      │                      Watermark: max 500 nodes/pass, cursor-based resumption
-      ▼
-promotion_policy_v3.py    ← Promotes corroborated nodes to CoreMemory (retained by GC)
+Live transcript → om_fast_write.py → Neo4j Message/Episode nodes
+                                              │
+                                     om_compressor.py → OMNode observations
+                                              │
+                                     om_convergence.py → Lifecycle state machine
+                                              │
+                                     promotion_policy_v3.py → CoreMemory (on corroboration)
 ```
 
-### Quick Commands
+OM types: `WorldState`, `Judgment`, `OperationalRule`, `Commitment`, `Friction`. Nodes progress through `OPEN → MONITORING → CLOSED/ABANDONED` with optional `REOPENED` paths.
 
-```bash
-# Fast-write a message
-python3 scripts/om_fast_write.py write \
-  --session-id "<session_id>" --role user \
-  --content "<text>" --created-at "2026-02-26T12:00:00Z"
+For operations details, see [OM Operations Runbook](docs/runbooks/om-operations.md).
 
-# Run the compressor (respects trigger threshold)
-python3 scripts/om_compressor.py
+---
 
-# Run convergence (state machine + dead-letter sync)
-PYTHONPATH=. python3 scripts/om_convergence.py
+## Graph Lanes & Custom Ontologies
 
-# GC dry-run (90-day TTL, no deletions)
-PYTHONPATH=. python3 scripts/om_convergence.py --run-gc --gc-dry-run
+Each domain of knowledge lives in its own isolated graph (`group_id`). Data never leaks between lanes.
 
-# Promote a corroborated candidate to CoreMemory
-PYTHONPATH=. python3 truth/promotion_policy_v3.py --candidate-id <id>
+Each lane can define its own **extraction ontology** — domain-specific entity and relationship types. A content-inspiration lane extracts `RhetoricalMove`, `HookPattern`, `VoiceQuality`; an engineering lane extracts `FailurePattern`, `ToolApiBehavior`, `ArchitectureDecision`.
 
-# Exact-dedupe OMNodes (dry-run first, then --apply)
-uv run python scripts/om_dedupe.py --dry-run
-uv run python scripts/om_dedupe.py --apply
+Ontologies are defined in YAML config (`config/extraction_ontologies.yaml`). Adding a new lane requires only a YAML block — zero code changes.
 
-# Backfill timeline timestamps on pre-Phase-B OMNodes
-uv run python scripts/om_backfill_timestamps.py --dry-run
-uv run python scripts/om_backfill_timestamps.py --apply
+### Lane Matrix (v3)
 
-# Normalize edge names to SCREAMING_SNAKE_CASE (dry-run first)
-python scripts/normalize_edge_names.py
-python scripts/normalize_edge_names.py --apply
+| Lane (`group_id`) | Retrieval | Candidate-Generating | Notes |
+|---|---|---|---|
+| `s1_sessions_main` | ✅ Global | ✅ Yes | Primary conversational memory |
+| `s1_observational_memory` | ✅ Global | ✅ Yes | OM synthesis nodes |
+| `s1_chatgpt_history` | ✅ Global | ✅ Yes | Imported conversation history |
+| `s1_memory_day1` | ❌ Corroboration-only | ✅ Yes | Bootstrap memory (not surfaced directly) |
+| `s1_curated_refs` | ✅ Global | ❌ No | Reference snapshots |
+| `s1_inspiration_*`, `s1_writing_samples`, `s1_content_strategy` | ❌ Pack injection | ❌ No | Craft patterns, injected via content packs |
+| `engineering_learnings`, `learning_self_audit` | ❌ Separate domain | ❌ (own pipeline) | Own ledger pipelines, different trust semantics |
 
-# Run closure semantics pass (RESOLVES/SUPERSEDES auto-invalidation)
-python scripts/apply_closure_semantics.py
-python scripts/apply_closure_semantics.py --apply
+For ontology details, see [Custom Ontologies](docs/custom-ontologies.md).
 
-# Cross-lane contamination check (exit 0 = clean, 1 = contamination)
-python scripts/contamination_sentinel.py --json
-```
+---
 
-### Key Numbers
+## Context & Workflow Packs
 
-| Parameter | Value |
-|---|---|
-| Compressor trigger (backlog) | ≥ 50 messages |
-| Compressor trigger (age) | ≥ 48 hours |
-| Messages per chunk | min(50, backlog) |
-| Max chunks per run | 10 (configurable) |
-| Dead-letter threshold | 3 failed attempts |
-| Convergence pass limit | 500 nodes |
-| GC TTL (default) | 90 days |
-| GC retention gate | EVIDENCE\_FOR active OMNode OR SUPPORTS\_CORE active CoreMemory |
+### Content Packs (L3 Read Models)
 
-### Phase B: Dedupe & Timeline Semantics
+Scoped read-assembly bundles. Each pack defines:
+- **Retrieval matrix:** Which graph lanes to query, by mode
+- **Token budget tier:** A (600/10), B (1200/20, default), C (2400/40)
+- **Scope policy:** `private` (DMs) or `group_safe` (group chats, auto-selected)
+- **ChatGPT lane policy:** `off`, `scoped`, `global`
 
-- **Exact dedupe** (`scripts/om_dedupe.py`): Detects and merges OMNodes sharing the same `node_type + normalize(content)` key across semantic domains. Canonical node = earliest `created_at`; metadata merged (union provenance, max urgency, most-active status). Dry-run default.
-- **Timeline semantics**: OMNodes carry `first_observed_at` and `last_observed_at` derived from source message event time (not wall-clock extraction time). Convergence age-decay and GC eligibility use event time. Pre-existing nodes: `scripts/om_backfill_timestamps.py`.
+### Workflow Packs
 
-### Phase C: Graph Maintenance & Guardrails
+Multi-step orchestration on top of content packs:
+- Declares required context pack dependencies
+- Defines tool steps with explicit permission boundaries
+- Execution modes: `draft_only` or `execute_with_approval`
+- Supports dual-lane ingest: artifacts (few-shot examples) + extracted claims (policy-gated)
 
-- **Edge normalization** (`scripts/normalize_edge_names.py`): Universal SCREAMING\_SNAKE\_CASE normalization, preventing case-variant dedup collisions. Also exported as `graphiti_core.utils.maintenance.normalize_relation_type` for inline use.
-- **Closure semantics** (`scripts/apply_closure_semantics.py`): RESOLVES/SUPERSEDES edges auto-invalidate the target entity's active facts. Pure graph pass - no LLM calls. Idempotent, dry-run default.
-- **Endpoint split** (`graphiti_core/utils/env_utils.py`): Separate `LLM_BASE_URL` and `EMBEDDER_BASE_URL` resolution to prevent accidental embedding-to-OpenRouter routing. See `.env.example` for priority chain.
-- **Contamination sentinel** (`scripts/contamination_sentinel.py`): Read-only cross-lane integrity check. `--json` for CI. Exit 0 = clean.
-- **Recall gate** (`--recall-gate 0.75 --recall-baseline ...` on `run_retrieval_benchmark.py`): CI-friendly quality gate.
-- **Scope policy** ([`docs/scope-policy.md`](docs/scope-policy.md)): Frozen as of Phase C. Messages only by default; `toolResult` opt-in via `TOOL_RESULT_ALLOWLIST`.
+The **Runtime Pack Router** (`scripts/runtime_pack_router.py`) resolves which packs are active for a given agent + intent, applies policy, and returns formatted context.
 
-For the full operations guide including lock ordering, split/isolate failure recovery,
-and convergence state machine details, see [OM Operations Runbook](docs/runbooks/om-operations.md).
+---
+
+## Trust-Aware Retrieval
+
+Promotion status feeds back into retrieval quality:
+
+| Status | `trust_score` | Effect |
+|---|---|---|
+| Promoted (in ChangeLedger) | 1.0 | Strongest boost |
+| Corroborated (≥2 independent sources) | 0.6 | Moderate boost |
+| Standard candidate (single source) | 0.25 | Minimal signal |
+| Not in pipeline | NULL | Neutral baseline |
+
+Boost: `final_score = rrf_score + (trust_score × trust_weight)`. Default `trust_weight` is 0.15, configurable via `GRAPHITI_TRUST_WEIGHT`.
+
+For details, see [Retrieval Trust Scoring](docs/retrieval-trust-scoring.md).
 
 ---
 
@@ -314,10 +239,8 @@ and convergence state machine details, see [OM Operations Runbook](docs/runbooks
 
 This fork operates on an **Engine/Fuel** split:
 
-- **Public repo (this one):** The runtime architecture, routing logic, policy enforcement, ontology framework, and tooling. It knows *how* to route requests to packs but contains no private data.
-- **Private overlay repo (yours):** Your actual `runtime_pack_registry.json`, `runtime_consumer_profiles.json`, `plugin_intent_rules.json`, `workflows/*.pack.yaml`, extraction ontology config, and graph state.
-
-**To deploy:** Clone the public repo, overlay your private config, and run the runtime from the merged working tree.
+- **Public repo (this one):** Runtime architecture, routing logic, policy enforcement, ontology framework, tooling. Knows *how* to route requests but contains no private data.
+- **Private overlay repo (yours):** Your `runtime_pack_registry.json`, `runtime_consumer_profiles.json`, `plugin_intent_rules.json`, `workflows/*.pack.yaml`, extraction ontology config, and graph state.
 
 ```bash
 # Apply private overlay into your runtime checkout
@@ -330,141 +253,115 @@ This fork operates on an **Engine/Fuel** split:
 
 ### Prerequisites
 - Python 3.13+
-- Neo4j (default) or FalkorDB (legacy) - graph database backend
+- Neo4j (default) or FalkorDB (legacy) — graph database backend
 - OpenAI API key (for LLM extraction + embeddings)
-- **Endpoint split (recommended):** set `LLM_BASE_URL` for LLM routing and `EMBEDDER_BASE_URL` for embedding routing separately. This prevents accidental embedding traffic to OpenRouter when LLM routing is redirected. See `.env.example` for the full priority chain.
+- **Endpoint split (recommended):** set `LLM_BASE_URL` for LLM routing and `EMBEDDER_BASE_URL` for embedding routing separately
 
 ### Quick Start
 
 ```bash
-# Clone
 git clone https://github.com/yhl999/bicameral.git
 cd bicameral
-
-# Install dependencies
-uv sync
-# OR: pip install -e ".[neo4j]"
-
-# Configure (copy and edit)
+uv sync                    # OR: pip install -e ".[neo4j]"
 cp config/config.example.yaml config/config.yaml
-# Edit config.yaml: set your Neo4j/FalkorDB connection, OpenAI key, etc.
+# Edit config.yaml: Neo4j connection, OpenAI key, etc.
 
-# Verify delta tooling
-python3 scripts/delta_tool.py list-commands
-
-# Verify runtime pack configuration
-python3 scripts/runtime_pack_router.py --verify-only
-
-# Start the MCP server (HTTP transport)
-python3 mcp_server/main.py
+python3 scripts/delta_tool.py list-commands        # Verify delta tooling
+python3 scripts/runtime_pack_router.py --verify-only  # Verify pack config
+python3 mcp_server/main.py                         # Start MCP server (HTTP)
 ```
-
-### Ingest Sanitization (Token-Cost Hygiene)
-
-Before evidence is sent to the LLM extractor, a sanitizer strips known wrapper noise that adds tokens without semantic value:
-
-| What gets stripped | Why |
-|---|---|
-| `<graphiti-context>…</graphiti-context>` blocks | OpenClaw injects memory context back into agent prompts; re-ingesting it creates circular artifacts and inflates token cost by re-processing already-extracted memory |
-| `Conversation info (untrusted metadata): ```json … ``` ` | Telegram/channel metadata injected by OpenClaw for routing - irrelevant to memory extraction |
-| `Sender (untrusted metadata): …` | Same wrapper pattern - routing metadata, not user content |
-| `Replied message (untrusted, for context): …` | Quote context markers - may cause extraction to attribute quotes as primary statements |
-
-Raw human/assistant message body content is **preserved** unchanged. The sanitizer runs at `strip_ingestion_noise()` in `scripts/mcp_ingest_sessions.py`, applied to both the main episode body and sub-chunk bodies.
-
-**Token-cost rationale:** A single session transcript can include multiple graphiti-context injections (each 300-800 tokens) plus per-message channel metadata. Stripping before extraction reduces per-episode LLM input by 20-60% on typical sessions, with zero loss of extractable signal.
-
----
 
 ### Ingesting Data
 
-Data flows through a 7-stage pipeline: Source Material → Evidence (deterministic chunking) → Ingest Registry (watermarks + dedup) → Graphiti MCP (LLM extraction) → Candidates DB (quarantine) → Promotion Policy (gates) → Fact Ledger (canonical truth).
+Data flows through a 7-stage pipeline: Source Material → Evidence → Ingest Registry → Graphiti MCP → Candidates DB → Promotion Policy → ChangeLedger.
 
 ```bash
-# 1. Bootstrap Neo4j with historical session transcripts (first-time setup)
+# Bootstrap Neo4j with historical transcripts
 python3 scripts/import_transcripts_to_neo4j.py \
   --sessions-dir path/to/session_transcripts/ --dry-run
 python3 scripts/import_transcripts_to_neo4j.py \
   --sessions-dir path/to/session_transcripts/
 
-# 2. Ingest sessions - Neo4j source mode (default, production path)
-# NOTE: If Neo4j has no Message nodes (empty graph), a BOOTSTRAP_REQUIRED guard
-# fires and the script exits non-zero. Run step 1 first to populate Neo4j.
+# Ingest sessions (Neo4j source mode, production path)
 python3 scripts/mcp_ingest_sessions.py \
-  --group-id s1_sessions_main \
-  --source-mode neo4j \
+  --group-id s1_sessions_main --source-mode neo4j \
   --mcp-url http://localhost:8000/mcp
 
-# 2b. Rollback - evidence source mode (reads from disk, bypasses Neo4j)
-python3 scripts/mcp_ingest_sessions.py \
-  --group-id s1_sessions_main \
-  --source-mode evidence \
-  --evidence path/to/sessions_evidence/
-
-# 3. Check ingestion status (watermarks, queue depth, last success/failure)
+# Check ingestion status
 python3 scripts/registry_status.py
 
-# 4. Verify adapter contract compliance (INGEST_ADAPTER_CONTRACT_V1)
+# Verify adapter contract compliance
 python3 scripts/ingest_adapter_contract_check.py --strict
 ```
 
-Ingestion is idempotent (content-hash dedup), incremental (delta since last watermark), and supports sub-chunking for large evidence (>10k chars). All adapters must conform to `INGEST_ADAPTER_CONTRACT_V1` - see `ingest/contracts.py` and `docs/runbooks/adding-data-sources.md`.
+Ingestion is idempotent (content-hash dedup), incremental (delta since last watermark), and supports sub-chunking for large evidence (>10k chars).
+
+### Ingest Sanitization
+
+Before evidence reaches the LLM extractor, a sanitizer strips wrapper noise: `<graphiti-context>` blocks, untrusted metadata wrappers, and channel routing metadata. Raw message content is preserved unchanged. Token savings: ~20–60% per episode.
 
 ---
 
 ## Keeping Up with Upstream
 
-This fork tracks `getzep/graphiti` via a deterministic PR-based sync lane using an explicit patch stack for `graphiti_core` hotfixes.
+This fork tracks `getzep/graphiti` via a deterministic PR-based sync lane with an explicit patch stack for `graphiti_core` hotfixes.
 
-- **Default cadence:** Weekly (Monday) via GitHub Action.
-- **Conflict policy:** Upstream wins. If conflicts arise in `graphiti_core/**`, accept upstream's version and re-apply our local patch stack located in `patches/graphiti_core/`.
-- **Core Guardrail:** CI automatically enforces that no undocumented `graphiti_core` files drift from upstream.
+- **Default cadence:** Weekly (Monday) via GitHub Action
+- **Conflict policy:** Upstream wins. Re-apply local patch stack from `patches/graphiti_core/`
+- **Core guardrail:** CI enforces no undocumented `graphiti_core` drift
 
-For the full sync and patch application procedure, see the [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md) and [`HOTFIXES.md`](HOTFIXES.md).
+See [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md) and [`HOTFIXES.md`](HOTFIXES.md).
 
 ---
 
 ## Documentation Index
 
 ### Architecture & Concepts
-- [Custom Ontologies](docs/custom-ontologies.md) - defining per-lane extraction entity types
-- [Retrieval Trust Scoring](docs/retrieval-trust-scoring.md) - how promoted/corroborated facts boost search ranking
-- [Memory Runtime Wiring](docs/MEMORY-RUNTIME-WIRING.md) - Graphiti-primary retrieval + QMD failover contract
-- [Scope Policy](docs/scope-policy.md) - ingestion scope freeze: message-only default, toolResult opt-in allowlist, change process
-- [Runtime Pack Overlay](docs/runbooks/runtime-pack-overlay.md) - how private packs map to agents
+- [The Dual-Brain Architecture](docs/DUAL-BRAIN-ARCHITECTURE.md) — Why two systems, how trust works, OM synthesis
+- [Custom Ontologies](docs/custom-ontologies.md) — Per-lane extraction entity types
+- [Retrieval Trust Scoring](docs/retrieval-trust-scoring.md) — Trust multiplier mechanics
+- [Memory Runtime Wiring](docs/MEMORY-RUNTIME-WIRING.md) — Backend profiles, evidence plane, OM wiring
+- [Scope Policy](docs/scope-policy.md) — Ingestion scope: message-only default, toolResult opt-in
+- [Runtime Pack Overlay](docs/runbooks/runtime-pack-overlay.md) — How private packs map to agents
 
 ### Operations
-- [OM Operations](docs/runbooks/om-operations.md) — Observational Memory: fast-write, compressor, convergence, GC, promotion, dedupe, timeline semantics
-- [Sessions Ingestion](docs/runbooks/sessions-ingestion.md) — architecture, batch & steady-state config, high-throughput tuning, sub-chunking, retrieval benchmark, recall gate, post-processing, troubleshooting
-- [Adding Data Sources](docs/runbooks/adding-data-sources.md) — onboarding new content: group_id, ontology design, adapter patterns, cron setup
+- [OM Operations](docs/runbooks/om-operations.md) — Fast-write, compressor, convergence, GC, promotion, dedupe
+- [Sessions Ingestion](docs/runbooks/sessions-ingestion.md) — Batch & steady-state config, sub-chunking, recall gate
+- [Dual-Brain Operators Guide](docs/runbooks/dual-brain-operators-guide.md) — Approving facts, handling conflicts, debugging
+- [Adding Data Sources](docs/runbooks/adding-data-sources.md) — Onboarding new content
 - [Upstream Sync Runbook](docs/runbooks/upstream-sync-openclaw.md)
 - [State Migration Runbook](docs/runbooks/state-migration.md)
-- [Publicization & Backup](docs/runbooks/publicization-backup-cutover.md)
-- [OpenClaw Plugin Troubleshooting](docs/runbooks/openclaw-plugin-troubleshooting.md) — handling strict schema validation crashes and gateway port exhaustion
-- **Operator Rollout Runbook** (private) — merge/rebuild/smoke/pilot/backfill decision flow: `bicameral-private/docs/runbooks/operator-rollout-runbook.md`
+- [OpenClaw Plugin Troubleshooting](docs/runbooks/openclaw-plugin-troubleshooting.md)
 
 ### Technical Contracts
 - [Boundary Contract](docs/public/BOUNDARY-CONTRACT.md)
 - [Migration Sync Toolkit](docs/public/MIGRATION-SYNC-TOOLKIT.md)
 - [Release Checklist](docs/public/RELEASE-CHECKLIST.md)
 
-### Delta Tooling
-- `scripts/delta_tool.py` - unified CLI for delta operations
-- `scripts/runtime_pack_router.py` - the pack routing engine
-- `scripts/upstream_sync_doctor.py` - sync safety checks
-
 ---
 
 ## Current Status
 
-- Publicization execution lanes completed: adapter wiring, backup wiring, cron cutover.
-- Integration gate: **GO** (`reports/publicization/integration-report.md`).
-- Boundary policy: **ALLOW=370 / BLOCK=0 / AMBIGUOUS=0**.
-- **Truth pipeline: operational, with deterministic migration closeout policy.** Fact ledger + trust-aware retrieval are live, and curated-facts migration now uses deterministic disposition-aware validation (rather than ad-hoc/manual overrides) for unresolved legacy mappings. Canonical curated migration closeout is complete.
-- **Promotion policy v3 unified:** Policy v3 is now the default for all code paths — both OM-derived candidates and graph-lane candidates. The prior v2/v3 split-brain is resolved (`truth/candidates.py` `POLICY_VERSION_DEFAULT = "promotion-v3"`).
-- **Lane matrix locked (v3):** Retrieval eligibility, corroboration-only classification, and candidate-generating status are codified in `truth/candidates.py` constants and `config/runtime_pack_registry.json` `lane_policy`. See Candidate Generation Policy table above.
-- **Ingest sanitization live:** Session ingest strips `<graphiti-context>` blocks, untrusted metadata wrappers, and tool-call noise before LLM extraction (`scripts/mcp_ingest_sessions.py`). Token savings: ~20–60% per episode on typical sessions.
-- **Flip readiness caveat:** do not treat this status as automatic "Graphiti-primary GO." First confirm extraction freshness / queue-drain reliability, pass a fresh shadow-compare window, and complete a pilot run with per-lane quality report; otherwise keep Graphiti in governed shadow mode with QMD failover semantics. See private repo `docs/runbooks/operator-rollout-runbook.md` for the merge/rebuild/smoke/pilot/backfill decision flow.
+### What's Shipped
+- **Dual-brain architecture** with Neo4j (Brain 1) + SQLite ChangeLedger (Brain 2) operational
+- **Promotion policy v3** unified across all code paths (OM + graph-lane candidates)
+- **Lane matrix v3** locked and codified in config + code
+- **OM pipeline** operational: fast-write → compressor → convergence → CoreMemory promotion
+- **Trust-aware retrieval** with RRF + trust multiplier live
+- **Ingest sanitization** stripping wrapper noise before extraction (~20-60% token savings)
+- **Custom ontologies** with per-lane YAML config, zero-code lane addition
+- **Public/private split** with overlay model, deterministic rebuild, security rails
+
+### In Progress (Typed Memory Rescope)
+The typed memory rescope epic is actively shipping the post-rescope architecture described above:
+- **Phase 0 (Schema + Interface Decision):** ✅ Locked — schema, event vocabulary, must-win suite defined
+- **Phase 1 (ChangeLedger + Typed Object Base):** Building canonical change model and StateFact/Episode/Procedure implementations
+- **Phases 2-4 (Lane Unification, Typed Retrieval, Procedural Memory):** Parallel fan-out after Phase 1
+- **Phase 5 (OM Closeout):** Carry-forward under rescoped architecture
+- **Integration:** Must-win proof/kill suite (6 blind questions, 5/6 win/tie required)
+
+### Operator Note
+Runtime retrieval is currently QMD-primary with Graphiti in governed shadow mode. The typed memory rescope will gate the flip to Bicameral-primary retrieval on passing the must-win evaluation suite. See private repo `docs/runbooks/operator-rollout-runbook.md` for the decision flow.
 
 ## CI Policy
 

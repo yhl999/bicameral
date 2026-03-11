@@ -2,22 +2,24 @@
 
 This runbook explains how to operate the Dual-Brain system in practice: when to approve facts, how to handle conflicts, and how to debug when Brain 1 and Brain 2 disagree.
 
-> **Operational status (2026-02-22):** canonical curated migration is closed out, but Graphiti-primary retrieval flip should stay gated until extraction freshness / queue-drain reliability is verified over a fresh shadow-compare window.
+> **Architecture note:** Brain 2 is the **ChangeLedger** — an append-only, hash-chained event stream that records every assertion, supersession, invalidation, and promotion. The typed memory rescope (in progress) layers StateFact, Episode, and Procedure typed objects on top of the ChangeLedger governance.
 >
-> **Command notice:** this public runbook is architecture guidance. Some CLI examples below are illustrative and may refer to internal/private operator tooling not published in this repo.
+> **Operational status:** Runtime retrieval is QMD-primary; Graphiti-primary flip is gated on passing the must-win evaluation suite. See private repo `docs/runbooks/operator-rollout-runbook.md` for the decision flow.
+>
+> **Command notice:** This public runbook is architecture guidance. Some CLI examples below are illustrative and may refer to internal/private operator tooling not published in this repo.
 
 ---
 
 ## Quick Reference: The Two Brains
 
-| Aspect | Brain 1 (Neo4j) | Brain 2 (Ledger) |
+| Aspect | Brain 1 — Semantic Engine (Neo4j) | Brain 2 — ChangeLedger (SQLite) |
 |--------|----------------|-----------------|
-| **Type** | Semantic graph | Append-only ledger |
+| **Type** | Semantic graph (entities, relationships, embeddings) | Append-only event stream (assert, supersede, invalidate, promote…) |
 | **Source of truth?** | No. Derived. | **Yes. Canonical.** |
-| **Update speed** | Fast (extraction runs continuously) | Slow (approval is gated) |
-| **Audit trail** | Partial (timestamps, extraction metadata) | **Complete (full provenance)** |
+| **Update speed** | Fast (extraction runs continuously) | Gated (approval required for high-risk) |
+| **Audit trail** | Partial (timestamps, extraction metadata) | **Complete (full provenance, hash-chained)** |
 | **Rollback?** | Messy (requires re-extraction or manual edge deletion) | **Clean (single ledger entry)** |
-| **Trust decisions** | None (all edges equal until synced) | **Yes (promotion policy)** |
+| **Trust decisions** | None (all edges equal until synced) | **Yes (promotion policy v3)** |
 
 ## Daily Operations
 
