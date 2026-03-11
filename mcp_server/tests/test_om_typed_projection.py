@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from mcp_server.src.models.typed_memory import Episode, StateFact
 from mcp_server.src.services.om_typed_projection import OMTypedProjectionService
 

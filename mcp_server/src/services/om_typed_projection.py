@@ -1161,7 +1161,7 @@ class OMTypedProjectionService:
                     'relation_type': relation_type,
                 }
             )
-        for key, rows in closure_rows.items():
+        for _key, rows in closure_rows.items():
             rows.sort(key=lambda edge: (_timestamp_sort_key(edge.get('created_at')), edge.get('relation_type') or '', edge.get('source_id') or ''))
         return closure_rows
 

@@ -41,9 +41,9 @@ try:
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
     )
+    from .services.om_typed_projection import OMTypedProjectionService
     from .services.ontology_registry import OntologyRegistry
     from .services.queue_service import QueueService, build_om_candidate_rows
-    from .services.om_typed_projection import OMTypedProjectionService
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
     from .utils.formatting import format_fact_result
@@ -64,9 +64,9 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
     )
+    from services.om_typed_projection import OMTypedProjectionService
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
-    from services.om_typed_projection import OMTypedProjectionService
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
     from utils.formatting import format_fact_result
