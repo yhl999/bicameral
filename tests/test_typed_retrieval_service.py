@@ -42,6 +42,9 @@ def _state_fact(
     is_current: bool = True,
     source_lane: str = 's1_sessions_main',
     source_key: str = 'session:1',
+    invalid_at: str | None = None,
+    lifecycle_status: str = 'asserted',
+    promotion_status: str = 'proposed',
 ):
     return StateFact(
         object_id=object_id,
@@ -66,6 +69,9 @@ def _state_fact(
         predicate='likes',
         value=value,
         scope='private',
+        invalid_at=invalid_at,
+        lifecycle_status=lifecycle_status,
+        promotion_status=promotion_status,
     )
 
 
@@ -73,7 +79,7 @@ def _memory_ledger() -> ChangeLedger:
     return ChangeLedger(sqlite3.connect(':memory:'))
 
 
-def _episode(*, object_id: str, root_id: str, version: int, summary: str, is_current: bool = True, parent_id: str | None = None, superseded_by: str | None = None, invalid_at: str | None = None):
+def _episode(*, object_id: str, root_id: str, version: int, summary: str, is_current: bool = True, parent_id: str | None = None, superseded_by: str | None = None, invalid_at: str | None = None, source_key: str | None = None):
     return Episode(
         object_id=object_id,
         root_id=root_id,
@@ -81,7 +87,7 @@ def _episode(*, object_id: str, root_id: str, version: int, summary: str, is_cur
         version=version,
         is_current=is_current,
         source_lane='s1_observational_memory',
-        source_key=f'om:s1_observational_memory:node:{object_id}',
+        source_key=source_key or f'om:s1_observational_memory:node:{object_id}',
         policy_scope='private',
         visibility_scope='private',
         title=summary[:40],
@@ -551,6 +557,198 @@ def test_om_projection_only_projects_episodes_when_ledger_already_has_om_state()
         'om_episode:s1_observational_memory:travel-style-v1',
     ]
     assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
+
+
+def test_ledger_backed_om_history_derives_episode_lineage_for_promoted_om_state():
+    previous = _state_fact(
+        object_id='ledger_state_v1',
+        root_id='ledger_root',
+        version=1,
+        value='checked bag only',
+        is_current=False,
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style-v1',
+        invalid_at='2026-03-09T00:00:00Z',
+        lifecycle_status='superseded',
+        promotion_status='promoted',
+    )
+    current = _state_fact(
+        object_id='ledger_state_v2',
+        root_id='ledger_root',
+        version=2,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style-v2',
+        lifecycle_status='promoted',
+        promotion_status='promoted',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[
+            _episode(
+                object_id='om_episode:s1_observational_memory:travel-style-v1',
+                root_id='om_episode:s1_observational_memory:travel-style-v1',
+                version=1,
+                summary='checked bag only',
+                is_current=False,
+                invalid_at='2026-03-09T00:00:00Z',
+                superseded_by='om_episode:s1_observational_memory:travel-style-v2',
+                source_key='om:s1_observational_memory:node:travel-style-v1',
+            ),
+            _episode(
+                object_id='om_episode:s1_observational_memory:travel-style-v2',
+                root_id='om_episode:s1_observational_memory:travel-style-v1',
+                version=2,
+                summary='carry-on only',
+                parent_id='om_episode:s1_observational_memory:travel-style-v1',
+                source_key='om:s1_observational_memory:node:travel-style-v2',
+            ),
+        ],
+        search_overrides={
+            'om_episode:s1_observational_memory:travel-style-v1': 'checked bag only before change',
+            'om_episode:s1_observational_memory:travel-style-v2': 'carry-on only now',
+        },
+        limits={
+            'enabled': True,
+            'reason': 'projected_history',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 2,
+            'state_projected': 0,
+            'max_results': 10,
+            'history_mode': True,
+            'history_candidates': 1,
+            'history_lineages_projected': 1,
+            'history_state_projection_supported': False,
+            'unsupported_object_types': [],
+            'skipped_candidates': [],
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [previous, current],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {
+            'ledger_state_v1': 'checked bag only before change',
+            'ledger_state_v2': 'carry-on only now',
+        },
+    )
+
+    response = _run(
+        service.search(
+            query='what changed with travel style carry-on',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            history_mode='history',
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert len(projection.calls) == 1
+    assert projection.calls[0]['object_types'] == {'episode'}
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode_shadow:ledger_state_v2',
+        'om_episode_shadow:ledger_state_v1',
+    ]
+    assert response['episodes'][0]['root_id'] == 'ledger_root'
+    assert response['episodes'][0]['parent_id'] == 'om_episode_shadow:ledger_state_v1'
+    assert response['episodes'][1]['superseded_by'] == 'om_episode_shadow:ledger_state_v2'
+    assert response['limits_applied']['materialization']['ledger_backed_om_history'] == {
+        'enabled': True,
+        'reason': 'ledger_promoted_om_state_history',
+        'episodes_derived': 2,
+        'roots_covered': 1,
+        'source_nodes_covered': 2,
+    }
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_projected_episodes'] == 2
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_projected_episode_nodes'] == 2
+
+
+def test_ledger_backed_om_history_keeps_uncovered_projected_episodes():
+    ledger_obj = _state_fact(
+        object_id='ledger_state',
+        root_id='ledger_root',
+        version=1,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style',
+        lifecycle_status='promoted',
+        promotion_status='promoted',
+    )
+    covered_episode = _episode(
+        object_id='om_episode:s1_observational_memory:travel-style',
+        root_id='om_episode:s1_observational_memory:travel-style',
+        version=1,
+        summary='travel style before promotion',
+        source_key='om:s1_observational_memory:node:travel-style',
+    )
+    uncovered_episode = _episode(
+        object_id='om_episode:s1_observational_memory:packing-habit',
+        root_id='om_episode:s1_observational_memory:packing-habit',
+        version=1,
+        summary='packs a charger in every bag',
+        source_key='om:s1_observational_memory:node:packing-habit',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[covered_episode, uncovered_episode],
+        search_overrides={
+            'om_episode:s1_observational_memory:travel-style': 'carry-on only travel style',
+            'om_episode:s1_observational_memory:packing-habit': 'carry-on only and always packs charger',
+        },
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 2,
+            'state_projected': 0,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [ledger_obj],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {'ledger_state': 'carry-on only'},
+    )
+
+    response = _run(
+        service.search(
+            query='carry-on',
+            effective_group_ids=['s1_observational_memory'],
+            object_types=['episode'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode_shadow:ledger_state',
+        'om_episode:s1_observational_memory:packing-habit',
+    ]
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_projected_episodes'] == 1
 
 
 def test_om_projection_auto_history_query_merges_lineage_objects():

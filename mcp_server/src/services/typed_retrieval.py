@@ -180,6 +180,25 @@ class TypedRetrievalService:
         else:
             all_objects, materialization_limits, search_text_overrides = materialized
 
+        (
+            derived_om_episodes,
+            derived_episode_search_overrides,
+            derived_om_history_limits,
+            covered_om_episode_nodes,
+        ) = self._derive_ledger_backed_om_history(
+            requested_object_types=normalized_object_types,
+            ledger_objects=all_objects,
+        )
+        if derived_om_episodes:
+            seen_ids = {obj.object_id for obj in all_objects}
+            for episode in derived_om_episodes:
+                if episode.object_id in seen_ids:
+                    continue
+                all_objects.append(episode)
+                seen_ids.add(episode.object_id)
+            search_text_overrides.update(derived_episode_search_overrides)
+        materialization_limits['ledger_backed_om_history'] = derived_om_history_limits
+
         om_limits: dict[str, Any] = {'enabled': False, 'reason': 'no_projection_service'}
         om_projection_object_types, om_projection_suppression = self._om_projection_request(
             requested_object_types=normalized_object_types,
@@ -206,11 +225,24 @@ class TypedRetrievalService:
                     else:
                         om_objects, om_search_overrides, om_limits = om_result
                     seen_ids = {obj.object_id for obj in all_objects}
+                    suppressed_projected_episodes = 0
                     for om_obj in om_objects:
+                        if self._should_suppress_projected_om_object(
+                            om_obj,
+                            covered_om_episode_nodes=covered_om_episode_nodes,
+                        ):
+                            suppressed_projected_episodes += 1
+                            continue
                         if om_obj.object_id not in seen_ids:
                             all_objects.append(om_obj)
                             seen_ids.add(om_obj.object_id)
                     search_text_overrides.update(om_search_overrides)
+                    if suppressed_projected_episodes:
+                        om_limits = {
+                            **om_limits,
+                            'suppressed_projected_episodes': suppressed_projected_episodes,
+                            'suppressed_projected_episode_nodes': len(covered_om_episode_nodes),
+                        }
                     if om_projection_suppression:
                         om_limits = {**om_limits, **om_projection_suppression}
                 except Exception:
@@ -469,6 +501,129 @@ class TypedRetrievalService:
             return None
         return coerce_typed_object(json.loads(str(payload_json)))
 
+    def _derive_ledger_backed_om_history(
+        self,
+        *,
+        requested_object_types: set[str],
+        ledger_objects: list[TypedMemoryObject],
+    ) -> tuple[list[Episode], dict[str, str], dict[str, Any], set[tuple[str, str]]]:
+        if requested_object_types and 'episode' not in requested_object_types:
+            return [], {}, {'enabled': False, 'reason': 'episodes_not_requested'}, set()
+
+        promoted_om_state_facts = [
+            obj
+            for obj in ledger_objects
+            if isinstance(obj, StateFact)
+            and is_om_native_group_id(getattr(obj, 'source_lane', None))
+            and getattr(obj, 'promotion_status', None) == 'promoted'
+            and _om_node_key_from_source_key(getattr(obj, 'source_key', None)) is not None
+        ]
+        if not promoted_om_state_facts:
+            return [], {}, {'enabled': False, 'reason': 'no_promoted_om_state_history'}, set()
+
+        grouped_facts: dict[str, list[StateFact]] = defaultdict(list)
+        for fact in promoted_om_state_facts:
+            grouped_facts[fact.root_id].append(fact)
+
+        derived_episodes: list[Episode] = []
+        search_text_overrides: dict[str, str] = {}
+        covered_nodes: set[tuple[str, str]] = set()
+        roots_covered = 0
+
+        for root_id, facts in grouped_facts.items():
+            ordered_facts = sorted(
+                facts,
+                key=lambda fact: (
+                    fact.version,
+                    fact.created_at,
+                    fact.object_id,
+                ),
+            )
+            if not ordered_facts:
+                continue
+            roots_covered += 1
+            derived_object_ids = [
+                _ledger_backed_om_episode_object_id(fact.object_id)
+                for fact in ordered_facts
+            ]
+            for index, fact in enumerate(ordered_facts):
+                node_key = _om_node_key_from_source_key(fact.source_key)
+                if node_key is not None:
+                    covered_nodes.add(node_key)
+                parent_id = derived_object_ids[index - 1] if index > 0 else None
+                superseded_by = derived_object_ids[index + 1] if index + 1 < len(derived_object_ids) else None
+                title = _ledger_backed_om_episode_title(fact)
+                summary = _ledger_backed_om_episode_summary(fact)
+                history_meta = {
+                    'lineage_kind': 'promoted_om_state',
+                    'lineage_basis': 'ledger_state_history',
+                    'derivation_level': 'ledger',
+                    'state_object_id': fact.object_id,
+                    'state_root_id': fact.root_id,
+                    'state_version': fact.version,
+                    'state_fact_type': fact.fact_type,
+                    'promotion_status': fact.promotion_status,
+                    'root_id': fact.root_id,
+                    'parent_id': parent_id,
+                    'version': fact.version,
+                    'is_current': fact.is_current,
+                    'superseded_by': superseded_by,
+                    'invalid_at': fact.invalid_at,
+                }
+                if node_key is not None:
+                    history_meta['source_group_id'] = node_key[0]
+                    history_meta['source_node_id'] = node_key[1]
+
+                episode = Episode(
+                    object_id=derived_object_ids[index],
+                    root_id=root_id,
+                    parent_id=parent_id,
+                    version=max(1, int(fact.version)),
+                    is_current=fact.is_current,
+                    source_lane=fact.source_lane,
+                    source_key=fact.source_key,
+                    policy_scope=fact.policy_scope,
+                    visibility_scope=fact.visibility_scope,
+                    title=title,
+                    summary=summary,
+                    annotations=[
+                        'om_native',
+                        'ledger_backed',
+                        'ledger_canonical_om_history',
+                        'history_derived',
+                        f'state_fact_type:{fact.fact_type}',
+                    ],
+                    history_meta=history_meta,
+                    created_at=fact.created_at,
+                    valid_at=fact.valid_at,
+                    invalid_at=fact.invalid_at,
+                    superseded_by=superseded_by,
+                    lifecycle_status=fact.lifecycle_status,
+                    evidence_refs=list(fact.evidence_refs),
+                )
+                derived_episodes.append(episode)
+                search_text_overrides[episode.object_id] = _searchable_text(episode)
+
+        limits = {
+            'enabled': True,
+            'reason': 'ledger_promoted_om_state_history',
+            'episodes_derived': len(derived_episodes),
+            'roots_covered': roots_covered,
+            'source_nodes_covered': len(covered_nodes),
+        }
+        return derived_episodes, search_text_overrides, limits, covered_nodes
+
+    def _should_suppress_projected_om_object(
+        self,
+        obj: TypedMemoryObject,
+        *,
+        covered_om_episode_nodes: set[tuple[str, str]],
+    ) -> bool:
+        if not covered_om_episode_nodes or not isinstance(obj, Episode):
+            return False
+        node_key = _om_node_key_from_source_key(getattr(obj, 'source_key', None))
+        return node_key in covered_om_episode_nodes
+
     def _om_projection_request(
         self,
         *,
@@ -589,6 +744,39 @@ class TypedRetrievalService:
             object_ids_by_uri=object_ids_by_uri,
             max_items=max_evidence,
         )
+
+
+
+def _om_node_key_from_source_key(source_key: str | None) -> tuple[str, str] | None:
+    raw = str(source_key or '').strip()
+    parts = raw.split(':')
+    if len(parts) < 4 or parts[0] != 'om' or parts[2] != 'node':
+        return None
+    group_id = str(parts[1]).strip()
+    node_id = ':'.join(parts[3:]).strip()
+    if not group_id or not node_id:
+        return None
+    return group_id, node_id
+
+
+def _ledger_backed_om_episode_object_id(state_object_id: str) -> str:
+    return f'om_episode_shadow:{state_object_id}'
+
+
+def _ledger_backed_om_episode_title(fact: StateFact) -> str:
+    return str(fact.predicate or fact.fact_type or fact.object_id)
+
+
+def _ledger_backed_om_episode_summary(fact: StateFact) -> str:
+    return ' '.join(
+        part
+        for part in [
+            str(fact.subject or '').strip(),
+            str(fact.predicate or '').strip(),
+            _stringify(fact.value).strip(),
+        ]
+        if part
+    ).strip()
 
 
 def _normalize_object_types(object_types: list[str] | None) -> set[str]:
