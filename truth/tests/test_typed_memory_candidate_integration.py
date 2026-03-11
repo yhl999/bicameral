@@ -753,3 +753,101 @@ def test_deny_retry_after_partial_failure_no_duplicate_invalidate_events():
         f'Fact must remain non-current after retry (no ledger resurrection), '
         f'found: {current_after_retry!r}'
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue #3 — build_object_from_candidate_fact: scalar preconditions must not
+# be iterated as characters
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _procedure_fact(**overrides) -> dict:
+    """Minimal fact dict for a procedure candidate."""
+    payload = {
+        'assertion_type': 'procedure',
+        'predicate': 'procedure.steps',
+        'subject': 'user:principal',
+        'scope': 'private',
+        'evidence_refs': [{'source_key': 'sessions:s1', 'evidence_id': 'msg-1', 'scope': 's1_sessions_main'}],
+        'value': {
+            'name': 'DeployService',
+            'trigger': 'on push to main',
+            'steps': ['run tests', 'deploy'],
+            'preconditions': [],
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_build_procedure_scalar_preconditions_not_split():
+    """A scalar string precondition must not be iterated as individual characters."""
+    from mcp_server.src.models.typed_memory import Procedure
+    from mcp_server.src.services.change_ledger import build_object_from_candidate_fact
+
+    fact = _procedure_fact(
+        value={
+            'name': 'DeployService',
+            'trigger': 'on push to main',
+            'steps': ['run tests', 'deploy'],
+            'preconditions': 'CI must pass',  # scalar — not a list
+        }
+    )
+    obj = build_object_from_candidate_fact(
+        candidate_id='cand-scalar-precond',
+        fact=fact,
+        policy_version='v3',
+        recorded_at='2026-03-11T00:00:00Z',
+    )
+    assert isinstance(obj, Procedure)
+    # Must be exactly one precondition, not a list of individual characters.
+    assert obj.preconditions == ['CI must pass'], (
+        f'Expected ["CI must pass"], got {obj.preconditions!r}'
+    )
+
+
+def test_build_procedure_list_preconditions_unchanged():
+    """List preconditions must pass through untouched."""
+    from mcp_server.src.models.typed_memory import Procedure
+    from mcp_server.src.services.change_ledger import build_object_from_candidate_fact
+
+    fact = _procedure_fact(
+        value={
+            'name': 'DeployService',
+            'trigger': 'on push to main',
+            'steps': ['run tests', 'deploy'],
+            'preconditions': ['CI must pass', 'branch is main'],
+        }
+    )
+    obj = build_object_from_candidate_fact(
+        candidate_id='cand-list-precond',
+        fact=fact,
+        policy_version='v3',
+        recorded_at='2026-03-11T00:00:00Z',
+    )
+    assert isinstance(obj, Procedure)
+    assert obj.preconditions == ['CI must pass', 'branch is main']
+
+
+def test_build_procedure_empty_preconditions_list():
+    """Empty preconditions (None or []) must result in an empty list, not an error."""
+    from mcp_server.src.models.typed_memory import Procedure
+    from mcp_server.src.services.change_ledger import build_object_from_candidate_fact
+
+    for empty_val in (None, [], ''):
+        fact = _procedure_fact(
+            value={
+                'name': 'DeployService',
+                'trigger': 'on push to main',
+                'steps': ['run tests'],
+                'preconditions': empty_val,
+            }
+        )
+        obj = build_object_from_candidate_fact(
+            candidate_id=f'cand-empty-precond-{empty_val!r}',
+            fact=fact,
+            policy_version='v3',
+            recorded_at='2026-03-11T00:00:00Z',
+        )
+        assert isinstance(obj, Procedure)
+        assert obj.preconditions == [], f'Expected [] for preconditions={empty_val!r}, got {obj.preconditions!r}'

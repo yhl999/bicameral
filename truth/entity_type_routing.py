@@ -76,11 +76,16 @@ def route_entity_edge(
 
     # --- Procedure routing ---------------------------------------------------
     if all_labels & PROCEDURE_ENTITY_LABELS:
+        # Use the name of whichever endpoint carries the Procedure label.
+        # When the label is on the target (b), the procedure is named after
+        # target_name; falling back to source_name covers source-labeled or
+        # both-labeled cases.
+        typed_name = target_name if PROCEDURE_ENTITY_LABELS & b_set else source_name
         return (
             "procedure.steps",
             "procedure",
             {
-                "name": source_name,
+                "name": typed_name,
                 "trigger": (rel_name or "").strip() or "relates_to",
                 "description": fact.strip() if fact else "",
             },
@@ -89,11 +94,13 @@ def route_entity_edge(
 
     # --- Episode routing -----------------------------------------------------
     if all_labels & EPISODE_ENTITY_LABELS:
+        # Same side-selection logic for episode nodes.
+        typed_name = target_name if EPISODE_ENTITY_LABELS & b_set else source_name
         return (
             "episode.description",
             "episode",
             {
-                "name": source_name,
+                "name": typed_name,
                 "description": fact.strip() if fact else "",
                 "participants": [source_name, target_name],
             },

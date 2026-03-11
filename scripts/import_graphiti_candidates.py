@@ -271,8 +271,14 @@ def to_content_subject_id(source_name: str) -> str:
 
 
 def iter_anchor_aliases(anchors: Iterable[Anchor]) -> Iterable[Tuple[str, str]]:
-    """Yield (alias_name, subject_id) pairs."""
+    """Yield (name, subject_id) pairs for every lookup name of each anchor.
+
+    Yields the canonical_name first, then each alias.  Previously only aliases
+    were yielded, so an anchor whose graph node uses canonical_name would
+    silently produce zero query results.
+    """
     for a in anchors:
+        yield a.canonical_name, a.subject_id
         for alias in a.aliases:
             yield alias, a.subject_id
 

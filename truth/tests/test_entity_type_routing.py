@@ -101,3 +101,71 @@ def test_rel_name_fallback_when_empty() -> None:
     assert result is not None
     _, _, value, _ = result
     assert value["trigger"] == "relates_to"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2 fixes: typed-node name must follow the labeled side
+# ---------------------------------------------------------------------------
+
+
+def test_procedure_label_on_source_uses_source_name() -> None:
+    """When the Procedure label is on the source, value['name'] == source_name."""
+    result = route_entity_edge(
+        source_name="OnboardUser",
+        target_name="NewEmployee",
+        rel_name="GUIDES",
+        fact="OnboardUser guides NewEmployee through setup.",
+        a_labels=["Procedure", "Entity"],
+        b_labels=["Entity"],
+    )
+    assert result is not None
+    _, _, value, _ = result
+    assert value["name"] == "OnboardUser"
+
+
+def test_procedure_label_on_target_uses_target_name() -> None:
+    """When the Procedure label is only on the target, value['name'] == target_name."""
+    result = route_entity_edge(
+        source_name="Yuan",
+        target_name="MorningWorkout",
+        rel_name="FOLLOWS",
+        fact="Yuan follows MorningWorkout before 10:30am.",
+        a_labels=["Entity"],
+        b_labels=["Procedure"],
+    )
+    assert result is not None
+    _, assertion_type, value, _ = result
+    assert assertion_type == "procedure"
+    assert value["name"] == "MorningWorkout"
+
+
+def test_episode_label_on_source_uses_source_name() -> None:
+    """When the Episode-family label is on the source, value['name'] == source_name."""
+    result = route_entity_edge(
+        source_name="CodexQuotaExhaustion",
+        target_name="PRBlockedEvent",
+        rel_name="CAUSED",
+        fact="Codex quota exhaustion caused 6 PRs to be blocked.",
+        a_labels=["EngineeringIncident"],
+        b_labels=["Entity"],
+    )
+    assert result is not None
+    _, assertion_type, value, _ = result
+    assert assertion_type == "episode"
+    assert value["name"] == "CodexQuotaExhaustion"
+
+
+def test_episode_label_on_target_uses_target_name() -> None:
+    """When the Episode-family label is only on the target, value['name'] == target_name."""
+    result = route_entity_edge(
+        source_name="Yuan",
+        target_name="Q1ReviewEpisode",
+        rel_name="PARTICIPATED_IN",
+        fact="Yuan participated in Q1ReviewEpisode.",
+        a_labels=["Entity"],
+        b_labels=["AuditEpisode"],
+    )
+    assert result is not None
+    _, assertion_type, value, _ = result
+    assert assertion_type == "episode"
+    assert value["name"] == "Q1ReviewEpisode"

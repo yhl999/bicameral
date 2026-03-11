@@ -851,12 +851,15 @@ def build_object_from_candidate_fact(
                 or 'extracted from source'
             )
             steps = [fallback]
+        raw_preconditions = value.get('preconditions') or []
+        if isinstance(raw_preconditions, str):
+            raw_preconditions = [raw_preconditions]
         return Procedure.model_validate(
             {
                 **base,
                 'name': str(value.get('name') or fact.get('subject') or 'unnamed_procedure').strip() or 'unnamed_procedure',
                 'trigger': str(value.get('trigger') or fact.get('predicate') or '').strip(),
-                'preconditions': [str(p).strip() for p in (value.get('preconditions') or []) if str(p).strip()],
+                'preconditions': [str(p).strip() for p in raw_preconditions if str(p).strip()],
                 'steps': steps,
                 'expected_outcome': str(value.get('expected_outcome') or '').strip(),
                 'risk_level': str(value.get('risk_level') or 'medium').strip() or 'medium',
