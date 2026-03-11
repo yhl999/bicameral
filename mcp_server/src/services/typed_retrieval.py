@@ -199,6 +199,28 @@ class TypedRetrievalService:
             search_text_overrides.update(derived_episode_search_overrides)
         materialization_limits['ledger_backed_om_history'] = derived_om_history_limits
 
+        # Phase 2 platonic: provisional episodes written at OM-write time are
+        # already in all_objects from ledger materialization.  Track them for
+        # dedup against projected episodes and against promoted shadow episodes.
+        provisional_episodes_to_remove: set[str] = set()
+        for obj in all_objects:
+            if isinstance(obj, Episode) and 'provisional' in (obj.annotations or []):
+                node_key = _om_node_key_from_source_key(getattr(obj, 'source_key', None))
+                if node_key is not None:
+                    if node_key in covered_om_episode_nodes:
+                        # This provisional episode's node has been promoted and
+                        # has a ledger-backed shadow episode — suppress it.
+                        provisional_episodes_to_remove.add(obj.object_id)
+                    else:
+                        # Not yet promoted: mark as covered so projection
+                        # service doesn't produce a duplicate.
+                        covered_om_episode_nodes.add(node_key)
+        if provisional_episodes_to_remove:
+            all_objects = [
+                obj for obj in all_objects
+                if obj.object_id not in provisional_episodes_to_remove
+            ]
+
         om_limits: dict[str, Any] = {'enabled': False, 'reason': 'no_projection_service'}
         if self.om_projection_service is not None:
             # Projection now only produces provisional episodes for unpromoted

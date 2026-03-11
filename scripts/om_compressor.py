@@ -43,6 +43,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from truth import candidates as candidates_store  # noqa: E402
 
+# Phase 2 platonic: write provisional ledger episodes at OM-write time
+from mcp_server.src.services.change_ledger import ChangeLedger, DB_PATH_DEFAULT as _LEDGER_DB_DEFAULT  # noqa: E402
+from mcp_server.src.models.typed_memory import Episode, EvidenceRef  # noqa: E402
+
 DEFAULT_LOCK_FILENAME = "om_graph_write.lock"
 NEO4J_ENV_FALLBACK_FILE = Path.home() / ".clawdbot" / "credentials" / "neo4j.env"
 NEO4J_NON_DEV_FALLBACK_OPT_IN_ENV = "OM_NEO4J_ENV_FALLBACK_NON_DEV"
@@ -79,6 +83,152 @@ RELATION_TYPE_TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 class OMCompressorError(RuntimeError):
     pass
+
+
+@dataclass
+class WrittenOMNode:
+    """Metadata for an OM node successfully written to Neo4j.
+
+    Captured inside _process_chunk_tx so the caller can write a corresponding
+    provisional episode to the change ledger (Phase 2 platonic ideal).
+    """
+    node_id: str
+    group_id: str
+    content: str
+    semantic_domain: str
+    node_type: str
+    source_key: str
+    created_at: str
+    valid_at: str | None
+    source_message_ids: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Provisional ledger episode writer (Phase 2 platonic ideal)
+#
+# After the Neo4j transaction successfully writes OM nodes, this function
+# writes corresponding provisional Episode entries to the change ledger so
+# that unpromoted OM content is discoverable through the canonical ledger
+# path — no read-time projection needed.
+# ---------------------------------------------------------------------------
+
+_PROVISIONAL_LEDGER: ChangeLedger | None = None
+
+
+def _get_provisional_ledger() -> ChangeLedger:
+    """Lazy singleton for the change ledger used by provisional writes."""
+    global _PROVISIONAL_LEDGER
+    if _PROVISIONAL_LEDGER is None:
+        ledger_path = Path(os.environ.get("CHANGE_LEDGER_PATH", str(_LEDGER_DB_DEFAULT)))
+        _PROVISIONAL_LEDGER = ChangeLedger(ledger_path)
+    return _PROVISIONAL_LEDGER
+
+
+def _provisional_episode_object_id(group_id: str, node_id: str) -> str:
+    """Deterministic object_id for a provisional OM episode."""
+    return f"om_provisional_episode:{group_id}:{node_id}"
+
+
+def _provisional_episode_root_id(group_id: str, node_id: str) -> str:
+    """Deterministic root_id for a provisional OM episode."""
+    return f"om_provisional_root:{group_id}:{node_id}"
+
+
+def _write_provisional_ledger_episodes(
+    written_nodes: list[WrittenOMNode],
+    *,
+    chunk_id: str,
+) -> int:
+    """Write provisional Episode entries to the change ledger for OM nodes.
+
+    Idempotent: if a provisional episode already exists for a node_id, it is
+    skipped (the create event's unique constraint on object_id prevents dupes).
+
+    Returns the number of new provisional episodes written.
+    """
+    if not written_nodes:
+        return 0
+
+    ledger = _get_provisional_ledger()
+    written = 0
+
+    for node in written_nodes:
+        object_id = _provisional_episode_object_id(node.group_id, node.node_id)
+        root_id = _provisional_episode_root_id(node.group_id, node.node_id)
+
+        # Idempotency: skip if already written
+        existing = ledger.root_id_for_object(object_id)
+        if existing is not None:
+            continue
+
+        episode = Episode(
+            object_id=object_id,
+            root_id=root_id,
+            parent_id=None,
+            version=1,
+            is_current=True,
+            source_lane=f"om:{node.group_id}",
+            source_key=node.source_key,
+            policy_scope="observational",
+            visibility_scope="owner",
+            title=node.content[:120] if node.content else node.node_id,
+            summary=node.content,
+            annotations=[
+                "om_native",
+                "provisional",
+                "unpromoted",
+                f"node_type:{node.node_type}",
+                f"semantic_domain:{node.semantic_domain}",
+            ],
+            history_meta={
+                "lineage_kind": "om_provisional",
+                "lineage_basis": "write_time_ledger",
+                "derivation_level": "provisional",
+                "om_node_id": node.node_id,
+                "om_group_id": node.group_id,
+                "chunk_id": chunk_id,
+                "promotion_status": "unpromoted",
+            },
+            created_at=node.created_at,
+            valid_at=node.valid_at,
+            invalid_at=None,
+            superseded_by=None,
+            lifecycle_status="asserted",
+            evidence_refs=[
+                EvidenceRef(
+                    kind="event_log",
+                    source_system=f"om:{node.group_id}",
+                    locator={
+                        "system": f"om:{node.group_id}",
+                        "stream": f"om:{node.group_id}",
+                        "event_id": node.node_id,
+                    },
+                    observed_at=node.created_at,
+                ),
+            ],
+        )
+
+        try:
+            ledger.append_event(
+                "assert",
+                actor_id="om_compressor",
+                reason="provisional_om_write",
+                recorded_at=node.created_at,
+                payload=episode,
+                root_id=root_id,
+            )
+            written += 1
+        except Exception as exc:
+            # Log but don't fail the chunk on ledger write errors — the Neo4j
+            # write already succeeded and is the primary record.
+            emit_event(
+                "OM_PROVISIONAL_LEDGER_WRITE_ERROR",
+                node_id=node.node_id,
+                object_id=object_id,
+                error=str(exc),
+            )
+
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -2628,6 +2778,7 @@ def _process_chunk_tx(
     node_by_id: dict[str, ExtractionNode] = {node.node_id: node for node in ranked_nodes}
 
     node_ids: set[str] = set()
+    written_om_nodes: list[WrittenOMNode] = []
 
     for node in ranked_nodes:
         check_row = tx.run(
@@ -2764,6 +2915,20 @@ def _process_chunk_tx(
             ).consume()
 
         node_ids.add(node.node_id)
+
+        # Collect metadata for provisional ledger episode (only for genuinely new nodes)
+        if existing_content is None:
+            written_om_nodes.append(WrittenOMNode(
+                node_id=node.node_id,
+                group_id=group_id,
+                content=incoming_content,
+                semantic_domain=node.semantic_domain,
+                node_type=node.node_type,
+                source_key=f"om:{group_id}:node:{node.node_id}",
+                created_at=canonical_created_at,
+                valid_at=canonical_valid_at,
+                source_message_ids=list(node.source_message_ids),
+            ))
 
     for edge in extracted.edges:
         if not _legal_edge(edge):
@@ -2965,6 +3130,7 @@ def _process_chunk_tx(
         "messages": len(messages),
         "nodes": len(ranked_nodes),
         "edges": len(extracted.edges),
+        "written_om_nodes": written_om_nodes,
     }
 
 
@@ -3014,12 +3180,16 @@ def _handle_parent_failure(
 
 def _process_single_message(session: Any, cfg: ExtractorConfig, message: MessageRow, chunk_id: str) -> bool:
     try:
-        _process_chunk(
+        result = _process_chunk(
             session,
             messages=[message],
             chunk_id=chunk_id,
             cfg=cfg,
             observed_node_ids=[],
+        )
+        _write_provisional_ledger_episodes(
+            result.get("written_om_nodes", []),
+            chunk_id=chunk_id,
         )
         return True
     except Exception as exc:
@@ -3064,12 +3234,16 @@ def _process_structured_parent(session: Any, parent: ParentState, cfg: Extractor
     else:
         try:
             _, observed_ids = _activate_energy_scores(session, child_messages)
-            _process_chunk(
+            child_result = _process_chunk(
                 session,
                 messages=child_messages,
                 chunk_id=child.child_chunk_id,
                 cfg=cfg,
                 observed_node_ids=observed_ids,
+            )
+            _write_provisional_ledger_episodes(
+                child_result.get("written_om_nodes", []),
+                chunk_id=child.child_chunk_id,
             )
             success = True
         except Exception as exc:
@@ -3301,6 +3475,10 @@ def _run_claim_mode(
                     cfg=cfg,
                     observed_node_ids=observed_ids,
                 )
+                _write_provisional_ledger_episodes(
+                    result.get("written_om_nodes", []),
+                    chunk_id=chunk_id,
+                )
 
                 if not _confirm_chunk_done(
                     session,
@@ -3344,7 +3522,7 @@ def _run_claim_mode(
 
                 emit_event(
                     "OM_CHUNK_PROCESSED",
-                    **result,
+                    **{k: v for k, v in result.items() if k != "written_om_nodes"},
                     worker_id=worker_id,
                     shard_index=int(args.shard_index),
                     shards=int(args.shards),
@@ -3512,7 +3690,11 @@ def run(args: argparse.Namespace) -> int:
                     cfg=cfg,
                     observed_node_ids=observed_ids,
                 )
-                emit_event("OM_CHUNK_PROCESSED", **result)
+                _write_provisional_ledger_episodes(
+                    result.get("written_om_nodes", []),
+                    chunk_id=chunk_id,
+                )
+                emit_event("OM_CHUNK_PROCESSED", **{k: v for k, v in result.items() if k != "written_om_nodes"})
                 processed += 1
             except NodeContentMismatchError as exc:
                 emit_event(
