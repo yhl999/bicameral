@@ -808,6 +808,11 @@ Your job is to extract durable observational memory about the human, their real-
 context, recurring routines, commitments, frictions, meaningful changes over time, and
 assistive implications grounded in repeated behavior or observed context.
 
+CRITICAL:
+- Extract the implication, not the implementation.
+- Distill the human-facing implication while preserving the actionable detail needed for future assistance.
+- If the evidence is technical or operational, keep the durable assistive meaning, not raw implementation detail.
+
 OUTPUT FORMAT: Return a single JSON object with exactly two top-level keys:
   "nodes": array of node objects
   "edges": array of edge objects
@@ -853,12 +858,14 @@ NODE-TYPE GUIDANCE:
 EXTRACTION RULES:
 - Extract durable observational memory, not generic operational doctrine.
 - Prefer human/context memory over system/process memory.
+- When evidence is technical or operational, infer the durable human-facing implication and preserve only the actionable detail needed to keep the memory useful.
 - Skip ephemeral conversational filler and one-off chatter without durable assistive value.
 - Normalize and deduplicate: if two messages express the same memory, emit one node.
 - Only emit edges where the relationship is clearly evidenced in the transcript.
 - relation_type MUST be one of the five allowed values above — no others are valid.
 - source_index and target_index must be valid 0-based indices into the nodes array.
 - If material would fit better in engineering, self-audit, security, or tooling memory, do not emit it here.
+- Raw implementation detail with no durable human-facing implication should not be emitted.
 - Return valid JSON only. No markdown fences, no explanation, no text outside the JSON object.
 - If no meaningful observational memory can be extracted, return {"nodes": [], "edges": []}.
 

@@ -1032,6 +1032,31 @@ def test_om_extract_system_prompt_contains_supersedes_guidance() -> None:
     )
 
 
+def test_om_extract_system_prompt_adds_light_touch_implication_rule() -> None:
+    """Variant I should add implication-not-implementation guidance without turning into G."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    assert "CRITICAL:" in prompt
+    assert "Extract the implication, not the implementation." in prompt
+    assert "Distill the human-facing implication while preserving the actionable detail needed for future assistance." in prompt
+    assert "If the evidence is technical or operational, keep the durable assistive meaning, not raw implementation detail." in prompt
+    assert prompt.index("CRITICAL:") < prompt.index("OUTPUT FORMAT:"), (
+        "The light-touch implication rule should appear before the schema contract"
+    )
+    assert "WHAT BELONGS:" not in prompt
+    assert "WHAT DOES NOT BELONG:" not in prompt
+
+
+def test_om_extract_system_prompt_preserves_f_style_actionable_extraction_rules() -> None:
+    """Variant I should keep F's concrete extraction style while pruning raw implementation detail."""
+    prompt = om_compressor._OM_EXTRACT_SYSTEM_PROMPT
+    assert "Extract durable observational memory, not generic operational doctrine." in prompt
+    assert "Prefer human/context memory over system/process memory." in prompt
+    assert "infer the durable human-facing implication and preserve only the actionable detail needed to keep the memory useful" in prompt
+    assert "Raw implementation detail with no durable human-facing implication should not be emitted." in prompt
+    assert "WHAT BELONGS IN OBSERVATIONAL MEMORY:" in prompt
+    assert "WHAT DOES NOT BELONG IN OBSERVATIONAL MEMORY:" in prompt
+
+
 def test_fetch_messages_by_ids_returns_chronological_order() -> None:
     """_fetch_messages_by_ids returns rows in created_at ASC order (DB fetch order), not
     input message_ids order — ensuring temporal sequencing for the extractor."""
