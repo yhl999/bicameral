@@ -43,12 +43,14 @@ try:
         requires_strict_om_native_only_scope,
     )
     from .services.om_typed_projection import OMTypedProjectionService
+    from .services.change_ledger import ChangeLedger
     from .services.ontology_registry import OntologyRegistry
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
+    from .models.typed_memory import StateFact
 except ImportError:  # pragma: no cover - script/top-level import fallback
     from config.schema import GraphitiConfig, ServerConfig
     from models.response_types import (
@@ -66,12 +68,14 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         requires_strict_om_native_only_scope,
     )
     from services.om_typed_projection import OMTypedProjectionService
+    from services.change_ledger import ChangeLedger
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
+    from models.typed_memory import StateFact
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -1240,6 +1244,7 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None
+change_ledger: ChangeLedger | None = None
 search_service = SearchService(om_group_id=DEFAULT_OM_GROUP_ID)
 
 # Global client for backward compatibility
@@ -2119,6 +2124,164 @@ async def search_memory_facts(
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
+
+
+class ChangeEvent(BaseModel):
+    # A single mutable fact change event in lineal history.
+    uuid: str
+    type: str
+    subject: str
+    predicate: str
+    value: Any
+    timestamp: str
+    source: str
+    status: str
+    supersedes: str | None = None
+    superseded_by: str | None = None
+
+
+def _change_ledger() -> ChangeLedger:
+    # Lazily initialize and return the change ledger singleton.
+    global change_ledger
+    if change_ledger is None:
+        change_ledger = ChangeLedger()
+    return change_ledger
+
+
+def _normalize_subject_or_predicate(value: str | None) -> str:
+    return str(value or '').strip()
+
+
+def _change_history_events_for_subject(
+    *,
+    subject: str,
+    predicate: str | None = None,
+) -> list[StateFact]:
+    # Return history chain facts for a subject and optional predicate.
+    ledger = _change_ledger()
+    subject_norm = _normalize_subject_or_predicate(subject)
+    predicate_norm = _normalize_subject_or_predicate(predicate)
+
+    matching: list[StateFact] = []
+    rows = ledger.conn.execute(
+        "SELECT root_id FROM typed_roots WHERE object_type = 'state_fact' ORDER BY root_id"
+    ).fetchall()
+    for row in rows:
+        root_id = str(row['root_id'])
+        for fact in ledger.materialize_lineage(root_id):
+            if not isinstance(fact, StateFact):
+                continue
+            if fact.subject != subject_norm:
+                continue
+            if predicate_norm and fact.predicate != predicate_norm:
+                continue
+            matching.append(fact)
+
+    matching.sort(key=lambda item: (item.created_at, item.version, item.object_id))
+    return matching
+
+
+def _current_state_candidates(subject: str, predicate: str | None) -> list[StateFact]:
+    ledger = _change_ledger()
+    subject_norm = _normalize_subject_or_predicate(subject)
+    return [
+        fact
+        for fact in ledger.current_state_facts()
+        if fact.subject == subject_norm
+        and (predicate is None or fact.predicate == _normalize_subject_or_predicate(predicate))
+    ]
+
+
+def _infer_event_sources(ledger: ChangeLedger, root_id: str) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for event in ledger.events_for_root(root_id):
+        if event.object_id is None:
+            continue
+
+        if event.reason:
+            sources[event.object_id] = str(event.reason)
+            continue
+
+        if event.event_type in {'assert', 'derive'}:
+            sources[event.object_id] = 'owner_asserted'
+        elif event.event_type in {'refine', 'supersede'}:
+            sources[event.object_id] = 'inferred'
+    return sources
+
+
+@mcp.tool()
+async def get_current_state(
+    subject: str,
+    predicate: str | None = None,
+) -> StateFact | ErrorResponse:
+    # Return the current state fact for a subject (and optional predicate).
+    normalized_subject = _normalize_subject_or_predicate(subject)
+    if not normalized_subject:
+        return ErrorResponse(error='invalid_input: subject cannot be empty')
+
+    normalized_predicate = _normalize_subject_or_predicate(predicate)
+    if normalized_predicate:
+        matches = _current_state_candidates(
+            subject=normalized_subject,
+            predicate=normalized_predicate,
+        )
+        if not matches:
+            return ErrorResponse(
+                error=(
+                    f'not_found: no active fact found for subject={normalized_subject!r} '
+                    f'and predicate={normalized_predicate!r}'
+                )
+            )
+        return max(matches, key=lambda item: (item.created_at, item.version, item.object_id))
+
+    candidates = _current_state_candidates(subject=normalized_subject, predicate=None)
+    predicates = sorted({fact.predicate for fact in candidates})
+    if not candidates:
+        return ErrorResponse(error=f'not_found: no active fact found for subject={normalized_subject!r}')
+    if len(predicates) > 1:
+        return ErrorResponse(
+            error='ambiguous_subject: subject matches multiple predicates '
+            f"(specify predicate): {", ".join(predicates)}"
+        )
+
+    return max(candidates, key=lambda item: (item.created_at, item.version, item.object_id))
+
+
+@mcp.tool()
+async def get_history(
+    subject: str,
+    predicate: str | None = None,
+) -> list[ChangeEvent]:
+    # Return historical state-fact change events for a subject.
+    normalized_subject = _normalize_subject_or_predicate(subject)
+    if not normalized_subject:
+        return []
+
+    facts = _change_history_events_for_subject(subject=normalized_subject, predicate=predicate)
+    if not facts:
+        return []
+
+    source_map: dict[str, str] = {}
+    ledger = _change_ledger()
+    for root_id in {fact.root_id for fact in facts}:
+        source_map.update(_infer_event_sources(ledger, root_id))
+
+    return [
+        ChangeEvent(
+            uuid=f.object_id,
+            type=str(f.fact_type),
+            subject=f.subject,
+            predicate=f.predicate,
+            value=f.value,
+            timestamp=f.created_at,
+            source=source_map.get(f.object_id, 'owner_asserted'),
+            status='active' if f.is_current else 'superseded',
+            supersedes=f.parent_id,
+            superseded_by=f.superseded_by,
+        )
+        for f in facts
+    ]
+
 
 
 @mcp.tool()
