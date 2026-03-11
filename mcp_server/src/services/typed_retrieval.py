@@ -20,6 +20,7 @@ try:
     )
     from .change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
     from .evidence_callback import EvidenceCallbackRegistry
+    from .om_group_scope import is_om_native_group_id
 except ImportError:  # pragma: no cover - top-level import fallback
     from models.typed_memory import (
         Episode,
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - top-level import fallback
     )
     from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, project_objects
     from services.evidence_callback import EvidenceCallbackRegistry
+    from services.om_group_scope import is_om_native_group_id
 
 _OBJECT_TYPE_ALIASES = {
     'state': 'state_fact',
@@ -179,27 +181,42 @@ class TypedRetrievalService:
             all_objects, materialization_limits, search_text_overrides = materialized
 
         om_limits: dict[str, Any] = {'enabled': False, 'reason': 'no_projection_service'}
+        om_projection_object_types, om_projection_suppression = self._om_projection_request(
+            requested_object_types=normalized_object_types,
+            ledger_objects=all_objects,
+        )
         if self.om_projection_service is not None:
-            try:
-                om_result = self.om_projection_service.project(
-                    query=query,
-                    effective_group_ids=effective_group_ids,
-                    object_types=normalized_object_types,
-                    max_results=effective_max_results,
-                    query_mode=query_mode,
-                )
-                if inspect.isawaitable(om_result):
-                    om_objects, om_search_overrides, om_limits = await om_result
-                else:
-                    om_objects, om_search_overrides, om_limits = om_result
-                seen_ids = {obj.object_id for obj in all_objects}
-                for om_obj in om_objects:
-                    if om_obj.object_id not in seen_ids:
-                        all_objects.append(om_obj)
-                        seen_ids.add(om_obj.object_id)
-                search_text_overrides.update(om_search_overrides)
-            except Exception:
-                om_limits = {'enabled': False, 'reason': 'projection_error'}
+            if om_projection_object_types is None:
+                om_limits = {
+                    'enabled': False,
+                    'reason': 'ledger_canonical_om_state',
+                    **(om_projection_suppression or {}),
+                }
+            else:
+                try:
+                    om_result = self.om_projection_service.project(
+                        query=query,
+                        effective_group_ids=effective_group_ids,
+                        object_types=om_projection_object_types,
+                        max_results=effective_max_results,
+                        query_mode=query_mode,
+                    )
+                    if inspect.isawaitable(om_result):
+                        om_objects, om_search_overrides, om_limits = await om_result
+                    else:
+                        om_objects, om_search_overrides, om_limits = om_result
+                    seen_ids = {obj.object_id for obj in all_objects}
+                    for om_obj in om_objects:
+                        if om_obj.object_id not in seen_ids:
+                            all_objects.append(om_obj)
+                            seen_ids.add(om_obj.object_id)
+                    search_text_overrides.update(om_search_overrides)
+                    if om_projection_suppression:
+                        om_limits = {**om_limits, **om_projection_suppression}
+                except Exception:
+                    om_limits = {'enabled': False, 'reason': 'projection_error'}
+                    if om_projection_suppression:
+                        om_limits.update(om_projection_suppression)
         materialization_limits['om_projection'] = om_limits
 
         filtered_objects = [
@@ -451,6 +468,41 @@ class TypedRetrievalService:
         if not payload_json:
             return None
         return coerce_typed_object(json.loads(str(payload_json)))
+
+    def _om_projection_request(
+        self,
+        *,
+        requested_object_types: set[str],
+        ledger_objects: list[TypedMemoryObject],
+    ) -> tuple[set[str] | None, dict[str, Any] | None]:
+        ledger_backed_om_state_roots = sorted(
+            {
+                obj.root_id
+                for obj in ledger_objects
+                if obj.object_type == 'state_fact'
+                and is_om_native_group_id(getattr(obj, 'source_lane', None))
+            }
+        )
+        if not ledger_backed_om_state_roots:
+            return requested_object_types, None
+
+        suppress_state_projection = not requested_object_types or 'state_fact' in requested_object_types
+        if not suppress_state_projection:
+            return requested_object_types, None
+
+        suppression = {
+            'suppression_reason': 'ledger_canonical_om_state',
+            'suppressed_object_types': ['state_fact'],
+            'ledger_canonical_om_state_roots': len(ledger_backed_om_state_roots),
+        }
+        if requested_object_types:
+            projected_types = {object_type for object_type in requested_object_types if object_type != 'state_fact'}
+        else:
+            projected_types = {'episode'}
+
+        if projected_types:
+            return projected_types, suppression
+        return None, suppression
 
     def _select_objects(
         self,

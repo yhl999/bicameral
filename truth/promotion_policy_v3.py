@@ -404,31 +404,71 @@ def promote_candidate(
     source_lane = str(getattr(promoted_object, "source_lane", "") or "").strip() or None
     support_key = ledger_root_id or candidate_id
 
-    core_query = """
-    MATCH (n:OMNode {node_id:$candidate_id})
-    MERGE (c:CoreMemory {core_memory_id:$core_memory_id})
-    ON CREATE SET c.created_at = $promoted_at
-    SET c.candidate_id = $candidate_id,
-        c.content = n.content,
-        c.typed_summary = $content,
-        c.promoted_at = $promoted_at,
-        c.retention_status = 'active',
-        c.content_embedding = n.content_embedding,
-        c.embedding_model = n.embedding_model,
-        c.embedding_dim = n.embedding_dim,
-        c.ledger_event_id = coalesce($ledger_event_id, c.ledger_event_id),
-        c.ledger_object_id = coalesce($ledger_object_id, c.ledger_object_id),
-        c.ledger_root_id = coalesce($ledger_root_id, c.ledger_root_id),
-        c.object_type = coalesce($object_type, c.object_type),
-        c.fact_type = coalesce($fact_type, c.fact_type),
-        c.subject = coalesce($subject, c.subject),
-        c.predicate = coalesce($predicate, c.predicate),
-        c.scope = coalesce($scope, c.scope),
-        c.source_lane = coalesce($source_lane, c.source_lane)
-    RETURN c.core_memory_id AS core_memory_id,
-           c.promoted_at AS promoted_at,
-           c.candidate_id AS candidate_id
-    """
+    if promoted_object is not None:
+        core_query = """
+        MERGE (c:CoreMemory {core_memory_id:$core_memory_id})
+        ON CREATE SET c.created_at = $promoted_at
+        WITH c
+        OPTIONAL MATCH (n:OMNode {node_id:$candidate_id})
+        SET c.candidate_id = $candidate_id,
+            c.content = coalesce($content, n.content, c.content, $candidate_id),
+            c.typed_summary = $content,
+            c.promoted_at = $promoted_at,
+            c.retention_status = 'active',
+            c.content_embedding = coalesce(n.content_embedding, c.content_embedding),
+            c.embedding_model = coalesce(n.embedding_model, c.embedding_model),
+            c.embedding_dim = coalesce(n.embedding_dim, c.embedding_dim),
+            c.ledger_event_id = coalesce($ledger_event_id, c.ledger_event_id),
+            c.ledger_object_id = coalesce($ledger_object_id, c.ledger_object_id),
+            c.ledger_root_id = coalesce($ledger_root_id, c.ledger_root_id),
+            c.object_type = coalesce($object_type, c.object_type),
+            c.fact_type = coalesce($fact_type, c.fact_type),
+            c.subject = coalesce($subject, c.subject),
+            c.predicate = coalesce($predicate, c.predicate),
+            c.scope = coalesce($scope, c.scope),
+            c.source_lane = coalesce($source_lane, c.source_lane),
+            c.materialization_source = CASE
+                WHEN $ledger_root_id IS NOT NULL THEN 'change_ledger'
+                ELSE coalesce(c.materialization_source, 'om_graph')
+            END,
+            c.materialized_from = CASE
+                WHEN $ledger_root_id IS NOT NULL THEN 'ledger_root'
+                ELSE coalesce(c.materialized_from, 'candidate')
+            END,
+            c.source_om_node_id = coalesce(n.node_id, c.source_om_node_id)
+        RETURN c.core_memory_id AS core_memory_id,
+               c.promoted_at AS promoted_at,
+               c.candidate_id AS candidate_id
+        """
+    else:
+        core_query = """
+        MATCH (n:OMNode {node_id:$candidate_id})
+        MERGE (c:CoreMemory {core_memory_id:$core_memory_id})
+        ON CREATE SET c.created_at = $promoted_at
+        SET c.candidate_id = $candidate_id,
+            c.content = n.content,
+            c.typed_summary = $content,
+            c.promoted_at = $promoted_at,
+            c.retention_status = 'active',
+            c.content_embedding = n.content_embedding,
+            c.embedding_model = n.embedding_model,
+            c.embedding_dim = n.embedding_dim,
+            c.ledger_event_id = coalesce($ledger_event_id, c.ledger_event_id),
+            c.ledger_object_id = coalesce($ledger_object_id, c.ledger_object_id),
+            c.ledger_root_id = coalesce($ledger_root_id, c.ledger_root_id),
+            c.object_type = coalesce($object_type, c.object_type),
+            c.fact_type = coalesce($fact_type, c.fact_type),
+            c.subject = coalesce($subject, c.subject),
+            c.predicate = coalesce($predicate, c.predicate),
+            c.scope = coalesce($scope, c.scope),
+            c.source_lane = coalesce($source_lane, c.source_lane),
+            c.materialization_source = coalesce(c.materialization_source, 'om_graph'),
+            c.materialized_from = coalesce(c.materialized_from, 'candidate'),
+            c.source_om_node_id = coalesce(n.node_id, c.source_om_node_id)
+        RETURN c.core_memory_id AS core_memory_id,
+               c.promoted_at AS promoted_at,
+               c.candidate_id AS candidate_id
+        """
 
     support_query = """
     MATCH (m:Message {message_id:$message_id})
@@ -439,7 +479,11 @@ def promote_candidate(
         r.source_promotion_key = $support_key,
         r.source_ledger_event_id = coalesce($ledger_event_id, r.source_ledger_event_id),
         r.source_ledger_object_id = coalesce($ledger_object_id, r.source_ledger_object_id),
-        r.source_ledger_root_id = coalesce($ledger_root_id, r.source_ledger_root_id)
+        r.source_ledger_root_id = coalesce($ledger_root_id, r.source_ledger_root_id),
+        r.source_materialization_source = CASE
+            WHEN $ledger_root_id IS NOT NULL THEN 'change_ledger'
+            ELSE coalesce(r.source_materialization_source, 'om_graph')
+        END
     RETURN count(r) AS rel_count
     """
 

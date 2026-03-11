@@ -134,7 +134,8 @@ def test_promote_candidate_omnode_not_found_skips_gracefully(
         def run(self, query: str, params: dict[str, Any]) -> _FakeResult:
             self.calls.append((query, params))
             if "MERGE (c:CoreMemory" in query:
-                # Simulate OMNode absent: MATCH finds no row, single() → None
+                # No ledger-backed typed object exists on this path, so the query
+                # must still require the OMNode and fail closed when it's gone.
                 return _FakeResult(None, nodes_created=0)
             return _FakeResult({"rel_count": 1})
 
@@ -157,6 +158,75 @@ def test_promote_candidate_omnode_not_found_skips_gracefully(
     assert result["reason"] == "omnode_not_found"
     assert result["candidate_id"] == "ghost-cand-1"
     assert "core_memory_id" in result
+
+
+
+def test_promote_candidate_with_ledger_materializes_corememory_without_omnode():
+    conn = candidates_store.connect(':memory:')
+    ledger = _memory_ledger()
+
+    candidate = candidates_store.upsert_candidate(
+        conn,
+        subject='user:principal',
+        predicate='pref.travel_style',
+        scope='private',
+        assertion_type='preference',
+        value={'value': 'carry-on only'},
+        evidence_refs=[
+            {
+                'source_key': 'om:s1_observational_memory:node:travel-style',
+                'evidence_id': 'm1',
+                'scope': 's1_observational_memory',
+            }
+        ],
+        speaker_id='owner',
+        confidence=0.92,
+        origin='extracted',
+    )
+
+    class _LedgerBackedNoOMNodeSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__(nodes_created=1)
+
+        def run(self, query: str, params: dict[str, Any]) -> _FakeResult:
+            self.calls.append((query, params))
+            if "MERGE (c:CoreMemory" in query:
+                assert "OPTIONAL MATCH (n:OMNode {node_id:$candidate_id})" in query
+                return _FakeResult(
+                    {
+                        "core_memory_id": params["core_memory_id"],
+                        "promoted_at": params["promoted_at"],
+                        "candidate_id": params["candidate_id"],
+                    },
+                    nodes_created=1,
+                )
+            return _FakeResult({"rel_count": 1})
+
+    class _LedgerBackedNoOMNodeDriver(_FakeDriver):
+        def __init__(self) -> None:
+            super().__init__(nodes_created=1)
+
+        def session(self, database: str | None = None) -> _LedgerBackedNoOMNodeSession:
+            self.last_session = _LedgerBackedNoOMNodeSession()
+            return self.last_session
+
+    driver = _LedgerBackedNoOMNodeDriver()
+    result = promotion_policy_v3.promote_candidate(
+        candidate_id=candidate.candidate_id,
+        verification=_verification(candidate.candidate_id),
+        hard_block_check=lambda _: False,
+        neo4j_driver=driver,
+        candidates_conn=conn,
+        ledger=ledger,
+    )
+
+    assert result['promoted'] is True
+    assert result['ledger_root_id'] is not None
+    assert driver.last_session is not None
+    core_query, core_params = driver.last_session.calls[0]
+    assert "OPTIONAL MATCH (n:OMNode {node_id:$candidate_id})" in core_query
+    assert "c.materialization_source = CASE" in core_query
+    assert core_params['content'] == 'user:principal pref.travel_style {"value": "carry-on only"}'
 
 
 def test_promote_candidate_with_candidates_conn_requires_ledger(monkeypatch: pytest.MonkeyPatch) -> None:

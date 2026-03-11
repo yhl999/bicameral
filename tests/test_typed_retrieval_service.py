@@ -33,14 +33,23 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _state_fact(*, object_id: str, root_id: str, version: int, value: str, is_current: bool = True):
+def _state_fact(
+    *,
+    object_id: str,
+    root_id: str,
+    version: int,
+    value: str,
+    is_current: bool = True,
+    source_lane: str = 's1_sessions_main',
+    source_key: str = 'session:1',
+):
     return StateFact(
         object_id=object_id,
         root_id=root_id,
         version=version,
         is_current=is_current,
-        source_lane='s1_sessions_main',
-        source_key='session:1',
+        source_lane=source_lane,
+        source_key=source_key,
         policy_scope='private',
         visibility_scope='private',
         evidence_refs=[
@@ -404,6 +413,144 @@ def test_om_projection_deduplicates_against_ledger_objects():
     )
 
     assert response['counts']['state'] == 1
+
+
+def test_om_projection_skips_state_projection_when_ledger_already_has_om_state():
+    """Ledger-backed OM facts should be the canonical state path; projection becomes fallback-only."""
+    ledger_obj = _state_fact(
+        object_id='ledger_state',
+        root_id='ledger_root',
+        version=1,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style',
+    )
+    projection = _FakeOMProjectionService(
+        objects=[_om_state_fact(object_id='om_state:s1_observational_memory:rel-shadow')],
+        search_overrides={'om_state:s1_observational_memory:rel-shadow': 'carry-on only'},
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [ledger_obj],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {'ledger_state': 'carry-on only'},
+    )
+
+    response = _run(
+        service.search(
+            query='carry-on',
+            object_types=['state'],
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert projection.calls == []
+    assert response['counts']['state'] == 1
+    assert response['state'][0]['object_id'] == 'ledger_state'
+    assert response['limits_applied']['materialization']['om_projection']['reason'] == 'ledger_canonical_om_state'
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
+
+
+
+def test_om_projection_only_projects_episodes_when_ledger_already_has_om_state():
+    """When OM state is ledger-backed, read-time projection should only fill the episode/history gap."""
+    ledger_obj = _state_fact(
+        object_id='ledger_state',
+        root_id='ledger_root',
+        version=1,
+        value='carry-on only',
+        source_lane='s1_observational_memory',
+        source_key='om:s1_observational_memory:node:travel-style',
+    )
+    om_episode = _episode(
+        object_id='om_episode:s1_observational_memory:travel-style-v1',
+        root_id='om_episode:s1_observational_memory:travel-style-v1',
+        version=1,
+        summary='travel style before the ledger promotion',
+    )
+    class _FilteringProjection(_FakeOMProjectionService):
+        async def project(self, *, query, effective_group_ids, object_types, max_results, query_mode):
+            self.calls.append({
+                'query': query,
+                'effective_group_ids': effective_group_ids,
+                'object_types': object_types,
+                'max_results': max_results,
+                'query_mode': query_mode,
+            })
+            projected = list(self._objects)
+            if object_types:
+                projected = [obj for obj in projected if obj.object_type in object_types]
+            limits = dict(self._limits)
+            limits['episodes_projected'] = sum(1 for obj in projected if obj.object_type == 'episode')
+            limits['state_projected'] = sum(1 for obj in projected if obj.object_type == 'state_fact')
+            return projected, self._search_overrides, limits
+
+    projection = _FilteringProjection(
+        objects=[_om_state_fact(object_id='om_state:s1_observational_memory:rel-shadow'), om_episode],
+        search_overrides={
+            'om_state:s1_observational_memory:rel-shadow': 'carry-on only',
+            'om_episode:s1_observational_memory:travel-style-v1': 'travel style before the ledger promotion',
+        },
+        limits={
+            'enabled': True,
+            'reason': 'projected',
+            'groups_considered': ['s1_observational_memory'],
+            'episodes_projected': 1,
+            'state_projected': 1,
+            'max_results': 10,
+        },
+    )
+    service = TypedRetrievalService(
+        ledger=_FakeLedger(),
+        evidence_registry=_FakeEvidenceRegistry(),
+        om_projection_service=projection,
+    )
+    service._materialize_candidate_objects = lambda **kwargs: (
+        [ledger_obj],
+        {
+            'candidate_roots': 1,
+            'materialized_roots': 1,
+            'snapshot_only_roots_over_event_cap': 0,
+            'skipped_roots_over_event_cap': 0,
+            'root_selection_strategy': 'test',
+            'max_candidate_roots': 250,
+            'max_lineage_events': 256,
+        },
+        {'ledger_state': 'carry-on only'},
+    )
+
+    response = _run(
+        service.search(
+            query='carry-on travel style',
+            effective_group_ids=['s1_observational_memory'],
+            max_results=10,
+            max_evidence=10,
+        )
+    )
+
+    assert len(projection.calls) == 1
+    assert projection.calls[0]['object_types'] == {'episode'}
+    assert response['counts']['state'] == 1
+    assert response['counts']['episodes'] == 1
+    assert [item['object_id'] for item in response['state']] == ['ledger_state']
+    assert [item['object_id'] for item in response['episodes']] == [
+        'om_episode:s1_observational_memory:travel-style-v1',
+    ]
+    assert response['limits_applied']['materialization']['om_projection']['suppressed_object_types'] == ['state_fact']
 
 
 def test_om_projection_auto_history_query_merges_lineage_objects():
