@@ -18,7 +18,7 @@ from services.neo4j_service import (
 )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_nodes_requires_explicit_group_id_match():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -33,7 +33,7 @@ async def test_search_om_nodes_requires_explicit_group_id_match():
 
     query_text = driver.execute_query.await_args.args[0]
     assert 'CALL db.index.fulltext.queryNodes' in query_text
-    assert 'node.group_id = $group_id' not in query_text
+    assert 'node.group_id = $group_id' in query_text
     assert 'coalesce(node.group_id, $group_id) = $group_id' not in query_text
     assert 'reduce(' not in query_text
     assert 'CONTAINS token' not in query_text
@@ -47,7 +47,7 @@ async def test_search_om_nodes_requires_explicit_group_id_match():
     )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_facts_requires_rel_and_node_group_matches():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -62,7 +62,7 @@ async def test_search_om_facts_requires_rel_and_node_group_matches():
 
     query_text = driver.execute_query.await_args.args[0]
     assert 'CALL db.index.fulltext.queryNodes' in query_text
-    assert 'matched_node.group_id = $group_id' not in query_text
+    assert 'matched_node.group_id = $group_id' in query_text
     assert 'rel.group_id = $group_id' in query_text
     assert 'coalesce(neighbor.group_id, $group_id) = $group_id' in query_text
     assert '$center_node_uuid IS NULL' in query_text
@@ -87,7 +87,7 @@ async def test_search_om_facts_requires_rel_and_node_group_matches():
     assert driver.execute_query.await_args.kwargs['center_node_uuid'] is None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_facts_applies_center_node_scope_when_provided():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -123,7 +123,7 @@ def test_tokenize_query_bounds_unique_tokens():
     assert tokens == [f't{i:02d}' for i in range(OM_QUERY_MAX_UNIQUE_TOKENS)]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_nodes_tokenization_stays_backward_compatible_for_normal_query():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -153,7 +153,7 @@ def test_tokenize_query_filters_stopwords_and_short_tokens():
     assert tokens == ['neo4j', 'heap']
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_nodes_empty_query_short_circuits_without_db_scan():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -170,7 +170,7 @@ async def test_search_om_nodes_empty_query_short_circuits_without_db_scan():
     driver.execute_query.assert_not_awaited()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_facts_empty_query_without_center_short_circuits_without_db_scan():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -187,7 +187,7 @@ async def test_search_om_facts_empty_query_without_center_short_circuits_without
     driver.execute_query.assert_not_awaited()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_search_om_facts_empty_query_with_center_uses_bounded_center_path():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(return_value=([], None, None))
@@ -238,7 +238,7 @@ def test_fulltext_candidate_limit_clamps_min_and_max(limit: int, multiplier: int
     assert _fulltext_candidate_limit(limit, multiplier=multiplier) == expected
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_verify_om_fulltext_index_shape_auto_creates_when_missing():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(
@@ -269,7 +269,7 @@ async def test_verify_om_fulltext_index_shape_auto_creates_when_missing():
     assert driver.execute_query.await_args_list[1].args[0].strip().startswith('CREATE FULLTEXT INDEX')
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_verify_om_fulltext_index_shape_rejects_wrong_shape_without_auto_fix():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(
@@ -300,7 +300,7 @@ async def test_verify_om_fulltext_index_shape_rejects_wrong_shape_without_auto_f
     assert 'CREATE FULLTEXT INDEX' not in driver.execute_query.await_args.args[0]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_verify_om_fulltext_index_shape_accepts_required_shape():
     driver = AsyncMock()
     driver.execute_query = AsyncMock(

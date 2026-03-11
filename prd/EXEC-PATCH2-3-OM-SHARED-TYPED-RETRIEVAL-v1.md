@@ -26,6 +26,7 @@ Owned Paths:
 - `scripts/typed_retrieval_smoke.py`
 - `mcp_server/tests/test_search_om_lane.py`
 - `mcp_server/tests/test_om_typed_projection.py`
+- `mcp_server/tests/test_neo4j_service_om_scoping.py`
 - `tests/test_typed_retrieval_service.py`
 - `tests/test_search_memory_facts_typed_mode.py`
 - `tests/test_retrieval_benchmark.py`

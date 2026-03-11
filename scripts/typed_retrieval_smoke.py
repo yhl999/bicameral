@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -211,44 +213,200 @@ class _FakeOMSearchService:
         return [gid for gid in group_ids if 'observational_memory' in gid or '_om_' in gid]
 
     async def search_observational_nodes(self, *, graphiti_service, query, group_ids, max_nodes, entity_types):
+        group_id = group_ids[0] if group_ids else 's1_observational_memory'
         return [
             {
-                'uuid': 'om-node-smoke-1',
-                'name': 'Neo4j heap cap observation',
-                'summary': 'Neo4j heap cap should stay below 70 percent.',
-                'created_at': '2026-03-01T12:00:00Z',
-                'group_id': group_ids[0] if group_ids else 's1_observational_memory',
+                'uuid': 'plan_v2',
+                'name': 'Heap cap mitigation plan',
+                'summary': 'Ship the heap cap guardrail',
+                'created_at': '2026-03-05T00:00:00Z',
+                'group_id': group_id,
                 'attributes': {
                     'source': 'om_primitive',
-                    'status': 'open',
-                    'semantic_domain': 'sessions_main',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
                 },
             }
         ]
 
     async def search_observational_facts(self, *, graphiti_service, query, group_ids, max_facts, center_node_uuid):
+        group_id = group_ids[0] if group_ids else 's1_observational_memory'
+        neighborhood_rows = {
+            'plan_v1': [
+                {
+                    'uuid': 'rel_plan_v1_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: investigate heap cap -> heap cap issue',
+                    'group_id': group_id,
+                    'source_node_uuid': 'plan_v1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Investigate heap cap spike',
+                        'target_content': 'Heap cap issue',
+                    },
+                }
+            ],
+            'plan_v2': [
+                {
+                    'uuid': 'rel_plan_v2_issue',
+                    'name': 'ADDRESSES',
+                    'fact': 'ADDRESSES: ship heap cap guardrail -> heap cap issue',
+                    'group_id': group_id,
+                    'source_node_uuid': 'plan_v2',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship heap cap guardrail',
+                        'target_content': 'Heap cap issue',
+                    },
+                }
+            ],
+            'issue_1': [
+                {
+                    'uuid': 'rel_fix_resolves_issue',
+                    'name': 'RESOLVES',
+                    'fact': 'RESOLVES: ship heap cap guardrail -> heap cap issue',
+                    'group_id': group_id,
+                    'source_node_uuid': 'fix_1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship heap cap guardrail',
+                        'target_content': 'Heap cap issue',
+                    },
+                }
+            ],
+            'fix_1': [
+                {
+                    'uuid': 'rel_fix_resolves_issue',
+                    'name': 'RESOLVES',
+                    'fact': 'RESOLVES: ship heap cap guardrail -> heap cap issue',
+                    'group_id': group_id,
+                    'source_node_uuid': 'fix_1',
+                    'target_node_uuid': 'issue_1',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'attributes': {
+                        'source_content': 'Ship heap cap guardrail',
+                        'target_content': 'Heap cap issue',
+                    },
+                }
+            ],
+        }
+        if center_node_uuid is not None:
+            return neighborhood_rows.get(center_node_uuid, [])
         return [
             {
-                'uuid': 'om-rel-smoke-1',
-                'name': 'CONSTRAINS',
-                'fact': 'Neo4j heap cap must stay below 70 percent under load.',
-                'group_id': group_ids[0] if group_ids else 's1_observational_memory',
-                'source_node_uuid': 'om-node-1',
-                'target_node_uuid': 'om-node-2',
-                'created_at': '2026-03-01T13:00:00Z',
+                'uuid': 'rel_plan_v2_issue',
+                'name': 'ADDRESSES',
+                'fact': 'ADDRESSES: ship heap cap guardrail -> heap cap issue',
+                'group_id': group_id,
+                'source_node_uuid': 'plan_v2',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-05T00:00:00Z',
                 'attributes': {
-                    'source': 'om_primitive',
-                    'source_content': 'Neo4j heap cap observation.',
-                    'target_content': 'Heap cap threshold enforced.',
+                    'source_content': 'Ship heap cap guardrail',
+                    'target_content': 'Heap cap issue',
                 },
-            }
+            },
+            {
+                'uuid': 'rel_fix_resolves_issue',
+                'name': 'RESOLVES',
+                'fact': 'RESOLVES: ship heap cap guardrail -> heap cap issue',
+                'group_id': group_id,
+                'source_node_uuid': 'fix_1',
+                'target_node_uuid': 'issue_1',
+                'created_at': '2026-03-06T00:00:00Z',
+                'attributes': {
+                    'source_content': 'Ship heap cap guardrail',
+                    'target_content': 'Heap cap issue',
+                },
+            },
         ]
+
+
+class _FakeOMDriver:
+    def __init__(self):
+        self.calls = []
+        self._records = {
+            'plan_v2': [
+                {
+                    'node_id': 'plan_v1',
+                    'uuid': 'plan_v1',
+                    'content': 'Investigate heap cap spike',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                },
+                {
+                    'node_id': 'plan_v2',
+                    'uuid': 'plan_v2',
+                    'content': 'Ship heap cap guardrail',
+                    'created_at': '2026-03-05T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [
+                        {
+                            'target_id': 'plan_v1',
+                            'created_at': '2026-03-05T00:00:00Z',
+                            'relation_uuid': 'rel_plan_v2_v1',
+                        }
+                    ],
+                },
+            ],
+            'issue_1': [
+                {
+                    'node_id': 'issue_1',
+                    'uuid': 'issue_1',
+                    'content': 'Heap cap issue',
+                    'created_at': '2026-03-01T00:00:00Z',
+                    'status': 'open',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+            'fix_1': [
+                {
+                    'node_id': 'fix_1',
+                    'uuid': 'fix_1',
+                    'content': 'Ship heap cap guardrail',
+                    'created_at': '2026-03-06T00:00:00Z',
+                    'status': 'active',
+                    'semantic_domain': 'observational_memory',
+                    'supersedes': [],
+                }
+            ],
+        }
+
+    async def execute_query(self, _query, **params):
+        self.calls.append(params)
+        group_id = params.get('group_id') or 's1_observational_memory'
+        seed_node_id = params.get('seed_node_id')
+        rows = []
+        for row in self._records.get(seed_node_id, []):
+            copied = deepcopy(row)
+            copied['group_id'] = group_id
+            rows.append(copied)
+        return rows, None, None
+
+
+class _FakeOMGraphitiService:
+    class config:
+        class database:
+            provider = 'neo4j'
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    async def get_client(self):
+        return SimpleNamespace(driver=self.driver)
 
 
 async def _run_om_projection_smoke() -> None:
     """Smoke test: OM projected objects surface through typed buckets."""
     fake_search = _FakeOMSearchService()
-    fake_graphiti = object()  # projection only needs it for passthrough
+    fake_graphiti = _FakeOMGraphitiService(_FakeOMDriver())
 
     om_projection = OMTypedProjectionService(
         search_service=fake_search,
