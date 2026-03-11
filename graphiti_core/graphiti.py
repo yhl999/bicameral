@@ -170,7 +170,9 @@ def _phase3c_source_chunk_key(source_description: str) -> str:
 
 
 def _phase3c_allows_short_craft_text(group_id: str, labels: set[str]) -> bool:
-    return group_id == 's1_writing_samples' and bool(labels & PHASE3C_WRITING_SAMPLES_SHORT_CRAFT_TYPES)
+    return group_id in ('s1_writing_samples', 's1_inspiration_short_form', 's1_inspiration_long_form') and bool(
+        labels & PHASE3C_WRITING_SAMPLES_SHORT_CRAFT_TYPES
+    )
 
 
 def _phase3c_is_meta_or_tautological(text: str, *, allow_short_text: bool = False) -> bool:
