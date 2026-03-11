@@ -1,173 +1,290 @@
-"""Packs router — list/get/describe/create backed by JSON registry."""
+"""Pack router with materialization-backed context/workflow pack APIs."""
 
 from __future__ import annotations
 
-import logging
-import re
+import fnmatch
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-try:
-    from ..services.pack_registry import PackRegistryService
-except ImportError:  # pragma: no cover - top-level import fallback
-    from services.pack_registry import PackRegistryService  # type: ignore[no-redef]
-
-logger = logging.getLogger(__name__)
-
-_SEMVER_RE = re.compile(r'^\d+\.\d+\.\d+$')
+from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
+from ..services.pack_registry import (
+    PackRegistryError,
+    PackRegistryService,
+)
 
 
-def _matches_filter(pack: dict[str, Any], filters: dict[str, Any] | None) -> bool:
-    if not filters:
-        return True
-    for key in ('scope', 'intent', 'consumer', 'type'):
-        expected = filters.get(key)
-        if expected is None:
-            continue
-        if str(pack.get(key)) != str(expected):
-            return False
-    return True
+def _to_iso_ts(value: Any) -> str:
+    if isinstance(value, str) and value:
+        return value
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
-def _filter_context_items(items: list[Any], task: str | None) -> list[Any]:
+def _serialise_fact(fact: Any) -> dict[str, Any]:
+    if hasattr(fact, 'model_dump'):
+        return fact.model_dump(mode='json')
+    if hasattr(fact, 'dict'):
+        return fact.dict()
+    if isinstance(fact, dict):
+        return dict(fact)
+    return {'value': fact}
+
+
+def _to_text(value: Any) -> str:
+    if isinstance(value, (str, int, float, bool)):
+        return str(value).lower()
+    if value is None:
+        return ''
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False).lower()
+        except (TypeError, ValueError):
+            return str(value).lower()
+    return str(value).lower()
+
+
+def _parse_event_time(value: Any) -> float:
+    if not value:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        # datetime.fromisoformat does not accept trailing Z pre-3.11.
+        normalized = str(value)
+        if normalized.endswith('Z'):
+            normalized = normalized[:-1] + '+00:00'
+        return datetime.fromisoformat(normalized).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fact_confidence(fact: Any) -> float:
+    for path in (
+        ('confidence',),
+        ('history_meta', 'confidence'),
+        ('value', 'confidence'),
+    ):
+        current: Any = fact
+        for part in path:
+            if isinstance(current, dict):
+                current = current.get(part)
+                continue
+            if hasattr(current, part):
+                current = getattr(current, part)
+                continue
+            current = None
+            break
+        if isinstance(current, (int, float)):
+            return max(0.0, min(1.0, float(current)))
+    return 0.5
+
+
+def _predicates_for_pack(pack: dict[str, Any]) -> list[str]:
+    patterns = pack.get('predicates', [])
+    if not patterns:
+        definition = pack.get('definition')
+        if isinstance(definition, dict):
+            patterns = definition.get('predicates') or definition.get('predicate_patterns', [])
+    return [str(item).lower() for item in patterns if str(item).strip()]
+
+
+def _matches_predicate(predicate: str, patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+
+    normalized = str(predicate or '').lower()
+    for pattern in patterns:
+        if fnmatch.fnmatch(normalized, str(pattern).strip().lower()):
+            return True
+    return False
+
+
+def _matches_task(fact: Any, task: str | None) -> bool:
     if not task:
-        return items
-    tokens = {token.lower() for token in str(task).split() if token.strip()}
+        return True
+
+    tokens = [tok for tok in task.lower().split() if tok]
     if not tokens:
-        return items
+        return True
 
-    filtered: list[Any] = []
-    for item in items:
-        blob = str(item).lower()
-        if any(token in blob for token in tokens):
-            filtered.append(item)
-    return filtered
+    serialised = [
+        str(getattr(fact, 'subject', '')),
+        str(getattr(fact, 'predicate', '')),
+        _to_text(getattr(fact, 'value', None)),
+        _to_text(_serialise_fact(fact).get('value')),  # fallback if value is nested
+    ]
+    blob = ' '.join(serialised).lower()
+
+    return all(token in blob for token in tokens)
 
 
-async def list_packs(filter: dict[str, Any] | None = None) -> dict[str, Any]:
+def _resolve_ledger_path(override: str | Path | None = None) -> Path:
+    if override:
+        return Path(override)
+    override = os.getenv('BICAMERAL_CHANGE_LEDGER_PATH', '').strip()
+    return Path(override) if override else Path(DB_PATH_DEFAULT)
+
+
+def _materialize_pack_facts(
+    *,
+    pack: dict[str, Any],
+    task: str | None,
+    ledger_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    patterns = _predicates_for_pack(pack)
+    if not patterns:
+        return []
+
+    ledger = ChangeLedger(_resolve_ledger_path(ledger_path))
+    current_facts = ledger.current_state_facts()
+
+    selected: list[tuple[float, float, str, Any]] = []
+    for fact in current_facts:
+        if not _matches_predicate(fact.predicate, patterns):
+            continue
+        if not _matches_task(fact, task):
+            continue
+
+        selected_ts = _parse_event_time(
+            getattr(fact, 'valid_at', None)
+            or getattr(fact, 'created_at', None)
+            or getattr(fact, 'updated_at', None)
+            or getattr(fact, 'recorded_at', None),
+        )
+        selected.append((selected_ts, _fact_confidence(_serialise_fact(fact)), getattr(fact, 'object_id', ''), fact))
+
+    selected.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [_serialise_fact(item[3]) for item in selected]
+
+
+def _pack_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'id': row.get('id'),
+        'scope': row.get('scope'),
+        'intent': row.get('intent'),
+        'description': row.get('description'),
+        'consumer': row.get('consumer'),
+        'version': row.get('version'),
+        'predicates': row.get('predicates', []),
+        'created_at': row.get('created_at'),
+        'last_updated': row.get('last_updated'),
+    }
+
+
+def _infer_schema(definition: dict[str, Any] | None) -> dict[str, Any]:
+    if definition and isinstance(definition.get('schema'), dict):
+        return definition['schema']
+
+    return {
+        'type': 'object',
+        'required': ['subject', 'predicate', 'value'],
+        'properties': {
+            'subject': {'type': 'string'},
+            'predicate': {'type': 'string'},
+            'value': {'type': ['string', 'number', 'boolean', 'object', 'array', 'null']},
+        },
+    }
+
+
+async def list_packs(
+    filter: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """List all registered packs filtered by scope/intent/consumer."""
     try:
         service = PackRegistryService()
-        packs = [pack for pack in service.list_packs() if _matches_filter(pack, filter)]
-        return {
-            'message': f'Found {len(packs)} pack(s)',
-            'packs': [
-                {
-                    'pack_id': pack['pack_id'],
-                    'type': pack.get('type'),
-                    'scope': pack.get('scope'),
-                    'intent': pack.get('intent'),
-                    'consumer': pack.get('consumer'),
-                    'version': pack.get('version'),
-                    'checksum': pack.get('checksum'),
-                    'updated_at': pack.get('updated_at'),
-                }
-                for pack in packs
-            ],
-        }
-    except Exception as e:
-        logger.exception('list_packs failed')
-        return {'error': f'list_packs failed: {e}'}
+        return service.list_packs(filter=filter)
+    except Exception:
+        return []
 
 
-async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
+async def get_context_pack(
+    pack_id: str,
+    task: str | None = None,
+) -> dict[str, Any]:
+    """Resolve context pack definition and materialized facts."""
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
-        if pack is None:
-            return {'error': f'Pack not found: {pack_id}'}
-        if str(pack.get('type')) != 'context':
-            return {'error': f'Pack {pack_id} is not a context pack'}
+        if not pack:
+            return {'error': f'pack not found: {pack_id!r}'}
+        if pack.get('scope') != 'context':
+            return {'error': f'pack {pack_id!r} is not a context pack'}
 
-        definition = pack.get('definition') or {}
-        items = definition.get('items') or []
-        if not isinstance(items, list):
-            items = [items]
-        materialized = _filter_context_items(items, task)
+        facts = _materialize_pack_facts(pack=pack, task=task)
         return {
-            'message': f'Context pack {pack_id} loaded',
-            'pack_id': pack_id,
-            'items': materialized,
-            'count': len(materialized),
+            'pack_id': pack['id'],
+            'pack_metadata': _pack_metadata(pack),
+            'facts': facts,
+            'task_context': task,
+            'materialized_at': _to_iso_ts(None),
+            'fact_count': len(facts),
         }
-    except Exception as e:
-        logger.exception('get_context_pack failed')
-        return {'error': f'get_context_pack failed: {e}'}
+    except Exception as exc:
+        return {'error': f'get_context_pack failed: {exc}'}
 
 
-async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
+async def get_workflow_pack(
+    pack_id: str,
+    task: str | None = None,
+) -> dict[str, Any]:
+    """Resolve workflow pack definition and materialized trigger facts."""
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
-        if pack is None:
-            return {'error': f'Pack not found: {pack_id}'}
-        if str(pack.get('type')) != 'workflow':
-            return {'error': f'Pack {pack_id} is not a workflow pack'}
+        if not pack:
+            return {'error': f'pack not found: {pack_id!r}'}
+        if pack.get('scope') != 'workflow':
+            return {'error': f'pack {pack_id!r} is not a workflow pack'}
 
-        definition = pack.get('definition') or {}
-        steps = definition.get('steps') or []
-        if not isinstance(steps, list):
-            steps = [steps]
-        # v1: task argument is accepted for API parity but does not alter steps.
-        _ = task
+        facts = _materialize_pack_facts(pack=pack, task=task)
         return {
-            'message': f'Workflow pack {pack_id} loaded',
-            'pack_id': pack_id,
-            'steps': steps,
-            'count': len(steps),
+            'pack_id': pack['id'],
+            'pack_metadata': _pack_metadata(pack),
+            'facts': facts,
+            'task_context': task,
+            'definition': pack.get('definition', {}),
+            'materialized_at': _to_iso_ts(None),
+            'fact_count': len(facts),
         }
-    except Exception as e:
-        logger.exception('get_workflow_pack failed')
-        return {'error': f'get_workflow_pack failed: {e}'}
+    except Exception as exc:
+        return {'error': f'get_workflow_pack failed: {exc}'}
 
 
 async def describe_pack(pack_id: str) -> dict[str, Any]:
+    """Return schema/definition metadata for a pack."""
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
-        if pack is None:
-            return {'error': f'Pack not found: {pack_id}'}
+        if not pack:
+            return {'error': f'pack not found: {pack_id!r}'}
+
+        definition = pack.get('definition')
+        if not isinstance(definition, dict):
+            definition = {}
+
         return {
-            'message': f'Pack {pack_id} definition',
-            'pack': pack,
+            'pack_id': pack['id'],
+            'metadata': _pack_metadata(pack),
+            'predicates': pack.get('predicates', []),
+            'schema': _infer_schema(definition),
+            'examples': definition.get('examples', []),
+            'instructions': definition.get('instructions'),
+            'definition': definition,
         }
-    except Exception as e:
-        logger.exception('describe_pack failed')
-        return {'error': f'describe_pack failed: {e}'}
+    except Exception as exc:
+        return {'error': f'describe_pack failed: {exc}'}
 
 
 async def create_workflow_pack(definition: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(definition, dict):
-        return {'error': 'definition must be an object/dict'}
-
-    if str(definition.get('type') or 'workflow') != 'workflow':
-        return {'error': 'create_workflow_pack only accepts type="workflow"'}
-
-    version = str(definition.get('version') or '').strip()
-    if not _SEMVER_RE.match(version):
-        return {'error': 'definition.version must be semver (e.g., 1.2.3)'}
-
-    steps = definition.get('steps')
-    if not isinstance(steps, list) or not steps:
-        return {'error': 'definition.steps must be a non-empty list'}
-
+    """Create a new workflow pack definition and persist it."""
     try:
         service = PackRegistryService()
-        entry = service.create_pack(definition)
-        return {
-            'message': f'Workflow pack created: {entry["pack_id"]}',
-            'pack': {
-                'pack_id': entry['pack_id'],
-                'type': entry['type'],
-                'scope': entry['scope'],
-                'intent': entry['intent'],
-                'consumer': entry['consumer'],
-                'version': entry['version'],
-                'checksum': entry['checksum'],
-                'updated_at': entry['updated_at'],
-            },
-        }
-    except Exception as e:
-        logger.exception('create_workflow_pack failed')
-        return {'error': f'create_workflow_pack failed: {e}'}
+        row = service.create_pack(definition)
+        return {'pack': row}
+    except Exception as exc:
+        return {'error': f'create_workflow_pack failed: {exc}'}
 
 
 def register_tools(mcp: Any) -> None:
