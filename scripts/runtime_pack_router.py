@@ -843,6 +843,16 @@ def _graphiti_mcp_request(
 
 
 def _extract_graphiti_tool_payload(tool_result: object) -> dict[str, object]:
+    """
+    Extract facts from a Graphiti MCP tool result with ordered fallbacks.
+
+    MCP envelope contract:
+    - structuredContent (primary): {"result": {"structuredContent": {"result": {...}}}}
+    - content array (secondary): {"result": {"content": [{"text": "JSON-encoded facts"}]}}
+    - facts direct (fallback): {"result": {"facts": [...]}} — used when no envelope wrapper
+
+    Returns a dict with at minimum a 'facts' key containing the extracted facts list.
+    """
     if not isinstance(tool_result, dict):
         raise RuntimeError('graphiti_mcp_invalid_payload')
 
@@ -946,6 +956,8 @@ def _graphiti_search_facts(
         raise RuntimeError(f'graphiti_mcp_error_{code}:{message}')
 
     tool_result = tool_result_envelope.get('result')
+    if isinstance(tool_result, dict) and tool_result.get('isError'):
+        raise RuntimeError(f'Graphiti tool error: {tool_result.get("error", "unknown error")}')
     payload = _extract_graphiti_tool_payload(tool_result)
 
     facts_raw = payload.get('facts')
@@ -1006,6 +1018,10 @@ def _materialization_query(source: str, task_query: str) -> str:
     hint = MATERIALIZE_QUERY_HINTS.get(source, '')
     if hint:
         return hint
+    if source.startswith('graphiti_') and source not in MATERIALIZE_QUERY_HINTS:
+        logger.warning(
+            f'No MATERIALIZE_QUERY_HINTS entry for source={source}; falling back to task query. Consider adding an entry.'
+        )
     return task
 
 
