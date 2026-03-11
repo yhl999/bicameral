@@ -98,6 +98,7 @@ ELIGIBLE_ASSERTION_TYPES = {
     "preference",
     "factual_assertion",
     "episode",
+    "procedure",  # Procedure entity edges from graph extraction (s1_sessions_main ontology)
 }
 
 VERIFICATION_STATUSES = {

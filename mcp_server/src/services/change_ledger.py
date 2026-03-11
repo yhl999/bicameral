@@ -837,6 +837,32 @@ def build_object_from_candidate_fact(
             }
         )
 
+    if assertion_type == 'procedure':
+        value = fact.get('value') if isinstance(fact.get('value'), dict) else {}
+        raw_steps = value.get('steps') or []
+        if isinstance(raw_steps, str):
+            raw_steps = [raw_steps]
+        steps = [str(s).strip() for s in raw_steps if str(s).strip()]
+        if not steps:
+            # Synthesise a single placeholder step from the value description or subject
+            fallback = (
+                str(value.get('description') or '').strip()
+                or str(fact.get('subject') or '').strip()
+                or 'extracted from source'
+            )
+            steps = [fallback]
+        return Procedure.model_validate(
+            {
+                **base,
+                'name': str(value.get('name') or fact.get('subject') or 'unnamed_procedure').strip() or 'unnamed_procedure',
+                'trigger': str(value.get('trigger') or fact.get('predicate') or '').strip(),
+                'preconditions': [str(p).strip() for p in (value.get('preconditions') or []) if str(p).strip()],
+                'steps': steps,
+                'expected_outcome': str(value.get('expected_outcome') or '').strip(),
+                'risk_level': str(value.get('risk_level') or 'medium').strip() or 'medium',
+            }
+        )
+
     return StateFact.model_validate(
         {
             **base,
