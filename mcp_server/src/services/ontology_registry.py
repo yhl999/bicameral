@@ -13,12 +13,13 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
 from pydantic import BaseModel
@@ -78,6 +79,33 @@ def _sanitize_intent_guidance(text: str, field_name: str, lane_id: str) -> str:
         )
         sanitized = sanitized[:_INTENT_GUIDANCE_MAX_CHARS]
     return sanitized
+
+
+def _merge_ontology_documents(base: Any, overlay: Any) -> Any:
+    """Merge two ontology YAML fragments deterministically.
+
+    Rules:
+    - mappings merge recursively
+    - lists replace wholesale
+    - scalars replace wholesale
+
+    This keeps overlay behaviour explicit and predictable: an overlay may add new
+    lanes, override selected scalar/dict fields, or replace an entire lane block
+    by re-declaring it.
+    """
+    if base is None:
+        return copy.deepcopy(overlay)
+    if overlay is None:
+        return copy.deepcopy(base)
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = {key: copy.deepcopy(value) for key, value in base.items()}
+        for key, value in overlay.items():
+            if key in merged:
+                merged[key] = _merge_ontology_documents(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+    return copy.deepcopy(overlay)
 
 
 @dataclass(frozen=True)
@@ -175,23 +203,47 @@ class OntologyRegistry:
     # ── Factory ────────────────────────────────────────────────
 
     @classmethod
-    def load(cls, path: str | Path) -> OntologyRegistry:
-        """Load ontology profiles from a YAML config file.
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        overlay_paths: Sequence[str | Path] | None = None,
+    ) -> OntologyRegistry:
+        """Load ontology profiles from a YAML config file plus optional overlays.
+
+        Composition contract:
+        - ``path`` is loaded first as the base ontology document.
+        - ``overlay_paths`` are applied in order.
+        - mappings merge recursively.
+        - lists and scalars replace wholesale.
+
+        This keeps the shared/base ontology stable while allowing private or
+        deployment-local overlays to add lanes or override specific lane blocks.
 
         Args:
-            path: Filesystem path to ``extraction_ontologies.yaml``.
+            path: Filesystem path to the base ``extraction_ontologies.yaml``.
+            overlay_paths: Optional YAML fragments layered on top of *path*.
 
         Returns:
             A populated :class:`OntologyRegistry`.
 
         Raises:
-            FileNotFoundError: If *path* does not exist.
-            yaml.YAMLError: If the file is not valid YAML.
+            FileNotFoundError: If any configured path does not exist.
+            yaml.YAMLError: If any file is not valid YAML.
+            ValueError: If a loaded document is not a mapping.
         """
-        path = Path(path)
-        logger.info("Loading extraction ontologies from %s", path)
+        base_path = Path(path)
+        paths = [base_path, *(Path(p) for p in (overlay_paths or ()))]
+        logger.info("Loading extraction ontologies from %s", ", ".join(str(p) for p in paths))
 
-        raw: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+        raw: dict[str, Any] = {}
+        for source_path in paths:
+            source_raw = yaml.safe_load(source_path.read_text()) or {}
+            if not isinstance(source_raw, dict):
+                raise ValueError(
+                    f"Ontology config {source_path} must deserialize to a mapping, got {type(source_raw).__name__}"
+                )
+            raw = _merge_ontology_documents(raw, source_raw)
 
         profiles: dict[str, OntologyProfile] = {}
         for group_id, definition in raw.items():

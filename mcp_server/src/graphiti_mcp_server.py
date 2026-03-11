@@ -82,6 +82,34 @@ else:
     load_dotenv()
 
 
+_ONTOLOGY_OVERLAY_PATHS_ENV = 'BICAMERAL_ONTOLOGY_OVERLAY_PATHS'
+
+
+def _resolve_ontology_overlay_paths() -> list[Path]:
+    """Return optional ontology overlay paths from the environment.
+
+    Paths are separated by ``os.pathsep``. Relative paths resolve against the
+    MCP server directory so local dev setups can use short repo-relative paths.
+    """
+    raw = os.getenv(_ONTOLOGY_OVERLAY_PATHS_ENV, '').strip()
+    if not raw:
+        return []
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for entry in raw.split(os.pathsep):
+        candidate_raw = entry.strip()
+        if not candidate_raw:
+            continue
+        candidate = Path(candidate_raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (mcp_server_dir / candidate).resolve()
+        if candidate not in seen:
+            resolved.append(candidate)
+            seen.add(candidate)
+    return resolved
+
+
 # Semaphore limit for concurrent Graphiti operations.
 #
 # This controls how many episodes can be processed simultaneously. Each episode
@@ -1023,11 +1051,17 @@ class GraphitiService:
             # Load optional per-lane extraction ontology registry
             try:
                 ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
+                overlay_paths = _resolve_ontology_overlay_paths()
                 if ontology_path.exists():
-                    self.ontology_registry = OntologyRegistry.load(ontology_path)
+                    self.ontology_registry = OntologyRegistry.load(
+                        ontology_path,
+                        overlay_paths=overlay_paths,
+                    )
                     logger.info(
-                        'Loaded ontology profiles for %d lanes',
+                        'Loaded ontology profiles for %d lanes from base=%s overlays=%s',
                         len(self.ontology_registry.configured_groups),
+                        ontology_path,
+                        [str(path) for path in overlay_paths],
                     )
                 else:
                     self.ontology_registry = None

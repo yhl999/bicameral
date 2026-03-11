@@ -213,6 +213,73 @@ class TestEdgeTypes:
 
 
 # ---------------------------------------------------------------------------
+# overlay composition tests
+# ---------------------------------------------------------------------------
+
+
+class TestOverlayComposition:
+    """Base + overlay composition is deterministic and backward compatible."""
+
+    def test_overlay_can_replace_a_lane_block_and_add_new_lane(self):
+        import tempfile
+        from pathlib import Path
+
+        from mcp_server.src.services.ontology_registry import OntologyRegistry
+
+        base_content = yaml.dump(
+            {
+                'schema_version': 1,
+                'engineering_learnings': {
+                    'entity_types': [{'name': 'FailurePattern', 'description': 'base'}],
+                    'relationship_types': [{'name': 'CAUSED_BY', 'description': 'base'}],
+                    'extraction_emphasis': 'Base guidance.',
+                },
+            }
+        )
+        overlay_content = yaml.dump(
+            {
+                'engineering_learnings': {
+                    'extraction_mode': 'constrained_soft',
+                    'intent_guidance': 'Overlay guidance.',
+                    'entity_types': [
+                        {'name': 'EngineeringIncident', 'description': 'overlay anchor'},
+                        {'name': 'FailurePattern', 'description': 'overlay failure'},
+                    ],
+                },
+                'private_lane': {
+                    'entity_types': [{'name': 'PrivateEntity', 'description': 'private'}],
+                },
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / 'base.yaml'
+            overlay_path = Path(tmpdir) / 'overlay.yaml'
+            base_path.write_text(base_content)
+            overlay_path.write_text(overlay_content)
+
+            registry = OntologyRegistry.load(base_path, overlay_paths=[overlay_path])
+
+        engineering = registry.get('engineering_learnings')
+        assert engineering is not None
+        assert engineering.extraction_mode == 'constrained_soft'
+        assert engineering.intent_guidance == 'Overlay guidance.'
+        assert set(engineering.entity_types) == {'EngineeringIncident', 'FailurePattern'}
+        assert set(engineering.edge_types) == {'CAUSED_BY'}
+
+        private_lane = registry.get('private_lane')
+        assert private_lane is not None
+        assert set(private_lane.entity_types) == {'PrivateEntity'}
+
+    def test_no_overlay_preserves_existing_behavior(self):
+        registry = _load_registry(_yaml_lane(extraction_emphasis='Base guidance.'))
+        profile = registry.get('target_lane')
+        assert profile is not None
+        assert profile.intent_guidance == 'Base guidance.'
+        assert profile.extraction_mode == 'permissive'
+
+
+# ---------------------------------------------------------------------------
 # resolve_ontology 4-tuple integration test
 # ---------------------------------------------------------------------------
 
