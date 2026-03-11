@@ -48,7 +48,7 @@ class _GraphitiStubHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_sse(self, status: int, payload: object, *, session_id: str | None = None) -> None:
-        body = f"event: message\ndata: {json.dumps(payload)}\n\n".encode('utf-8')
+        body = f"event: message\ndata: {json.dumps(payload)}\n\n".encode()
         self.send_response(status)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Content-Length', str(len(body)))

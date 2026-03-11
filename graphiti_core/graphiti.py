@@ -1207,14 +1207,14 @@ class Graphiti:
             try:
                 from config.tool_result_allowlist import enforce_tool_result_scope
                 enforce_tool_result_scope(tool_name)
-            except ImportError:
+            except ImportError as e:
                 # config package not on path — enforce a closed default: reject
                 # any named tool result rather than silently allowing everything.
                 raise ValueError(
                     f'tool_name={tool_name!r} was supplied but the scope-policy '
                     'allowlist (config.tool_result_allowlist) is not importable. '
                     'Refusing to ingest tool result to fail closed.'
-                )
+                ) from e
 
         start = time()
         now = utc_now()

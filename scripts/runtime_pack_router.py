@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -13,6 +14,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_SCOPE: dict[str, int] = {
     'public': 0,
