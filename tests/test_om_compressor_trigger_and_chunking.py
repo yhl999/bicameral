@@ -991,7 +991,8 @@ class TestOMCompressorSmartCutterIntegration(unittest.TestCase):
     """
 
     def _make_row(self, i: int, *, has_embedding: bool = True) -> MessageRow:
-        
+        from scripts.om_compressor import MessageRow
+
         return MessageRow(
             message_id=f'msg{i:04d}',
             source_session_id='sess1',

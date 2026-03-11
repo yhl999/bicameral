@@ -83,6 +83,22 @@ Because the velocity of upstream `getzep/graphiti` is high, we track explicit pa
 - Validation: Disposable-group live canary passed after this fix (`add_memory` -> extraction -> `get_episodes` -> `search_memory_facts`).
 - Patch: `patches/graphiti_core/utils/maintenance/edge_operations.py.patch`
 
+### 7) Core ingestion/runtime hardening hotfixes
+- Purpose: Keep three deliberate Graphiti-core fixes durable across future upstream syncs instead of treating them as accidental drift.
+- Files:
+  - `graphiti_core/utils/content_chunking.py`
+  - `graphiti_core/utils/env_utils.py`
+  - `graphiti_core/utils/maintenance/closure.py`
+- Behavior:
+  - `content_chunking.py` mirrors chunking defaults locally so constant-only imports do not pull in `graphiti_core.helpers` (and its heavy `numpy` dependency chain), while still honoring environment overrides.
+  - `content_chunking.py` keeps the lightweight import path Pyright-clean by separating runtime `EpisodeType` access from type-check-only annotations.
+  - `env_utils.py` and `maintenance/closure.py` use modern `str | None` annotations so the hotfix paths remain type-check-clean.
+- Rationale: These are small but intentional Bicameral survivability fixes: OM compressor tests and lightweight tooling import `content_chunking` directly, and the env/closure helpers must not regress under type-check or upstream resync churn.
+- Patches:
+  - `patches/graphiti_core/utils/content_chunking.py.patch`
+  - `patches/graphiti_core/utils/env_utils.py.patch`
+  - `patches/graphiti_core/utils/maintenance/closure.py.patch`
+
 ## How to Sync Upstream
 
 To safely absorb upstream updates while keeping these hotfixes:
