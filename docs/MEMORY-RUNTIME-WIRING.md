@@ -2,6 +2,8 @@
 
 This document defines the runtime backend switch contract for memory retrieval.
 
+> **Rescope note (2026-03-11):** the old `qmd_primary` ↔ `graphiti_primary` switch story is now a **legacy migration surface**, not the whole program. Current forward work converges on the established `search_memory_facts` surface returning typed buckets (`state`, `episodes`, `procedures`, `evidence`) backed by ChangeLedger + graph projection + evidence callback. Do **not** treat this runbook as permission to flip a Graphiti-primary default without the typed-memory proof/kill gates, caller-compat checks, and replay validation.
+
 ## Runtime model
 
 Two backend profiles are supported:

@@ -1,8 +1,10 @@
-# Bicameral - Dual-Brain Memory Runtime for Agents
+# Bicameral — Ledger-First Memory Runtime for Agents
 
-This repository is a **production delta layer** on top of [upstream Graphiti](https://github.com/getzep/graphiti). It turns Graphiti from a graph-memory library into a **dual-brain, policy-governed memory runtime** for OpenClaw agents.
+This repository is the **public core** of Bicameral: the shared runtime, MCP server, typed-memory services, OM plumbing, retrieval/projection logic, and overlay framework that sit on top of [upstream Graphiti](https://github.com/getzep/graphiti).
 
-The key insight: **A single LLM-powered brain can't be trusted with your memories.** We added a second brain-a strict, append-only Fact Ledger-that acts as a thermostat to keep the semantic engine honest.
+The deployment-specific parts — private ontologies, runtime pack registry, consumer profiles, workflows, graph state, rollout docs, and operator wiring — live in a separate private overlay repo. Public main should therefore be read as **the reusable engine + migration surface**, not as a claim that every deployment-specific decision is already validated everywhere.
+
+> **State of world (2026-03-11):** Bicameral is mid-rescope from an overextended “Graphiti-primary memory system” into a **ledger-first typed-memory system**. Public main now contains the new ChangeLedger / typed retrieval / OM projection path, but **broad replay, default public-surface flip, and final cleanup are still open**. When this README's older dual-brain prose conflicts with the typed-memory rescope status, the rescope status wins.
 
 If you're looking for the core Graphiti framework docs:
 - Upstream repo: <https://github.com/getzep/graphiti>
@@ -10,7 +12,7 @@ If you're looking for the core Graphiti framework docs:
 
 ---
 
-## Why This Exists: The Dual-Brain Philosophy
+## Why This Exists: From Dual Brain to Typed Memory
 
 Plain vector search (RAG) is good at recall ("find documents about X") but terrible at **truth management**. And even Graphiti-a breakthrough temporal knowledge graph-relies 100% on an LLM to decide what's true. We call this "Brain 1 only."
 
@@ -457,14 +459,12 @@ For the full sync and patch application procedure, see the [Upstream Sync Runboo
 
 ## Current Status
 
-- Publicization execution lanes completed: adapter wiring, backup wiring, cron cutover.
-- Integration gate: **GO** (`reports/publicization/integration-report.md`).
-- Boundary policy: **ALLOW=370 / BLOCK=0 / AMBIGUOUS=0**.
-- **Truth pipeline: operational, with deterministic migration closeout policy.** Fact ledger + trust-aware retrieval are live, and curated-facts migration now uses deterministic disposition-aware validation (rather than ad-hoc/manual overrides) for unresolved legacy mappings. Canonical curated migration closeout is complete.
-- **Promotion policy v3 unified:** Policy v3 is now the default for all code paths — both OM-derived candidates and graph-lane candidates. The prior v2/v3 split-brain is resolved (`truth/candidates.py` `POLICY_VERSION_DEFAULT = "promotion-v3"`).
-- **Lane matrix locked (v3):** Retrieval eligibility, corroboration-only classification, and candidate-generating status are codified in `truth/candidates.py` constants and `config/runtime_pack_registry.json` `lane_policy`. See Candidate Generation Policy table above.
-- **Ingest sanitization live:** Session ingest strips `<graphiti-context>` blocks, untrusted metadata wrappers, and tool-call noise before LLM extraction (`scripts/mcp_ingest_sessions.py`). Token savings: ~20–60% per episode on typical sessions.
-- **Flip readiness caveat:** do not treat this status as automatic "Graphiti-primary GO." First confirm extraction freshness / queue-drain reliability, pass a fresh shadow-compare window, and complete a pilot run with per-lane quality report; otherwise keep Graphiti in governed shadow mode with QMD failover semantics. See private repo `docs/runbooks/operator-rollout-runbook.md` for the merge/rebuild/smoke/pilot/backfill decision flow.
+- **Typed-memory rescope is active.** Public main now includes ChangeLedger-backed typed-memory primitives, typed retrieval services, and OM typed projection/history plumbing.
+- **Recent public merges materially changed the state of play:** OM prompt-bias hardening (#161), OM-native retrieval visibility/projection/history work (#162, #163, #164, #168, #169), procedure-entity promotion routing (#170), ontology overlay composition (#172), and OM compressor JSON-contract repair (#173).
+- **What is actually proven right now:** the lane-policy matrix is codified; the repaired bakeoff/fixture chain produced documented current lane winners (`chatgpt_history=B`, `learning_self_audit=B`, `sessions_main=ship-now B`, `engineering_learnings=E`, `OM=F` with caveats); `learning_self_audit` is globally retrievable; craft/content lanes remain pack-injection-only.
+- **What is not yet proven:** broad replay on the unified typed substrate, legacy-caller compatibility on the established `search_memory_facts` surface, the default typed flip, and post-rescope cleanup/dead-code deletion.
+- **Legacy surfaces still exist in-tree.** Fact-ledger/trust-pipeline code remains part of the migration surface; do not infer from that alone that the old Graphiti-primary story is still the forward plan.
+- **Operator reality:** the public repo is only half the picture. Runtime wiring, pack policy, rollout gates, and deployment-specific truth live in the private overlay repo and must be checked before claiming a full end-to-end “go.”
 
 ## CI Policy
 

@@ -1,5 +1,7 @@
 # The Dual-Brain Architecture: Why Two Systems Are Better Than One
 
+> **Status note (2026-03-11):** This document explains the original Dual Brain / Fact Ledger rationale that still informs Bicameral's trust model. The current forward architecture is the **typed-memory rescope**: ChangeLedger as canonical typed state, graph as derived projection/search surface, and a pluggable evidence callback for grounding. Treat this file as historical rationale and carry-forward context, not as a statement that the old Graphiti-primary read path is the current ship target.
+
 ## The Problem With "Magic" AI Memory
 
 Most AI memory systems rely on a single brain: an LLM that reads new information, looks at old information, and decides what's true. Graphiti (the upstream library) does this. It uses a prompt to ask an LLM: "Here's what we knew. Here's what we just learned. Does the new thing contradict the old thing?"
