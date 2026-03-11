@@ -809,7 +809,7 @@ CRITICAL:
 - For each candidate memory, ask: what durable human-context memory does this imply, if any?
 - If the evidence is technical or operational, store only the durable human-facing implication.
 - Technical detail may be the carrier or evidence of a memory; it is not automatically the memory itself.
-- If there is no durable human-facing implication, emit nothing.
+- If there is no durable human-facing implication, return {"nodes": [], "edges": []}.
 
 WHAT BELONGS:
 - Durable human context and world-state that would help future assistance.
@@ -865,7 +865,7 @@ PUBLIC-SAFE EXAMPLES OF THE IMPLICATION RULE:
 - Technical evidence: "page me on Signal when urgent" -> memory: urgent updates should use that channel.
 - Technical evidence: "wait for my approval before deploying" -> memory: prefers approval before deploys.
 - Technical evidence: "this output feels risky or too aggressive" -> memory: has an ongoing concern about risky content.
-- Pure implementation with no durable human implication -> emit nothing.
+- Pure implementation with no durable human implication -> return {"nodes": [], "edges": []}.
 
 TEMPORAL SEQUENCING — SUPERSEDES:
 - Messages are provided in strict chronological order (oldest first).

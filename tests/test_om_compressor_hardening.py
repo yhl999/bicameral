@@ -1039,7 +1039,7 @@ def test_om_extract_system_prompt_prioritizes_human_implication_over_implementat
     assert "Extract the implication, not the implementation." in prompt
     assert "what durable human-context memory does this imply, if any?" in prompt
     assert "carrier or evidence of a memory" in prompt
-    assert "If there is no durable human-facing implication, emit nothing." in prompt
+    assert "If there is no durable human-facing implication, return {\"nodes\": [], \"edges\": []}." in prompt
     assert prompt.index("CRITICAL:") < prompt.index("TEMPORAL SEQUENCING"), (
         "Core admission rules must appear before SUPERSEDES guidance"
     )
