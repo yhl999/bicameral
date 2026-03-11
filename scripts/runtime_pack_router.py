@@ -957,8 +957,9 @@ def _graphiti_search_facts(
 
     tool_result = tool_result_envelope.get('result')
     if isinstance(tool_result, dict) and tool_result.get('isError'):
-        _content = tool_result.get('content', [])
-        _msg = _content[0].get('text', 'unknown error') if _content else 'unknown error'
+        _content = tool_result.get('content') or []
+        _first = _content[0] if _content else {}
+        _msg = _first.get('text', 'unknown error') if isinstance(_first, dict) else str(_first)
         raise RuntimeError(f'Graphiti tool error: {_msg}')
     payload = _extract_graphiti_tool_payload(tool_result)
 
