@@ -12,6 +12,7 @@ import math
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -37,6 +38,7 @@ try:
         StatusResponse,
         SuccessResponse,
     )
+    from .services.change_ledger import ChangeLedger
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from .services.om_group_scope import (
         is_om_native_only_scope,
@@ -44,9 +46,11 @@ try:
     )
     from .services.om_typed_projection import OMTypedProjectionService
     from .services.ontology_registry import OntologyRegistry
+    from .services.procedure_service import ProcedureService
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
+    from .models.typed_memory import Episode, Procedure
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 except ImportError:  # pragma: no cover - script/top-level import fallback
@@ -60,6 +64,7 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         StatusResponse,
         SuccessResponse,
     )
+    from services.change_ledger import ChangeLedger
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from services.om_group_scope import (
         is_om_native_only_scope,
@@ -67,9 +72,11 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
     )
     from services.om_typed_projection import OMTypedProjectionService
     from services.ontology_registry import OntologyRegistry
+    from services.procedure_service import ProcedureService
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
+    from models.typed_memory import Episode, Procedure
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
@@ -1240,6 +1247,8 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None
+change_ledger: ChangeLedger | None = None
+procedure_service: ProcedureService | None = None
 search_service = SearchService(om_group_id=DEFAULT_OM_GROUP_ID)
 
 # Global client for backward compatibility
@@ -2119,6 +2128,171 @@ async def search_memory_facts(
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
+
+
+
+def _change_ledger() -> ChangeLedger:
+    global change_ledger
+    if change_ledger is None:
+        change_ledger = ChangeLedger()
+    return change_ledger
+
+
+def _procedure_service() -> ProcedureService:
+    global procedure_service
+    if procedure_service is None:
+        procedure_service = ProcedureService(_change_ledger())
+    return procedure_service
+
+
+def _normalize_text(value: str | None) -> str:
+    return str(value or '').strip().lower()
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def _match_text(subject: str | None, query: str) -> bool:
+    if not query:
+        return True
+    normalized = _normalize_text(subject)
+    return query in normalized
+
+
+def _episode_within_time_range(
+    episode: Episode,
+    *,
+    time_range: dict[str, str] | None,
+) -> bool:
+    if not time_range:
+        return True
+
+    start_text = str(time_range.get('start') or '').strip()
+    end_text = str(time_range.get('end') or '').strip()
+
+    start_at = _parse_time(start_text)
+    end_at = _parse_time(end_text)
+
+    if start_at is not None:
+        episode_started = _parse_time(episode.started_at) or _parse_time(episode.created_at)
+        if episode_started is None:
+            return False
+        if episode_started < start_at:
+            return False
+
+    if end_at is not None:
+        if episode.ended_at is None:
+            return True
+
+        episode_ended = _parse_time(episode.ended_at) or _parse_time(episode.created_at)
+        if episode_ended is not None and episode_ended > end_at:
+            return False
+
+    return True
+
+
+@mcp.tool()
+async def search_episodes(
+    query: str,
+    time_range: dict[str, str] | None = None,
+    include_history: bool = False,
+) -> list[Episode]:
+    # Return episode snapshots from typed ChangeLedger state.
+    q = _normalize_text(query)
+    ledger = _change_ledger()
+
+    rows = ledger.conn.execute(
+        "SELECT DISTINCT root_id FROM typed_roots WHERE object_type = 'episode' ORDER BY root_id"
+    ).fetchall()
+
+    matches: list[Episode] = []
+    for row in rows:
+        root_id = str(row['root_id'])
+
+        objects: list[Episode] = []
+        if include_history:
+            for materialized in ledger.materialize_lineage(root_id):
+                if isinstance(materialized, Episode):
+                    objects.append(materialized)
+        else:
+            current = ledger.current_object(root_id)
+            if isinstance(current, Episode):
+                objects.append(current)
+
+        for episode in objects:
+            if not _episode_within_time_range(episode, time_range=time_range):
+                continue
+
+            if not q:
+                matches.append(episode)
+                continue
+
+            if _match_text(episode.title, q) or _match_text(episode.summary, q):
+                matches.append(episode)
+
+    # TODO(typed-retrieval-v2): replace with embedding/typed search once index exists.
+    matches.sort(key=lambda item: item.created_at, reverse=True)
+    return matches[:50]
+
+
+@mcp.tool()
+async def get_episode(episode_id: str) -> Episode | ErrorResponse:
+    # Return a typed episode by object id or root id.
+    if not str(episode_id or '').strip():
+        return ErrorResponse(error='not_found: episode_id is required')
+
+    episode = _change_ledger().materialize_object(str(episode_id).strip())
+    if not isinstance(episode, Episode):
+        return ErrorResponse(error=f'not_found: No episode with id {episode_id}')
+
+    return episode
+
+
+@mcp.tool()
+async def search_procedures(
+    query: str,
+    include_all: bool = False,
+) -> list[Procedure]:
+    # Return procedures from ProcedureService with simple case-insensitive filter.
+    # TODO(typed-retrieval-v2): replace with vector/semantic search once indexing is in place.
+    q = _normalize_text(query)
+    procedures = _procedure_service().list_current_procedures(include_proposed=include_all)
+    matches = [
+        procedure
+        for procedure in procedures
+        if not q or _match_text(procedure.name, q) or _match_text(procedure.trigger, q)
+    ]
+
+    return sorted(matches, key=lambda item: item.success_count, reverse=True)
+
+
+@mcp.tool()
+async def get_procedure(procedure_id: str) -> Procedure | ErrorResponse:
+    # Return current procedure by identifier from ProcedureService evolution.
+    normalized = str(procedure_id or '').strip()
+    if not normalized:
+        return ErrorResponse(error='not_found: procedure_id is required')
+
+    try:
+        procedure = _procedure_service().evolution.resolve_current(normalized)
+    except Exception as exc:  # pragma: no cover - delegated error path
+        return ErrorResponse(error=f'not_found: No procedure with id {procedure_id}')
+
+    if not isinstance(procedure, Procedure):
+        return ErrorResponse(error=f'not_found: No procedure with id {procedure_id}')
+
+    return procedure
 
 
 @mcp.tool()
