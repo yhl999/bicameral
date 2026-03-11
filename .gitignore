@@ -174,3 +174,22 @@ exports/
 evidence/
 reports/private/
 logs/
+
+# Gas Town local operator/runtime surface (non-canonical, machine-local state)
+/mayor/
+/deacon/
+/daemon/
+/settings/
+/witness/
+/refinery/
+/crew/
+/polecats/
+/bicameral/
+/.runtime/
+/.events.jsonl
+/.events.jsonl.lock
+/.dolt-data/
+/dolt/
+/dolt-server.lock
+/dolt-server.pid
+/dolt-server.port
