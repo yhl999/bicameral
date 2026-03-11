@@ -82,6 +82,34 @@ else:
     load_dotenv()
 
 
+_ONTOLOGY_OVERLAY_PATHS_ENV = 'BICAMERAL_ONTOLOGY_OVERLAY_PATHS'
+
+
+def _resolve_ontology_overlay_paths() -> list[Path]:
+    """Return optional ontology overlay paths from the environment.
+
+    Paths are separated by ``os.pathsep``. Relative paths resolve against the
+    MCP server directory so local dev setups can use short repo-relative paths.
+    """
+    raw = os.getenv(_ONTOLOGY_OVERLAY_PATHS_ENV, '').strip()
+    if not raw:
+        return []
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for entry in raw.split(os.pathsep):
+        candidate_raw = entry.strip()
+        if not candidate_raw:
+            continue
+        candidate = Path(candidate_raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (mcp_server_dir / candidate).resolve()
+        if candidate not in seen:
+            resolved.append(candidate)
+            seen.add(candidate)
+    return resolved
+
+
 # Semaphore limit for concurrent Graphiti operations.
 #
 # This controls how many episodes can be processed simultaneously. Each episode
@@ -1021,19 +1049,40 @@ class GraphitiService:
             self.entity_types = custom_types
 
             # Load optional per-lane extraction ontology registry
+            ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
+            overlay_paths = _resolve_ontology_overlay_paths()
             try:
-                ontology_path = mcp_server_dir / 'config' / 'extraction_ontologies.yaml'
                 if ontology_path.exists():
-                    self.ontology_registry = OntologyRegistry.load(ontology_path)
+                    self.ontology_registry = OntologyRegistry.load(
+                        ontology_path,
+                        overlay_paths=overlay_paths,
+                    )
                     logger.info(
-                        'Loaded ontology profiles for %d lanes',
+                        'Loaded ontology profiles for %d lanes from base=%s overlays=%s',
                         len(self.ontology_registry.configured_groups),
+                        ontology_path,
+                        [str(path) for path in overlay_paths],
+                    )
+                elif overlay_paths:
+                    raise RuntimeError(
+                        f'Configured ontology overlay(s) {[str(path) for path in overlay_paths]} '
+                        f'require base ontology file {ontology_path}, but it was not found'
                     )
                 else:
                     self.ontology_registry = None
                     logger.info('No extraction ontology file found; using default entity types only')
             except Exception as ontology_error:
                 self.ontology_registry = None
+                if overlay_paths:
+                    logger.exception(
+                        'Configured ontology overlay load failed for base=%s overlays=%s',
+                        ontology_path,
+                        [str(path) for path in overlay_paths],
+                    )
+                    raise RuntimeError(
+                        f'Configured ontology overlay load failed for base={ontology_path} '
+                        f'overlays={[str(path) for path in overlay_paths]}: {ontology_error}'
+                    ) from ontology_error
                 logger.warning(f'Failed to load ontology registry: {ontology_error}')
 
             # Initialize default Graphiti client for configured database

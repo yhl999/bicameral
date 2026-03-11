@@ -214,6 +214,60 @@ Two enforcement passes run after LLM extraction (in code, not prompt):
 
 Domain-specific off-ontology edges (e.g. `CRITICIZED_BY`, `WRITTEN_IN_RESPONSE_TO`) are **kept** — only generic connector noise is filtered.
 
+## Ontology Overlays
+
+For deployments that need private or environment-specific ontology additions, the
+registry can compose a **base ontology file** with one or more **overlay YAML
+fragments**. At runtime, additional overlay paths can be supplied with the
+`BICAMERAL_ONTOLOGY_OVERLAY_PATHS` environment variable (separated by
+`os.pathsep`).
+
+Composition rules are intentionally boring:
+
+- Base file loads first
+- Overlay files apply in order
+- Mapping keys merge recursively
+- Lists replace wholesale
+- Scalars replace wholesale
+
+This means an overlay can:
+- add a brand-new lane
+- override a specific lane field like `intent_guidance` or `extraction_mode`
+- replace an entire lane block by re-declaring its lists
+
+Recommended split:
+- keep shared/general lanes in the base file
+- keep private-only lanes or stricter local specializations in overlays
+
+Example:
+
+```yaml
+# base: config/extraction_ontologies.yaml
+schema_version: 1
+
+support_tickets:
+  entity_types:
+    - name: CustomerIssue
+      description: "A customer-reported problem."
+```
+
+```yaml
+# overlay: config/extraction_ontologies.private.overlay.yaml
+support_tickets:
+  extraction_mode: constrained_soft
+  intent_guidance: >-
+    Use only ontology edges for governed support extraction.
+  entity_types:
+    - name: SupportIncident
+      description: "Anchor node for the ticket or incident."
+    - name: CustomerIssue
+      description: "A customer-reported problem."
+```
+
+In the composed result, `support_tickets` keeps any untouched mapping fields from
+base, while the overlay replaces the `entity_types` list and adds the stricter
+lane guidance.
+
 ## Operational Safety Notes
 
 ### Relationship type enforcement
