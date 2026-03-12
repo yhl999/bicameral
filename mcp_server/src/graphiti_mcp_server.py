@@ -2425,22 +2425,37 @@ def _state_history_root_ids(
     return [str(row['root_id']) for row in rows if row['root_id']]
 
 
-def _history_event_timestamps_for_root(
+def _state_history_status_for_fact(fact: StateFact) -> str:
+    return 'active' if fact.is_current else str(fact.lifecycle_status)
+
+
+def _state_history_wire_metadata(
     ledger: ChangeLedger,
     *,
     root_id: str,
-) -> dict[str, str]:
-    timestamps: dict[str, str] = {}
+    facts: list[StateFact],
+) -> dict[str, tuple[str, str]]:
+    metadata = {
+        fact.object_id: (fact.created_at, _state_history_status_for_fact(fact))
+        for fact in facts
+    }
+
     for event in ledger.events_for_root(root_id):
-        object_id = (
-            event.object_id
-            if event.event_type in {'assert', 'supersede', 'refine', 'derive'}
-            else event.target_object_id or event.object_id
-        )
-        if object_id is None:
-            continue
-        timestamps[str(object_id)] = str(event.recorded_at)
-    return timestamps
+        if event.event_type == 'promote':
+            target_id = event.target_object_id or event.object_id
+            if target_id and target_id in metadata:
+                _timestamp, status = metadata[target_id]
+                metadata[target_id] = (event.recorded_at, status)
+        elif event.event_type == 'invalidate':
+            target_id = event.target_object_id or event.object_id
+            if target_id and target_id in metadata:
+                metadata[target_id] = (event.recorded_at, 'invalidated')
+        elif event.event_type in {'refine', 'supersede'}:
+            parent_id = event.target_object_id
+            if parent_id and parent_id in metadata:
+                metadata[parent_id] = (event.recorded_at, 'superseded')
+
+    return metadata
 
 
 def _change_history_events_for_subject(
@@ -2449,7 +2464,7 @@ def _change_history_events_for_subject(
     predicate: str | None,
     scope: str | None,
     effective_group_ids: list[str],
-) -> list[tuple[StateFact, str]]:
+) -> list[tuple[StateFact, str, str]]:
     ledger = _change_ledger()
     root_ids = _state_history_root_ids(
         ledger,
@@ -2459,7 +2474,7 @@ def _change_history_events_for_subject(
         effective_group_ids=effective_group_ids,
     )
 
-    matching: list[tuple[StateFact, str]] = []
+    matching: list[tuple[StateFact, str, str]] = []
     for root_id in root_ids:
         if _typed_root_lineage_too_large(
             ledger,
@@ -2473,7 +2488,7 @@ def _change_history_events_for_subject(
             )
             continue
 
-        event_timestamps = _history_event_timestamps_for_root(ledger, root_id=root_id)
+        visible_facts: list[StateFact] = []
         for fact in ledger.materialize_lineage(root_id):
             if not isinstance(fact, StateFact):
                 continue
@@ -2485,7 +2500,15 @@ def _change_history_events_for_subject(
                 continue
             if not _state_fact_is_visible(fact, effective_group_ids=effective_group_ids):
                 continue
-            matching.append((fact, event_timestamps.get(fact.object_id, fact.created_at)))
+            visible_facts.append(fact)
+
+        wire_metadata = _state_history_wire_metadata(ledger, root_id=root_id, facts=visible_facts)
+        for fact in visible_facts:
+            timestamp, status = wire_metadata.get(
+                fact.object_id,
+                (fact.created_at, _state_history_status_for_fact(fact)),
+            )
+            matching.append((fact, timestamp, status))
             if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
                 break
         if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
@@ -2675,7 +2698,7 @@ async def get_history(
         return scope_error or ErrorResponse(error='group_scope_required')
 
     try:
-        history_entries = _change_history_events_for_subject(
+        entries = _change_history_events_for_subject(
             subject=normalized_subject,
             predicate=normalized_predicate,
             scope=normalized_scope,
@@ -2684,30 +2707,30 @@ async def get_history(
 
         source_map: dict[str, str] = {}
         ledger = _change_ledger()
-        for root_id in {fact.root_id for fact, _timestamp in history_entries}:
-            source_map.update(_infer_event_sources(ledger, root_id))
+        for fact, _, _ in entries:
+            source_map.update(_infer_event_sources(ledger, fact.root_id))
     except Exception as exc:
         logger.exception('get_history failed for subject=%r', normalized_subject)
         return ErrorResponse(error='ledger_error', message=str(exc))
 
-    truncated = len(history_entries) > limit
-    selected_entries = history_entries[-limit:] if truncated else history_entries
+    truncated = len(entries) > limit
+    selected_entries = entries[-limit:] if truncated else entries
     history = [
         ChangeEvent(
-            uuid=f.object_id,
-            type=str(f.fact_type),
-            subject=f.subject,
-            predicate=f.predicate,
-            scope=f.scope,
-            value=f.value,
+            uuid=fact.object_id,
+            type=str(fact.fact_type),
+            subject=fact.subject,
+            predicate=fact.predicate,
+            scope=fact.scope,
+            value=fact.value,
             timestamp=timestamp,
-            source=source_map.get(f.object_id, 'owner_asserted'),
-            source_lane=f.source_lane,
-            status='active' if f.is_current else str(f.lifecycle_status),
-            supersedes=f.parent_id,
-            superseded_by=f.superseded_by,
+            source=source_map.get(fact.object_id, 'owner_asserted'),
+            source_lane=fact.source_lane,
+            status=status,
+            supersedes=fact.parent_id,
+            superseded_by=fact.superseded_by,
         ).model_dump(mode='json')
-        for f, timestamp in selected_entries
+        for fact, timestamp, status in selected_entries
     ]
     metadata = _build_typed_query_metadata(
         subject=normalized_subject,
@@ -2754,7 +2777,6 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
         error_msg = str(e)
         logger.error(f'Error deleting entity edge: {error_msg}')
         return ErrorResponse(error=f'Error deleting entity edge: {error_msg}')
-
 
 @mcp.tool()
 async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:

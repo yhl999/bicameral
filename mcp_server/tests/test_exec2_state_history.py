@@ -238,6 +238,62 @@ async def test_get_current_state_can_filter_same_subject_predicate_by_scope(ledg
 
 
 @pytest.mark.anyio
+async def test_get_history_uses_lifecycle_timestamp_for_superseded_parent(ledger: ChangeLedger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='chain-1',
+            root_id='r-chain',
+            subject='Workspace',
+            predicate='theme',
+            value='light',
+            created_at='2026-01-01T10:00:00Z',
+        ),
+        root_id='r-chain',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'refine',
+        payload=_state_fact(
+            object_id='chain-2',
+            root_id='r-chain',
+            subject='Workspace',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T11:00:00Z',
+        ),
+        target_object_id='chain-1',
+        root_id='r-chain',
+        recorded_at='2026-01-01T11:00:00Z',
+    )
+    ledger.append_event(
+        'refine',
+        payload=_state_fact(
+            object_id='chain-3',
+            root_id='r-chain',
+            subject='Workspace',
+            predicate='theme',
+            value='system',
+            created_at='2026-01-01T12:00:00Z',
+        ),
+        target_object_id='chain-2',
+        root_id='r-chain',
+        recorded_at='2026-01-01T12:00:00Z',
+    )
+
+    result = await server.get_history('Workspace', predicate='theme', group_ids=['s1_sessions_main'])
+
+    assert 'error' not in result
+    assert [event['value'] for event in result['history']] == ['light', 'dark', 'system']
+    assert [event['timestamp'] for event in result['history']] == [
+        '2026-01-01T11:00:00Z',
+        '2026-01-01T12:00:00Z',
+        '2026-01-01T12:00:00Z',
+    ]
+    assert [event['status'] for event in result['history']] == ['superseded', 'superseded', 'active']
+
+
+@pytest.mark.anyio
 async def test_get_history_returns_scoped_history_envelope_with_recent_limit(ledger: ChangeLedger):
     ledger.append_event(
         'assert',
@@ -265,6 +321,19 @@ async def test_get_history_returns_scoped_history_envelope_with_recent_limit(led
         target_object_id='chain-1',
         root_id='r-chain',
         recorded_at='2026-01-01T11:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='chain-unrelated',
+            root_id='r-chain-unrelated',
+            subject='Workspace',
+            predicate='theme',
+            value='blue',
+            created_at='2026-01-01T11:30:00Z',
+        ),
+        root_id='r-chain-unrelated',
+        recorded_at='2026-01-01T11:30:00Z',
     )
     ledger.append_event(
         'refine',
@@ -313,6 +382,7 @@ async def test_get_history_returns_scoped_history_envelope_with_recent_limit(led
 
     assert 'error' not in result
     assert [event['value'] for event in result['history']] == ['dark', 'system']
+    assert [event['timestamp'] for event in result['history']] == ['2026-01-01T12:00:00Z', '2026-01-01T12:00:00Z']
     assert [event['status'] for event in result['history']] == ['superseded', 'active']
     assert all(event['source_lane'] == 's1_sessions_main' for event in result['history'])
     assert result['metadata'] == {
