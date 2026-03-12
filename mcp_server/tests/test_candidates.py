@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -100,6 +101,60 @@ def test_list_candidates_default_scope(ledger_path: Path):
     state_candidates = asyncio.run(candidates_router.list_candidates(status='quarantine', type_filter='state'))
     assert len(state_candidates) == 1
     assert state_candidates[0]['uuid'] == 'cand-b'
+
+
+def test_candidates_schema_migrates_legacy_rows_to_exec4_contract(ledger_path: Path):
+    conn = sqlite3.connect(str(ledger_path))
+    conn.execute(
+        '''
+        CREATE TABLE candidates (
+            uuid TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            value TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        '''
+    )
+    conn.execute(
+        '''
+        INSERT INTO candidates(uuid, type, subject, predicate, value, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            'cand-legacy',
+            'preference',
+            'Yuan',
+            'prefers',
+            '"tea"',
+            'pending',
+            '2026-03-10T09:00:00Z',
+            '2026-03-10T09:00:00Z',
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    db = candidates_router.CandidatesDB(ledger_path)
+    migrated = db.get_candidate('cand-legacy')
+    assert migrated is not None
+    assert migrated['status'] == 'quarantine'
+    assert migrated['confidence'] == 0.0
+    assert migrated['resolution'] is None
+    assert migrated['metadata'] is None
+    assert migrated['conflicting_fact_uuid'] is None
+
+    columns = {
+        row['name']
+        for row in db.conn.execute("PRAGMA table_info('candidates')").fetchall()
+    }
+    assert {'conflicting_fact_uuid', 'resolution', 'confidence', 'reviewed_at', 'reviewed_by', 'promoted_at', 'promoted_by', 'reason', 'metadata_json'} <= columns
+
+    quarantine = asyncio.run(candidates_router.list_candidates())
+    assert [row['uuid'] for row in quarantine] == ['cand-legacy']
 
 
 def test_promote_candidate_supersede_marks_candidate_and_promotes_fact(ledger_path: Path):

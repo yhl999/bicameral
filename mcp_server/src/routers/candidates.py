@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS candidates (
     reason TEXT,
     metadata_json TEXT
 );
+"""
+
+
+CANDIDATES_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_candidates_status_created
     ON candidates(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_candidates_type_confidence
@@ -92,17 +96,24 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     }
 
     missing_to_sql = {
+        'conflicting_fact_uuid': 'ALTER TABLE candidates ADD COLUMN conflicting_fact_uuid TEXT',
+        'resolution': 'ALTER TABLE candidates ADD COLUMN resolution TEXT',
+        'confidence': 'ALTER TABLE candidates ADD COLUMN confidence REAL NOT NULL DEFAULT 0.0',
         'reviewed_at': 'ALTER TABLE candidates ADD COLUMN reviewed_at TEXT',
         'reviewed_by': 'ALTER TABLE candidates ADD COLUMN reviewed_by TEXT',
         'promoted_at': 'ALTER TABLE candidates ADD COLUMN promoted_at TEXT',
         'promoted_by': 'ALTER TABLE candidates ADD COLUMN promoted_by TEXT',
         'reason': 'ALTER TABLE candidates ADD COLUMN reason TEXT',
+        'metadata_json': 'ALTER TABLE candidates ADD COLUMN metadata_json TEXT',
     }
 
     for col, statement in missing_to_sql.items():
         if col not in existing:
             conn.execute(statement)
 
+    conn.execute(
+        "UPDATE candidates SET status = 'quarantine' WHERE status = 'pending'"
+    )
     conn.commit()
 
 
@@ -137,6 +148,7 @@ class CandidatesDB:
     def ensure_schema(self) -> None:
         self.conn.executescript(CANDIDATES_SCHEMA_SQL)
         _ensure_columns(self.conn)
+        self.conn.executescript(CANDIDATES_INDEXES_SQL)
         self.conn.commit()
 
     def list_candidates(
