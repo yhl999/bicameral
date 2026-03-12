@@ -29,13 +29,16 @@ from starlette.responses import JSONResponse
 try:
     from .config.schema import GraphitiConfig, ServerConfig
     from .models.response_types import (
+        CurrentStateResponse,
         EpisodeSearchResponse,
         ErrorResponse,
         FactSearchResponse,
+        HistoryResponse,
         NodeResult,
         NodeSearchResponse,
         StatusResponse,
         SuccessResponse,
+        TypedMemoryQueryMetadata,
     )
     from .models.typed_memory import StateFact
     from .services.change_ledger import ChangeLedger
@@ -54,13 +57,16 @@ try:
 except ImportError:  # pragma: no cover - script/top-level import fallback
     from config.schema import GraphitiConfig, ServerConfig
     from models.response_types import (
+        CurrentStateResponse,
         EpisodeSearchResponse,
         ErrorResponse,
         FactSearchResponse,
+        HistoryResponse,
         NodeResult,
         NodeSearchResponse,
         StatusResponse,
         SuccessResponse,
+        TypedMemoryQueryMetadata,
     )
     from models.typed_memory import StateFact
     from services.change_ledger import ChangeLedger
@@ -162,6 +168,8 @@ _MAX_STATE_CURRENT_ROOTS = 128
 _MAX_STATE_HISTORY_ROOTS = 128
 _MAX_STATE_HISTORY_RESULTS = 512
 _MAX_STATE_LINEAGE_EVENTS_PER_ROOT = 512
+_MAX_STATE_FACTS_CAP = 100
+_MAX_HISTORY_EVENTS_CAP = 200
 _PRIVATE_SCOPE = 'private'
 _SOURCE_LANE_FILTER_ERROR = (
     "metadata_filters.source_lane must be a scalar, array, or object with 'eq' or 'in'"
@@ -2140,6 +2148,7 @@ class ChangeEvent(BaseModel):
     value: Any
     timestamp: str
     source: str
+    source_lane: str | None = None
     status: str
     supersedes: str | None = None
     superseded_by: str | None = None
@@ -2171,19 +2180,22 @@ def _state_fact_is_visible(
     return policy_scope == _PRIVATE_SCOPE and visibility_scope == _PRIVATE_SCOPE
 
 
-def _resolve_state_query_scope(
+def _resolve_state_history_scope(
     *,
     group_ids: list[str] | None,
     lane_alias: list[str] | None,
 ) -> tuple[list[str] | None, ErrorResponse | None]:
     if config is None:
-        fallback_group_id = str(os.getenv('GRAPHITI_GROUP_ID') or 'default').strip()
-        if not fallback_group_id:
-            return None, ErrorResponse(
-                error='invalid_input',
-                message='state/history retrieval requires a default group scope',
-            )
-        return [fallback_group_id], None
+        fallback_group_id = str(os.getenv('GRAPHITI_GROUP_ID') or '').strip()
+        if fallback_group_id:
+            return [fallback_group_id], None
+        return None, ErrorResponse(
+            error='group_scope_required',
+            message=(
+                'state/history retrieval requires explicit group_ids/lane_alias '
+                'or a configured default group'
+            ),
+        )
 
     try:
         effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
@@ -2194,23 +2206,17 @@ def _resolve_state_query_scope(
         return None, ErrorResponse(error='invalid_input', message=str(exc))
 
     if invalid_aliases:
-        return (
-            None,
-            ErrorResponse(
-                error='invalid_input',
-                message=f'Unknown lane aliases: {", ".join(invalid_aliases)}',
-            ),
+        return None, ErrorResponse(
+            error='invalid_input',
+            message=f'Unknown lane aliases: {", ".join(invalid_aliases)}',
         )
 
     if not effective_group_ids:
-        return (
-            None,
-            ErrorResponse(
-                error='invalid_input',
-                message=(
-                    'state/history retrieval requires explicit group scope when '
-                    'default group_id is unset'
-                ),
+        return None, ErrorResponse(
+            error='group_scope_required',
+            message=(
+                'state/history retrieval requires explicit group_ids/lane_alias '
+                'or a configured default group'
             ),
         )
 
@@ -2317,6 +2323,16 @@ def _current_state_candidates(
         if not _state_fact_is_visible(current, effective_group_ids=effective_group_ids):
             continue
         matches.append(current)
+
+    matches.sort(
+        key=lambda item: (
+            item.created_at,
+            item.predicate,
+            str(item.source_lane or ''),
+            item.object_id,
+        ),
+        reverse=True,
+    )
     return matches
 
 
@@ -2415,6 +2431,31 @@ def _change_history_events_for_subject(
     return matching
 
 
+def _build_typed_query_metadata(
+    *,
+    subject: str,
+    predicate: str | None,
+    effective_group_ids: list[str],
+    lane_alias: list[str] | None,
+    limit: int,
+    result_count: int,
+    truncated: bool,
+) -> TypedMemoryQueryMetadata:
+    return TypedMemoryQueryMetadata(
+        subject=subject,
+        predicate=predicate,
+        group_ids=list(effective_group_ids),
+        lane_alias=list(lane_alias) if lane_alias is not None else None,
+        limit=limit,
+        result_count=result_count,
+        truncated=truncated,
+    )
+
+
+def _serialize_state_fact(fact: StateFact) -> dict[str, Any]:
+    return fact.model_dump(mode='json')
+
+
 def _infer_event_sources(
     ledger: ChangeLedger,
     root_id: str,
@@ -2463,8 +2504,11 @@ def _infer_event_sources(
 async def get_current_state(
     subject: str,
     predicate: str | None = None,
-) -> StateFact | ErrorResponse:
-    # Return the current state fact for a subject (and optional predicate).
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    limit: int = _MAX_STATE_FACTS_CAP,
+) -> CurrentStateResponse | ErrorResponse:
+    # Return scoped current state facts for a subject and optional predicate.
     normalized_subject = _normalize_subject_or_predicate(subject)
     if not normalized_subject:
         return ErrorResponse(error='invalid_input', message='subject must be a non-empty string')
@@ -2475,15 +2519,19 @@ async def get_current_state(
         if not normalized_predicate:
             return ErrorResponse(error='invalid_input', message='predicate must be a non-empty string')
 
-    effective_group_ids, scope_error = _resolve_state_query_scope(
-        group_ids=None,
-        lane_alias=None,
+    if limit <= 0:
+        return ErrorResponse(error='invalid_input', message='limit must be a positive integer')
+    limit = min(limit, _MAX_STATE_FACTS_CAP)
+
+    effective_group_ids, scope_error = _resolve_state_history_scope(
+        group_ids=group_ids,
+        lane_alias=lane_alias,
     )
     if scope_error is not None or effective_group_ids is None:
-        return scope_error or ErrorResponse(error='invalid_input')
+        return scope_error or ErrorResponse(error='group_scope_required')
 
     try:
-        candidates = _current_state_candidates(
+        matches = _current_state_candidates(
             subject=normalized_subject,
             predicate=normalized_predicate,
             effective_group_ids=effective_group_ids,
@@ -2492,34 +2540,37 @@ async def get_current_state(
         logger.exception('get_current_state failed for subject=%r', normalized_subject)
         return ErrorResponse(error='ledger_error', message=str(exc))
 
-    if not candidates:
-        subject_key = f'{normalized_subject}:{normalized_predicate}' if normalized_predicate else normalized_subject
-        return ErrorResponse(
-            error='not_found',
-            message=f'No active fact found for {subject_key}',
-        )
-
-    if normalized_predicate is None:
-        predicates = sorted({fact.predicate for fact in candidates})
-        if len(predicates) > 1:
-            return ErrorResponse(
-                error='ambiguous',
-                message='Ambiguous subject. Specify one predicate.',
-                details={
-                    'subject': normalized_subject,
-                    'predicates': predicates,
-                },
-            )
-
-    return max(candidates, key=lambda item: (item.created_at, item.version, item.object_id))
+    truncated = len(matches) > limit
+    facts = [_serialize_state_fact(fact) for fact in matches[:limit]]
+    metadata = _build_typed_query_metadata(
+        subject=normalized_subject,
+        predicate=normalized_predicate,
+        effective_group_ids=effective_group_ids,
+        lane_alias=lane_alias,
+        limit=limit,
+        result_count=len(facts),
+        truncated=truncated,
+    )
+    return CurrentStateResponse(
+        message=(
+            f'Found {len(facts)} current state fact(s)'
+            if facts
+            else f'No current state facts found for subject={normalized_subject!r}'
+        ),
+        facts=facts,
+        metadata=metadata,
+    )
 
 
 @mcp.tool()
 async def get_history(
     subject: str,
     predicate: str | None = None,
-) -> list[ChangeEvent] | ErrorResponse:
-    # Return historical state-fact change events for a subject.
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    limit: int = _MAX_HISTORY_EVENTS_CAP,
+) -> HistoryResponse | ErrorResponse:
+    # Return scoped historical state-fact change events for a subject.
     normalized_subject = _normalize_subject_or_predicate(subject)
     if not normalized_subject:
         return ErrorResponse(error='invalid_input', message='subject must be a non-empty string')
@@ -2530,12 +2581,16 @@ async def get_history(
         if not normalized_predicate:
             return ErrorResponse(error='invalid_input', message='predicate must be a non-empty string')
 
-    effective_group_ids, scope_error = _resolve_state_query_scope(
-        group_ids=None,
-        lane_alias=None,
+    if limit <= 0:
+        return ErrorResponse(error='invalid_input', message='limit must be a positive integer')
+    limit = min(limit, _MAX_HISTORY_EVENTS_CAP)
+
+    effective_group_ids, scope_error = _resolve_state_history_scope(
+        group_ids=group_ids,
+        lane_alias=lane_alias,
     )
     if scope_error is not None or effective_group_ids is None:
-        return scope_error or ErrorResponse(error='invalid_input')
+        return scope_error or ErrorResponse(error='group_scope_required')
 
     try:
         facts = _change_history_events_for_subject(
@@ -2543,19 +2598,18 @@ async def get_history(
             predicate=normalized_predicate,
             effective_group_ids=effective_group_ids,
         )
+
+        source_map: dict[str, str] = {}
+        ledger = _change_ledger()
+        for root_id in {fact.root_id for fact in facts}:
+            source_map.update(_infer_event_sources(ledger, root_id))
     except Exception as exc:
         logger.exception('get_history failed for subject=%r', normalized_subject)
         return ErrorResponse(error='ledger_error', message=str(exc))
 
-    if not facts:
-        return []
-
-    source_map: dict[str, str] = {}
-    ledger = _change_ledger()
-    for root_id in {fact.root_id for fact in facts}:
-        source_map.update(_infer_event_sources(ledger, root_id))
-
-    return [
+    truncated = len(facts) > limit
+    selected_facts = facts[-limit:] if truncated else facts
+    history = [
         ChangeEvent(
             uuid=f.object_id,
             type=str(f.fact_type),
@@ -2564,12 +2618,31 @@ async def get_history(
             value=f.value,
             timestamp=f.created_at,
             source=source_map.get(f.object_id, 'owner_asserted'),
+            source_lane=f.source_lane,
             status='active' if f.is_current else 'superseded',
             supersedes=f.parent_id,
             superseded_by=f.superseded_by,
-        )
-        for f in facts
+        ).model_dump(mode='json')
+        for f in selected_facts
     ]
+    metadata = _build_typed_query_metadata(
+        subject=normalized_subject,
+        predicate=normalized_predicate,
+        effective_group_ids=effective_group_ids,
+        lane_alias=lane_alias,
+        limit=limit,
+        result_count=len(history),
+        truncated=truncated,
+    )
+    return HistoryResponse(
+        message=(
+            f'Found {len(history)} history event(s)'
+            if history
+            else f'No history found for subject={normalized_subject!r}'
+        ),
+        history=history,
+        metadata=metadata,
+    )
 
 
 @mcp.tool()

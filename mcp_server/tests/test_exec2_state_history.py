@@ -1,243 +1,44 @@
 from __future__ import annotations
 
-import sys
-import types
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-# Lightweight stubs so tests can run without the full Graphiti runtime.
-if 'graphiti_core' not in sys.modules:
-    graphiti_core = types.ModuleType('graphiti_core')
-    graphiti_core.Graphiti = type('Graphiti', (), {})
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_HELPER_PATH = REPO_ROOT / 'tests' / 'helpers_mcp_import.py'
+_HELPER_SPEC = spec_from_file_location('repo_tests_helpers_mcp_import', _HELPER_PATH)
+assert _HELPER_SPEC is not None and _HELPER_SPEC.loader is not None
+_HELPER_MODULE = module_from_spec(_HELPER_SPEC)
+_HELPER_SPEC.loader.exec_module(_HELPER_MODULE)
+load_graphiti_mcp_server = _HELPER_MODULE.load_graphiti_mcp_server
 
-    graphiti_edges = types.ModuleType('graphiti_core.edges')
-    graphiti_edges.EntityEdge = type('EntityEdge', (), {})
+server = load_graphiti_mcp_server()
 
-    class _EpisodeType:
-        memory = 'memory'
-
-    graphiti_nodes = types.ModuleType('graphiti_core.nodes')
-    graphiti_nodes.EpisodeType = _EpisodeType
-    graphiti_nodes.EpisodicNode = type('EpisodicNode', (), {})
-
-    search_filters_module = types.ModuleType('graphiti_core.search.search_filters')
-    search_filters_module.SearchFilters = type('SearchFilters', (), {})
-
-    maintenance_graph_data = types.ModuleType('graphiti_core.utils.maintenance.graph_data_operations')
-    maintenance_graph_data.clear_data = lambda *args, **kwargs: None
-
-    graphiti_utils = types.ModuleType('graphiti_core.utils')
-    graphiti_utils.__path__ = []
-    maintenance_module = types.ModuleType('graphiti_core.utils.maintenance')
-    maintenance_module.__path__ = []
-    search_module = types.ModuleType('graphiti_core.search')
-    search_module.__path__ = []
-
-    sys.modules['graphiti_core'] = graphiti_core
-    sys.modules['graphiti_core.edges'] = graphiti_edges
-    sys.modules['graphiti_core.nodes'] = graphiti_nodes
-    sys.modules['graphiti_core.search'] = search_module
-    sys.modules['graphiti_core.search.search_filters'] = search_filters_module
-    sys.modules['graphiti_core.utils'] = graphiti_utils
-    sys.modules['graphiti_core.utils.maintenance'] = maintenance_module
-    sys.modules['graphiti_core.utils.maintenance.graph_data_operations'] = maintenance_graph_data
-
-if 'mcp' not in sys.modules:
-    mcp = types.ModuleType('mcp')
-    server_mod = types.ModuleType('mcp.server')
-    server_mod.__path__ = []
-
-    auth_module = types.ModuleType('mcp.server.auth')
-    auth_module.__path__ = []
-    middleware_module = types.ModuleType('mcp.server.auth.middleware')
-    middleware_module.__path__ = []
-    auth_context_module = types.ModuleType('mcp.server.auth.middleware.auth_context')
-    auth_context_module.get_access_token = lambda: None
-
-    class _Context:
-        client_id: str | None = None
-
-    class _FastMCP:
-        def __init__(self, *args, **kwargs):
-            self.title = args[0] if args else 'fastmcp'
-
-        def _decorate(self, *args):
-            if args and callable(args[0]) and len(args) == 1:
-                return args[0]
-
-            def decorator(func):
-                return func
-
-            return decorator
-
-        def tool(self, *args, **kwargs):
-            return self._decorate(*args)
-
-        def custom_route(self, *args, **kwargs):
-            return self._decorate(*args)
-
-    fastmcp_module = types.ModuleType('mcp.server.fastmcp')
-    fastmcp_module.Context = _Context
-    fastmcp_module.FastMCP = _FastMCP
-
-    sys.modules['mcp'] = mcp
-    sys.modules['mcp.server'] = server_mod
-    sys.modules['mcp.server.auth'] = auth_module
-    sys.modules['mcp.server.auth.middleware'] = middleware_module
-    sys.modules['mcp.server.auth.middleware.auth_context'] = auth_context_module
-    sys.modules['mcp.server.fastmcp'] = fastmcp_module
-
-if 'mcp_server.src.config.schema' not in sys.modules:
-    schema = types.ModuleType('mcp_server.src.config.schema')
-
-    class GraphitiConfig:
-        def __init__(self, *args, **kwargs):
-            self.graphiti = types.SimpleNamespace(group_id='default', lane_aliases={})
-            self.database = types.SimpleNamespace(provider='neo4j')
-
-    class ServerConfig:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    schema.GraphitiConfig = GraphitiConfig
-    schema.ServerConfig = ServerConfig
-    sys.modules['mcp_server.src.config.schema'] = schema
-    sys.modules['config.schema'] = schema
-
-if 'mcp_server.src.services.factories' not in sys.modules:
-    factories = types.ModuleType('mcp_server.src.services.factories')
-
-    class DatabaseDriverFactory:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def create(*args, **kwargs):
-            return None
-
-    class EmbedderFactory:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def create(*args, **kwargs):
-            return None
-
-    class LLMClientFactory:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def create(*args, **kwargs):
-            return None
-
-    factories.DatabaseDriverFactory = DatabaseDriverFactory
-    factories.EmbedderFactory = EmbedderFactory
-    factories.LLMClientFactory = LLMClientFactory
-    sys.modules['mcp_server.src.services.factories'] = factories
-    sys.modules['services.factories'] = factories
-
-if 'mcp_server.src.services.om_group_scope' not in sys.modules:
-    scope = types.ModuleType('mcp_server.src.services.om_group_scope')
-    scope.is_om_native_only_scope = lambda *args, **kwargs: False
-    scope.requires_strict_om_native_only_scope = lambda *args, **kwargs: False
-    sys.modules['mcp_server.src.services.om_group_scope'] = scope
-    sys.modules['services.om_group_scope'] = scope
-
-if 'mcp_server.src.services.om_typed_projection' not in sys.modules:
-    proj = types.ModuleType('mcp_server.src.services.om_typed_projection')
-
-    class OMTypedProjectionService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    proj.OMTypedProjectionService = OMTypedProjectionService
-    sys.modules['mcp_server.src.services.om_typed_projection'] = proj
-    sys.modules['services.om_typed_projection'] = proj
-
-if 'mcp_server.src.services.ontology_registry' not in sys.modules:
-    registry = types.ModuleType('mcp_server.src.services.ontology_registry')
-    registry.OntologyRegistry = object
-    sys.modules['mcp_server.src.services.ontology_registry'] = registry
-    sys.modules['services.ontology_registry'] = registry
-
-if 'mcp_server.src.services.queue_service' not in sys.modules:
-    queue_service = types.ModuleType('mcp_server.src.services.queue_service')
-    queue_service.QueueService = object
-    queue_service.build_om_candidate_rows = lambda rows: []
-    sys.modules['mcp_server.src.services.queue_service'] = queue_service
-    sys.modules['services.queue_service'] = queue_service
-
-if 'mcp_server.src.services.search_service' not in sys.modules:
-    search_service_mod = types.ModuleType('mcp_server.src.services.search_service')
-    search_service_mod.DEFAULT_OM_GROUP_ID = 'om'
-
-    class SearchService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @property
-        def om_projection(self):
-            return None
-
-        def includes_observational_memory(self, *_args, **kwargs):
-            return False
-
-        async def search_observational_facts(self, *args, **kwargs):
-            return []
-
-    search_service_mod.SearchService = SearchService
-    sys.modules['mcp_server.src.services.search_service'] = search_service_mod
-    sys.modules['services.search_service'] = search_service_mod
-
-if 'mcp_server.src.services.typed_retrieval' not in sys.modules:
-    typed_retrieval = types.ModuleType('mcp_server.src.services.typed_retrieval')
-
-    class TypedRetrievalService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def search(self, *args, **kwargs):
-            return {'facts': [], 'episodes': [], 'procedures': []}
-
-    typed_retrieval.TypedRetrievalService = TypedRetrievalService
-    sys.modules['mcp_server.src.services.typed_retrieval'] = typed_retrieval
-    sys.modules['services.typed_retrieval'] = typed_retrieval
-
-if 'mcp_server.src.utils.formatting' not in sys.modules:
-    formatting = types.ModuleType('mcp_server.src.utils.formatting')
-
-    def format_fact_result(*_args, **_kwargs):
-        return {}
-
-    formatting.format_fact_result = format_fact_result
-    sys.modules['mcp_server.src.utils.formatting'] = formatting
-    sys.modules['utils.formatting'] = formatting
-
-if 'mcp_server.src.utils.rate_limiter' not in sys.modules:
-    limiter = types.ModuleType('mcp_server.src.utils.rate_limiter')
-
-    class SlidingWindowRateLimiter:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def is_allowed(self, *_args, **_kwargs):
-            return True
-
-    limiter.SlidingWindowRateLimiter = SlidingWindowRateLimiter
-    sys.modules['mcp_server.src.utils.rate_limiter'] = limiter
-    sys.modules['utils.rate_limiter'] = limiter
-
-from mcp_server.src import graphiti_mcp_server as server
-from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
-from mcp_server.src.services.change_ledger import ChangeLedger
+from mcp_server.src.models.typed_memory import EvidenceRef, StateFact  # noqa: E402
+from mcp_server.src.services.change_ledger import ChangeLedger  # noqa: E402
 
 
-def _evidence_ref(tag: str) -> EvidenceRef:
+def _config(default_group_id: str | None = 's1_sessions_main'):
+    return SimpleNamespace(
+        database=SimpleNamespace(provider='neo4j'),
+        graphiti=SimpleNamespace(
+            group_id=default_group_id,
+            lane_aliases={
+                'sessions_main': ['s1_sessions_main'],
+                'curated': ['s1_curated_refs'],
+            },
+        ),
+    )
+
+
+def _evidence_ref(tag: str, lane: str) -> EvidenceRef:
     return EvidenceRef.from_legacy_ref(
         {
             'source_key': 'unit-test',
             'evidence_id': tag,
+            'scope': lane,
         }
     )
 
@@ -250,7 +51,7 @@ def _state_fact(
     predicate: str,
     value: str,
     created_at: str,
-    source_lane: str = 'default',
+    source_lane: str = 's1_sessions_main',
     policy_scope: str = 'private',
     visibility_scope: str = 'private',
 ) -> StateFact:
@@ -263,100 +64,123 @@ def _state_fact(
             'subject': subject,
             'predicate': predicate,
             'value': value,
+            'scope': 'private',
             'source_lane': source_lane,
             'policy_scope': policy_scope,
             'visibility_scope': visibility_scope,
             'created_at': created_at,
-            'evidence_refs': [_evidence_ref(object_id)],
+            'evidence_refs': [_evidence_ref(object_id, source_lane)],
         }
     )
 
 
+@pytest.fixture(autouse=True)
+def _server_config(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(server, 'config', _config())
+
+
 @pytest.fixture
-def ledger(monkeypatch, tmp_path):
+def ledger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     temp_ledger = ChangeLedger(tmp_path / 'change_ledger.db')
     monkeypatch.setattr(server, 'change_ledger', temp_ledger)
     return temp_ledger
 
 
 @pytest.mark.anyio
-async def test_get_current_state_prefers_predicate_when_subject_is_ambiguous(ledger):
+async def test_get_current_state_returns_scoped_fact_envelope(ledger: ChangeLedger):
     ledger.append_event(
         'assert',
         payload=_state_fact(
-            object_id='f1',
-            root_id='r-state-user',
+            object_id='theme-main',
+            root_id='r-theme-main',
             subject='UI',
             predicate='theme',
             value='dark',
             created_at='2026-01-01T10:00:00Z',
         ),
-        root_id='r-state-user',
+        root_id='r-theme-main',
         recorded_at='2026-01-01T10:00:00Z',
     )
     ledger.append_event(
         'assert',
         payload=_state_fact(
-            object_id='f2',
-            root_id='r-display-user',
+            object_id='font-main',
+            root_id='r-font-main',
             subject='UI',
             predicate='font',
             value='serif',
-            created_at='2026-01-01T10:00:00Z',
+            created_at='2026-01-01T10:05:00Z',
         ),
-        root_id='r-display-user',
-        recorded_at='2026-01-01T10:00:00Z',
+        root_id='r-font-main',
+        recorded_at='2026-01-01T10:05:00Z',
     )
-
-    result = await server.get_current_state('UI')
-    assert result['error'] == 'ambiguous'
-    assert result['details']['predicates'] == ['font', 'theme']
-
-
-@pytest.mark.anyio
-async def test_get_current_state_returns_not_found_when_no_state_for_subject(ledger):
-    result = await server.get_current_state('missing')
-    assert result['error'] == 'not_found'
-
-
-@pytest.mark.anyio
-async def test_get_current_state_returns_most_recent_matching_predicate(ledger):
     ledger.append_event(
         'assert',
         payload=_state_fact(
-            object_id='theme-1',
-            root_id='r-theme',
+            object_id='theme-curated',
+            root_id='r-theme-curated',
             subject='UI',
             predicate='theme',
-            value='light',
-            created_at='2026-01-01T10:00:00Z',
+            value='solarized',
+            created_at='2026-01-01T10:10:00Z',
+            source_lane='s1_curated_refs',
         ),
-        root_id='r-theme',
-        recorded_at='2026-01-01T10:00:00Z',
+        root_id='r-theme-curated',
+        recorded_at='2026-01-01T10:10:00Z',
     )
     ledger.append_event(
-        'refine',
+        'assert',
         payload=_state_fact(
-            object_id='theme-2',
-            root_id='r-theme',
+            object_id='theme-public',
+            root_id='r-theme-public',
             subject='UI',
             predicate='theme',
-            value='dark',
-            created_at='2026-01-01T11:00:00Z',
+            value='public',
+            created_at='2026-01-01T10:15:00Z',
+            visibility_scope='public',
         ),
-        target_object_id='theme-1',
-        root_id='r-theme',
-        recorded_at='2026-01-01T11:00:00Z',
+        root_id='r-theme-public',
+        recorded_at='2026-01-01T10:15:00Z',
     )
 
-    result = await server.get_current_state('UI', predicate='theme')
+    result = await server.get_current_state('UI', lane_alias=['sessions_main'])
+
     assert 'error' not in result
-    assert result.value == 'dark'
-    assert result.predicate == 'theme'
+    assert result['metadata'] == {
+        'subject': 'UI',
+        'predicate': None,
+        'group_ids': ['s1_sessions_main'],
+        'lane_alias': ['sessions_main'],
+        'limit': 100,
+        'result_count': 2,
+        'truncated': False,
+    }
+    assert [fact['predicate'] for fact in result['facts']] == ['font', 'theme']
+    assert {fact['value'] for fact in result['facts']} == {'serif', 'dark'}
+    assert all(fact['source_lane'] == 's1_sessions_main' for fact in result['facts'])
 
 
 @pytest.mark.anyio
-async def test_get_history_returns_full_statused_chain_in_order(ledger):
+async def test_get_current_state_empty_match_returns_empty_envelope(ledger: ChangeLedger):
+    result = await server.get_current_state('missing', group_ids=['s1_sessions_main'])
+
+    assert result == {
+        'message': "No current state facts found for subject='missing'",
+        'facts': [],
+        'metadata': {
+            'subject': 'missing',
+            'predicate': None,
+            'group_ids': ['s1_sessions_main'],
+            'lane_alias': None,
+            'limit': 100,
+            'result_count': 0,
+            'truncated': False,
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_get_history_returns_scoped_history_envelope_with_recent_limit(ledger: ChangeLedger):
     ledger.append_event(
         'assert',
         payload=_state_fact(
@@ -398,219 +222,97 @@ async def test_get_history_returns_full_statused_chain_in_order(ledger):
         root_id='r-chain',
         recorded_at='2026-01-01T12:00:00Z',
     )
-
-    # Add a different predicate so predicate-agnostic history still includes all subject facts.
     ledger.append_event(
         'assert',
         payload=_state_fact(
-            object_id='contrast',
-            root_id='r-contrast',
-            subject='Workspace',
-            predicate='contrast',
-            value='high',
-            created_at='2026-01-01T09:00:00Z',
-        ),
-        root_id='r-contrast',
-        recorded_at='2026-01-01T09:00:00Z',
-    )
-
-    by_predicate = await server.get_history('Workspace', predicate='theme')
-    assert len(by_predicate) == 3
-    assert [event.value for event in by_predicate] == ['light', 'dark', 'system']
-    assert by_predicate[-1].status == 'active'
-    assert by_predicate[0].status == 'superseded'
-
-    by_subject = await server.get_history('Workspace')
-    assert len(by_subject) == 4
-
-
-@pytest.mark.anyio
-async def test_get_history_returns_empty_list_when_no_records(ledger):
-    assert await server.get_history('never-seen') == []
-
-
-@pytest.mark.anyio
-async def test_get_current_state_enforces_lane_and_private_scope(ledger):
-    ledger.append_event(
-        'assert',
-        payload=_state_fact(
-            object_id='lane-ok',
-            root_id='r-lane-ok',
-            subject='UI',
-            predicate='theme',
-            value='dark',
-            created_at='2026-01-01T09:00:00Z',
-            source_lane='default',
-        ),
-        root_id='r-lane-ok',
-        recorded_at='2026-01-01T09:00:00Z',
-    )
-    ledger.append_event(
-        'assert',
-        payload=_state_fact(
-            object_id='lane-other',
-            root_id='r-lane-other',
-            subject='UI',
-            predicate='theme',
-            value='light',
-            created_at='2026-01-01T11:00:00Z',
-            source_lane='other-lane',
-        ),
-        root_id='r-lane-other',
-        recorded_at='2026-01-01T11:00:00Z',
-    )
-    ledger.append_event(
-        'assert',
-        payload=_state_fact(
-            object_id='lane-public',
-            root_id='r-lane-public',
-            subject='UI',
-            predicate='theme',
-            value='solarized',
-            created_at='2026-01-01T12:00:00Z',
-            source_lane='default',
-            visibility_scope='public',
-        ),
-        root_id='r-lane-public',
-        recorded_at='2026-01-01T12:00:00Z',
-    )
-
-    result = await server.get_current_state('UI', predicate='theme')
-    assert 'error' not in result
-    assert result.object_id == 'lane-ok'
-
-
-@pytest.mark.anyio
-async def test_get_history_enforces_lane_and_private_scope(ledger):
-    ledger.append_event(
-        'assert',
-        payload=_state_fact(
-            object_id='hist-1',
-            root_id='r-hist',
+            object_id='chain-curated',
+            root_id='r-chain-curated',
             subject='Workspace',
             predicate='theme',
-            value='light',
-            created_at='2026-01-01T10:00:00Z',
-            source_lane='default',
+            value='neon',
+            created_at='2026-01-01T12:30:00Z',
+            source_lane='s1_curated_refs',
         ),
-        root_id='r-hist',
-        recorded_at='2026-01-01T10:00:00Z',
-    )
-    ledger.append_event(
-        'refine',
-        payload=_state_fact(
-            object_id='hist-2',
-            root_id='r-hist',
-            subject='Workspace',
-            predicate='theme',
-            value='dark',
-            created_at='2026-01-01T11:00:00Z',
-            source_lane='default',
-        ),
-        target_object_id='hist-1',
-        root_id='r-hist',
-        recorded_at='2026-01-01T11:00:00Z',
+        root_id='r-chain-curated',
+        recorded_at='2026-01-01T12:30:00Z',
     )
     ledger.append_event(
         'assert',
         payload=_state_fact(
-            object_id='hist-other-lane',
-            root_id='r-hist-other-lane',
-            subject='Workspace',
-            predicate='theme',
-            value='other',
-            created_at='2026-01-01T12:00:00Z',
-            source_lane='other-lane',
-        ),
-        root_id='r-hist-other-lane',
-        recorded_at='2026-01-01T12:00:00Z',
-    )
-    ledger.append_event(
-        'assert',
-        payload=_state_fact(
-            object_id='hist-public',
-            root_id='r-hist-public',
+            object_id='chain-public',
+            root_id='r-chain-public',
             subject='Workspace',
             predicate='theme',
             value='public',
-            created_at='2026-01-01T13:00:00Z',
-            source_lane='default',
+            created_at='2026-01-01T12:45:00Z',
             policy_scope='public',
         ),
-        root_id='r-hist-public',
-        recorded_at='2026-01-01T13:00:00Z',
+        root_id='r-chain-public',
+        recorded_at='2026-01-01T12:45:00Z',
     )
 
-    history = await server.get_history('Workspace', predicate='theme')
-    assert [event.uuid for event in history] == ['hist-1', 'hist-2']
+    result = await server.get_history('Workspace', predicate='theme', group_ids=['s1_sessions_main'], limit=2)
+
+    assert 'error' not in result
+    assert [event['value'] for event in result['history']] == ['dark', 'system']
+    assert [event['status'] for event in result['history']] == ['superseded', 'active']
+    assert all(event['source_lane'] == 's1_sessions_main' for event in result['history'])
+    assert result['metadata'] == {
+        'subject': 'Workspace',
+        'predicate': 'theme',
+        'group_ids': ['s1_sessions_main'],
+        'lane_alias': None,
+        'limit': 2,
+        'result_count': 2,
+        'truncated': True,
+    }
 
 
 @pytest.mark.anyio
-async def test_state_history_invalid_input_contract(ledger):
-    current = await server.get_current_state('  ')
-    assert current['error'] == 'invalid_input'
+async def test_state_and_history_reject_empty_subject_consistently(ledger: ChangeLedger):
+    current = await server.get_current_state('   ')
+    history = await server.get_history('\n\t')
 
-    history = await server.get_history('Workspace', predicate='  ')
-    assert history['error'] == 'invalid_input'
+    assert current == {'error': 'invalid_input', 'message': 'subject must be a non-empty string'}
+    assert history == {'error': 'invalid_input', 'message': 'subject must be a non-empty string'}
 
 
 @pytest.mark.anyio
-async def test_get_current_state_returns_ledger_error_on_query_failure(monkeypatch):
+async def test_state_and_history_reject_empty_predicate_consistently(ledger: ChangeLedger):
+    current = await server.get_current_state('UI', predicate='   ')
+    history = await server.get_history('UI', predicate='   ')
+
+    assert current == {'error': 'invalid_input', 'message': 'predicate must be a non-empty string'}
+    assert history == {'error': 'invalid_input', 'message': 'predicate must be a non-empty string'}
+
+
+@pytest.mark.anyio
+async def test_state_and_history_fail_closed_without_group_scope(
+    ledger: ChangeLedger,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(server, 'config', _config(default_group_id=None))
+
+    current = await server.get_current_state('UI')
+    history = await server.get_history('UI')
+
+    expected = {
+        'error': 'group_scope_required',
+        'message': (
+            'state/history retrieval requires explicit group_ids/lane_alias '
+            'or a configured default group'
+        ),
+    }
+    assert current == expected
+    assert history == expected
+
+
+@pytest.mark.anyio
+async def test_get_current_state_returns_ledger_error_on_failure(monkeypatch: pytest.MonkeyPatch):
     def _boom():
         raise RuntimeError('boom')
 
     monkeypatch.setattr(server, '_change_ledger', _boom)
-    result = await server.get_current_state('UI', predicate='theme')
-    assert result['error'] == 'ledger_error'
-    assert 'boom' in result['message']
+    result = await server.get_current_state('UI', group_ids=['s1_sessions_main'])
 
-
-@pytest.mark.anyio
-async def test_get_history_caps_results(ledger, monkeypatch):
-    monkeypatch.setattr(server, '_MAX_STATE_HISTORY_RESULTS', 2)
-
-    ledger.append_event(
-        'assert',
-        payload=_state_fact(
-            object_id='cap-1',
-            root_id='r-cap',
-            subject='Project',
-            predicate='status',
-            value='draft',
-            created_at='2026-01-01T09:00:00Z',
-        ),
-        root_id='r-cap',
-        recorded_at='2026-01-01T09:00:00Z',
-    )
-    ledger.append_event(
-        'refine',
-        payload=_state_fact(
-            object_id='cap-2',
-            root_id='r-cap',
-            subject='Project',
-            predicate='status',
-            value='review',
-            created_at='2026-01-01T10:00:00Z',
-        ),
-        target_object_id='cap-1',
-        root_id='r-cap',
-        recorded_at='2026-01-01T10:00:00Z',
-    )
-    ledger.append_event(
-        'refine',
-        payload=_state_fact(
-            object_id='cap-3',
-            root_id='r-cap',
-            subject='Project',
-            predicate='status',
-            value='published',
-            created_at='2026-01-01T11:00:00Z',
-        ),
-        target_object_id='cap-2',
-        root_id='r-cap',
-        recorded_at='2026-01-01T11:00:00Z',
-    )
-
-    history = await server.get_history('Project', predicate='status')
-    assert len(history) == 2
-    assert [event.value for event in history] == ['draft', 'review']
+    assert result == {'error': 'ledger_error', 'message': 'boom'}

@@ -41,6 +41,28 @@ class EpisodeSearchResponse(TypedDict):
     episodes: list[dict[str, Any]]
 
 
+class TypedMemoryQueryMetadata(TypedDict):
+    subject: str
+    predicate: str | None
+    group_ids: list[str]
+    lane_alias: list[str] | None
+    limit: int
+    result_count: int
+    truncated: bool
+
+
+class CurrentStateResponse(TypedDict):
+    message: str
+    facts: list[dict[str, Any]]
+    metadata: TypedMemoryQueryMetadata
+
+
+class HistoryResponse(TypedDict):
+    message: str
+    history: list[dict[str, Any]]
+    metadata: TypedMemoryQueryMetadata
+
+
 class StatusResponse(TypedDict):
     status: str
     message: str
