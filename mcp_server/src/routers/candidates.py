@@ -454,6 +454,7 @@ async def promote_candidate(
             fact=_build_candidate_fact(candidate),
             conflict_with_fact_id=conflict_with,
             allow_parallel=(resolution == 'parallel'),
+            require_supersede=(resolution == 'supersede'),
             manage_transaction=False,
         )
 

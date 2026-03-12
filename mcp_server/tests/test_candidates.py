@@ -244,6 +244,30 @@ def test_promote_candidate_parallel_keeps_conflicting_fact_current(ledger_path: 
     assert promoted_id in ids
 
 
+def test_promote_candidate_supersede_requires_materialized_target(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+    ledger = ChangeLedger(ledger_path)
+
+    _make_candidate(
+        db=db,
+        candidate_id='cand-missing-target',
+        value='oolong',
+        conflicting_fact_uuid='missing-fact',
+    )
+
+    result = asyncio.run(candidates_router.promote_candidate('cand-missing-target', resolution='supersede'))
+    assert result == {
+        'error': "promote_candidate failed: explicit supersede requested but no valid supersede target was materialized for 'missing-fact'"
+    }
+
+    candidate = db.get_candidate('cand-missing-target')
+    assert candidate is not None
+    assert candidate['status'] == 'quarantine'
+    assert candidate['resolution'] is None
+    assert ledger.current_state_facts() == []
+    assert ledger.conn.execute("SELECT count(*) FROM change_events").fetchone()[0] == 0
+
+
 def test_promote_candidate_rejects_heterogeneous_supersede_target(ledger_path: Path):
     db = candidates_router.CandidatesDB(ledger_path)
     ledger = ChangeLedger(ledger_path)

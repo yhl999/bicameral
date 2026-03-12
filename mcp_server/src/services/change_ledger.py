@@ -447,6 +447,7 @@ class ChangeLedger:
         conflict_with_fact_id: str | None = None,
         seeded_supersede_ok: bool = False,  # kept for API compat
         allow_parallel: bool = False,
+        require_supersede: bool = False,
         recorded_at: str | None = None,
         manage_transaction: bool = True,
     ) -> CandidatePromotionResult:
@@ -457,9 +458,11 @@ class ChangeLedger:
         the two inserts, neither event is committed.
 
         For historical compatibility, ``seeded_supersede_ok`` is accepted but no
-        longer changes behavior by itself. ``manage_transaction=False`` allows
-        callers to compose candidate-row status transitions and ledger writes
-        inside one outer transaction.
+        longer changes behavior by itself. ``require_supersede`` fails closed
+        instead of silently degrading an explicit supersede request into a plain
+        assert when no valid target can be materialized. ``manage_transaction``
+        allows callers to compose candidate-row status transitions and ledger
+        writes inside one outer transaction.
         """
         recorded_at = recorded_at or _now_iso()
         typed_object = build_object_from_candidate_fact(
@@ -473,6 +476,8 @@ class ChangeLedger:
         creation_type = 'assert'
         parent_id: str | None = None
         root_id = typed_object.root_id
+        requested_conflict_with_fact_id = str(conflict_with_fact_id or '').strip() or None
+        resolved_conflict_with_fact_id = requested_conflict_with_fact_id
 
         # ── Serialize the read-currentness + write-events critical section ───
         # BEGIN IMMEDIATE acquires the write reservation (RESERVED lock) before
@@ -494,11 +499,11 @@ class ChangeLedger:
                         _current.conflict_set == _conflict_set
                         and _current.object_id != typed_object.object_id
                     ):
-                        conflict_with_fact_id = _current.object_id
+                        resolved_conflict_with_fact_id = _current.object_id
                         break
 
-            if not allow_parallel and conflict_with_fact_id:
-                prior = self.materialize_object(conflict_with_fact_id)
+            if not allow_parallel and resolved_conflict_with_fact_id:
+                prior = self.materialize_object(resolved_conflict_with_fact_id)
                 if prior is not None:
                     _validate_supersede_target(candidate=typed_object, prior=prior)
                     creation_type = 'supersede'
@@ -511,6 +516,17 @@ class ChangeLedger:
                             'version': prior.version + 1,
                         }
                     )
+
+            if require_supersede and creation_type != 'supersede':
+                if requested_conflict_with_fact_id:
+                    raise ValueError(
+                        'explicit supersede requested but no valid supersede target '
+                        f'was materialized for {requested_conflict_with_fact_id!r}'
+                    )
+                raise ValueError(
+                    'explicit supersede requested but no current conflict-set occupant '
+                    'was found to supersede'
+                )
 
             create_row = self._build_event_row(
                 creation_type,
@@ -866,12 +882,15 @@ def _validate_supersede_target(*, candidate: TypedMemoryObject, prior: TypedMemo
             f'{prior.object_type} object {prior.object_id}'
         )
 
-    if isinstance(candidate, StateFact) and isinstance(prior, StateFact):
-        if candidate.conflict_set != prior.conflict_set:
-            raise ValueError(
-                'incompatible supersede target: '
-                f'state_fact conflict set mismatch for target {prior.object_id}'
-            )
+    if (
+        isinstance(candidate, StateFact)
+        and isinstance(prior, StateFact)
+        and candidate.conflict_set != prior.conflict_set
+    ):
+        raise ValueError(
+            'incompatible supersede target: '
+            f'state_fact conflict set mismatch for target {prior.object_id}'
+        )
 
 
 def _prepare_object_for_create_event(
