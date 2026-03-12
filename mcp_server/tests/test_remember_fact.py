@@ -197,8 +197,9 @@ def test_remember_fact_conflict_returns_dialog_and_candidate(isolated_memory):
     assert conflict['status'] == 'conflict'
     assert conflict['type'] == 'ConflictDialog'
     assert [option['label'] for option in conflict['options']] == ['Supersede', 'Cancel']
-    assert 'promote_candidate(candidate_id, resolution="supersede")' in conflict['resolve_via']
-    assert 'reject_candidate(candidate_id)' in conflict['resolve_via']
+    assert 'promote_candidate(candidate_id, resolution="supersede"' in conflict['resolve_via']
+    assert 'actor_id=' in conflict['resolve_via']
+    assert 'reject_candidate(candidate_id' in conflict['resolve_via']
     assert conflict['candidate_uuid']
     assert len(isolated_memory['candidates'].list_candidates(status='pending')) == 1
 

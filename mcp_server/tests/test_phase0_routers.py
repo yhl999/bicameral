@@ -175,13 +175,27 @@ class TestAllStubsReturnValidTypes:
         }
 
     @pytest.mark.anyio
-    async def test_candidates_promote_contract(self):
+    async def test_candidates_promote_requires_actor_id(self):
+        """promote_candidate without actor_id returns unauthorized (auth gate fires first)."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['promote_candidate']
         result = await fn(candidate_id='cand-001', resolution='supersede')
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'unauthorized'
+
+    @pytest.mark.anyio
+    async def test_candidates_promote_contract(self, monkeypatch):
+        """promote_candidate with authorized actor_id returns not_found for unknown candidate."""
+        from mcp_server.src.routers.candidates import register_tools
+
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['promote_candidate']
+        result = await fn(candidate_id='cand-001', resolution='supersede', actor_id='system:test')
         assert result == {
             'status': 'error',
             'error_type': 'not_found',
@@ -189,13 +203,27 @@ class TestAllStubsReturnValidTypes:
         }
 
     @pytest.mark.anyio
-    async def test_candidates_reject_contract(self):
+    async def test_candidates_reject_requires_actor_id(self):
+        """reject_candidate without actor_id returns unauthorized (auth gate fires first)."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='cand-001')
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'unauthorized'
+
+    @pytest.mark.anyio
+    async def test_candidates_reject_contract(self, monkeypatch):
+        """reject_candidate with authorized actor_id returns not_found for unknown candidate."""
+        from mcp_server.src.routers.candidates import register_tools
+
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['reject_candidate']
+        result = await fn(candidate_id='cand-001', actor_id='system:test')
         assert result == {
             'status': 'error',
             'error_type': 'not_found',
@@ -203,13 +231,15 @@ class TestAllStubsReturnValidTypes:
         }
 
     @pytest.mark.anyio
-    async def test_candidates_reject_contract_treats_unmatched_identifier_as_not_found(self):
+    async def test_candidates_reject_contract_treats_unmatched_identifier_as_not_found(self, monkeypatch):
+        """reject_candidate with authorized actor_id and unrecognized ID returns not_found."""
         from mcp_server.src.routers.candidates import register_tools
 
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
-        result = await fn(candidate_id='Bad Candidate Id')
+        result = await fn(candidate_id='Bad Candidate Id', actor_id='system:test')
         assert result == {
             'status': 'error',
             'error_type': 'not_found',

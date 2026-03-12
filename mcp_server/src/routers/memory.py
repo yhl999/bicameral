@@ -970,7 +970,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             'existing_fact': conflict_existing,
             'new_fact': _candidate_payload(candidate),
             'options': _CONFLICT_OPTIONS,
-            'resolve_via': 'promote_candidate(candidate_id, resolution="supersede") or reject_candidate(candidate_id)',
+            'resolve_via': 'promote_candidate(candidate_id, resolution="supersede", actor_id=<trusted_actor>) or reject_candidate(candidate_id, actor_id=<trusted_actor>)',
             'candidate_id': candidate.get('candidate_id'),
             'candidate_uuid': candidate.get('candidate_id'),
             'supersede_requested': supersede_requested,
