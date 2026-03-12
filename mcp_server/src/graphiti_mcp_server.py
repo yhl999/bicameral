@@ -37,20 +37,20 @@ try:
         StatusResponse,
         SuccessResponse,
     )
+    from .models.typed_memory import StateFact
+    from .services.change_ledger import ChangeLedger
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from .services.om_group_scope import (
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
     )
     from .services.om_typed_projection import OMTypedProjectionService
-    from .services.change_ledger import ChangeLedger
     from .services.ontology_registry import OntologyRegistry
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
-    from .models.typed_memory import StateFact
 except ImportError:  # pragma: no cover - script/top-level import fallback
     from config.schema import GraphitiConfig, ServerConfig
     from models.response_types import (
@@ -62,20 +62,20 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         StatusResponse,
         SuccessResponse,
     )
+    from models.typed_memory import StateFact
+    from services.change_ledger import ChangeLedger
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from services.om_group_scope import (
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
     )
     from services.om_typed_projection import OMTypedProjectionService
-    from services.change_ledger import ChangeLedger
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
-    from models.typed_memory import StateFact
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -158,6 +158,11 @@ _MAX_NODES_CAP = 200
 _MAX_FACTS_CAP = 200
 _MAX_TYPED_RESULTS_CAP = 200
 _MAX_TYPED_EVIDENCE_CAP = 200
+_MAX_STATE_CURRENT_ROOTS = 128
+_MAX_STATE_HISTORY_ROOTS = 128
+_MAX_STATE_HISTORY_RESULTS = 512
+_MAX_STATE_LINEAGE_EVENTS_PER_ROOT = 512
+_PRIVATE_SCOPE = 'private'
 _SOURCE_LANE_FILTER_ERROR = (
     "metadata_filters.source_lane must be a scalar, array, or object with 'eq' or 'in'"
 )
@@ -1056,27 +1061,27 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
         ),
         _tool_schema_entry(
             name='get_current_state',
-            description='Query the typed-memory ledger for current non-superseded facts',
+            description='Query current typed state for a subject/predicate within lane and private scope boundaries',
             mode_hint='typed',
             inputs={
                 'subject': 'string',
                 'predicate': 'string | null',
             },
-            output='{"message": string, "facts": list[TypedFact]} | ErrorResponse',
+            output='TypedFact | ErrorResponse(error in {invalid_input, not_found, ambiguous, ledger_error})',
             examples=[{'subject': 'user', 'predicate': 'preferred_editor'}],
-            phase0_behavior='Returns an empty facts list after input validation.',
+            phase0_behavior='Implemented: validates scope and returns one current StateFact.',
         ),
         _tool_schema_entry(
             name='get_history',
-            description='Retrieve typed-memory change history for a subject / predicate',
+            description='Retrieve typed state change history for a subject/predicate within lane and private scope boundaries',
             mode_hint='typed',
             inputs={
                 'subject': 'string',
                 'predicate': 'string | null',
             },
-            output='{"message": string, "history": list[TypedFact]} | ErrorResponse',
+            output='list[ChangeEvent] | ErrorResponse(error in {invalid_input, ledger_error})',
             examples=[{'subject': 'project-alpha', 'predicate': 'status'}],
-            phase0_behavior='Returns an empty history list after input validation.',
+            phase0_behavior='Implemented: returns chronological ChangeEvent entries.',
         ),
         _tool_schema_entry(
             name='list_candidates',
@@ -2152,60 +2157,305 @@ def _normalize_subject_or_predicate(value: str | None) -> str:
     return str(value or '').strip()
 
 
+def _state_fact_is_visible(
+    fact: StateFact,
+    *,
+    effective_group_ids: list[str],
+) -> bool:
+    lane = str(fact.source_lane or '').strip()
+    if not lane or lane not in set(effective_group_ids):
+        return False
+
+    policy_scope = str(fact.policy_scope or '').strip().lower()
+    visibility_scope = str(fact.visibility_scope or '').strip().lower()
+    return policy_scope == _PRIVATE_SCOPE and visibility_scope == _PRIVATE_SCOPE
+
+
+def _resolve_state_query_scope(
+    *,
+    group_ids: list[str] | None,
+    lane_alias: list[str] | None,
+) -> tuple[list[str] | None, ErrorResponse | None]:
+    if config is None:
+        fallback_group_id = str(os.getenv('GRAPHITI_GROUP_ID') or 'default').strip()
+        if not fallback_group_id:
+            return None, ErrorResponse(
+                error='invalid_input',
+                message='state/history retrieval requires a default group scope',
+            )
+        return [fallback_group_id], None
+
+    try:
+        effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
+        )
+    except ValueError as exc:
+        return None, ErrorResponse(error='invalid_input', message=str(exc))
+
+    if invalid_aliases:
+        return (
+            None,
+            ErrorResponse(
+                error='invalid_input',
+                message=f'Unknown lane aliases: {", ".join(invalid_aliases)}',
+            ),
+        )
+
+    if not effective_group_ids:
+        return (
+            None,
+            ErrorResponse(
+                error='invalid_input',
+                message=(
+                    'state/history retrieval requires explicit group scope when '
+                    'default group_id is unset'
+                ),
+            ),
+        )
+
+    return effective_group_ids, None
+
+
+def _typed_root_lineage_too_large(
+    ledger: ChangeLedger,
+    *,
+    root_id: str,
+    max_events: int,
+) -> bool:
+    snapshot = ledger.typed_root_snapshot(root_id)
+    if snapshot is None:
+        return False
+    try:
+        lineage_event_count = int(snapshot['lineage_event_count'] or 0)
+    except (TypeError, ValueError):
+        return False
+    return lineage_event_count > max_events
+
+
+def _state_current_root_ids(
+    ledger: ChangeLedger,
+    *,
+    subject: str,
+    predicate: str | None,
+    effective_group_ids: list[str],
+) -> list[str]:
+    clauses = [
+        "object_type = 'state_fact'",
+        'current_payload_json IS NOT NULL',
+        "json_extract(current_payload_json, '$.subject') = ?",
+        "json_extract(current_payload_json, '$.policy_scope') = ?",
+        "json_extract(current_payload_json, '$.visibility_scope') = ?",
+    ]
+    params: list[Any] = [subject, _PRIVATE_SCOPE, _PRIVATE_SCOPE]
+
+    if predicate is not None:
+        clauses.append("json_extract(current_payload_json, '$.predicate') = ?")
+        params.append(predicate)
+
+    placeholders = ', '.join('?' for _ in effective_group_ids)
+    clauses.append(f'source_lane IN ({placeholders})')
+    params.extend(effective_group_ids)
+
+    rows = ledger.conn.execute(
+        f"""
+        SELECT root_id
+          FROM typed_roots
+         WHERE {' AND '.join(clauses)}
+         ORDER BY latest_recorded_at DESC, root_id
+         LIMIT ?
+        """,
+        [*params, _MAX_STATE_CURRENT_ROOTS + 1],
+    ).fetchall()
+
+    if len(rows) > _MAX_STATE_CURRENT_ROOTS:
+        logger.warning(
+            'get_current_state root selection hit cap=%d for subject=%r; truncating',
+            _MAX_STATE_CURRENT_ROOTS,
+            subject,
+        )
+        rows = rows[:_MAX_STATE_CURRENT_ROOTS]
+
+    return [str(row['root_id']) for row in rows if row['root_id']]
+
+
+def _current_state_candidates(
+    *,
+    subject: str,
+    predicate: str | None,
+    effective_group_ids: list[str],
+) -> list[StateFact]:
+    ledger = _change_ledger()
+    root_ids = _state_current_root_ids(
+        ledger,
+        subject=subject,
+        predicate=predicate,
+        effective_group_ids=effective_group_ids,
+    )
+
+    matches: list[StateFact] = []
+    for root_id in root_ids:
+        if _typed_root_lineage_too_large(
+            ledger,
+            root_id=root_id,
+            max_events=_MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
+        ):
+            logger.warning(
+                'Skipping current-state root=%s with lineage beyond cap=%d',
+                root_id,
+                _MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
+            )
+            continue
+
+        current = ledger.current_object(root_id)
+        if not isinstance(current, StateFact):
+            continue
+        if current.subject != subject:
+            continue
+        if predicate is not None and current.predicate != predicate:
+            continue
+        if not _state_fact_is_visible(current, effective_group_ids=effective_group_ids):
+            continue
+        matches.append(current)
+    return matches
+
+
+def _state_history_root_ids(
+    ledger: ChangeLedger,
+    *,
+    subject: str,
+    predicate: str | None,
+    effective_group_ids: list[str],
+) -> list[str]:
+    clauses = [
+        "object_type = 'state_fact'",
+        'payload_json IS NOT NULL',
+        'root_id IS NOT NULL',
+        "json_extract(payload_json, '$.subject') = ?",
+        "json_extract(payload_json, '$.policy_scope') = ?",
+        "json_extract(payload_json, '$.visibility_scope') = ?",
+    ]
+    params: list[Any] = [subject, _PRIVATE_SCOPE, _PRIVATE_SCOPE]
+
+    if predicate is not None:
+        clauses.append("json_extract(payload_json, '$.predicate') = ?")
+        params.append(predicate)
+
+    placeholders = ', '.join('?' for _ in effective_group_ids)
+    clauses.append(f"json_extract(payload_json, '$.source_lane') IN ({placeholders})")
+    params.extend(effective_group_ids)
+
+    rows = ledger.conn.execute(
+        f"""
+        SELECT root_id, max(recorded_at) AS last_recorded_at
+          FROM change_events
+         WHERE {' AND '.join(clauses)}
+         GROUP BY root_id
+         ORDER BY last_recorded_at DESC, root_id
+         LIMIT ?
+        """,
+        [*params, _MAX_STATE_HISTORY_ROOTS + 1],
+    ).fetchall()
+
+    if len(rows) > _MAX_STATE_HISTORY_ROOTS:
+        logger.warning(
+            'get_history root selection hit cap=%d for subject=%r; truncating',
+            _MAX_STATE_HISTORY_ROOTS,
+            subject,
+        )
+        rows = rows[:_MAX_STATE_HISTORY_ROOTS]
+
+    return [str(row['root_id']) for row in rows if row['root_id']]
+
+
 def _change_history_events_for_subject(
     *,
     subject: str,
-    predicate: str | None = None,
+    predicate: str | None,
+    effective_group_ids: list[str],
 ) -> list[StateFact]:
-    # Return history chain facts for a subject and optional predicate.
     ledger = _change_ledger()
-    subject_norm = _normalize_subject_or_predicate(subject)
-    predicate_norm = _normalize_subject_or_predicate(predicate)
+    root_ids = _state_history_root_ids(
+        ledger,
+        subject=subject,
+        predicate=predicate,
+        effective_group_ids=effective_group_ids,
+    )
 
     matching: list[StateFact] = []
-    rows = ledger.conn.execute(
-        "SELECT root_id FROM typed_roots WHERE object_type = 'state_fact' ORDER BY root_id"
-    ).fetchall()
-    for row in rows:
-        root_id = str(row['root_id'])
+    for root_id in root_ids:
+        if _typed_root_lineage_too_large(
+            ledger,
+            root_id=root_id,
+            max_events=_MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
+        ):
+            logger.warning(
+                'Skipping history root=%s with lineage beyond cap=%d',
+                root_id,
+                _MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
+            )
+            continue
+
         for fact in ledger.materialize_lineage(root_id):
             if not isinstance(fact, StateFact):
                 continue
-            if fact.subject != subject_norm:
+            if fact.subject != subject:
                 continue
-            if predicate_norm and fact.predicate != predicate_norm:
+            if predicate is not None and fact.predicate != predicate:
+                continue
+            if not _state_fact_is_visible(fact, effective_group_ids=effective_group_ids):
                 continue
             matching.append(fact)
+            if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
+                break
+        if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
+            break
 
     matching.sort(key=lambda item: (item.created_at, item.version, item.object_id))
     return matching
 
 
-def _current_state_candidates(subject: str, predicate: str | None) -> list[StateFact]:
-    ledger = _change_ledger()
-    subject_norm = _normalize_subject_or_predicate(subject)
-    return [
-        fact
-        for fact in ledger.current_state_facts()
-        if fact.subject == subject_norm
-        and (predicate is None or fact.predicate == _normalize_subject_or_predicate(predicate))
-    ]
+def _infer_event_sources(
+    ledger: ChangeLedger,
+    root_id: str,
+) -> dict[str, str]:
+    rows = ledger.conn.execute(
+        """
+        SELECT event_type, reason, object_id
+          FROM change_events
+         WHERE root_id = ?
+            OR object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+            OR target_object_id IN (SELECT object_id FROM change_events WHERE root_id = ?)
+         ORDER BY recorded_at, rowid
+         LIMIT ?
+        """,
+        (root_id, root_id, root_id, _MAX_STATE_LINEAGE_EVENTS_PER_ROOT + 1),
+    ).fetchall()
 
+    if len(rows) > _MAX_STATE_LINEAGE_EVENTS_PER_ROOT:
+        logger.warning(
+            'Source inference truncated at %d events for root=%s',
+            _MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
+            root_id,
+        )
+        rows = rows[:_MAX_STATE_LINEAGE_EVENTS_PER_ROOT]
 
-def _infer_event_sources(ledger: ChangeLedger, root_id: str) -> dict[str, str]:
     sources: dict[str, str] = {}
-    for event in ledger.events_for_root(root_id):
-        if event.object_id is None:
+    for row in rows:
+        object_id = row['object_id']
+        if object_id is None:
             continue
 
-        if event.reason:
-            sources[event.object_id] = str(event.reason)
+        reason = row['reason']
+        if reason:
+            sources[str(object_id)] = str(reason)
             continue
 
-        if event.event_type in {'assert', 'derive'}:
-            sources[event.object_id] = 'owner_asserted'
-        elif event.event_type in {'refine', 'supersede'}:
-            sources[event.object_id] = 'inferred'
+        event_type = str(row['event_type'] or '')
+        if event_type in {'assert', 'derive'}:
+            sources[str(object_id)] = 'owner_asserted'
+        elif event_type in {'refine', 'supersede'}:
+            sources[str(object_id)] = 'inferred'
     return sources
 
 
@@ -2217,32 +2467,49 @@ async def get_current_state(
     # Return the current state fact for a subject (and optional predicate).
     normalized_subject = _normalize_subject_or_predicate(subject)
     if not normalized_subject:
-        return ErrorResponse(error='invalid_input: subject cannot be empty')
+        return ErrorResponse(error='invalid_input', message='subject must be a non-empty string')
 
-    normalized_predicate = _normalize_subject_or_predicate(predicate)
-    if normalized_predicate:
-        matches = _current_state_candidates(
+    normalized_predicate: str | None = None
+    if predicate is not None:
+        normalized_predicate = _normalize_subject_or_predicate(predicate)
+        if not normalized_predicate:
+            return ErrorResponse(error='invalid_input', message='predicate must be a non-empty string')
+
+    effective_group_ids, scope_error = _resolve_state_query_scope(
+        group_ids=None,
+        lane_alias=None,
+    )
+    if scope_error is not None or effective_group_ids is None:
+        return scope_error or ErrorResponse(error='invalid_input')
+
+    try:
+        candidates = _current_state_candidates(
             subject=normalized_subject,
             predicate=normalized_predicate,
+            effective_group_ids=effective_group_ids,
         )
-        if not matches:
-            return ErrorResponse(
-                error=(
-                    f'not_found: no active fact found for subject={normalized_subject!r} '
-                    f'and predicate={normalized_predicate!r}'
-                )
-            )
-        return max(matches, key=lambda item: (item.created_at, item.version, item.object_id))
+    except Exception as exc:
+        logger.exception('get_current_state failed for subject=%r', normalized_subject)
+        return ErrorResponse(error='ledger_error', message=str(exc))
 
-    candidates = _current_state_candidates(subject=normalized_subject, predicate=None)
-    predicates = sorted({fact.predicate for fact in candidates})
     if not candidates:
-        return ErrorResponse(error=f'not_found: no active fact found for subject={normalized_subject!r}')
-    if len(predicates) > 1:
+        subject_key = f'{normalized_subject}:{normalized_predicate}' if normalized_predicate else normalized_subject
         return ErrorResponse(
-            error='ambiguous_subject: subject matches multiple predicates '
-            f"(specify predicate): {", ".join(predicates)}"
+            error='not_found',
+            message=f'No active fact found for {subject_key}',
         )
+
+    if normalized_predicate is None:
+        predicates = sorted({fact.predicate for fact in candidates})
+        if len(predicates) > 1:
+            return ErrorResponse(
+                error='ambiguous',
+                message='Ambiguous subject. Specify one predicate.',
+                details={
+                    'subject': normalized_subject,
+                    'predicates': predicates,
+                },
+            )
 
     return max(candidates, key=lambda item: (item.created_at, item.version, item.object_id))
 
@@ -2251,13 +2518,35 @@ async def get_current_state(
 async def get_history(
     subject: str,
     predicate: str | None = None,
-) -> list[ChangeEvent]:
+) -> list[ChangeEvent] | ErrorResponse:
     # Return historical state-fact change events for a subject.
     normalized_subject = _normalize_subject_or_predicate(subject)
     if not normalized_subject:
-        return []
+        return ErrorResponse(error='invalid_input', message='subject must be a non-empty string')
 
-    facts = _change_history_events_for_subject(subject=normalized_subject, predicate=predicate)
+    normalized_predicate: str | None = None
+    if predicate is not None:
+        normalized_predicate = _normalize_subject_or_predicate(predicate)
+        if not normalized_predicate:
+            return ErrorResponse(error='invalid_input', message='predicate must be a non-empty string')
+
+    effective_group_ids, scope_error = _resolve_state_query_scope(
+        group_ids=None,
+        lane_alias=None,
+    )
+    if scope_error is not None or effective_group_ids is None:
+        return scope_error or ErrorResponse(error='invalid_input')
+
+    try:
+        facts = _change_history_events_for_subject(
+            subject=normalized_subject,
+            predicate=normalized_predicate,
+            effective_group_ids=effective_group_ids,
+        )
+    except Exception as exc:
+        logger.exception('get_history failed for subject=%r', normalized_subject)
+        return ErrorResponse(error='ledger_error', message=str(exc))
+
     if not facts:
         return []
 
@@ -2281,7 +2570,6 @@ async def get_history(
         )
         for f in facts
     ]
-
 
 
 @mcp.tool()

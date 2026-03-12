@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import os
 import sys
 import types
 
 import pytest
-
 
 # Lightweight stubs so tests can run without the full Graphiti runtime.
 if 'graphiti_core' not in sys.modules:
@@ -94,7 +92,7 @@ if 'mcp_server.src.config.schema' not in sys.modules:
 
     class GraphitiConfig:
         def __init__(self, *args, **kwargs):
-            self.graphiti = types.SimpleNamespace(group_id='default')
+            self.graphiti = types.SimpleNamespace(group_id='default', lane_aliases={})
             self.database = types.SimpleNamespace(provider='neo4j')
 
     class ServerConfig:
@@ -252,6 +250,9 @@ def _state_fact(
     predicate: str,
     value: str,
     created_at: str,
+    source_lane: str = 'default',
+    policy_scope: str = 'private',
+    visibility_scope: str = 'private',
 ) -> StateFact:
     return StateFact.model_validate(
         {
@@ -262,8 +263,9 @@ def _state_fact(
             'subject': subject,
             'predicate': predicate,
             'value': value,
-            'policy_scope': 'private',
-            'visibility_scope': 'private',
+            'source_lane': source_lane,
+            'policy_scope': policy_scope,
+            'visibility_scope': visibility_scope,
             'created_at': created_at,
             'evidence_refs': [_evidence_ref(object_id)],
         }
@@ -307,15 +309,14 @@ async def test_get_current_state_prefers_predicate_when_subject_is_ambiguous(led
     )
 
     result = await server.get_current_state('UI')
-    assert 'error' in result
-    assert 'ambiguous_subject' in result['error']
+    assert result['error'] == 'ambiguous'
+    assert result['details']['predicates'] == ['font', 'theme']
 
 
 @pytest.mark.anyio
 async def test_get_current_state_returns_not_found_when_no_state_for_subject(ledger):
     result = await server.get_current_state('missing')
-    assert 'error' in result
-    assert 'not_found' in result['error']
+    assert result['error'] == 'not_found'
 
 
 @pytest.mark.anyio
@@ -426,3 +427,190 @@ async def test_get_history_returns_full_statused_chain_in_order(ledger):
 @pytest.mark.anyio
 async def test_get_history_returns_empty_list_when_no_records(ledger):
     assert await server.get_history('never-seen') == []
+
+
+@pytest.mark.anyio
+async def test_get_current_state_enforces_lane_and_private_scope(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='lane-ok',
+            root_id='r-lane-ok',
+            subject='UI',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T09:00:00Z',
+            source_lane='default',
+        ),
+        root_id='r-lane-ok',
+        recorded_at='2026-01-01T09:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='lane-other',
+            root_id='r-lane-other',
+            subject='UI',
+            predicate='theme',
+            value='light',
+            created_at='2026-01-01T11:00:00Z',
+            source_lane='other-lane',
+        ),
+        root_id='r-lane-other',
+        recorded_at='2026-01-01T11:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='lane-public',
+            root_id='r-lane-public',
+            subject='UI',
+            predicate='theme',
+            value='solarized',
+            created_at='2026-01-01T12:00:00Z',
+            source_lane='default',
+            visibility_scope='public',
+        ),
+        root_id='r-lane-public',
+        recorded_at='2026-01-01T12:00:00Z',
+    )
+
+    result = await server.get_current_state('UI', predicate='theme')
+    assert 'error' not in result
+    assert result.object_id == 'lane-ok'
+
+
+@pytest.mark.anyio
+async def test_get_history_enforces_lane_and_private_scope(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='hist-1',
+            root_id='r-hist',
+            subject='Workspace',
+            predicate='theme',
+            value='light',
+            created_at='2026-01-01T10:00:00Z',
+            source_lane='default',
+        ),
+        root_id='r-hist',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'refine',
+        payload=_state_fact(
+            object_id='hist-2',
+            root_id='r-hist',
+            subject='Workspace',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T11:00:00Z',
+            source_lane='default',
+        ),
+        target_object_id='hist-1',
+        root_id='r-hist',
+        recorded_at='2026-01-01T11:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='hist-other-lane',
+            root_id='r-hist-other-lane',
+            subject='Workspace',
+            predicate='theme',
+            value='other',
+            created_at='2026-01-01T12:00:00Z',
+            source_lane='other-lane',
+        ),
+        root_id='r-hist-other-lane',
+        recorded_at='2026-01-01T12:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='hist-public',
+            root_id='r-hist-public',
+            subject='Workspace',
+            predicate='theme',
+            value='public',
+            created_at='2026-01-01T13:00:00Z',
+            source_lane='default',
+            policy_scope='public',
+        ),
+        root_id='r-hist-public',
+        recorded_at='2026-01-01T13:00:00Z',
+    )
+
+    history = await server.get_history('Workspace', predicate='theme')
+    assert [event.uuid for event in history] == ['hist-1', 'hist-2']
+
+
+@pytest.mark.anyio
+async def test_state_history_invalid_input_contract(ledger):
+    current = await server.get_current_state('  ')
+    assert current['error'] == 'invalid_input'
+
+    history = await server.get_history('Workspace', predicate='  ')
+    assert history['error'] == 'invalid_input'
+
+
+@pytest.mark.anyio
+async def test_get_current_state_returns_ledger_error_on_query_failure(monkeypatch):
+    def _boom():
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(server, '_change_ledger', _boom)
+    result = await server.get_current_state('UI', predicate='theme')
+    assert result['error'] == 'ledger_error'
+    assert 'boom' in result['message']
+
+
+@pytest.mark.anyio
+async def test_get_history_caps_results(ledger, monkeypatch):
+    monkeypatch.setattr(server, '_MAX_STATE_HISTORY_RESULTS', 2)
+
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='cap-1',
+            root_id='r-cap',
+            subject='Project',
+            predicate='status',
+            value='draft',
+            created_at='2026-01-01T09:00:00Z',
+        ),
+        root_id='r-cap',
+        recorded_at='2026-01-01T09:00:00Z',
+    )
+    ledger.append_event(
+        'refine',
+        payload=_state_fact(
+            object_id='cap-2',
+            root_id='r-cap',
+            subject='Project',
+            predicate='status',
+            value='review',
+            created_at='2026-01-01T10:00:00Z',
+        ),
+        target_object_id='cap-1',
+        root_id='r-cap',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'refine',
+        payload=_state_fact(
+            object_id='cap-3',
+            root_id='r-cap',
+            subject='Project',
+            predicate='status',
+            value='published',
+            created_at='2026-01-01T11:00:00Z',
+        ),
+        target_object_id='cap-2',
+        root_id='r-cap',
+        recorded_at='2026-01-01T11:00:00Z',
+    )
+
+    history = await server.get_history('Project', predicate='status')
+    assert len(history) == 2
+    assert [event.value for event in history] == ['draft', 'review']
