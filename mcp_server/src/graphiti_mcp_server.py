@@ -2380,35 +2380,44 @@ def _state_history_root_ids(
     scope: str | None,
     effective_group_ids: list[str],
 ) -> list[str]:
+    # Query typed_roots instead of change_events so that the ordering key
+    # (latest_recorded_at) reflects the true latest event for each root —
+    # including lifecycle-only events such as `invalidate` and `promote` that
+    # carry no payload_json.  The old change_events query ranked roots by
+    # max(recorded_at) WHERE payload_json IS NOT NULL, causing roots whose most
+    # recent activity was a lifecycle event to be ranked by their older payload
+    # timestamp and potentially dropped when the root cap was hit.
+    #
+    # Using typed_roots also avoids scanning raw change_events rows for scope
+    # enforcement: source_lane is a first-class indexed column here (not derived
+    # via json_extract on ad-hoc payload blobs), and current_payload_json is the
+    # processed canonical snapshot produced by the lineage index.
     clauses = [
         "object_type = 'state_fact'",
-        'payload_json IS NOT NULL',
-        'root_id IS NOT NULL',
-        "json_extract(payload_json, '$.subject') = ?",
-        "json_extract(payload_json, '$.policy_scope') = ?",
-        "json_extract(payload_json, '$.visibility_scope') = ?",
+        "json_extract(current_payload_json, '$.subject') = ?",
+        "json_extract(current_payload_json, '$.policy_scope') = ?",
+        "json_extract(current_payload_json, '$.visibility_scope') = ?",
     ]
     params: list[Any] = [subject, _PRIVATE_SCOPE, _PRIVATE_SCOPE]
 
     if predicate is not None:
-        clauses.append("json_extract(payload_json, '$.predicate') = ?")
+        clauses.append("json_extract(current_payload_json, '$.predicate') = ?")
         params.append(predicate)
 
     if scope is not None:
-        clauses.append("json_extract(payload_json, '$.scope') = ?")
+        clauses.append("json_extract(current_payload_json, '$.scope') = ?")
         params.append(scope)
 
     placeholders = ', '.join('?' for _ in effective_group_ids)
-    clauses.append(f"json_extract(payload_json, '$.source_lane') IN ({placeholders})")
+    clauses.append(f'source_lane IN ({placeholders})')
     params.extend(effective_group_ids)
 
     rows = ledger.conn.execute(
         f"""
-        SELECT root_id, max(recorded_at) AS last_recorded_at
-          FROM change_events
+        SELECT root_id
+          FROM typed_roots
          WHERE {' AND '.join(clauses)}
-         GROUP BY root_id
-         ORDER BY last_recorded_at DESC, root_id
+         ORDER BY latest_recorded_at DESC, root_id
          LIMIT ?
         """,
         [*params, _MAX_STATE_HISTORY_ROOTS + 1],

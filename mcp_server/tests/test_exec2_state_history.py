@@ -596,3 +596,94 @@ async def test_get_current_state_returns_ledger_error_on_failure(monkeypatch: py
     result = await server.get_current_state('UI', group_ids=['s1_sessions_main'])
 
     assert result == {'error': 'ledger_error', 'message': 'boom'}
+
+
+@pytest.mark.anyio
+async def test_get_history_lifecycle_only_root_not_dropped_at_cap(
+    ledger: ChangeLedger,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: roots with recent lifecycle-only events (invalidate/promote)
+    must not be dropped when the root cap is hit.
+
+    The old ``_state_history_root_ids`` query ranked roots by
+    ``max(recorded_at) WHERE payload_json IS NOT NULL``.  ``invalidate`` and
+    ``promote`` events carry no ``payload_json``, so a root whose latest payload
+    event is old but whose latest *lifecycle* event is recent would rank by its
+    stale payload timestamp and fall off the cap.
+
+    The fix switches the query to ``typed_roots`` whose ``latest_recorded_at``
+    column is updated on every append — including lifecycle-only events.
+    """
+    # Reduce the cap to 2 so only 3 roots are enough to trigger the bug.
+    monkeypatch.setattr(server, '_MAX_STATE_HISTORY_ROOTS', 2)
+
+    # Root A (r-font): old assert at T=10, recent promote at T=14.
+    # With the old bug this root ranks by T=10 (payload-only) and is dropped.
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='cap-font-1',
+            root_id='r-cap-font',
+            subject='CapSubject',
+            predicate='font',
+            value='serif',
+            created_at='2026-01-01T10:00:00Z',
+        ),
+        root_id='r-cap-font',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'promote',
+        object_id='cap-font-1',
+        root_id='r-cap-font',
+        recorded_at='2026-01-01T14:00:00Z',
+    )
+
+    # Root B (r-theme): assert at T=11, no lifecycle → ranks by T=11.
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='cap-theme-1',
+            root_id='r-cap-theme',
+            subject='CapSubject',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T11:00:00Z',
+        ),
+        root_id='r-cap-theme',
+        recorded_at='2026-01-01T11:00:00Z',
+    )
+
+    # Root C (r-layout): assert at T=12, no lifecycle → ranks by T=12.
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='cap-layout-1',
+            root_id='r-cap-layout',
+            subject='CapSubject',
+            predicate='layout',
+            value='grid',
+            created_at='2026-01-01T12:00:00Z',
+        ),
+        root_id='r-cap-layout',
+        recorded_at='2026-01-01T12:00:00Z',
+    )
+
+    # With cap=2 the fix must return the two roots with the HIGHEST
+    # latest_recorded_at: r-cap-font (T=14 via promote) and r-cap-layout (T=12).
+    # The old (buggy) query would return r-cap-layout (T=12) and r-cap-theme
+    # (T=11), silently dropping r-cap-font despite it being the most recently
+    # touched root.
+    result = await server.get_history('CapSubject', group_ids=['s1_sessions_main'])
+
+    assert 'error' not in result
+    predicates = {event['predicate'] for event in result['history']}
+    assert 'font' in predicates, (
+        'root with recent lifecycle-only event (promote at T=14) must not be '
+        'dropped when root cap is hit'
+    )
+    assert 'layout' in predicates, 'second-most-recent root must be included'
+    assert 'theme' not in predicates, (
+        'oldest root (by latest_recorded_at) must be the one dropped at cap'
+    )
