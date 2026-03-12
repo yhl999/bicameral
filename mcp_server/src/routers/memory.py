@@ -27,6 +27,51 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
 
 logger = logging.getLogger(__name__)
 
+TOOL_CONTRACTS: list[dict[str, Any]] = [
+    {
+        'name': 'remember_fact',
+        'description': 'Validate typed-memory write input for Phase 0; Exec 1 implements the ledger write',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'text': 'string',
+                'hint': 'object | null',
+            },
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: TypedFact | ConflictDialog | ErrorResponse',
+        },
+        'examples': [{'text': 'I prefer tabs over spaces', 'hint': {'fact_type': 'preference'}}],
+        'phase0_behavior': 'Validates text/hint and then returns not_implemented.',
+    },
+    {
+        'name': 'get_current_state',
+        'description': 'Query the typed-memory ledger for current non-superseded facts',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'subject': 'string',
+                'predicate': 'string | null',
+            },
+            'output': '{"message": string, "facts": list[TypedFact]} | ErrorResponse',
+        },
+        'examples': [{'subject': 'user', 'predicate': 'preferred_editor'}],
+        'phase0_behavior': 'Returns an empty facts list after input validation.',
+    },
+    {
+        'name': 'get_history',
+        'description': 'Retrieve typed-memory change history for a subject / predicate',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'subject': 'string',
+                'predicate': 'string | null',
+            },
+            'output': '{"message": string, "history": list[TypedFact]} | ErrorResponse',
+        },
+        'examples': [{'subject': 'project-alpha', 'predicate': 'status'}],
+        'phase0_behavior': 'Returns an empty history list after input validation.',
+    },
+]
+
 
 def register_tools(mcp: Any) -> dict[str, Any]:
     """Register all memory router tools with the MCP server instance."""

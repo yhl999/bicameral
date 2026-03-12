@@ -45,6 +45,7 @@ class TestAllRoutersImportable:
         except ImportError:
             from routers import memory  # type: ignore[no-redef]
         assert hasattr(memory, 'register_tools')
+        assert hasattr(memory, 'TOOL_CONTRACTS')
 
     def test_candidates_router_importable(self):
         try:
@@ -52,6 +53,7 @@ class TestAllRoutersImportable:
         except ImportError:
             from routers import candidates  # type: ignore[no-redef]
         assert hasattr(candidates, 'register_tools')
+        assert hasattr(candidates, 'TOOL_CONTRACTS')
 
     def test_packs_router_importable(self):
         try:
@@ -59,6 +61,7 @@ class TestAllRoutersImportable:
         except ImportError:
             from routers import packs  # type: ignore[no-redef]
         assert hasattr(packs, 'register_tools')
+        assert hasattr(packs, 'TOOL_CONTRACTS')
 
     def test_episodes_procedures_router_importable(self):
         try:
@@ -66,6 +69,7 @@ class TestAllRoutersImportable:
         except ImportError:
             from routers import episodes_procedures  # type: ignore[no-redef]
         assert hasattr(episodes_procedures, 'register_tools')
+        assert hasattr(episodes_procedures, 'TOOL_CONTRACTS')
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +99,10 @@ class TestMcpServerInitializesWithAllRouters:
         assert hasattr(mod, '_GET_TOOLS_RESPONSE')
         assert isinstance(mod._GET_TOOLS_RESPONSE, list)
         assert len(mod._GET_TOOLS_RESPONSE) >= 20
+
+    def test_router_contracts_match_registered_router_tools(self):
+        mod = load_graphiti_mcp_server()
+        assert {tool['name'] for tool in mod._ROUTER_TOOL_CONTRACTS} == set(mod._REGISTERED_ROUTER_TOOLS)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +280,11 @@ class TestAllStubsReturnValidTypes:
         fn = mock_mcp._tools['search_episodes']
         result = await fn(query='last deployment')
         assert result['episodes'] == []
+        assert result['limit'] == 10
+        assert result['offset'] == 0
+        assert result['total'] == 0
+        assert result['has_more'] is False
+        assert result['next_offset'] is None
         assert 'status' not in result
 
     @pytest.mark.anyio
@@ -282,6 +295,28 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['search_episodes']
         result = await fn(query='last deployment', time_range={'start': 'not-a-date'})
+        assert result['error'] == 'validation_error'
+
+    @pytest.mark.anyio
+    async def test_episodes_procedures_search_episodes_accepts_empty_query_and_pagination(self):
+        from mcp_server.src.routers.episodes_procedures import register_tools
+
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['search_episodes']
+        result = await fn(query='', limit=3, offset=2)
+        assert result['episodes'] == []
+        assert result['limit'] == 3
+        assert result['offset'] == 2
+
+    @pytest.mark.anyio
+    async def test_episodes_procedures_search_episodes_rejects_invalid_group_ids(self):
+        from mcp_server.src.routers.episodes_procedures import register_tools
+
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['search_episodes']
+        result = await fn(query='last deployment', group_ids=['ok', ''])
         assert result['error'] == 'validation_error'
 
     @pytest.mark.anyio
@@ -329,6 +364,11 @@ class TestAllStubsReturnValidTypes:
         fn = mock_mcp._tools['search_procedures']
         result = await fn(query='how to deploy')
         assert result['procedures'] == []
+        assert result['limit'] == 10
+        assert result['offset'] == 0
+        assert result['total'] == 0
+        assert result['has_more'] is False
+        assert result['next_offset'] is None
         assert 'status' not in result
 
     @pytest.mark.anyio
@@ -339,6 +379,28 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['search_procedures']
         result = await fn(query=123)
+        assert result['error'] == 'validation_error'
+
+    @pytest.mark.anyio
+    async def test_episodes_procedures_search_procedures_accepts_empty_query_and_pagination(self):
+        from mcp_server.src.routers.episodes_procedures import register_tools
+
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['search_procedures']
+        result = await fn(query='', include_all=True, limit=5, offset=1)
+        assert result['procedures'] == []
+        assert result['limit'] == 5
+        assert result['offset'] == 1
+
+    @pytest.mark.anyio
+    async def test_episodes_procedures_search_procedures_rejects_invalid_offset(self):
+        from mcp_server.src.routers.episodes_procedures import register_tools
+
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['search_procedures']
+        result = await fn(query='deploy', offset=-1)
         assert result['error'] == 'validation_error'
 
     @pytest.mark.anyio

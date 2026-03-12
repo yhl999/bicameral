@@ -51,6 +51,24 @@ def phase0_empty_list_response(method_name: str, list_key: str) -> dict[str, Any
     }
 
 
+def phase0_paginated_list_response(
+    method_name: str,
+    list_key: str,
+    *,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    return {
+        'message': _PHASE0_EMPTY_RESULT_MESSAGE.format(method_name=method_name),
+        list_key: [],
+        'limit': limit,
+        'offset': offset,
+        'total': 0,
+        'has_more': False,
+        'next_offset': None,
+    }
+
+
 def phase0_not_implemented(method_name: str) -> ErrorResponse:
     return error_response(
         'not_implemented',
@@ -58,13 +76,20 @@ def phase0_not_implemented(method_name: str) -> ErrorResponse:
     )
 
 
-def require_non_empty_string(field_name: str, value: Any) -> ErrorResponse | None:
+def require_string(field_name: str, value: Any) -> ErrorResponse | None:
     if not isinstance(value, str):
         return error_response(
             'validation_error',
             message=f'{field_name} must be a string',
             details={'field': field_name, 'expected_type': 'string', 'actual_type': type(value).__name__},
         )
+    return None
+
+
+def require_non_empty_string(field_name: str, value: Any) -> ErrorResponse | None:
+    string_error = require_string(field_name, value)
+    if string_error is not None:
+        return string_error
     if value.strip() == '':
         return error_response(
             'validation_error',
@@ -119,6 +144,64 @@ def require_optional_non_empty_string(field_name: str, value: Any) -> ErrorRespo
     if value is None:
         return None
     return require_non_empty_string(field_name, value)
+
+
+def require_boolean(field_name: str, value: Any) -> ErrorResponse | None:
+    if not isinstance(value, bool):
+        return error_response(
+            'validation_error',
+            message=f'{field_name} must be a boolean',
+            details={'field': field_name, 'expected_type': 'boolean', 'actual_type': type(value).__name__},
+        )
+    return None
+
+
+def require_optional_string_list(field_name: str, value: Any) -> ErrorResponse | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return error_response(
+            'validation_error',
+            message=f'{field_name} must be a list of strings when provided',
+            details={'field': field_name, 'expected_type': 'list[string]', 'actual_type': type(value).__name__},
+        )
+    for index, item in enumerate(value):
+        item_error = require_non_empty_string(f'{field_name}[{index}]', item)
+        if item_error is not None:
+            return item_error
+    return None
+
+
+def validate_pagination(
+    *,
+    limit: Any,
+    offset: Any,
+    default_limit: int = 10,
+    default_offset: int = 0,
+) -> tuple[int, int, ErrorResponse | None]:
+    if limit is None:
+        limit_value = default_limit
+    elif isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return 0, 0, error_response(
+            'validation_error',
+            message='limit must be a positive integer when provided',
+            details={'field': 'limit', 'actual': limit},
+        )
+    else:
+        limit_value = limit
+
+    if offset is None:
+        offset_value = default_offset
+    elif isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return 0, 0, error_response(
+            'validation_error',
+            message='offset must be a non-negative integer when provided',
+            details={'field': 'offset', 'actual': offset},
+        )
+    else:
+        offset_value = offset
+
+    return limit_value, offset_value, None
 
 
 def require_optional_dict(field_name: str, value: Any) -> ErrorResponse | None:

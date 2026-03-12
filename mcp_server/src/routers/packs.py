@@ -31,6 +31,79 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
 
 logger = logging.getLogger(__name__)
 
+TOOL_CONTRACTS: list[dict[str, Any]] = [
+    {
+        'name': 'list_packs',
+        'description': 'List available context and workflow packs',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'filter': 'object | null'},
+            'output': '{"message": string, "packs": list[PackRegistry]} | ErrorResponse',
+        },
+        'examples': [{'filter': {'scope': 'private'}}],
+        'phase0_behavior': 'Returns an empty pack list after input validation.',
+    },
+    {
+        'name': 'get_context_pack',
+        'description': 'Validate lookup input for a materialized context pack',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'pack_id': 'string',
+                'task': 'string | null',
+            },
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
+        },
+        'examples': [{'pack_id': 'coding-defaults', 'task': 'write a Python function'}],
+        'phase0_behavior': 'Validates pack_id/task and then returns not_implemented.',
+    },
+    {
+        'name': 'get_workflow_pack',
+        'description': 'Validate lookup input for a materialized workflow pack',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'pack_id': 'string',
+                'task': 'string | null',
+            },
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
+        },
+        'examples': [{'pack_id': 'deploy-workflow', 'task': 'deploy to staging'}],
+        'phase0_behavior': 'Validates pack_id/task and then returns not_implemented.',
+    },
+    {
+        'name': 'describe_pack',
+        'description': 'Validate lookup input for a full pack definition',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'pack_id': 'string'},
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackDefinition | ErrorResponse',
+        },
+        'examples': [{'pack_id': 'coding-defaults'}],
+        'phase0_behavior': 'Validates pack_id and then returns not_implemented.',
+    },
+    {
+        'name': 'create_workflow_pack',
+        'description': 'Validate a PackDefinition payload for workflow-pack creation',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'definition': 'PackDefinition object'},
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackRegistry | ErrorResponse',
+        },
+        'examples': [{
+            'definition': {
+                'pack_id': 'my-workflow',
+                'scope': 'workflow',
+                'intent': 'deploy service safely',
+                'consumer': 'archibald',
+                'version': '1.0',
+                'workflow_steps': ['run tests', 'deploy to staging'],
+            }
+        }],
+        'phase0_behavior': 'Validates definition against PackDefinition, requires workflow/both scope, and then returns not_implemented.',
+    },
+]
+
 
 def register_tools(mcp: Any) -> dict[str, Any]:
     """Register all pack router tools with the MCP server instance."""

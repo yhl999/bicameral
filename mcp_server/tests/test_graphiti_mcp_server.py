@@ -428,6 +428,35 @@ class TestGetToolsSignature:
         assert tool['mode_hint'] == 'both'
 
     @pytest.mark.anyio
+    async def test_router_contract_slice_matches_registered_router_tools(self):
+        assert {tool['name'] for tool in self.module._ROUTER_TOOL_CONTRACTS} == set(self.module._REGISTERED_ROUTER_TOOLS)
+
+    @pytest.mark.anyio
+    async def test_episode_and_procedure_contracts_advertise_pagination_inputs(self):
+        result = await self.module.get_tools()
+        tools_by_name = {tool['name']: tool for tool in result}
+
+        assert list(tools_by_name['search_episodes']['schema']['inputs']) == [
+            'query',
+            'time_range',
+            'include_history',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert list(tools_by_name['search_procedures']['schema']['inputs']) == [
+            'query',
+            'include_all',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert tools_by_name['search_episodes']['schema']['output'] == 'EpisodeSearchResponse | ErrorResponse'
+        assert tools_by_name['search_procedures']['schema']['output'] == 'ProcedureSearchResponse | ErrorResponse'
+
+    @pytest.mark.anyio
     async def test_debug_tools_absent_without_flag(self):
         result = await self.module.get_tools()
         names = {t['name'] for t in result}

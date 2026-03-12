@@ -29,6 +29,45 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_CANDIDATE_STATUS = {'pending', 'promoted', 'rejected'}
 
+TOOL_CONTRACTS: list[dict[str, Any]] = [
+    {
+        'name': 'list_candidates',
+        'description': 'List quarantined fact candidates awaiting promotion review',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'status': '"pending" | "promoted" | "rejected" | null'},
+            'output': '{"message": string, "candidates": list[Candidate]} | ErrorResponse',
+        },
+        'examples': [{'status': 'pending'}],
+        'phase0_behavior': 'Returns an empty candidate list after input validation.',
+    },
+    {
+        'name': 'promote_candidate',
+        'description': 'Validate promotion input for a candidate fact; Exec 4 wires the ledger integration',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'candidate_id': 'string',
+                'resolution': 'string',
+            },
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
+        },
+        'examples': [{'candidate_id': 'cand-001', 'resolution': 'Verified correct'}],
+        'phase0_behavior': 'Validates candidate_id/resolution and then returns not_implemented.',
+    },
+    {
+        'name': 'reject_candidate',
+        'description': 'Validate rejection input for a candidate fact; Exec 4 wires the ledger integration',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {'candidate_id': 'string'},
+            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
+        },
+        'examples': [{'candidate_id': 'cand-002'}],
+        'phase0_behavior': 'Validates candidate_id and then returns not_implemented.',
+    },
+]
+
 
 def register_tools(mcp: Any) -> dict[str, Any]:
     """Register all candidate router tools with the MCP server instance."""
