@@ -416,7 +416,7 @@ async def test_get_history_preserves_invalidated_status_on_wire(ledger: ChangeLe
             'predicate': 'theme',
             'scope': 'private',
             'value': 'dark',
-            'timestamp': '2026-01-01T10:00:00Z',
+            'timestamp': '2026-01-01T12:00:00Z',
             'source': 'owner_asserted',
             'source_lane': 's1_sessions_main',
             'status': 'invalidated',
@@ -424,6 +424,58 @@ async def test_get_history_preserves_invalidated_status_on_wire(ledger: ChangeLe
             'superseded_by': None,
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_get_history_orders_lifecycle_only_events_by_latest_ledger_time(ledger: ChangeLedger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='theme-1',
+            root_id='r-theme',
+            subject='Workspace',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T10:00:00Z',
+        ),
+        root_id='r-theme',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='layout-1',
+            root_id='r-layout',
+            subject='Workspace',
+            predicate='layout',
+            value='grid',
+            created_at='2026-01-01T11:00:00Z',
+        ),
+        root_id='r-layout',
+        recorded_at='2026-01-01T11:00:00Z',
+    )
+    ledger.append_event(
+        'invalidate',
+        object_id='layout-1',
+        target_object_id='layout-1',
+        root_id='r-layout',
+        recorded_at='2026-01-01T13:00:00Z',
+    )
+    ledger.append_event(
+        'promote',
+        object_id='theme-1',
+        root_id='r-theme',
+        recorded_at='2026-01-01T14:00:00Z',
+    )
+
+    result = await server.get_history('Workspace', group_ids=['s1_sessions_main'])
+
+    assert 'error' not in result
+    assert [(event['predicate'], event['timestamp']) for event in result['history']] == [
+        ('layout', '2026-01-01T13:00:00Z'),
+        ('theme', '2026-01-01T14:00:00Z'),
+    ]
+    assert [event['status'] for event in result['history']] == ['invalidated', 'active']
 
 
 @pytest.mark.anyio

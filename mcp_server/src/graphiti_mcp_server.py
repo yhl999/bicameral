@@ -1069,27 +1069,49 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
         ),
         _tool_schema_entry(
             name='get_current_state',
-            description='Query current typed state for a subject/predicate within lane and private scope boundaries',
+            description='Query current typed state facts for a subject and optional predicate/scope within explicit lane and private-scope boundaries',
             mode_hint='typed',
             inputs={
                 'subject': 'string',
                 'predicate': 'string | null',
+                'scope': 'string | null',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
+                'limit': 'integer',
             },
-            output='TypedFact | ErrorResponse(error in {invalid_input, not_found, ambiguous, ledger_error})',
-            examples=[{'subject': 'user', 'predicate': 'preferred_editor'}],
-            phase0_behavior='Implemented: validates scope and returns one current StateFact.',
+            output='{"message": string, "facts": list[StateFact], "metadata": TypedMemoryQueryMetadata} | ErrorResponse(error in {invalid_input, group_scope_required, ledger_error})',
+            examples=[
+                {
+                    'subject': 'user',
+                    'predicate': 'preferred_editor',
+                    'lane_alias': ['sessions_main'],
+                    'limit': 10,
+                }
+            ],
+            phase0_behavior='Implemented: validates subject/predicate/scope and lane scope, caps limit, and returns an envelope {message, facts, metadata}.',
         ),
         _tool_schema_entry(
             name='get_history',
-            description='Retrieve typed state change history for a subject/predicate within lane and private scope boundaries',
+            description='Retrieve typed state history for a subject and optional predicate/scope within explicit lane and private-scope boundaries',
             mode_hint='typed',
             inputs={
                 'subject': 'string',
                 'predicate': 'string | null',
+                'scope': 'string | null',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
+                'limit': 'integer',
             },
-            output='list[ChangeEvent] | ErrorResponse(error in {invalid_input, ledger_error})',
-            examples=[{'subject': 'project-alpha', 'predicate': 'status'}],
-            phase0_behavior='Implemented: returns chronological ChangeEvent entries.',
+            output='{"message": string, "history": list[ChangeEvent], "metadata": TypedMemoryQueryMetadata} | ErrorResponse(error in {invalid_input, group_scope_required, ledger_error})',
+            examples=[
+                {
+                    'subject': 'project-alpha',
+                    'predicate': 'status',
+                    'group_ids': ['s1_sessions_main'],
+                    'limit': 25,
+                }
+            ],
+            phase0_behavior='Implemented: validates subject/predicate/scope and lane scope, caps limit, and returns chronologically ordered envelope {message, history, metadata}.',
         ),
         _tool_schema_entry(
             name='list_candidates',
@@ -2403,13 +2425,31 @@ def _state_history_root_ids(
     return [str(row['root_id']) for row in rows if row['root_id']]
 
 
+def _history_event_timestamps_for_root(
+    ledger: ChangeLedger,
+    *,
+    root_id: str,
+) -> dict[str, str]:
+    timestamps: dict[str, str] = {}
+    for event in ledger.events_for_root(root_id):
+        object_id = (
+            event.object_id
+            if event.event_type in {'assert', 'supersede', 'refine', 'derive'}
+            else event.target_object_id or event.object_id
+        )
+        if object_id is None:
+            continue
+        timestamps[str(object_id)] = str(event.recorded_at)
+    return timestamps
+
+
 def _change_history_events_for_subject(
     *,
     subject: str,
     predicate: str | None,
     scope: str | None,
     effective_group_ids: list[str],
-) -> list[StateFact]:
+) -> list[tuple[StateFact, str]]:
     ledger = _change_ledger()
     root_ids = _state_history_root_ids(
         ledger,
@@ -2419,7 +2459,7 @@ def _change_history_events_for_subject(
         effective_group_ids=effective_group_ids,
     )
 
-    matching: list[StateFact] = []
+    matching: list[tuple[StateFact, str]] = []
     for root_id in root_ids:
         if _typed_root_lineage_too_large(
             ledger,
@@ -2433,6 +2473,7 @@ def _change_history_events_for_subject(
             )
             continue
 
+        event_timestamps = _history_event_timestamps_for_root(ledger, root_id=root_id)
         for fact in ledger.materialize_lineage(root_id):
             if not isinstance(fact, StateFact):
                 continue
@@ -2444,13 +2485,13 @@ def _change_history_events_for_subject(
                 continue
             if not _state_fact_is_visible(fact, effective_group_ids=effective_group_ids):
                 continue
-            matching.append(fact)
+            matching.append((fact, event_timestamps.get(fact.object_id, fact.created_at)))
             if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
                 break
         if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
             break
 
-    matching.sort(key=lambda item: (item.created_at, item.version, item.object_id))
+    matching.sort(key=lambda item: (item[1], item[0].version, item[0].object_id))
     return matching
 
 
@@ -2634,7 +2675,7 @@ async def get_history(
         return scope_error or ErrorResponse(error='group_scope_required')
 
     try:
-        facts = _change_history_events_for_subject(
+        history_entries = _change_history_events_for_subject(
             subject=normalized_subject,
             predicate=normalized_predicate,
             scope=normalized_scope,
@@ -2643,14 +2684,14 @@ async def get_history(
 
         source_map: dict[str, str] = {}
         ledger = _change_ledger()
-        for root_id in {fact.root_id for fact in facts}:
+        for root_id in {fact.root_id for fact, _timestamp in history_entries}:
             source_map.update(_infer_event_sources(ledger, root_id))
     except Exception as exc:
         logger.exception('get_history failed for subject=%r', normalized_subject)
         return ErrorResponse(error='ledger_error', message=str(exc))
 
-    truncated = len(facts) > limit
-    selected_facts = facts[-limit:] if truncated else facts
+    truncated = len(history_entries) > limit
+    selected_entries = history_entries[-limit:] if truncated else history_entries
     history = [
         ChangeEvent(
             uuid=f.object_id,
@@ -2659,14 +2700,14 @@ async def get_history(
             predicate=f.predicate,
             scope=f.scope,
             value=f.value,
-            timestamp=f.created_at,
+            timestamp=timestamp,
             source=source_map.get(f.object_id, 'owner_asserted'),
             source_lane=f.source_lane,
             status='active' if f.is_current else str(f.lifecycle_status),
             supersedes=f.parent_id,
             superseded_by=f.superseded_by,
         ).model_dump(mode='json')
-        for f in selected_facts
+        for f, timestamp in selected_entries
     ]
     metadata = _build_typed_query_metadata(
         subject=normalized_subject,
@@ -2972,6 +3013,8 @@ def _phase0_public_tool_callables() -> dict[str, Any]:
         'search_nodes': search_nodes,
         'search_memory_facts': search_memory_facts,
         **_REGISTERED_ROUTER_TOOLS,
+        'get_current_state': get_current_state,
+        'get_history': get_history,
         'delete_entity_edge': delete_entity_edge,
         'delete_episode': delete_episode,
         'clear_graph': clear_graph,
