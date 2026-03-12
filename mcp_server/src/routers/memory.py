@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - optional for test envs without fastmcp
 
 from ..models.typed_memory import EvidenceRef, StateFact
 from ..services.candidate_store import CandidateStore
-from ..services.change_ledger import ChangeLedger, _stable_object_id
+from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, _stable_object_id
 from ..services.neo4j_materialization import Neo4jMaterializationService
 from ..services.schema_validation import _validate_typed_object, detect_conflict
 
@@ -81,15 +81,11 @@ _ALLOWED_TRUST_KEYS = frozenset(
     }
 )
 
-# Stable module-level dependencies so tests can monkeypatch these easily.
-_change_ledger = ChangeLedger(
-    os.environ.get(
-        'BICAMERAL_CHANGE_LEDGER_DB',
-        str(ChangeLedger.__init__.__defaults__[0]),
-    )
-)
-_candidate_store = CandidateStore()
-_materializer = Neo4jMaterializationService()
+# Lazily-initialized module-level dependencies so importing the router does not
+# create SQLite files as a side effect. Tests can still monkeypatch these names.
+_change_ledger: ChangeLedger | None = None
+_candidate_store: CandidateStore | None = None
+_materializer: Neo4jMaterializationService | None = None
 
 # Canonicalization helpers for user-provided type hints.
 _SCHEME_BY_HINT = {
@@ -104,23 +100,47 @@ _CONFLICT_OPTIONS = [
     {
         'id': 'A',
         'label': 'Supersede',
-        'description': 'Replace existing with new fact',
+        'description': 'Replace the current fact with the quarantined candidate',
     },
     {
         'id': 'B',
-        'label': 'Parallel',
-        'description': 'Keep both facts as parallel beliefs',
-    },
-    {
-        'id': 'C',
         'label': 'Cancel',
-        'description': 'Discard new fact, keep existing',
+        'description': 'Reject the quarantined candidate and keep the current fact',
     },
 ]
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+
+def _ledger_db_path() -> str:
+    return str(
+        os.environ.get('BICAMERAL_CHANGE_LEDGER_DB')
+        or os.environ.get('BICAMERAL_CHANGE_LEDGER_PATH')
+        or DB_PATH_DEFAULT
+    )
+
+
+def _get_change_ledger() -> ChangeLedger:
+    global _change_ledger
+    if _change_ledger is None:
+        _change_ledger = ChangeLedger(_ledger_db_path())
+    return _change_ledger
+
+
+def _get_candidate_store() -> CandidateStore:
+    global _candidate_store
+    if _candidate_store is None:
+        _candidate_store = CandidateStore()
+    return _candidate_store
+
+
+def _get_materializer() -> Neo4jMaterializationService:
+    global _materializer
+    if _materializer is None:
+        _materializer = Neo4jMaterializationService()
+    return _materializer
 
 
 def _truncate_value_for_log(value: Any, max_len: int = 180) -> str:
@@ -355,7 +375,7 @@ def _coerce_bool(raw: Any) -> bool:
     if raw is None:
         return False
     text = str(raw).strip().lower()
-    return text in {'1', 'true', 'yes', 'y', 'on', 'supersede', 'parallel', 'update'}
+    return text in {'1', 'true', 'yes', 'y', 'on'}
 
 
 def _clean_text(text: str) -> str:
@@ -525,7 +545,7 @@ def _current_state_facts(
     predicate_key = (str(predicate or '') or '').strip().lower()
     scope_key = str(scope or DEFAULT_SCOPE).strip().lower()
     facts: list[StateFact] = []
-    for fact in _change_ledger.current_state_facts():
+    for fact in _get_change_ledger().current_state_facts():
         if fact.object_type != 'state_fact' or not fact.is_current:
             continue
 
@@ -559,7 +579,7 @@ def _materialize_fact(
     superseded_fact_id: str | None = None,
 ) -> tuple[bool, str | None]:
     graphiti_client = _get_graphiti_client()
-    return _materializer.materialize_typed_fact(
+    return _get_materializer().materialize_typed_fact(
         fact=fact,
         source=source,
         superseded_fact_id=superseded_fact_id,
@@ -817,7 +837,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             }
 
         try:
-            candidate = _candidate_store.create_candidate(
+            candidate = _get_candidate_store().create_candidate(
                 payload={
                     'subject': subject,
                     'predicate': predicate,
@@ -870,7 +890,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             'existing_fact': conflict_existing,
             'new_fact': _candidate_payload(candidate),
             'options': _CONFLICT_OPTIONS,
-            'resolve_via': 'promote_candidate(candidate_id, resolution="supersede"|"parallel"|"cancel")',
+            'resolve_via': 'promote_candidate(candidate_id, resolution="supersede") or reject_candidate(candidate_id)',
             'candidate_id': candidate.get('candidate_id'),
             'candidate_uuid': candidate.get('candidate_id'),
             'supersede_requested': supersede_requested,
@@ -922,7 +942,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
         }
 
     try:
-        _change_ledger.append_event(
+        _get_change_ledger().append_event(
             event_type,
             actor_id=write_context['actor_id'],
             reason='supersede' if parent is not None else DEFAULT_ACTION,
@@ -1051,18 +1071,25 @@ async def get_current_state(subject: str, predicate: str | None = None, scope: s
 
 
 async def get_history(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
-    """Return event history for current root(s) matching subject/predicate.
+    """Return ledger event history for the currently active root(s).
 
-    This is intentionally conservative (Phase-0 scope): it returns ledger events
-    scoped to currently active roots.
+    This intentionally follows Phase-0 semantics: it does not scan every historic
+    root ever associated with a subject. Instead it returns change-event summaries
+    for the root lineage(s) of the current state facts matching the query.
     """
     if not subject or not str(subject).strip():
         return {'status': 'error', 'error_type': 'validation_error', 'message': 'subject is required'}
 
     scope_value = _coerce_scope(scope)
+    ledger = _get_change_ledger()
     history: list[dict[str, Any]] = []
+    seen_roots: set[str] = set()
+
     for fact in _current_state_facts(subject=subject, predicate=predicate, scope=scope_value):
-        for row in _change_ledger.events_for_root(fact.root_id):
+        if fact.root_id in seen_roots:
+            continue
+        seen_roots.add(fact.root_id)
+        for row in ledger.events_for_root(fact.root_id):
             history.append(
                 {
                     'event_id': row.event_id,
@@ -1072,12 +1099,17 @@ async def get_history(subject: str, predicate: str | None = None, scope: str | N
                     'reason': row.reason,
                     'object_id': row.object_id,
                     'target_object_id': row.target_object_id,
+                    'root_id': row.root_id,
+                    'parent_id': row.parent_id,
+                    'candidate_id': row.candidate_id,
                 }
             )
 
     return {
         'status': 'ok',
         'history': history,
+        'scope': scope_value,
+        'roots_considered': sorted(seen_roots),
     }
 
 

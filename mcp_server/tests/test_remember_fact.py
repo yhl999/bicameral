@@ -8,8 +8,10 @@ from mcp_server.src.services.candidate_store import CandidateStore
 from mcp_server.src.services.change_ledger import ChangeLedger
 
 try:
+    from mcp_server.src.routers import candidates as candidates_router
     from mcp_server.src.routers import memory
 except ImportError:
+    from routers import candidates as candidates_router  # type: ignore
     from routers import memory  # type: ignore
 
 
@@ -56,6 +58,8 @@ def isolated_memory(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, '_change_ledger', ledger)
     monkeypatch.setattr(memory, '_candidate_store', candidates)
     monkeypatch.setattr(memory, '_materializer', _FakeMaterializer())
+    monkeypatch.setattr(candidates_router, '_change_ledger', ledger)
+    monkeypatch.setattr(candidates_router, '_candidate_store', candidates)
 
     return {
         'ledger': ledger,
@@ -128,6 +132,18 @@ def test_remember_fact_duplicate_returns_duplicate(isolated_memory):
     assert len(current) == 1
 
 
+def test_remember_fact_accepts_fact_type_alias(isolated_memory):
+    result = _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'fact_type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+
+    assert result['status'] == 'ok'
+    assert result['fact']['fact_type'] == 'preference'
+
+
 def test_remember_fact_invalid_type_is_validation_error(isolated_memory):
     result = _run(
         memory.remember_fact(
@@ -170,7 +186,9 @@ def test_remember_fact_conflict_returns_dialog_and_candidate(isolated_memory):
 
     assert conflict['status'] == 'conflict'
     assert conflict['type'] == 'ConflictDialog'
-    assert len(conflict['options']) == 3
+    assert [option['label'] for option in conflict['options']] == ['Supersede', 'Cancel']
+    assert 'promote_candidate(candidate_id, resolution="supersede")' in conflict['resolve_via']
+    assert 'reject_candidate(candidate_id)' in conflict['resolve_via']
     assert conflict['candidate_uuid']
     assert len(isolated_memory['candidates'].list_candidates(status='pending')) == 1
 
@@ -373,3 +391,162 @@ def test_remember_fact_neo4j_failure_is_observable_and_non_blocking(
 
     current = _subject_state_facts(isolated_memory['ledger'], 'UI preferences')
     assert len(current) == 1
+
+
+def test_promote_candidate_supersedes_quarantined_fact(isolated_memory):
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+
+    promoted = _run(
+        candidates_router.promote_candidate(
+            candidate_id=conflict['candidate_id'],
+            resolution='supersede',
+        )
+    )
+
+    assert promoted['status'] == 'ok'
+    assert promoted['action'] == 'promoted'
+    assert promoted['candidate']['status'] == 'promoted'
+    assert promoted['fact']['value'] == 'light mode'
+
+    current = _subject_state_facts(isolated_memory['ledger'], 'UI preferences')
+    assert len(current) == 1
+    assert current[0].value == 'light mode'
+
+
+def test_promote_candidate_rejects_parallel_resolution(isolated_memory):
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+
+    result = _run(
+        candidates_router.promote_candidate(
+            candidate_id=conflict['candidate_id'],
+            resolution='parallel',
+        )
+    )
+
+    assert result['status'] == 'error'
+    assert result['error_type'] == 'validation_error'
+    assert 'parallel resolution is not supported' in result['message']
+    current = _subject_state_facts(isolated_memory['ledger'], 'UI preferences')
+    assert len(current) == 1
+    assert current[0].value == 'dark mode'
+
+
+def test_promote_candidate_cancel_rejects_candidate(isolated_memory):
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+
+    cancelled = _run(
+        candidates_router.promote_candidate(
+            candidate_id=conflict['candidate_id'],
+            resolution='cancel',
+        )
+    )
+
+    assert cancelled['status'] == 'ok'
+    assert cancelled['action'] == 'cancelled'
+    assert cancelled['candidate']['status'] == 'rejected'
+
+
+def test_reject_candidate_marks_candidate_rejected(isolated_memory):
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+
+    rejected = _run(candidates_router.reject_candidate(candidate_id=conflict['candidate_id']))
+
+    assert rejected['status'] == 'ok'
+    assert rejected['action'] == 'rejected'
+    assert rejected['candidate']['status'] == 'rejected'
+
+
+def test_get_history_returns_event_summaries_for_current_roots(isolated_memory):
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences', 'supersede': 'parallel'},
+        )
+    )
+
+    history = _run(memory.get_history(subject='UI preferences'))
+
+    assert conflict['status'] == 'conflict'
+    assert history['status'] == 'ok'
+    assert history['scope'] == 'private'
+    assert len(history['roots_considered']) == 1
+    assert [row['event_type'] for row in history['history']] == ['assert']
+    assert all('root_id' in row for row in history['history'])
+
+
+def test_get_history_includes_supersede_event_for_current_root(isolated_memory):
+    trusted = _owner_trust(allow_conflict_supersede=True)
+
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {
+                'type': 'Preference',
+                'subject': 'UI preferences',
+                'supersede': True,
+                **trusted,
+            },
+        )
+    )
+
+    history = _run(memory.get_history(subject='UI preferences'))
+
+    assert history['status'] == 'ok'
+    assert [row['event_type'] for row in history['history']] == ['assert', 'supersede']
+    assert len(history['roots_considered']) == 1

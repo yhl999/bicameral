@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -62,7 +62,7 @@ def _coerce_status(status: str | None) -> str:
 
 @dataclass(slots=True)
 class CandidateStore:
-    db_path: Path | str = _default_candidates_db_path()
+    db_path: Path | str = field(default_factory=_default_candidates_db_path)
 
     def __post_init__(self) -> None:
         self.db_path = Path(self.db_path)
