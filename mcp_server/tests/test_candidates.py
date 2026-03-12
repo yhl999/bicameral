@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import asyncio
 import pytest
-
 from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 from mcp_server.src.routers import candidates as candidates_router
 from mcp_server.src.services.change_ledger import ChangeLedger
@@ -93,7 +94,9 @@ def test_list_candidates_default_scope(ledger_path: Path):
     _make_candidate(db=db, candidate_id='cand-b', candidate_type='state', confidence=0.95)
     _make_candidate(db=db, candidate_id='cand-c', candidate_type='state', status='promoted', confidence=0.99)
 
-    assert asyncio.run(candidates_router.list_candidates()) == asyncio.run(candidates_router.list_candidates(status='quarantine'))
+    assert asyncio.run(candidates_router.list_candidates()) == asyncio.run(
+        candidates_router.list_candidates(status='quarantine')
+    )
     state_candidates = asyncio.run(candidates_router.list_candidates(status='quarantine', type_filter='state'))
     assert len(state_candidates) == 1
     assert state_candidates[0]['uuid'] == 'cand-b'
@@ -103,7 +106,12 @@ def test_promote_candidate_supersede_marks_candidate_and_promotes_fact(ledger_pa
     db = candidates_router.CandidatesDB(ledger_path)
     ledger = ChangeLedger(ledger_path)
 
-    existing = _seed_state_fact(subject='Yuan', predicate='prefers', value='cold brew', object_id='existing-fact')
+    existing = _seed_state_fact(
+        subject='Yuan',
+        predicate='prefers',
+        value='cold brew',
+        object_id='existing-fact',
+    )
     ledger.append_event(
         'assert',
         actor_id='seed',
@@ -131,10 +139,10 @@ def test_promote_candidate_supersede_marks_candidate_and_promotes_fact(ledger_pa
     assert candidate['resolution'] == 'supersede'
     assert candidate['promoted_by'] == 'system'
     assert candidate['promoted_at']
+    assert candidate['reason'] == 'candidate_promoted_supersede'
 
-    # Superseded fact should no longer be current after promotion.
-    active = [f for f in ledger.current_state_facts() if f.predicate == 'prefers']
-    active_ids = {f.object_id for f in active}
+    active = [fact for fact in ledger.current_state_facts() if fact.predicate == 'prefers']
+    active_ids = {fact.object_id for fact in active}
     assert existing.object_id not in active_ids
     assert result['promotion']['object_id'] in active_ids
 
@@ -143,7 +151,12 @@ def test_promote_candidate_parallel_keeps_conflicting_fact_current(ledger_path: 
     db = candidates_router.CandidatesDB(ledger_path)
     ledger = ChangeLedger(ledger_path)
 
-    existing = _seed_state_fact(subject='Yuan', predicate='prefers', value='cold brew', object_id='existing-fact-p')
+    existing = _seed_state_fact(
+        subject='Yuan',
+        predicate='prefers',
+        value='cold brew',
+        object_id='existing-fact-p',
+    )
     ledger.append_event('assert', actor_id='seed', reason='seed', payload=existing, object_id=existing.object_id)
 
     _make_candidate(
@@ -156,11 +169,10 @@ def test_promote_candidate_parallel_keeps_conflicting_fact_current(ledger_path: 
     result = asyncio.run(candidates_router.promote_candidate('cand-parallel', resolution='parallel'))
     assert result.get('candidate', {}).get('status') == 'promoted'
 
-    # Both facts should remain in current state when resolved as parallel.
     promoted_id = result.get('promotion', {}).get('object_id')
     assert promoted_id
-    active = [f for f in ledger.current_state_facts() if f.predicate == 'prefers']
-    ids = {f.object_id for f in active}
+    active = [fact for fact in ledger.current_state_facts() if fact.predicate == 'prefers']
+    ids = {fact.object_id for fact in active}
     assert existing.object_id in ids
     assert promoted_id in ids
 
@@ -183,6 +195,8 @@ def test_cancel_and_reject_record_audit_fields(ledger_path: Path):
     assert cancel_candidate['reviewed_by'] == 'system'
     assert reject_candidate['reviewed_by'] == 'system'
     assert cancel_candidate['resolution'] == 'cancel'
+    assert cancel_candidate['reason'] == 'candidate_cancelled'
+    assert reject_candidate['reason'] == 'candidate_rejected'
     assert cancel_candidate['promoted_by'] is None
     assert cancel_candidate['reviewed_at']
 
@@ -201,14 +215,121 @@ def test_promote_and_reject_invalid_state_returns_error(ledger_path: Path):
     candidate_id = 'cand-invalid'
     _make_candidate(db=db, candidate_id=candidate_id, status='rejected')
 
-    assert asyncio.run(candidates_router.promote_candidate(candidate_id='missing', resolution='parallel')).get('error') == 'Candidate not found: missing'
-    assert asyncio.run(candidates_router.promote_candidate(candidate_id=candidate_id, resolution='parallel')).get('error') == (
-        f'Candidate {candidate_id} is already rejected'
-    )
+    assert asyncio.run(
+        candidates_router.promote_candidate(candidate_id='missing', resolution='parallel')
+    ).get('error') == 'Candidate not found: missing'
+    assert asyncio.run(
+        candidates_router.promote_candidate(candidate_id=candidate_id, resolution='parallel')
+    ).get('error') == f'Candidate {candidate_id} is already rejected'
 
-    assert asyncio.run(candidates_router.reject_candidate(candidate_id='missing')).get('error') == 'Candidate not found: missing'
+    assert asyncio.run(candidates_router.reject_candidate(candidate_id='missing')).get('error') == (
+        'Candidate not found: missing'
+    )
     assert asyncio.run(candidates_router.reject_candidate(candidate_id=candidate_id)).get('error') == (
         f'Candidate {candidate_id} is already rejected'
     )
 
     assert 'error' in asyncio.run(candidates_router.promote_candidate(candidate_id='new-id', resolution='bogus'))
+
+
+def test_candidate_lifecycle_end_to_end_flow(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+    ledger = ChangeLedger(ledger_path)
+
+    existing = _seed_state_fact(
+        subject='Yuan',
+        predicate='prefers',
+        value='cold brew',
+        object_id='existing-e2e',
+    )
+    ledger.append_event('assert', actor_id='seed', reason='seed', payload=existing, object_id=existing.object_id)
+
+    _make_candidate(
+        db=db,
+        candidate_id='cand-e2e-promote',
+        candidate_type='Preference',
+        value='matcha',
+        conflicting_fact_uuid=existing.object_id,
+    )
+    _make_candidate(
+        db=db,
+        candidate_id='cand-e2e-reject',
+        candidate_type='Preference',
+        value='latte',
+    )
+
+    quarantine = asyncio.run(candidates_router.list_candidates())
+    by_id = {row['uuid']: row for row in quarantine}
+    assert by_id['cand-e2e-promote']['status'] == 'quarantine'
+    assert by_id['cand-e2e-promote']['type'] == 'Preference'
+
+    promote_result = asyncio.run(
+        candidates_router.promote_candidate('cand-e2e-promote', resolution='supersede')
+    )
+    assert promote_result['candidate']['status'] == 'promoted'
+    assert promote_result['candidate']['resolution'] == 'supersede'
+
+    promoted = asyncio.run(candidates_router.list_candidates(status='promoted'))
+    promoted_ids = {row['uuid'] for row in promoted}
+    assert 'cand-e2e-promote' in promoted_ids
+
+    reject_result = asyncio.run(candidates_router.reject_candidate('cand-e2e-reject'))
+    assert reject_result['candidate']['status'] == 'rejected'
+
+    rejected = asyncio.run(candidates_router.list_candidates(status='rejected'))
+    rejected_ids = {row['uuid'] for row in rejected}
+    assert 'cand-e2e-reject' in rejected_ids
+
+    active = [fact for fact in ledger.current_state_facts() if fact.predicate == 'prefers']
+    active_ids = {fact.object_id for fact in active}
+    assert existing.object_id not in active_ids
+    assert promote_result['promotion']['object_id'] in active_ids
+
+
+def test_promote_candidate_serializes_concurrent_calls(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+    ledger = ChangeLedger(ledger_path)
+
+    existing = _seed_state_fact(
+        subject='Yuan',
+        predicate='prefers',
+        value='cold brew',
+        object_id='existing-race',
+    )
+    ledger.append_event('assert', actor_id='seed', reason='seed', payload=existing, object_id=existing.object_id)
+
+    _make_candidate(
+        db=db,
+        candidate_id='cand-race',
+        value='pour over',
+        conflicting_fact_uuid=existing.object_id,
+    )
+
+    barrier = threading.Barrier(3)
+
+    def _promote_once() -> dict[str, object]:
+        barrier.wait(timeout=5)
+        return asyncio.run(candidates_router.promote_candidate('cand-race', resolution='supersede'))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_promote_once), pool.submit(_promote_once)]
+        barrier.wait(timeout=5)
+        results = [future.result(timeout=10) for future in futures]
+
+    successes = [result for result in results if 'promotion' in result]
+    errors = [result for result in results if 'error' in result]
+    assert len(successes) == 1
+    assert len(errors) == 1
+    assert errors[0]['error'] == 'Candidate cand-race is already promoted'
+
+    promote_event_count = int(
+        ledger.conn.execute(
+            "SELECT count(*) FROM change_events WHERE candidate_id = ? AND event_type = 'promote'",
+            ('cand-race',),
+        ).fetchone()[0]
+    )
+    assert promote_event_count == 1
+
+    candidate = db.get_candidate('cand-race')
+    assert candidate is not None
+    assert candidate['status'] == 'promoted'

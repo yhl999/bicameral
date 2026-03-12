@@ -169,7 +169,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['promote_candidate']
         result = await fn(candidate_id='cand-001', resolution='looks good')
-        assert result['error'] == 'not_implemented'
+        assert result['error'].startswith('invalid resolution')
 
     @pytest.mark.anyio
     async def test_candidates_reject_stub(self):
@@ -179,17 +179,17 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='cand-001')
-        assert result['error'] == 'not_implemented'
+        assert result['error'] == 'Candidate not found: cand-001'
 
     @pytest.mark.anyio
-    async def test_candidates_reject_stub_validates_identifier_pattern(self):
+    async def test_candidates_reject_stub_requires_identifier(self):
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
-        result = await fn(candidate_id='Bad Candidate Id')
-        assert result['error'] == 'validation_error'
+        result = await fn(candidate_id='')
+        assert result['error'] == 'candidate_id is required'
 
     @pytest.mark.anyio
     async def test_packs_list_packs_stub(self):
@@ -199,7 +199,8 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_packs']
         result = await fn()
-        assert isinstance(result, list)
+        assert result['packs'] == []
+        assert 'status' not in result
 
     @pytest.mark.anyio
     async def test_packs_get_context_pack_stub(self):
@@ -209,8 +210,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_context_pack']
         result = await fn(pack_id='my-pack')
-        assert isinstance(result, dict)
-        assert 'facts' in result
+        assert result['error'] == 'not_implemented'
 
     @pytest.mark.anyio
     async def test_packs_get_workflow_pack_stub(self):
@@ -220,9 +220,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_workflow_pack']
         result = await fn(pack_id='my-pack')
-        assert isinstance(result, dict)
-        assert 'definition' in result
-        assert 'facts' in result
+        assert result['error'] == 'not_implemented'
 
     @pytest.mark.anyio
     async def test_packs_describe_pack_stub(self):

@@ -5,32 +5,25 @@
   "description": "A quarantined fact awaiting promotion review",
   "type": "object",
   "required": [
-    "candidate_id",
-    "fact_type",
+    "uuid",
+    "type",
     "subject",
     "predicate",
     "value"
   ],
   "properties": {
-    "candidate_id": {
+    "uuid": {
       "type": "string",
       "minLength": 1,
       "description": "Unique identifier for this candidate",
       "maxLength": 256,
       "pattern": "^[a-z0-9][a-z0-9:_-]{0,255}$"
     },
-    "fact_type": {
+    "type": {
       "type": "string",
-      "enum": [
-        "preference",
-        "decision",
-        "commitment",
-        "lesson",
-        "world_state",
-        "operational_rule",
-        "constraint",
-        "relationship"
-      ]
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Fact type for this candidate (for example preference, commitment, operational_rule)."
     },
     "subject": {
       "type": "string",
@@ -50,23 +43,89 @@
         }
       ]
     },
+    "conflicting_fact_uuid": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256
+    },
     "status": {
       "type": "string",
       "enum": [
-        "pending",
+        "quarantine",
         "promoted",
         "rejected"
       ],
-      "default": "pending"
+      "default": "quarantine"
     },
     "created_at": {
       "type": "string",
       "format": "date-time"
     },
-    "resolution": {
+    "updated_at": {
       "type": "string",
-      "description": "Reason for promotion or rejection",
+      "format": "date-time"
+    },
+    "reviewed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "reviewed_by": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256
+    },
+    "promoted_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "promoted_by": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
       "maxLength": 2048
+    },
+    "resolution": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "supersede",
+        "parallel",
+        "cancel",
+        null
+      ],
+      "description": "Conflict-resolution decision attached to a candidate outcome."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "metadata": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "maxProperties": 128
     }
   },
   "additionalProperties": false,

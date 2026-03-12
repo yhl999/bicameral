@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sqlite3
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 VALID_STATUSES = frozenset({'quarantine', 'promoted', 'rejected'})
 VALID_RESOLUTIONS = frozenset({'supersede', 'parallel', 'cancel'})
+_POLICY_VERSION = 'candidate_lifecycle_v1'
 
 CANDIDATES_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -62,7 +64,25 @@ def _ledger_path() -> Path:
 
 
 def _actor_id() -> str:
-    return os.getenv('BICAMERAL_MCP_ACTOR_ID', os.getenv('BICAMERAL_ACTOR_ID', 'system')).strip() or 'system'
+    return (
+        os.getenv('BICAMERAL_MCP_ACTOR_ID', os.getenv('BICAMERAL_ACTOR_ID', 'system')).strip()
+        or 'system'
+    )
+
+
+def _normalize_reason(reason: str | None) -> str | None:
+    normalized = str(reason or '').strip()
+    return normalized or None
+
+
+def _connect_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.execute('PRAGMA busy_timeout=5000')
+    return conn
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
@@ -86,6 +106,22 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _resolution_from_promotion_reason(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    prefix = 'candidate_promotion:'
+    if not reason.startswith(prefix):
+        return None
+    resolution = reason[len(prefix) :].strip().lower()
+    if resolution in VALID_RESOLUTIONS:
+        return resolution
+    return None
+
+
+def _candidate_status_error(candidate_id: str, candidate_status: str) -> dict[str, Any]:
+    return {'error': f'Candidate {candidate_id} is already {candidate_status}'}
+
+
 class CandidatesDB:
     """Persistence for candidate quarantine rows."""
 
@@ -94,12 +130,7 @@ class CandidatesDB:
             self.conn = conn_or_path
         else:
             db_path = Path(conn_or_path)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(str(db_path))
-            self.conn.row_factory = sqlite3.Row
-            self.conn.execute('PRAGMA journal_mode=WAL')
-            self.conn.execute('PRAGMA foreign_keys=ON')
-            self.conn.execute('PRAGMA busy_timeout=5000')
+            self.conn = _connect_db(db_path)
         self.conn.row_factory = sqlite3.Row
         self.ensure_schema()
 
@@ -127,7 +158,6 @@ class CandidatesDB:
             clauses.append('confidence >= ?')
             params.append(float(min_confidence))
 
-        # exec4 branch contract uses age_days; keep max_age_days for compatibility.
         effective_age = age_days if age_days is not None else max_age_days
         if effective_age is not None:
             cutoff = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=effective_age)
@@ -158,6 +188,8 @@ class CandidatesDB:
         resolution: str | None = None,
         actor: str | None = None,
         reason: str | None = None,
+        expected_current_status: str | None = None,
+        commit: bool = True,
     ) -> bool:
         now = _now_iso()
         payload = {
@@ -174,18 +206,23 @@ class CandidatesDB:
         if resolution is not None:
             payload['resolution'] = resolution
 
-        set_clause = ', '.join([f"{k} = ?" for k in payload.keys()])
-        params = list(payload.values()) + [candidate_id]
+        set_clause = ', '.join([f'{key} = ?' for key in payload])
+        where_clause = 'uuid = ?'
+        params: list[Any] = list(payload.values()) + [candidate_id]
+        if expected_current_status is not None:
+            where_clause += ' AND status = ?'
+            params.append(expected_current_status)
 
         updated = self.conn.execute(
             f"""
             UPDATE candidates
                SET {set_clause}
-             WHERE uuid = ?
+             WHERE {where_clause}
             """,
             params,
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return updated.rowcount > 0
 
     def insert_candidate(
@@ -230,7 +267,6 @@ class CandidatesDB:
         self.conn.commit()
 
 
-
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
 
@@ -245,10 +281,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
     raw_value = item.get('value')
     if isinstance(raw_value, str):
-        try:
+        with suppress(json.JSONDecodeError):
             item['value'] = json.loads(raw_value)
-        except json.JSONDecodeError:
-            pass
     return item
 
 
@@ -264,24 +298,34 @@ async def list_candidates(
         return []
 
     if min_confidence is not None:
-        min_confidence = float(min_confidence)
+        try:
+            min_confidence = float(min_confidence)
+        except (TypeError, ValueError):
+            return []
         if not (0.0 <= min_confidence <= 1.0):
             return []
 
-    if age_days is not None and int(age_days) <= 0:
-        return []
-    if max_age_days is not None and int(max_age_days) <= 0:
-        return []
+    for value in (age_days, max_age_days):
+        if value is None:
+            continue
+        try:
+            if int(value) <= 0:
+                return []
+        except (TypeError, ValueError):
+            return []
 
-    db = CandidatesDB(_ledger_path())
-    return db.list_candidates(
-        status=effective_status,
-        type_filter=(type_filter or None),
-        age_days=age_days,
-        min_confidence=min_confidence,
-        max_age_days=max_age_days,
-    )
-
+    conn = _connect_db(_ledger_path())
+    try:
+        db = CandidatesDB(conn)
+        return db.list_candidates(
+            status=effective_status,
+            type_filter=(type_filter or None),
+            age_days=age_days,
+            min_confidence=min_confidence,
+            max_age_days=max_age_days,
+        )
+    finally:
+        conn.close()
 
 
 def _build_candidate_fact(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -291,12 +335,11 @@ def _build_candidate_fact(candidate: dict[str, Any]) -> dict[str, Any]:
     elif not isinstance(metadata, dict):
         metadata = {'metadata': metadata}
 
-    value = candidate['value']
     return {
         'assertion_type': candidate['type'],
         'subject': candidate['subject'],
         'predicate': candidate['predicate'],
-        'value': value,
+        'value': candidate['value'],
         'scope': 'private',
         'evidence_refs': metadata.get('evidence_refs')
         or [
@@ -312,97 +355,199 @@ def _build_candidate_fact(candidate: dict[str, Any]) -> dict[str, Any]:
 async def promote_candidate(
     candidate_id: str,
     resolution: str,
-    reason: str = 'promoted',
+    reason: str | None = None,
 ) -> dict[str, Any]:
     candidate_id = str(candidate_id or '').strip()
     resolution = str(resolution or '').strip().lower()
+    reason = _normalize_reason(reason)
+
     if not candidate_id:
         return {'error': 'candidate_id is required'}
     if resolution not in VALID_RESOLUTIONS:
         return {'error': f'invalid resolution {resolution!r}; expected one of {sorted(VALID_RESOLUTIONS)}'}
 
-    db = CandidatesDB(_ledger_path())
-    candidate = db.get_candidate(candidate_id)
-    if candidate is None:
-        return {'error': f'Candidate not found: {candidate_id}'}
-    if candidate['status'] != 'quarantine':
-        return {'error': f'Candidate {candidate_id} is already {candidate["status"]}'}
-
+    conn = _connect_db(_ledger_path())
+    db = CandidatesDB(conn)
+    ledger = ChangeLedger(conn)
     actor = _actor_id()
 
-    if resolution == 'cancel':
-        db.update_status(candidate_id, status='rejected', resolution='cancel', actor=actor, reason=reason)
-        updated = db.get_candidate(candidate_id)
-        return {
-            'candidate': updated,
-            'action': 'cancelled',
-        }
-
-    conflict_with = candidate.get('conflicting_fact_uuid')
-    if resolution == 'parallel':
-        conflict_with = None
-
-    fact = _build_candidate_fact(candidate)
-
-    ledger = ChangeLedger(_ledger_path())
     try:
+        conn.execute('BEGIN IMMEDIATE')
+
+        candidate = db.get_candidate(candidate_id)
+        if candidate is None:
+            conn.rollback()
+            return {'error': f'Candidate not found: {candidate_id}'}
+
+        if candidate['status'] != 'quarantine':
+            conn.rollback()
+            return _candidate_status_error(candidate_id, candidate['status'])
+
+        existing_promotion = ledger.promotion_event_for_candidate(candidate_id)
+        if existing_promotion is not None:
+            reconciled_resolution = _resolution_from_promotion_reason(existing_promotion.reason)
+            db.update_status(
+                candidate_id,
+                status='promoted',
+                resolution=reconciled_resolution,
+                actor=actor,
+                reason=reason or 'candidate_promoted_reconciled',
+                expected_current_status='quarantine',
+                commit=False,
+            )
+            conn.commit()
+            return {
+                'candidate': db.get_candidate(candidate_id),
+                'promotion': {
+                    'object_id': existing_promotion.object_id,
+                    'root_id': existing_promotion.root_id,
+                    'event_id': existing_promotion.event_id,
+                    'event_ids': [existing_promotion.event_id],
+                    'reconciled': True,
+                },
+            }
+
+        if resolution == 'cancel':
+            transitioned = db.update_status(
+                candidate_id,
+                status='rejected',
+                resolution='cancel',
+                actor=actor,
+                reason=reason or 'candidate_cancelled',
+                expected_current_status='quarantine',
+                commit=False,
+            )
+            if not transitioned:
+                conn.rollback()
+                candidate = db.get_candidate(candidate_id)
+                if candidate is None:
+                    return {'error': f'Candidate not found: {candidate_id}'}
+                return _candidate_status_error(candidate_id, candidate['status'])
+
+            conn.commit()
+            return {
+                'candidate': db.get_candidate(candidate_id),
+                'action': 'cancelled',
+            }
+
+        conflict_with = candidate.get('conflicting_fact_uuid')
+        if resolution == 'parallel':
+            conflict_with = None
+
         promotion = ledger.promote_candidate_fact(
             actor_id=actor,
             reason=f'candidate_promotion:{resolution}',
-            policy_version='candidate_lifecycle_v1',
+            policy_version=_POLICY_VERSION,
             candidate_id=candidate_id,
-            fact=fact,
+            fact=_build_candidate_fact(candidate),
             conflict_with_fact_id=conflict_with,
             allow_parallel=(resolution == 'parallel'),
+            manage_transaction=False,
         )
+
+        transitioned = db.update_status(
+            candidate_id,
+            status='promoted',
+            resolution=resolution,
+            actor=actor,
+            reason=reason or f'candidate_promoted_{resolution}',
+            expected_current_status='quarantine',
+            commit=False,
+        )
+        if not transitioned:
+            raise RuntimeError('candidate status transition failed after ledger promotion')
+
+        conn.commit()
+        return {
+            'candidate': db.get_candidate(candidate_id),
+            'promotion': {
+                'object_id': promotion.object_id,
+                'root_id': promotion.root_id,
+                'event_id': promotion.event_id,
+                'event_ids': promotion.event_ids,
+            },
+        }
     except Exception as exc:
+        if conn.in_transaction:
+            conn.rollback()
         logger.exception('promote_candidate failed')
         return {'error': f'promote_candidate failed: {exc}'}
-
-    db.update_status(
-        candidate_id,
-        status='promoted',
-        resolution=resolution,
-        actor=actor,
-        reason=reason,
-    )
-    updated = db.get_candidate(candidate_id)
-
-    return {
-        'candidate': updated,
-        'promotion': {
-            'object_id': promotion.object_id,
-            'root_id': promotion.root_id,
-            'event_id': promotion.event_id,
-            'event_ids': promotion.event_ids,
-        },
-    }
+    finally:
+        conn.close()
 
 
 async def reject_candidate(
     candidate_id: str,
-    reason: str = 'rejected',
+    reason: str | None = None,
 ) -> dict[str, Any]:
     candidate_id = str(candidate_id or '').strip()
+    reason = _normalize_reason(reason)
     if not candidate_id:
         return {'error': 'candidate_id is required'}
 
-    db = CandidatesDB(_ledger_path())
-    candidate = db.get_candidate(candidate_id)
-    if candidate is None:
-        return {'error': f'Candidate not found: {candidate_id}'}
-    if candidate['status'] != 'quarantine':
-        return {'error': f'Candidate {candidate_id} is already {candidate["status"]}'}
-
+    conn = _connect_db(_ledger_path())
+    db = CandidatesDB(conn)
+    ledger = ChangeLedger(conn)
     actor = _actor_id()
-    db.update_status(candidate_id, status='rejected', actor=actor, reason=reason)
-    return {'candidate': db.get_candidate(candidate_id), 'action': 'rejected'}
+
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+
+        candidate = db.get_candidate(candidate_id)
+        if candidate is None:
+            conn.rollback()
+            return {'error': f'Candidate not found: {candidate_id}'}
+
+        if candidate['status'] != 'quarantine':
+            conn.rollback()
+            return _candidate_status_error(candidate_id, candidate['status'])
+
+        existing_promotion = ledger.promotion_event_for_candidate(candidate_id)
+        if existing_promotion is not None:
+            db.update_status(
+                candidate_id,
+                status='promoted',
+                resolution=_resolution_from_promotion_reason(existing_promotion.reason),
+                actor=actor,
+                reason='candidate_promoted_reconciled',
+                expected_current_status='quarantine',
+                commit=False,
+            )
+            conn.commit()
+            return _candidate_status_error(candidate_id, 'promoted')
+
+        transitioned = db.update_status(
+            candidate_id,
+            status='rejected',
+            actor=actor,
+            reason=reason or 'candidate_rejected',
+            expected_current_status='quarantine',
+            commit=False,
+        )
+        if not transitioned:
+            conn.rollback()
+            candidate = db.get_candidate(candidate_id)
+            if candidate is None:
+                return {'error': f'Candidate not found: {candidate_id}'}
+            return _candidate_status_error(candidate_id, candidate['status'])
+
+        conn.commit()
+        return {'candidate': db.get_candidate(candidate_id), 'action': 'rejected'}
+    except Exception as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        logger.exception('reject_candidate failed')
+        return {'error': f'reject_candidate failed: {exc}'}
+    finally:
+        conn.close()
 
 
-def register_tools(mcp: Any) -> None:
+def register_tools(mcp: Any) -> dict[str, Any]:
     mcp.tool()(list_candidates)
     mcp.tool()(promote_candidate)
     mcp.tool()(reject_candidate)
-
-
-
+    return {
+        'list_candidates': list_candidates,
+        'promote_candidate': promote_candidate,
+        'reject_candidate': reject_candidate,
+    }

@@ -200,11 +200,12 @@ class TestSchemaValidation:
 
     def test_valid_candidate(self):
         obj = {
-            'candidate_id': 'cand-001',
-            'fact_type': 'preference',
+            'uuid': 'cand-001',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is True
@@ -212,27 +213,27 @@ class TestSchemaValidation:
 
     def test_string_min_length_violation(self):
         obj = {
-            'candidate_id': '',
-            'fact_type': 'preference',
+            'uuid': '',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
-        assert 'candidate_id' in (err or '')
+        assert 'uuid' in (err or '')
 
-    def test_candidate_id_pattern_validation(self):
+    def test_candidate_uuid_pattern_validation(self):
         obj = {
-            'candidate_id': 'Bad Candidate Id',
-            'fact_type': 'preference',
+            'uuid': 'Bad Candidate Id',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
-        assert 'candidate_id' in (err or '')
+        assert 'uuid' in (err or '')
 
     def test_pack_definition_requires_workflow_fields(self):
         obj = {

@@ -448,6 +448,7 @@ class ChangeLedger:
         seeded_supersede_ok: bool = False,  # kept for API compat
         allow_parallel: bool = False,
         recorded_at: str | None = None,
+        manage_transaction: bool = True,
     ) -> CandidatePromotionResult:
         """Promote a candidate fact into the ledger.
 
@@ -456,7 +457,9 @@ class ChangeLedger:
         the two inserts, neither event is committed.
 
         For historical compatibility, ``seeded_supersede_ok`` is accepted but no
-        longer changes behavior by itself.
+        longer changes behavior by itself. ``manage_transaction=False`` allows
+        callers to compose candidate-row status transitions and ledger writes
+        inside one outer transaction.
         """
         recorded_at = recorded_at or _now_iso()
         typed_object = build_object_from_candidate_fact(
@@ -479,7 +482,8 @@ class ChangeLedger:
         # IMMEDIATE prevents that by forcing concurrent promotions to serialize
         # here.
         try:
-            self.conn.execute('BEGIN IMMEDIATE')
+            if manage_transaction:
+                self.conn.execute('BEGIN IMMEDIATE')
 
             # When parallel resolution is requested, explicitly skip the
             # legacy one-current-object enforcement.
@@ -531,9 +535,11 @@ class ChangeLedger:
 
             self._do_insert(create_row)
             self._do_insert(promote_row)
-            self.conn.commit()
+            if manage_transaction:
+                self.conn.commit()
         except Exception:
-            self.conn.rollback()
+            if manage_transaction:
+                self.conn.rollback()
             raise
 
         event_ids = [create_row.event_id, promote_row.event_id]
