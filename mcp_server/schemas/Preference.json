@@ -1,0 +1,143 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Preference",
+  "title": "Preference",
+  "description": "An owner-asserted preference fact",
+  "type": "object",
+  "required": [
+    "subject",
+    "predicate",
+    "value"
+  ],
+  "properties": {
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "The entity that holds this preference"
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "What the preference is about"
+    },
+    "value": {
+      "description": "Bounded JSON value: primitive, array, or object with capped string length, item counts, property counts, and nesting depth.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/boundedValue"
+        }
+      ]
+    },
+    "strength": {
+      "type": "string",
+      "enum": [
+        "weak",
+        "moderate",
+        "strong"
+      ],
+      "default": "moderate"
+    },
+    "context": {
+      "type": "string",
+      "description": "Context in which this preference applies",
+      "maxLength": 1024
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "subject": "user",
+      "predicate": "coding_style",
+      "value": "functional",
+      "strength": "strong"
+    }
+  ],
+  "definitions": {
+    "boundedString": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "boundedPrimitive": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedString"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "boundedArrayLevel1": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/definitions/boundedPrimitive"
+      }
+    },
+    "boundedObjectLevel1": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/boundedPrimitive"
+      }
+    },
+    "boundedValueLevel1": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedPrimitive"
+        },
+        {
+          "$ref": "#/definitions/boundedArrayLevel1"
+        },
+        {
+          "$ref": "#/definitions/boundedObjectLevel1"
+        }
+      ]
+    },
+    "boundedArrayLevel2": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/definitions/boundedValueLevel1"
+      }
+    },
+    "boundedObjectLevel2": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/boundedValueLevel1"
+      }
+    },
+    "boundedValue": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedPrimitive"
+        },
+        {
+          "$ref": "#/definitions/boundedArrayLevel2"
+        },
+        {
+          "$ref": "#/definitions/boundedObjectLevel2"
+        }
+      ]
+    }
+  }
+}
