@@ -1134,15 +1134,18 @@ async def get_history(subject: str, predicate: str | None = None, scope: str | N
 def register_tools(mcp: FastMCP) -> dict[str, Any]:
     """Register all memory tools with the MCP server instance."""
 
-    @mcp.tool()
+    # FastMCP defaults the exported tool name to the Python function name.
+    # Use the public contract names explicitly so runtime discovery/invocation
+    # matches get_tools() and the documented Exec 1 surface.
+    @mcp.tool(name='remember_fact')
     async def remember_fact_tool(text: str, hint: dict[str, Any] | None = None) -> dict[str, Any]:
         return await remember_fact(text=text, hint=hint)
 
-    @mcp.tool()
+    @mcp.tool(name='get_current_state')
     async def get_current_state_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
         return await get_current_state(subject=subject, predicate=predicate, scope=scope)
 
-    @mcp.tool()
+    @mcp.tool(name='get_history')
     async def get_history_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
         return await get_history(subject=subject, predicate=predicate, scope=scope)
 

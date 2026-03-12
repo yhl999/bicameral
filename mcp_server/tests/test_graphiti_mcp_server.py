@@ -42,9 +42,9 @@ def _make_mock_mcp() -> MagicMock:
     tools: dict[str, object] = {}
     mock = MagicMock()
 
-    def _tool_decorator():
+    def _tool_decorator(*_args, **kwargs):
         def decorator(fn):
-            tools[fn.__name__] = fn
+            tools[kwargs.get('name', fn.__name__)] = fn
             return fn
 
         return decorator
