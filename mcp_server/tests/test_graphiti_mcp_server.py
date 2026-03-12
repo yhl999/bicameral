@@ -420,6 +420,57 @@ class TestGetToolsSignature:
                 f'expected {expected_param_names}, got {actual_param_names}'
             )
 
+    def test_episode_procedure_tools_not_registered_via_router_map(self):
+        duplicated_names = {'search_episodes', 'get_episode', 'search_procedures', 'get_procedure'}
+        assert duplicated_names.isdisjoint(self.module._REGISTERED_ROUTER_TOOLS)
+
+    def test_episode_procedure_tools_use_authoritative_runtime_callables(self):
+        assert (
+            self.module._PHASE0_PUBLIC_TOOL_CALLABLES['search_episodes']
+            is self.module.search_episodes
+        )
+        assert self.module._PHASE0_PUBLIC_TOOL_CALLABLES['get_episode'] is self.module.get_episode
+        assert (
+            self.module._PHASE0_PUBLIC_TOOL_CALLABLES['search_procedures']
+            is self.module.search_procedures
+        )
+        assert (
+            self.module._PHASE0_PUBLIC_TOOL_CALLABLES['get_procedure'] is self.module.get_procedure
+        )
+
+    @pytest.mark.anyio
+    async def test_episode_procedure_tool_contracts_expose_full_signatures(self):
+        result = await self.module.get_tools()
+        tools_by_name = {tool['name']: tool for tool in result}
+
+        assert list(tools_by_name['search_episodes']['schema']['inputs']) == [
+            'query',
+            'time_range',
+            'include_history',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert list(tools_by_name['get_episode']['schema']['inputs']) == [
+            'episode_id',
+            'group_ids',
+            'lane_alias',
+        ]
+        assert list(tools_by_name['search_procedures']['schema']['inputs']) == [
+            'query',
+            'include_all',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert list(tools_by_name['get_procedure']['schema']['inputs']) == [
+            'trigger_or_id',
+            'group_ids',
+            'lane_alias',
+        ]
+
     @pytest.mark.anyio
     async def test_search_memory_facts_has_both_mode_hint(self):
         result = await self.module.get_tools()

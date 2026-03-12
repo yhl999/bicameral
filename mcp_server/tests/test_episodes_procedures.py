@@ -503,6 +503,42 @@ async def test_search_episodes_include_history_and_validate_time_range(ledger):
 
 
 @pytest.mark.anyio
+async def test_search_episodes_accepts_mixed_naive_and_aware_timestamps(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-mixed-ts',
+            root_id='root-mixed-ts',
+            title='Mixed timestamp formats',
+            summary='Exercise timezone-normalized comparisons',
+            created_at='2026-01-01T00:30:00',
+            started_at='2026-01-01T00:30:00',
+            ended_at='2026-01-01T00:45:00',
+        ),
+        root_id='root-mixed-ts',
+        recorded_at='2026-01-01T00:30:00Z',
+    )
+
+    mixed_bounds = await server.search_episodes(
+        '',
+        time_range={
+            'start': '2026-01-01T00:00:00Z',
+            'end': '2026-01-01T01:00:00',
+        },
+    )
+    assert [item['object_id'] for item in mixed_bounds['episodes']] == ['ep-mixed-ts']
+
+    reversed_mixed = await server.search_episodes(
+        '',
+        time_range={
+            'start': '2026-01-01T01:00:00Z',
+            'end': '2026-01-01T00:00:00',
+        },
+    )
+    assert reversed_mixed['error'] == 'validation_error'
+
+
+@pytest.mark.anyio
 async def test_get_episode_supports_root_lookup_and_respects_scope(ledger):
     ledger.append_event(
         'assert',

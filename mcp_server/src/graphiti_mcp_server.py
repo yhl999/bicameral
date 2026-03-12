@@ -12,7 +12,7 @@ import math
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -922,12 +922,10 @@ mcp = FastMCP(
 # Register router tool modules (Phase 0 skeleton)
 try:
     from .routers import candidates as _candidates_router
-    from .routers import episodes_procedures as _episodes_procedures_router
     from .routers import memory as _memory_router
     from .routers import packs as _packs_router
 except ImportError:  # pragma: no cover - script/top-level import fallback
     from routers import candidates as _candidates_router
-    from routers import episodes_procedures as _episodes_procedures_router
     from routers import memory as _memory_router
     from routers import packs as _packs_router
 
@@ -935,7 +933,6 @@ _REGISTERED_ROUTER_TOOLS: dict[str, Any] = {}
 _REGISTERED_ROUTER_TOOLS.update(_memory_router.register_tools(mcp))
 _REGISTERED_ROUTER_TOOLS.update(_candidates_router.register_tools(mcp))
 _REGISTERED_ROUTER_TOOLS.update(_packs_router.register_tools(mcp))
-_REGISTERED_ROUTER_TOOLS.update(_episodes_procedures_router.register_tools(mcp))
 
 # Debug flag: hide low-level tools unless explicitly enabled
 _BICAMERAL_DEBUG_TOOLS: bool = (
@@ -1166,42 +1163,63 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
         ),
         _tool_schema_entry(
             name='search_episodes',
-            description='Search episodic memory by semantic query and optional time range',
+            description='Search typed episodic memory in one scoped lane with optional time bounds and pagination',
             mode_hint='typed',
             inputs={
                 'query': 'string',
                 'time_range': 'object with optional start/end ISO timestamps | null',
+                'include_history': 'boolean (default false)',
+                'group_ids': 'list[string] | null (must resolve to exactly one group)',
+                'lane_alias': 'list[string] | null (must resolve to exactly one group)',
+                'limit': 'integer | null (default 10, max 50)',
+                'offset': 'integer | null (default 0)',
             },
-            output='{"message": string, "episodes": list[Episode]} | ErrorResponse',
-            examples=[{'query': 'last deployment', 'time_range': None}],
-            phase0_behavior='Returns an empty episode list after input validation.',
+            output='EpisodeSearchResponse | ErrorResponse',
+            examples=[{
+                'query': 'last deployment',
+                'time_range': {'start': '2026-01-01T00:00:00Z', 'end': '2026-01-31T23:59:59Z'},
+                'group_ids': ['team-alpha'],
+                'limit': 10,
+            }],
         ),
         _tool_schema_entry(
             name='get_episode',
-            description='Validate lookup input for a specific episode',
+            description='Retrieve a typed episode by object_id or root_id in one scoped lane',
             mode_hint='typed',
-            inputs={'episode_id': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: Episode | ErrorResponse',
-            examples=[{'episode_id': 'ep-001'}],
-            phase0_behavior='Validates episode_id and then returns not_implemented.',
+            inputs={
+                'episode_id': 'string',
+                'group_ids': 'list[string] | null (must resolve to exactly one group)',
+                'lane_alias': 'list[string] | null (must resolve to exactly one group)',
+            },
+            output='Episode | ErrorResponse',
+            examples=[{'episode_id': 'ep-001', 'group_ids': ['team-alpha']}],
         ),
         _tool_schema_entry(
             name='search_procedures',
-            description='Search procedural memory for relevant procedures',
+            description='Search typed procedures in one scoped lane with optional proposed results and pagination',
             mode_hint='typed',
-            inputs={'query': 'string'},
-            output='{"message": string, "procedures": list[Procedure]} | ErrorResponse',
-            examples=[{'query': 'how to run tests'}],
-            phase0_behavior='Returns an empty procedure list after input validation.',
+            inputs={
+                'query': 'string',
+                'include_all': 'boolean (default false; false returns promoted procedures only)',
+                'group_ids': 'list[string] | null (must resolve to exactly one group)',
+                'lane_alias': 'list[string] | null (must resolve to exactly one group)',
+                'limit': 'integer | null (default 10, max 50)',
+                'offset': 'integer | null (default 0)',
+            },
+            output='ProcedureSearchResponse | ErrorResponse',
+            examples=[{'query': 'run tests', 'group_ids': ['team-alpha'], 'include_all': False}],
         ),
         _tool_schema_entry(
             name='get_procedure',
-            description='Validate lookup input for a procedure by trigger or ID',
+            description='Retrieve the current promoted procedure by ID, trigger, or exact name in one scoped lane',
             mode_hint='typed',
-            inputs={'trigger_or_id': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: Procedure | ErrorResponse',
-            examples=[{'trigger_or_id': 'deploy to production'}],
-            phase0_behavior='Validates trigger_or_id and then returns not_implemented.',
+            inputs={
+                'trigger_or_id': 'string',
+                'group_ids': 'list[string] | null (must resolve to exactly one group)',
+                'lane_alias': 'list[string] | null (must resolve to exactly one group)',
+            },
+            output='Procedure | ErrorResponse',
+            examples=[{'trigger_or_id': 'deploy to production', 'group_ids': ['team-alpha']}],
         ),
         _tool_schema_entry(
             name='delete_entity_edge',
@@ -2180,7 +2198,10 @@ def _parse_time(value: str | None) -> datetime | None:
     if not text:
         return None
 
-    return datetime.fromisoformat(text.replace('Z', '+00:00'))
+    parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _parse_time_range(
@@ -2851,6 +2872,10 @@ def _phase0_public_tool_callables() -> dict[str, Any]:
         'search_nodes': search_nodes,
         'search_memory_facts': search_memory_facts,
         **_REGISTERED_ROUTER_TOOLS,
+        'search_episodes': search_episodes,
+        'get_episode': get_episode,
+        'search_procedures': search_procedures,
+        'get_procedure': get_procedure,
         'delete_entity_edge': delete_entity_edge,
         'delete_episode': delete_episode,
         'clear_graph': clear_graph,
