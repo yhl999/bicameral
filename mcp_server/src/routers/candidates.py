@@ -69,9 +69,10 @@ def _candidate_to_fact_input(candidate: dict[str, Any]) -> dict[str, Any]:
     memory = _memory_router()
     raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
     metadata = candidate.get('metadata') if isinstance(candidate.get('metadata'), dict) else {}
+    write_context = memory._resolve_write_context(raw_hint)
     evidence_refs = metadata.get('evidence_refs')
     if not evidence_refs:
-        source_key = str(candidate.get('source') or memory.DEFAULT_SOURCE)
+        source_key = str(candidate.get('source') or write_context['source'] or memory.DEFAULT_SOURCE)
         evidence_refs = [ref.model_dump(mode='json') for ref in memory._build_evidence_ref(source_key)]
 
     return {
@@ -82,6 +83,7 @@ def _candidate_to_fact_input(candidate: dict[str, Any]) -> dict[str, Any]:
         'scope': (
             raw_hint.get('scope')
             or raw_hint.get('policy_scope')
+            or write_context.get('scope_override')
             or metadata.get('scope')
             or memory.DEFAULT_SCOPE
         ),
@@ -150,8 +152,8 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
         }
 
     raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
-    policy_version = str(raw_hint.get('policy_version') or DEFAULT_POLICY_VERSION)
     promote_context = memory._resolve_write_context(raw_hint)
+    policy_version = str(raw_hint.get('policy_version') or DEFAULT_POLICY_VERSION)
     promotion_actor_id = str(promote_context.get('actor_id') or memory.DEFAULT_ACTOR_ID)
     promotion_source = str(candidate.get('source') or promote_context.get('source') or memory.DEFAULT_SOURCE)
     ledger = _get_change_ledger()
@@ -268,14 +270,17 @@ async def reject_candidate(candidate_id: str) -> dict[str, Any]:
 
 
 def register_tools(mcp: Any) -> dict[str, Any]:
-    registered_tools = {
-        'list_candidates': mcp.tool()(list_candidates),
-        'promote_candidate': mcp.tool()(promote_candidate),
-        'reject_candidate': mcp.tool()(reject_candidate),
+    mcp.tool()(list_candidates)
+    mcp.tool()(promote_candidate)
+    mcp.tool()(reject_candidate)
+
+    tool_map = {
+        'list_candidates': list_candidates,
+        'promote_candidate': promote_candidate,
+        'reject_candidate': reject_candidate,
     }
 
-    tool_registry = getattr(mcp, '_tools', None)
-    if isinstance(tool_registry, dict):
-        tool_registry.update(registered_tools)
+    if hasattr(mcp, '_tools') and isinstance(mcp._tools, dict):  # type: ignore[attr-defined]
+        mcp._tools.update(tool_map)  # type: ignore[attr-defined]
 
-    return registered_tools
+    return tool_map

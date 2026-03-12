@@ -103,10 +103,10 @@ class TestMcpServerInitializesWithAllRouters:
 
 
 class TestAllStubsReturnValidTypes:
-    """Verify all stub methods return Phase 0-shaped payloads instead of ad-hoc data."""
+    """Verify the branch's current Phase 0 surfaces return coherent typed payloads."""
 
     @pytest.mark.anyio
-    async def test_memory_remember_fact_stub(self):
+    async def test_memory_remember_fact_contract(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
@@ -114,83 +114,107 @@ class TestAllStubsReturnValidTypes:
         remember_fact = mock_mcp._tools['remember_fact']
         result = await remember_fact(text='test fact')
         assert result == {
-            'error': 'not_implemented',
-            'message': 'remember_fact is a Phase 0 stub and is not implemented yet.',
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': 'missing required field: subject',
         }
 
     @pytest.mark.anyio
-    async def test_memory_get_current_state_stub(self):
+    async def test_memory_get_current_state_contract(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_current_state']
         result = await fn(subject='user')
-        assert result['facts'] == []
-        assert 'status' not in result
-        assert 'message' in result
+        assert result == {
+            'status': 'ok',
+            'facts': [],
+        }
 
     @pytest.mark.anyio
-    async def test_memory_get_history_stub(self):
+    async def test_memory_get_history_contract(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_history']
         result = await fn(subject='user')
-        assert result['history'] == []
-        assert 'status' not in result
+        assert result == {
+            'status': 'ok',
+            'history': [],
+            'scope': 'private',
+            'roots_considered': [],
+        }
 
     @pytest.mark.anyio
-    async def test_memory_stub_validates_bad_input_instead_of_raising(self):
+    async def test_memory_contract_validates_bad_input_instead_of_raising(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         remember_fact = mock_mcp._tools['remember_fact']
         result = await remember_fact(text=123)
-        assert result['error'] == 'validation_error'
+        assert result == {
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': 'text must be a string',
+        }
 
     @pytest.mark.anyio
-    async def test_candidates_list_candidates_stub(self):
+    async def test_candidates_list_candidates_contract(self):
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
         result = await fn()
-        assert result['candidates'] == []
-        assert 'status' not in result
+        assert result == {
+            'status': 'ok',
+            'candidates': [],
+        }
 
     @pytest.mark.anyio
-    async def test_candidates_promote_stub(self):
+    async def test_candidates_promote_contract(self):
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['promote_candidate']
-        result = await fn(candidate_id='cand-001', resolution='looks good')
-        assert result['error'] == 'not_implemented'
+        result = await fn(candidate_id='cand-001', resolution='supersede')
+        assert result == {
+            'status': 'error',
+            'error_type': 'not_found',
+            'message': 'candidate not found: cand-001',
+        }
 
     @pytest.mark.anyio
-    async def test_candidates_reject_stub(self):
+    async def test_candidates_reject_contract(self):
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='cand-001')
-        assert result['error'] == 'not_implemented'
+        assert result == {
+            'status': 'error',
+            'error_type': 'not_found',
+            'message': 'candidate not found: cand-001',
+        }
 
     @pytest.mark.anyio
-    async def test_candidates_reject_stub_validates_identifier_pattern(self):
+    async def test_candidates_reject_contract_treats_unmatched_identifier_as_not_found(self):
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='Bad Candidate Id')
-        assert result['error'] == 'validation_error'
+        assert result == {
+            'status': 'error',
+            'error_type': 'not_found',
+            'message': 'candidate not found: Bad Candidate Id',
+        }
 
     @pytest.mark.anyio
     async def test_packs_list_packs_stub(self):

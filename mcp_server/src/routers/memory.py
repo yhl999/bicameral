@@ -630,13 +630,13 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
         - ConflictDialog dict when contradictory input is detected, or
         - ErrorResponse-style dict on validation/write failures.
     """
-    clean = _clean_text(text or '')
     if not isinstance(text, str):
         return {
             'status': 'error',
             'error_type': 'validation_error',
             'message': 'text must be a string',
         }
+    clean = _clean_text(text)
 
     if not clean:
         return {
@@ -1146,18 +1146,17 @@ def register_tools(mcp: FastMCP) -> dict[str, Any]:
     async def get_history_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
         return await get_history(subject=subject, predicate=predicate, scope=scope)
 
-    registered_tools = {
+    tool_map = {
         'remember_fact': remember_fact_tool,
         'get_current_state': get_current_state_tool,
         'get_history': get_history_tool,
     }
 
-    # Backward compatible tool names used by external discovery.
-    tool_registry = getattr(mcp, '_tools', None)
-    if isinstance(tool_registry, dict):
-        tool_registry.update(registered_tools)
+    # Backward compatible tool names used by external discovery and lightweight tests.
+    if hasattr(mcp, '_tools') and isinstance(mcp._tools, dict):  # type: ignore[attr-defined]
+        mcp._tools.update(tool_map)  # type: ignore[attr-defined]
 
-    return registered_tools
+    return tool_map
 
 
 __all__ = [

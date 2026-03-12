@@ -168,6 +168,16 @@ def test_remember_fact_missing_subject_is_validation_error(isolated_memory):
     assert result['error_type'] == 'validation_error'
 
 
+def test_remember_fact_non_string_text_returns_validation_error(isolated_memory):
+    result = _run(memory.remember_fact(123))  # type: ignore[arg-type]
+
+    assert result == {
+        'status': 'error',
+        'error_type': 'validation_error',
+        'message': 'text must be a string',
+    }
+
+
 def test_remember_fact_conflict_returns_dialog_and_candidate(isolated_memory):
     first = _run(
         memory.remember_fact(
@@ -418,10 +428,46 @@ def test_promote_candidate_supersedes_quarantined_fact(isolated_memory):
     assert promoted['action'] == 'promoted'
     assert promoted['candidate']['status'] == 'promoted'
     assert promoted['fact']['value'] == 'light mode'
+    assert isolated_memory['materialize_calls'][-1][1] == 'caller_asserted_unverified'
+    assert isolated_memory['materialize_calls'][-1][2] is True
 
     current = _subject_state_facts(isolated_memory['ledger'], 'UI preferences')
     assert len(current) == 1
     assert current[0].value == 'light mode'
+
+
+def test_promote_candidate_preserves_trusted_source_and_scope(isolated_memory):
+    trusted = _owner_trust()
+    trusted['trust']['scope'] = 'public'
+
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences', **trusted},
+        )
+    )
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences', **trusted},
+        )
+    )
+
+    promoted = _run(
+        candidates_router.promote_candidate(
+            candidate_id=conflict['candidate_id'],
+            resolution='supersede',
+        )
+    )
+
+    assert promoted['status'] == 'ok'
+    assert promoted['fact']['scope'] == 'public'
+    assert promoted['fact']['policy_scope'] == 'public'
+    assert isolated_memory['materialize_calls'][-1][1] == 'owner_asserted'
+    assert isolated_memory['materialize_calls'][-1][2] is True
+
+    public_state = _run(memory.get_current_state(subject='UI preferences', scope='public'))
+    assert [fact['value'] for fact in public_state['facts']] == ['light mode']
 
 
 def test_promote_candidate_rejects_parallel_resolution(isolated_memory):
