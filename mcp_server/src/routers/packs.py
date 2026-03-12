@@ -269,9 +269,16 @@ async def create_workflow_pack(definition: dict[str, Any]) -> dict[str, Any]:
         return {'error': f'create_workflow_pack failed: {exc}'}
 
 
-def register_tools(mcp: Any) -> None:
+def register_tools(mcp: Any) -> dict[str, Any]:
     mcp.tool()(list_packs)
     mcp.tool()(get_context_pack)
     mcp.tool()(get_workflow_pack)
     mcp.tool()(describe_pack)
     mcp.tool()(create_workflow_pack)
+    return {
+        'list_packs': list_packs,
+        'get_context_pack': get_context_pack,
+        'get_workflow_pack': get_workflow_pack,
+        'describe_pack': describe_pack,
+        'create_workflow_pack': create_workflow_pack,
+    }
