@@ -16,8 +16,11 @@ DEFAULT_PACK_SCOPES = {'context', 'workflow'}
 PACK_REGISTRY_SCHEMA_VERSION = '1.0.0'
 
 MAX_PACK_ID_LENGTH = 128
+MAX_INTENT_LENGTH = 512
 MAX_PREDICATE_COUNT = 64
 MAX_PREDICATE_LENGTH = 128
+MAX_CONSUMER_LENGTH = 128
+MAX_DESCRIPTION_LENGTH = 8_192
 MAX_DEFINITION_DEPTH = 10
 MAX_DEFINITION_NODES = 2_000
 MAX_DEFINITION_ITEMS = 256
@@ -234,6 +237,30 @@ def _normalize_version(value: Any) -> str:
     return version
 
 
+def _normalize_datetime(value: Any, *, field_name: str, default: str | None = None) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if default is not None:
+            return default
+        raise PackRegistryError(f'{field_name} is required')
+
+    if not isinstance(value, str):
+        raise PackRegistryError(f'{field_name} must be a string')
+
+    candidate = value.strip()
+    if candidate.endswith('Z'):
+        candidate = candidate[:-1] + '+00:00'
+
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise PackRegistryError(f'{field_name} must be a valid ISO 8601 date-time: {value!r}') from exc
+
+    if parsed.tzinfo is None:
+        raise PackRegistryError(f'{field_name} must include a timezone offset')
+
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+
 def _normalize_scope(value: Any) -> str:
     scope = str(value or '').strip().lower()
     if scope not in DEFAULT_PACK_SCOPES:
@@ -373,10 +400,18 @@ def _normalise_row(raw: dict[str, Any]) -> dict[str, Any]:
     intent = str(row.get('intent') or '').strip().lower()
     if not intent:
         raise PackRegistryError(f'pack {pack_id} is missing required field: intent')
+    if len(intent) > MAX_INTENT_LENGTH:
+        raise PackRegistryError(
+            f'pack {pack_id} intent exceeds max length ({MAX_INTENT_LENGTH})'
+        )
 
     consumer = str(row.get('consumer') or '').strip().lower()
     if not consumer:
         raise PackRegistryError(f'pack {pack_id} is missing required field: consumer')
+    if len(consumer) > MAX_CONSUMER_LENGTH:
+        raise PackRegistryError(
+            f'pack {pack_id} consumer exceeds max length ({MAX_CONSUMER_LENGTH})'
+        )
 
     definition_raw = row.get('definition')
     if definition_raw is None:
@@ -391,12 +426,25 @@ def _normalise_row(raw: dict[str, Any]) -> dict[str, Any]:
 
     definition = _normalise_definition(definition_raw, scope=scope)
 
-    created_at = str(row.get('created_at') or _now_iso())
-    last_updated = str(row.get('last_updated') or created_at)
-
     description = str(row.get('description') or '').strip()
     if not description:
         description = f'{scope} pack for {intent}'
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        raise PackRegistryError(
+            f'pack {pack_id} description exceeds max length ({MAX_DESCRIPTION_LENGTH})'
+        )
+
+    now_iso = _now_iso()
+    created_at = _normalize_datetime(
+        row.get('created_at'),
+        field_name=f'pack {pack_id} created_at',
+        default=now_iso,
+    )
+    last_updated = _normalize_datetime(
+        row.get('last_updated'),
+        field_name=f'pack {pack_id} last_updated',
+        default=created_at,
+    )
 
     version = _normalize_version(row.get('version'))
 

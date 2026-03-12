@@ -14,6 +14,7 @@ from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 from mcp_server.src.routers import packs
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.pack_registry import PackRegistryService
+from mcp_server.src.services.schema_validation import _validate_typed_object
 
 
 @pytest.fixture
@@ -88,6 +89,25 @@ def _nested_mapping(depth: int) -> dict[str, object]:
     for index in range(depth):
         current = {f'level_{index}': current}
     return current
+
+
+def _assert_schema_valid(obj: dict[str, object], schema_name: str) -> None:
+    ok, err = _validate_typed_object(obj, schema_name)
+    assert ok, err
+
+
+def _workflow_default_schema() -> dict[str, object]:
+    return {
+        'type': 'array',
+        'items': {
+            'type': 'object',
+            'required': ['step', 'action'],
+            'properties': {
+                'step': {'type': 'string'},
+                'action': {'type': 'string'},
+            },
+        },
+    }
 
 
 def test_list_packs_supports_filtering(registry_path: Path):
@@ -197,6 +217,53 @@ def test_create_workflow_pack_is_persistent_in_private_registry(registry_path: P
     assert persisted_ids == {'workflow-earnings-review'}
 
 
+def test_create_workflow_pack_normalizes_schema_valid_metadata_across_create_list_and_describe(
+    registry_path: Path,
+):
+    pack_id = 'workflow-metadata-roundtrip'
+    definition = _workflow_definition(pack_id=pack_id)
+    definition['created_at'] = '2026-03-11T12:34:56+02:00'
+    definition['last_updated'] = '2026-03-11T13:34:56+02:00'
+    definition['surprise'] = 'should not persist'
+
+    created = asyncio.run(packs.create_workflow_pack(definition))
+    assert created.get('id') == pack_id
+    assert created.get('created_at') == '2026-03-11T10:34:56Z'
+    assert created.get('last_updated') == '2026-03-11T11:34:56Z'
+    assert 'surprise' not in created
+    _assert_schema_valid(created, 'PackRegistry')
+
+    listed = next(item for item in asyncio.run(packs.list_packs({'scope': 'workflow'})) if item['id'] == pack_id)
+    assert 'surprise' not in listed
+    _assert_schema_valid(listed, 'PackRegistry')
+
+    described = asyncio.run(packs.describe_pack(pack_id))
+    assert described.get('pack_registry', {}).get('created_at') == '2026-03-11T10:34:56Z'
+    assert described.get('pack_registry', {}).get('last_updated') == '2026-03-11T11:34:56Z'
+    assert 'surprise' not in described.get('pack_registry', {})
+    _assert_schema_valid(described.get('pack_registry', {}), 'PackRegistry')
+    _assert_schema_valid(described, 'PackDefinition')
+
+    persisted = json.loads(registry_path.read_text(encoding='utf-8'))
+    persisted_pack = persisted['packs'][0]
+    assert persisted_pack['created_at'] == '2026-03-11T10:34:56Z'
+    assert persisted_pack['last_updated'] == '2026-03-11T11:34:56Z'
+    assert 'surprise' not in persisted_pack
+
+
+def test_create_workflow_pack_rejects_invalid_pack_registry_timestamps(registry_path: Path):
+    definition = _workflow_definition(pack_id='workflow-invalid-timestamps')
+    definition['created_at'] = 'not-a-date'
+
+    result = asyncio.run(packs.create_workflow_pack(definition))
+    assert result.get('error') == 'validation_error'
+    assert 'created_at' in result.get('message', '')
+
+    if registry_path.exists():
+        persisted = json.loads(registry_path.read_text(encoding='utf-8'))
+        assert persisted['packs'] == []
+
+
 def test_dotted_pack_ids_round_trip_across_create_describe_and_get(registry_path: Path):
     pack_id = 'workflow.earnings.review'
 
@@ -211,6 +278,20 @@ def test_dotted_pack_ids_round_trip_across_create_describe_and_get(registry_path
     assert materialized.get('pack_id') == pack_id
     assert materialized.get('pack_metadata', {}).get('id') == pack_id
     assert materialized.get('error') is None
+
+
+def test_describe_pack_defaults_workflow_schema_when_definition_schema_is_omitted(registry_path: Path):
+    pack_id = 'workflow-default-schema'
+    created = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id=pack_id)))
+    assert created.get('id') == pack_id
+
+    described = asyncio.run(packs.describe_pack(pack_id))
+    assert described.get('pack_id') == pack_id
+    assert described.get('schema') == _workflow_default_schema()
+    assert described.get('schema', {}).get('type') == 'array'
+    assert 'subject' not in json.dumps(described.get('schema', {}), sort_keys=True)
+    _assert_schema_valid(described, 'PackDefinition')
+
 
 
 def test_create_workflow_pack_rejects_duplicate_ids_and_builtin_hijack(registry_path: Path):
@@ -295,6 +376,47 @@ def test_list_packs_invalid_filter_returns_validation_error(registry_path: Path)
     result = asyncio.run(packs.list_packs({'scope': 'not-a-scope'}))
     assert result.get('error') == 'validation_error'
     assert 'scope' in result.get('message', '')
+
+
+def test_list_packs_and_describe_fail_closed_on_invalid_persisted_pack_registry_timestamps(
+    registry_path: Path,
+):
+    registry_path.write_text(
+        json.dumps(
+            {
+                'schema_version': '1.0.0',
+                'meta': {
+                    'created_at': '2026-03-11T12:34:56Z',
+                    'updated_at': '2026-03-11T12:34:56Z',
+                },
+                'packs': [
+                    {
+                        'id': 'workflow-invalid-persisted-timestamp',
+                        'scope': 'workflow',
+                        'intent': 'verifier',
+                        'description': 'Workflow with broken metadata',
+                        'consumer': 'planner',
+                        'version': '1.0.0',
+                        'predicates': ['risk'],
+                        'created_at': 'not-a-date',
+                        'last_updated': '2026-03-11T12:34:56Z',
+                        'definition': {'steps': [{'step': 'review', 'action': 'inspect risk facts'}]},
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding='utf-8',
+    )
+
+    listed = asyncio.run(packs.list_packs())
+    assert listed.get('error') == 'operational_error'
+    assert 'created_at' in listed.get('message', '')
+
+    described = asyncio.run(packs.describe_pack('workflow-invalid-persisted-timestamp'))
+    assert described.get('error') == 'operational_error'
+    assert 'created_at' in described.get('message', '')
+
 
 
 def test_list_packs_registry_load_failure_surfaces_operational_error(registry_path: Path):

@@ -183,9 +183,22 @@ def _pack_metadata(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _infer_schema(definition: dict[str, Any] | None) -> dict[str, Any]:
+def _infer_schema(definition: dict[str, Any] | None, *, scope: str | None = None) -> dict[str, Any]:
     if definition and isinstance(definition.get('schema'), dict):
         return definition['schema']
+
+    if scope == 'workflow' or (definition and isinstance(definition.get('steps'), list) and definition['steps']):
+        return {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'required': ['step', 'action'],
+                'properties': {
+                    'step': {'type': 'string'},
+                    'action': {'type': 'string'},
+                },
+            },
+        }
 
     return {
         'type': 'object',
@@ -309,7 +322,7 @@ async def describe_pack(pack_id: str) -> dict[str, Any]:
             'pack_id': pack['id'],
             'pack_registry': pack_registry,
             'predicates': pack.get('predicates', []),
-            'schema': _infer_schema(definition),
+            'schema': _infer_schema(definition, scope=pack.get('scope')),
             'examples': definition.get('examples', []),
             'instructions': definition.get('instructions'),
             'definition': definition,
