@@ -206,6 +206,10 @@ class TestSchemaValidation:
             'predicate': 'editor',
             'value': 'vim',
             'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
+            'metadata': {},
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is True
@@ -218,10 +222,31 @@ class TestSchemaValidation:
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
         assert 'uuid' in (err or '')
+
+    def test_candidate_status_enum_tracks_quarantine_contract(self):
+        obj = {
+            'uuid': 'cand-001',
+            'type': 'preference',
+            'subject': 'user',
+            'predicate': 'editor',
+            'value': 'vim',
+            'status': 'pending',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
+        }
+        ok, err = self.validate(obj, 'Candidate')
+        assert ok is False
+        assert err is not None
+        assert 'status' in err
 
     def test_candidate_uuid_pattern_validation(self):
         obj = {
@@ -230,6 +255,10 @@ class TestSchemaValidation:
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
@@ -427,6 +456,27 @@ class TestGetToolsSignature:
         tool = next((t for t in result if t['name'] == 'search_memory_facts'), None)
         assert tool is not None
         assert tool['mode_hint'] == 'both'
+
+    @pytest.mark.anyio
+    async def test_candidate_tool_metadata_matches_exec4_contract(self):
+        result = await self.module.get_tools()
+        tool_by_name = {tool['name']: tool for tool in result}
+
+        list_candidates = tool_by_name['list_candidates']
+        assert 'quarantine' in list_candidates['schema']['inputs']['status']
+        assert 'pending' not in list_candidates['schema']['inputs']['status']
+        assert list_candidates['examples'][0]['status'] == 'quarantine'
+        assert list_candidates['schema']['output'] == 'list[Candidate]'
+
+        promote_candidate = tool_by_name['promote_candidate']
+        assert 'supersede' in promote_candidate['schema']['inputs']['resolution']
+        assert 'parallel' in promote_candidate['schema']['inputs']['resolution']
+        assert 'cancel' in promote_candidate['schema']['inputs']['resolution']
+        assert promote_candidate['examples'][0]['resolution'] == 'supersede'
+
+        reject_candidate = tool_by_name['reject_candidate']
+        assert 'pending queue' not in reject_candidate['description']
+        assert reject_candidate['examples'][0]['candidate_id'] == 'cand-002'
 
     @pytest.mark.anyio
     async def test_debug_tools_absent_without_flag(self):

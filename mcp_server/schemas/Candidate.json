@@ -2,14 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "Candidate",
   "title": "Candidate",
-  "description": "A quarantined fact awaiting promotion review",
+  "description": "A persisted candidate row in the quarantine/promotion workflow",
   "type": "object",
   "required": [
     "uuid",
     "type",
     "subject",
     "predicate",
-    "value"
+    "value",
+    "status",
+    "confidence",
+    "created_at",
+    "updated_at"
   ],
   "properties": {
     "uuid": {
@@ -23,7 +27,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "description": "Fact type for this candidate (for example preference, commitment, operational_rule)."
+      "description": "Candidate assertion type for this row (for example preference, commitment, operational_rule, procedure, episode)."
     },
     "subject": {
       "type": "string",

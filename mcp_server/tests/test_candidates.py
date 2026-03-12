@@ -12,6 +12,7 @@ import pytest
 from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 from mcp_server.src.routers import candidates as candidates_router
 from mcp_server.src.services.change_ledger import ChangeLedger
+from mcp_server.src.services.schema_validation import _validate_typed_object
 
 
 @pytest.fixture
@@ -157,6 +158,17 @@ def test_candidates_schema_migrates_legacy_rows_to_exec4_contract(ledger_path: P
     assert [row['uuid'] for row in quarantine] == ['cand-legacy']
 
 
+def test_candidate_rows_match_public_schema(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+    _make_candidate(db=db, candidate_id='cand-schema', candidate_type='procedure', confidence=0.66)
+
+    candidates = asyncio.run(candidates_router.list_candidates(status='quarantine'))
+    assert len(candidates) == 1
+
+    ok, err = _validate_typed_object(candidates[0], 'Candidate')
+    assert ok is True, err
+
+
 def test_promote_candidate_supersede_marks_candidate_and_promotes_fact(ledger_path: Path):
     db = candidates_router.CandidatesDB(ledger_path)
     ledger = ChangeLedger(ledger_path)
@@ -230,6 +242,97 @@ def test_promote_candidate_parallel_keeps_conflicting_fact_current(ledger_path: 
     ids = {fact.object_id for fact in active}
     assert existing.object_id in ids
     assert promoted_id in ids
+
+
+def test_promote_candidate_rejects_heterogeneous_supersede_target(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+    ledger = ChangeLedger(ledger_path)
+
+    existing = _seed_state_fact(subject='Yuan', predicate='prefers', value='cold brew', object_id='existing-fact-h')
+    ledger.append_event('assert', actor_id='seed', reason='seed', payload=existing, object_id=existing.object_id)
+
+    _make_candidate(
+        db=db,
+        candidate_id='cand-procedure',
+        candidate_type='procedure',
+        subject='brew coffee',
+        predicate='procedure',
+        value={'steps': ['grind beans', 'brew']},
+        conflicting_fact_uuid=existing.object_id,
+    )
+
+    result = asyncio.run(candidates_router.promote_candidate('cand-procedure', resolution='supersede'))
+    assert 'error' in result
+    assert 'incompatible supersede target' in result['error']
+
+    candidate = db.get_candidate('cand-procedure')
+    assert candidate is not None
+    assert candidate['status'] == 'quarantine'
+
+    active = [fact for fact in ledger.current_state_facts() if fact.predicate == 'prefers']
+    assert {fact.object_id for fact in active} == {existing.object_id}
+    assert all(obj.object_type != 'procedure' for obj in ledger.materialize_lineage(existing.root_id))
+
+
+def test_promote_candidate_rejects_state_fact_supersede_across_conflict_sets(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+    ledger = ChangeLedger(ledger_path)
+
+    existing = _seed_state_fact(subject='Yuan', predicate='prefers', value='cold brew', object_id='existing-fact-cs')
+    ledger.append_event('assert', actor_id='seed', reason='seed', payload=existing, object_id=existing.object_id)
+
+    _make_candidate(
+        db=db,
+        candidate_id='cand-mismatch',
+        candidate_type='state',
+        subject='Archibald',
+        predicate='lives_in',
+        value='New York',
+        conflicting_fact_uuid=existing.object_id,
+    )
+
+    result = asyncio.run(candidates_router.promote_candidate('cand-mismatch', resolution='supersede'))
+    assert 'error' in result
+    assert 'conflict set mismatch' in result['error']
+
+    candidate = db.get_candidate('cand-mismatch')
+    assert candidate is not None
+    assert candidate['status'] == 'quarantine'
+    assert {fact.object_id for fact in ledger.current_state_facts()} == {existing.object_id}
+
+
+def test_promote_candidate_reconciles_existing_ledger_promotion(ledger_path: Path):
+    db = candidates_router.CandidatesDB(ledger_path)
+
+    _make_candidate(db=db, candidate_id='cand-reconcile', value='flat white')
+    first = asyncio.run(candidates_router.promote_candidate('cand-reconcile', resolution='parallel'))
+    assert first.get('candidate', {}).get('status') == 'promoted'
+
+    db.conn.execute(
+        """
+        UPDATE candidates
+           SET status = 'quarantine',
+               resolution = NULL,
+               reviewed_at = NULL,
+               reviewed_by = NULL,
+               promoted_at = NULL,
+               promoted_by = NULL,
+               reason = NULL
+         WHERE uuid = ?
+        """,
+        ('cand-reconcile',),
+    )
+    db.conn.commit()
+
+    reconciled = asyncio.run(candidates_router.promote_candidate('cand-reconcile', resolution='parallel'))
+    assert reconciled.get('candidate', {}).get('status') == 'promoted'
+    assert reconciled['promotion']['object_id'] == first['promotion']['object_id']
+    assert reconciled['promotion']['event_id'] == first['promotion']['event_id']
+
+    candidate = db.get_candidate('cand-reconcile')
+    assert candidate is not None
+    assert candidate['status'] == 'promoted'
+    assert candidate['resolution'] == 'parallel'
 
 
 def test_cancel_and_reject_record_audit_fields(ledger_path: Path):

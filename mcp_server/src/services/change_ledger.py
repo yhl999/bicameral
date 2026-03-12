@@ -500,6 +500,7 @@ class ChangeLedger:
             if not allow_parallel and conflict_with_fact_id:
                 prior = self.materialize_object(conflict_with_fact_id)
                 if prior is not None:
+                    _validate_supersede_target(candidate=typed_object, prior=prior)
                     creation_type = 'supersede'
                     parent_id = prior.object_id
                     root_id = prior.root_id
@@ -855,6 +856,22 @@ def build_object_from_candidate_fact(
             'policy_version': policy_version,
         }
     )
+
+
+def _validate_supersede_target(*, candidate: TypedMemoryObject, prior: TypedMemoryObject) -> None:
+    if candidate.object_type != prior.object_type:
+        raise ValueError(
+            'incompatible supersede target: '
+            f'{candidate.object_type} candidate cannot supersede '
+            f'{prior.object_type} object {prior.object_id}'
+        )
+
+    if isinstance(candidate, StateFact) and isinstance(prior, StateFact):
+        if candidate.conflict_set != prior.conflict_set:
+            raise ValueError(
+                'incompatible supersede target: '
+                f'state_fact conflict set mismatch for target {prior.object_id}'
+            )
 
 
 def _prepare_object_for_create_event(
