@@ -254,10 +254,12 @@ class ProcedureService:
         *,
         limit: int = 5,
         include_proposed: bool = False,
+        procedures: list[Procedure] | None = None,
     ) -> list[ProcedureMatch]:
         query_terms = _tokenize(query)
         matches: list[ProcedureMatch] = []
-        for procedure in self.list_current_procedures(include_proposed=include_proposed):
+        candidates = procedures if procedures is not None else self.list_current_procedures(include_proposed=include_proposed)
+        for procedure in candidates:
             score, matched_terms = _score_procedure(procedure, query, query_terms)
             if score <= 0:
                 continue

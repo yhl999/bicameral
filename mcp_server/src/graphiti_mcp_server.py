@@ -2533,15 +2533,25 @@ async def search_procedures(
         return offset_error
 
     q = _normalize_text(query)
-    procedures = _procedure_service().list_current_procedures(include_proposed=include_all)
-    matches = [
+    service = _procedure_service()
+    visible_procedures = [
         procedure
-        for procedure in procedures
+        for procedure in service.list_current_procedures(include_proposed=include_all)
         if _procedure_visible_in_scope(procedure, group_id=group_id, include_all=include_all)
-        and (not q or _match_text(procedure.name, q) or _match_text(procedure.trigger, q))
     ]
 
-    matches.sort(key=lambda item: (item.success_count, item.created_at, item.object_id), reverse=True)
+    if q:
+        ranked_matches = service.retrieve_procedures(
+            q,
+            limit=max(1, len(visible_procedures)),
+            include_proposed=include_all,
+            procedures=visible_procedures,
+        )
+        matches = [item.procedure for item in ranked_matches]
+    else:
+        matches = visible_procedures
+        matches.sort(key=lambda item: (item.success_count, item.created_at, item.object_id), reverse=True)
+
     return _procedure_search_response(matches, limit=limit_value, offset=offset_value)
 
 

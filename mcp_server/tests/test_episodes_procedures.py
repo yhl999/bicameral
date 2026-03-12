@@ -1,246 +1,27 @@
 from __future__ import annotations
 
+import importlib
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
-# Lightweight stubs so tests can run without the full Graphiti runtime.
-if 'graphiti_core' not in sys.modules:
-    graphiti_core = types.ModuleType('graphiti_core')
-    graphiti_core.Graphiti = type('Graphiti', (), {})
+_MCP_SRC = Path(__file__).parent.parent / 'src'
+if str(_MCP_SRC) not in sys.path:
+    sys.path.insert(0, str(_MCP_SRC.parent))
+    sys.path.insert(0, str(_MCP_SRC))
 
-    graphiti_edges = types.ModuleType('graphiti_core.edges')
-    graphiti_edges.EntityEdge = type('EntityEdge', (), {})
+_REPO_TESTS = Path(__file__).resolve().parents[2] / 'tests'
+if str(_REPO_TESTS) not in sys.path:
+    sys.path.insert(0, str(_REPO_TESTS))
 
-    class _EpisodeType:
-        memory = 'memory'
 
-    graphiti_nodes = types.ModuleType('graphiti_core.nodes')
-    graphiti_nodes.EpisodeType = _EpisodeType
-    graphiti_nodes.EpisodicNode = type('EpisodicNode', (), {})
+def load_graphiti_mcp_server():
+    return importlib.import_module('helpers_mcp_import').load_graphiti_mcp_server()
 
-    search_filters_module = types.ModuleType('graphiti_core.search.search_filters')
-    search_filters_module.SearchFilters = type('SearchFilters', (), {})
 
-    maintenance_graph_data = types.ModuleType('graphiti_core.utils.maintenance.graph_data_operations')
-    maintenance_graph_data.clear_data = lambda *args, **kwargs: None
-
-    graphiti_utils = types.ModuleType('graphiti_core.utils')
-    graphiti_utils.__path__ = []
-    maintenance_module = types.ModuleType('graphiti_core.utils.maintenance')
-    maintenance_module.__path__ = []
-    search_module = types.ModuleType('graphiti_core.search')
-    search_module.__path__ = []
-
-    sys.modules['graphiti_core'] = graphiti_core
-    sys.modules['graphiti_core.edges'] = graphiti_edges
-    sys.modules['graphiti_core.nodes'] = graphiti_nodes
-    sys.modules['graphiti_core.search'] = search_module
-    sys.modules['graphiti_core.search.search_filters'] = search_filters_module
-    sys.modules['graphiti_core.utils'] = graphiti_utils
-    sys.modules['graphiti_core.utils.maintenance'] = maintenance_module
-    sys.modules['graphiti_core.utils.maintenance.graph_data_operations'] = maintenance_graph_data
-
-if 'mcp' not in sys.modules:
-    mcp = types.ModuleType('mcp')
-    server_mod = types.ModuleType('mcp.server')
-    server_mod.__path__ = []
-
-    auth_module = types.ModuleType('mcp.server.auth')
-    auth_module.__path__ = []
-    middleware_module = types.ModuleType('mcp.server.auth.middleware')
-    middleware_module.__path__ = []
-    auth_context_module = types.ModuleType('mcp.server.auth.middleware.auth_context')
-    auth_context_module.get_access_token = lambda: None
-
-    class _Context:
-        client_id: str | None = None
-
-    class _FastMCP:
-        def __init__(self, *args, **kwargs):
-            self.title = args[0] if args else 'fastmcp'
-
-        def _decorate(self, *args):
-            if args and callable(args[0]) and len(args) == 1:
-                return args[0]
-
-            def decorator(func):
-                return func
-
-            return decorator
-
-        def tool(self, *args, **kwargs):
-            return self._decorate(*args)
-
-        def custom_route(self, *args, **kwargs):
-            return self._decorate(*args)
-
-    fastmcp_module = types.ModuleType('mcp.server.fastmcp')
-    fastmcp_module.Context = _Context
-    fastmcp_module.FastMCP = _FastMCP
-
-    sys.modules['mcp'] = mcp
-    sys.modules['mcp.server'] = server_mod
-    sys.modules['mcp.server.auth'] = auth_module
-    sys.modules['mcp.server.auth.middleware'] = middleware_module
-    sys.modules['mcp.server.auth.middleware.auth_context'] = auth_context_module
-    sys.modules['mcp.server.fastmcp'] = fastmcp_module
-
-if 'mcp_server.src.config.schema' not in sys.modules:
-    schema = types.ModuleType('mcp_server.src.config.schema')
-
-    class GraphitiConfig:
-        def __init__(self, *args, **kwargs):
-            self.graphiti = types.SimpleNamespace(group_id='default')
-            self.database = types.SimpleNamespace(provider='neo4j')
-
-    class ServerConfig:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    schema.GraphitiConfig = GraphitiConfig
-    schema.ServerConfig = ServerConfig
-    sys.modules['mcp_server.src.config.schema'] = schema
-    sys.modules['config.schema'] = schema
-
-if 'mcp_server.src.services.factories' not in sys.modules:
-    factories = types.ModuleType('mcp_server.src.services.factories')
-
-    class DatabaseDriverFactory:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def create(*args, **kwargs):
-            return None
-
-    class EmbedderFactory:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def create(*args, **kwargs):
-            return None
-
-    class LLMClientFactory:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @staticmethod
-        def create(*args, **kwargs):
-            return None
-
-    factories.DatabaseDriverFactory = DatabaseDriverFactory
-    factories.EmbedderFactory = EmbedderFactory
-    factories.LLMClientFactory = LLMClientFactory
-    sys.modules['mcp_server.src.services.factories'] = factories
-    sys.modules['services.factories'] = factories
-
-if 'mcp_server.src.services.om_group_scope' not in sys.modules:
-    scope = types.ModuleType('mcp_server.src.services.om_group_scope')
-    scope.is_om_native_only_scope = lambda *args, **kwargs: False
-    scope.requires_strict_om_native_only_scope = lambda *args, **kwargs: False
-    scope.is_om_group_scope = lambda *args, **kwargs: True
-    scope.is_om_type_scope = lambda *args, **kwargs: False
-    scope.is_om_type_only_scope = lambda *args, **kwargs: False
-    sys.modules['mcp_server.src.services.om_group_scope'] = scope
-    sys.modules['services.om_group_scope'] = scope
-
-if 'mcp_server.src.services.om_typed_projection' not in sys.modules:
-    proj = types.ModuleType('mcp_server.src.services.om_typed_projection')
-
-    class OMTypedProjectionService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    proj.OMTypedProjectionService = OMTypedProjectionService
-    sys.modules['mcp_server.src.services.om_typed_projection'] = proj
-    sys.modules['services.om_typed_projection'] = proj
-
-if 'mcp_server.src.services.ontology_registry' not in sys.modules:
-    registry = types.ModuleType('mcp_server.src.services.ontology_registry')
-    registry.OntologyRegistry = object
-    sys.modules['mcp_server.src.services.ontology_registry'] = registry
-    sys.modules['services.ontology_registry'] = registry
-
-if 'mcp_server.src.services.queue_service' not in sys.modules:
-    queue_service = types.ModuleType('mcp_server.src.services.queue_service')
-    queue_service.QueueService = object
-    queue_service.build_om_candidate_rows = lambda rows: []
-    sys.modules['mcp_server.src.services.queue_service'] = queue_service
-    sys.modules['services.queue_service'] = queue_service
-
-if 'mcp_server.src.services.search_service' not in sys.modules:
-    search_service_mod = types.ModuleType('mcp_server.src.services.search_service')
-    search_service_mod.DEFAULT_OM_GROUP_ID = 'om'
-
-    class SearchService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        @property
-        def om_projection(self):
-            return None
-
-        def includes_observational_memory(self, *_args, **kwargs):
-            return False
-
-        async def search_observational_facts(self, *args, **kwargs):
-            return []
-
-        async def search_observational_nodes(self, *args, **kwargs):
-            return []
-
-        class _Neo4jService:
-            async def verify_om_fulltext_index_shape(self, *args, **kwargs):
-                return None
-
-        neo4j_service = _Neo4jService()
-
-    search_service_mod.SearchService = SearchService
-    sys.modules['mcp_server.src.services.search_service'] = search_service_mod
-    sys.modules['services.search_service'] = search_service_mod
-
-if 'mcp_server.src.services.typed_retrieval' not in sys.modules:
-    typed_retrieval = types.ModuleType('mcp_server.src.services.typed_retrieval')
-
-    class TypedRetrievalService:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def search(self, *args, **kwargs):
-            return {'state': [], 'episodes': [], 'procedures': []}
-
-    typed_retrieval.TypedRetrievalService = TypedRetrievalService
-    sys.modules['mcp_server.src.services.typed_retrieval'] = typed_retrieval
-    sys.modules['services.typed_retrieval'] = typed_retrieval
-
-if 'mcp_server.src.utils.formatting' not in sys.modules:
-    formatting = types.ModuleType('mcp_server.src.utils.formatting')
-
-    def format_fact_result(*_args, **_kwargs):
-        return {}
-
-    formatting.format_fact_result = format_fact_result
-    sys.modules['mcp_server.src.utils.formatting'] = formatting
-    sys.modules['utils.formatting'] = formatting
-
-if 'mcp_server.src.utils.rate_limiter' not in sys.modules:
-    limiter = types.ModuleType('mcp_server.src.utils.rate_limiter')
-
-    class SlidingWindowRateLimiter:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def is_allowed(self, *_args, **_kwargs):
-            return True
-
-    limiter.SlidingWindowRateLimiter = SlidingWindowRateLimiter
-    sys.modules['mcp_server.src.utils.rate_limiter'] = limiter
-    sys.modules['utils.rate_limiter'] = limiter
-
-from mcp_server.src import graphiti_mcp_server as server
+server = load_graphiti_mcp_server()
 from mcp_server.src.models.typed_memory import Episode, EvidenceRef, Procedure
 from mcp_server.src.services.change_ledger import ChangeLedger
 
@@ -652,6 +433,55 @@ async def test_search_procedures_filters_default_include_all_and_paginates(ledge
 
     second_page = await server.search_procedures('', include_all=True, limit=1, offset=1)
     assert [item['object_id'] for item in second_page['procedures']] == ['proc-promoted']
+
+
+@pytest.mark.anyio
+async def test_search_procedures_matches_body_fields_without_cross_lane_leaks(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_procedure(
+            object_id='proc-body-match',
+            root_id='proc-body-match-root',
+            name='Recovery playbook',
+            trigger='service degraded',
+            steps=['Run browser status', 'Start browser if stopped', 'Retry automation'],
+            expected_outcome='Browser service is available before automation runs',
+            success_count=1,
+        ),
+        root_id='proc-body-match-root',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'promote',
+        object_id='proc-body-match',
+        root_id='proc-body-match-root',
+        recorded_at='2026-01-01T10:05:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_procedure(
+            object_id='proc-other-lane-match',
+            root_id='proc-other-lane-match-root',
+            name='Irrelevant other lane plan',
+            trigger='different lane',
+            steps=['Run browser status'],
+            expected_outcome='hidden',
+            source_lane='other',
+            success_count=99,
+        ),
+        root_id='proc-other-lane-match-root',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'promote',
+        object_id='proc-other-lane-match',
+        root_id='proc-other-lane-match-root',
+        recorded_at='2026-01-01T10:05:00Z',
+    )
+
+    result = await server.search_procedures('retry automation')
+    assert [item['object_id'] for item in result['procedures']] == ['proc-body-match']
+    assert result['total'] == 1
 
 
 @pytest.mark.anyio
