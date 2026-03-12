@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "PackRegistry",
+  "title": "PackRegistry",
+  "description": "Pack metadata entry in the registry",
+  "type": "object",
+  "required": [
+    "pack_id",
+    "scope",
+    "intent",
+    "consumer",
+    "version"
+  ],
+  "properties": {
+    "pack_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_-]+$"
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "context",
+        "workflow",
+        "both"
+      ],
+      "description": "Whether this pack provides context, workflow steps, or both"
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Human-readable description of what this pack does"
+    },
+    "consumer": {
+      "type": "string",
+      "description": "The agent or role this pack is designed for",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "default": "1.0"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "tags": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      }
+    }
+  },
+  "additionalProperties": false
+}

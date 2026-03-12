@@ -2,15 +2,18 @@
 
 from typing import Any
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 class ErrorResponse(TypedDict):
     error: str
+    message: NotRequired[str]
+    details: NotRequired[Any]
 
 
 class SuccessResponse(TypedDict):
     message: str
+    details: NotRequired[Any]
 
 
 class NodeResult(TypedDict):

@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "TypedFact",
+  "title": "TypedFact",
+  "description": "A typed, temporally-versioned fact in the memory ledger",
+  "type": "object",
+  "required": [
+    "subject",
+    "predicate",
+    "value",
+    "fact_type",
+    "timestamp"
+  ],
+  "properties": {
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "The entity this fact is about"
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "The relationship or attribute name"
+    },
+    "value": {
+      "description": "Bounded JSON value: primitive, array, or object with capped string length, item counts, property counts, and nesting depth.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/boundedValue"
+        }
+      ]
+    },
+    "fact_type": {
+      "type": "string",
+      "enum": [
+        "preference",
+        "decision",
+        "commitment",
+        "lesson",
+        "world_state",
+        "operational_rule",
+        "constraint",
+        "relationship"
+      ],
+      "description": "The semantic category of this fact"
+    },
+    "scope": {
+      "type": "string",
+      "default": "private",
+      "description": "Visibility scope of this fact"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp when this fact was recorded"
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "subject": "user",
+      "predicate": "prefers_dark_mode",
+      "value": true,
+      "fact_type": "preference",
+      "scope": "private",
+      "timestamp": "2026-03-11T12:34:56Z"
+    }
+  ],
+  "definitions": {
+    "boundedString": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "boundedPrimitive": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedString"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "boundedArrayLevel1": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/definitions/boundedPrimitive"
+      }
+    },
+    "boundedObjectLevel1": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/boundedPrimitive"
+      }
+    },
+    "boundedValueLevel1": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedPrimitive"
+        },
+        {
+          "$ref": "#/definitions/boundedArrayLevel1"
+        },
+        {
+          "$ref": "#/definitions/boundedObjectLevel1"
+        }
+      ]
+    },
+    "boundedArrayLevel2": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/definitions/boundedValueLevel1"
+      }
+    },
+    "boundedObjectLevel2": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/boundedValueLevel1"
+      }
+    },
+    "boundedValue": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedPrimitive"
+        },
+        {
+          "$ref": "#/definitions/boundedArrayLevel2"
+        },
+        {
+          "$ref": "#/definitions/boundedObjectLevel2"
+        }
+      ]
+    }
+  }
+}

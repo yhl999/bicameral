@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "Candidate",
+  "title": "Candidate",
+  "description": "A quarantined fact awaiting promotion review",
+  "type": "object",
+  "required": [
+    "candidate_id",
+    "fact_type",
+    "subject",
+    "predicate",
+    "value"
+  ],
+  "properties": {
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique identifier for this candidate",
+      "maxLength": 256,
+      "pattern": "^[a-z0-9][a-z0-9:_-]{0,255}$"
+    },
+    "fact_type": {
+      "type": "string",
+      "enum": [
+        "preference",
+        "decision",
+        "commitment",
+        "lesson",
+        "world_state",
+        "operational_rule",
+        "constraint",
+        "relationship"
+      ]
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "predicate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "value": {
+      "description": "Bounded JSON value: primitive, array, or object with capped string length, item counts, property counts, and nesting depth.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/boundedValue"
+        }
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "promoted",
+        "rejected"
+      ],
+      "default": "pending"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resolution": {
+      "type": "string",
+      "description": "Reason for promotion or rejection",
+      "maxLength": 2048
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "boundedString": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "boundedPrimitive": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedString"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "boundedArrayLevel1": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/definitions/boundedPrimitive"
+      }
+    },
+    "boundedObjectLevel1": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/boundedPrimitive"
+      }
+    },
+    "boundedValueLevel1": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedPrimitive"
+        },
+        {
+          "$ref": "#/definitions/boundedArrayLevel1"
+        },
+        {
+          "$ref": "#/definitions/boundedObjectLevel1"
+        }
+      ]
+    },
+    "boundedArrayLevel2": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/definitions/boundedValueLevel1"
+      }
+    },
+    "boundedObjectLevel2": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/boundedValueLevel1"
+      }
+    },
+    "boundedValue": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/boundedPrimitive"
+        },
+        {
+          "$ref": "#/definitions/boundedArrayLevel2"
+        },
+        {
+          "$ref": "#/definitions/boundedObjectLevel2"
+        }
+      ]
+    }
+  }
+}

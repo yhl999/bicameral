@@ -6,6 +6,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 import argparse
 import asyncio
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -908,6 +909,333 @@ mcp = FastMCP(
     'Graphiti Agent Memory',
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
 )
+
+# Register router tool modules (Phase 0 skeleton)
+try:
+    from .routers import candidates as _candidates_router
+    from .routers import episodes_procedures as _episodes_procedures_router
+    from .routers import memory as _memory_router
+    from .routers import packs as _packs_router
+except ImportError:  # pragma: no cover - script/top-level import fallback
+    from routers import candidates as _candidates_router
+    from routers import episodes_procedures as _episodes_procedures_router
+    from routers import memory as _memory_router
+    from routers import packs as _packs_router
+
+_REGISTERED_ROUTER_TOOLS: dict[str, Any] = {}
+_REGISTERED_ROUTER_TOOLS.update(_memory_router.register_tools(mcp))
+_REGISTERED_ROUTER_TOOLS.update(_candidates_router.register_tools(mcp))
+_REGISTERED_ROUTER_TOOLS.update(_packs_router.register_tools(mcp))
+_REGISTERED_ROUTER_TOOLS.update(_episodes_procedures_router.register_tools(mcp))
+
+# Debug flag: hide low-level tools unless explicitly enabled
+_BICAMERAL_DEBUG_TOOLS: bool = (
+    os.environ.get('BICAMERAL_DEBUG_TOOLS', '').strip() == '1'
+)
+
+# Precompute get_tools() response at module load time (not per-request)
+
+
+def _tool_schema_entry(
+    *,
+    name: str,
+    description: str,
+    mode_hint: str,
+    inputs: dict[str, str],
+    output: str,
+    examples: list[dict[str, Any]] | None = None,
+    details: dict[str, str] | None = None,
+    phase0_behavior: str | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        'name': name,
+        'description': description,
+        'mode_hint': mode_hint,
+        'schema': {
+            'inputs': inputs,
+            'output': output,
+        },
+        'examples': examples or [{}],
+    }
+    if details:
+        entry['details'] = details
+    if phase0_behavior:
+        entry['phase0_behavior'] = phase0_behavior
+    return entry
+
+
+def _build_get_tools_response() -> list[dict[str, Any]]:
+    return [
+        _tool_schema_entry(
+            name='add_memory',
+            description='Add a memory episode to the graph (raw text or JSON ingestion)',
+            mode_hint='facts',
+            inputs={
+                'name': 'string',
+                'episode_body': 'string',
+                'group_id': 'string | null',
+                'source': '"text" | "json" | "message" (default "text")',
+                'source_description': 'string (default "")',
+                'uuid': 'string | null',
+            },
+            output='SuccessResponse | ErrorResponse',
+            examples=[
+                {
+                    'name': 'Company News',
+                    'episode_body': 'Acme Corp announced a new product line today.',
+                    'source': 'text',
+                }
+            ],
+        ),
+        _tool_schema_entry(
+            name='search_nodes',
+            description='Search graph nodes by semantic / keyword / hybrid retrieval',
+            mode_hint='facts',
+            inputs={
+                'query': 'string',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
+                'search_mode': '"hybrid" | "semantic" | "keyword" (default "hybrid")',
+                'max_nodes': 'integer (default 10)',
+                'entity_types': 'list[string] | null',
+            },
+            output='NodeSearchResponse | ErrorResponse',
+            examples=[{'query': 'Acme', 'search_mode': 'hybrid'}],
+        ),
+        _tool_schema_entry(
+            name='search_memory_facts',
+            description='Search memory facts through the legacy graph-edge path or the typed retrieval contract',
+            mode_hint='both',
+            inputs={
+                'query': 'string',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
+                'search_mode': '"hybrid" | "semantic" | "keyword" (default "hybrid")',
+                'max_facts': 'integer (default 10)',
+                'center_node_uuid': 'string | null',
+                'result_format': '"facts" | "typed" (default "facts")',
+                'object_types': 'list[string] | null',
+                'metadata_filters': 'object | null',
+                'history_mode': '"auto" | "current" | "history" | "all" (default "auto")',
+                'current_only': 'boolean | null',
+                'max_results': 'integer | null',
+                'max_evidence': 'integer (default 20)',
+            },
+            output='FactSearchResponse | typed retrieval contract dict | ErrorResponse',
+            examples=[
+                {'query': 'user preferences', 'result_format': 'typed'},
+                {'query': 'recent events', 'result_format': 'facts'},
+            ],
+            details={
+                'facts': (
+                    'Search Neo4j/FalkorDB graph edges (legacy). '
+                    'Broad recall, lower precision on current state.'
+                ),
+                'typed': (
+                    'Ledger-backed retrieval of typed objects and evidence. '
+                    "Use for 'what is current/active?' queries."
+                ),
+                'om_note': 'OM content is projected from Neo4j in both modes.',
+            },
+        ),
+        _tool_schema_entry(
+            name='remember_fact',
+            description='Validate typed-memory write input for Phase 0; Exec 1 implements the ledger write',
+            mode_hint='typed',
+            inputs={
+                'text': 'string',
+                'hint': 'object | null',
+            },
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: TypedFact | ConflictDialog | ErrorResponse',
+            examples=[{'text': 'I prefer tabs over spaces', 'hint': {'fact_type': 'preference'}}],
+            phase0_behavior='Validates text/hint and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='get_current_state',
+            description='Query the typed-memory ledger for current non-superseded facts',
+            mode_hint='typed',
+            inputs={
+                'subject': 'string',
+                'predicate': 'string | null',
+            },
+            output='{"message": string, "facts": list[TypedFact]} | ErrorResponse',
+            examples=[{'subject': 'user', 'predicate': 'preferred_editor'}],
+            phase0_behavior='Returns an empty facts list after input validation.',
+        ),
+        _tool_schema_entry(
+            name='get_history',
+            description='Retrieve typed-memory change history for a subject / predicate',
+            mode_hint='typed',
+            inputs={
+                'subject': 'string',
+                'predicate': 'string | null',
+            },
+            output='{"message": string, "history": list[TypedFact]} | ErrorResponse',
+            examples=[{'subject': 'project-alpha', 'predicate': 'status'}],
+            phase0_behavior='Returns an empty history list after input validation.',
+        ),
+        _tool_schema_entry(
+            name='list_candidates',
+            description='List quarantined fact candidates awaiting promotion review',
+            mode_hint='typed',
+            inputs={'status': '"pending" | "promoted" | "rejected" | null'},
+            output='{"message": string, "candidates": list[Candidate]} | ErrorResponse',
+            examples=[{'status': 'pending'}],
+            phase0_behavior='Returns an empty candidate list after input validation.',
+        ),
+        _tool_schema_entry(
+            name='promote_candidate',
+            description='Validate promotion input for a candidate fact; Exec 4 wires the ledger integration',
+            mode_hint='typed',
+            inputs={'candidate_id': 'string', 'resolution': 'string'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
+            examples=[{'candidate_id': 'cand-001', 'resolution': 'Verified correct'}],
+            phase0_behavior='Validates candidate_id/resolution and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='reject_candidate',
+            description='Validate rejection input for a candidate fact; Exec 4 wires the ledger integration',
+            mode_hint='typed',
+            inputs={'candidate_id': 'string'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
+            examples=[{'candidate_id': 'cand-002'}],
+            phase0_behavior='Validates candidate_id and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='list_packs',
+            description='List available context and workflow packs',
+            mode_hint='typed',
+            inputs={'filter': 'object | null'},
+            output='{"message": string, "packs": list[PackRegistry]} | ErrorResponse',
+            examples=[{'filter': {'scope': 'private'}}],
+            phase0_behavior='Returns an empty pack list after input validation.',
+        ),
+        _tool_schema_entry(
+            name='get_context_pack',
+            description='Validate lookup input for a materialized context pack',
+            mode_hint='typed',
+            inputs={'pack_id': 'string', 'task': 'string | null'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
+            examples=[{'pack_id': 'coding-defaults', 'task': 'write a Python function'}],
+            phase0_behavior='Validates pack_id/task and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='get_workflow_pack',
+            description='Validate lookup input for a materialized workflow pack',
+            mode_hint='typed',
+            inputs={'pack_id': 'string', 'task': 'string | null'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
+            examples=[{'pack_id': 'deploy-workflow', 'task': 'deploy to staging'}],
+            phase0_behavior='Validates pack_id/task and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='describe_pack',
+            description='Validate lookup input for a full pack definition',
+            mode_hint='typed',
+            inputs={'pack_id': 'string'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackDefinition | ErrorResponse',
+            examples=[{'pack_id': 'coding-defaults'}],
+            phase0_behavior='Validates pack_id and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='create_workflow_pack',
+            description='Validate a PackDefinition payload for workflow-pack creation',
+            mode_hint='typed',
+            inputs={'definition': 'PackDefinition object'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackRegistry | ErrorResponse',
+            examples=[{
+                'definition': {
+                    'pack_id': 'my-workflow',
+                    'scope': 'workflow',
+                    'intent': 'deploy service safely',
+                    'consumer': 'archibald',
+                    'version': '1.0',
+                    'workflow_steps': ['run tests', 'deploy to staging'],
+                }
+            }],
+            phase0_behavior='Validates definition against PackDefinition, requires workflow/both scope, and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='search_episodes',
+            description='Search episodic memory by semantic query and optional time range',
+            mode_hint='typed',
+            inputs={
+                'query': 'string',
+                'time_range': 'object with optional start/end ISO timestamps | null',
+            },
+            output='{"message": string, "episodes": list[Episode]} | ErrorResponse',
+            examples=[{'query': 'last deployment', 'time_range': None}],
+            phase0_behavior='Returns an empty episode list after input validation.',
+        ),
+        _tool_schema_entry(
+            name='get_episode',
+            description='Validate lookup input for a specific episode',
+            mode_hint='typed',
+            inputs={'episode_id': 'string'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: Episode | ErrorResponse',
+            examples=[{'episode_id': 'ep-001'}],
+            phase0_behavior='Validates episode_id and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='search_procedures',
+            description='Search procedural memory for relevant procedures',
+            mode_hint='typed',
+            inputs={'query': 'string'},
+            output='{"message": string, "procedures": list[Procedure]} | ErrorResponse',
+            examples=[{'query': 'how to run tests'}],
+            phase0_behavior='Returns an empty procedure list after input validation.',
+        ),
+        _tool_schema_entry(
+            name='get_procedure',
+            description='Validate lookup input for a procedure by trigger or ID',
+            mode_hint='typed',
+            inputs={'trigger_or_id': 'string'},
+            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: Procedure | ErrorResponse',
+            examples=[{'trigger_or_id': 'deploy to production'}],
+            phase0_behavior='Validates trigger_or_id and then returns not_implemented.',
+        ),
+        _tool_schema_entry(
+            name='delete_entity_edge',
+            description='Delete an entity edge from the graph memory by UUID',
+            mode_hint='facts',
+            inputs={'uuid': 'string'},
+            output='SuccessResponse | ErrorResponse',
+            examples=[{'uuid': 'edge-uuid'}],
+        ),
+        _tool_schema_entry(
+            name='delete_episode',
+            description='Delete an episode from the graph memory by UUID',
+            mode_hint='facts',
+            inputs={'uuid': 'string'},
+            output='SuccessResponse | ErrorResponse',
+            examples=[{'uuid': 'episode-uuid'}],
+        ),
+        _tool_schema_entry(
+            name='clear_graph',
+            description='Clear graph data for one or more group IDs',
+            mode_hint='facts',
+            inputs={'group_ids': 'list[string] | null'},
+            output='SuccessResponse | ErrorResponse',
+            examples=[{'group_ids': ['s1_sessions_main']}],
+        ),
+        _tool_schema_entry(
+            name='get_status',
+            description='Get the status of the Graphiti MCP server and database connection',
+            mode_hint='facts',
+            inputs={},
+            output='StatusResponse',
+            examples=[{}],
+        ),
+        _tool_schema_entry(
+            name='get_tools',
+            description='Return all available MCP methods with runtime schema and Phase 0 behavior notes',
+            mode_hint='both',
+            inputs={},
+            output='list[ToolSchema-like dict]',
+            examples=[{}],
+        ),
+    ]
+
 
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
@@ -1854,6 +2182,11 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     """
     global graphiti_service
 
+    if not _BICAMERAL_DEBUG_TOOLS:
+        logger.debug('get_entity_edge called without BICAMERAL_DEBUG_TOOLS=1 — returning method_unavailable')
+        return ErrorResponse(error='method_unavailable')
+    logger.debug('get_entity_edge called with BICAMERAL_DEBUG_TOOLS=1 for uuid=%r', uuid)
+
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
@@ -1884,6 +2217,11 @@ async def get_episodes(
         max_episodes: Maximum number of episodes to return (default: 10)
     """
     global graphiti_service
+
+    if not _BICAMERAL_DEBUG_TOOLS:
+        logger.debug('get_episodes called without BICAMERAL_DEBUG_TOOLS=1 — returning method_unavailable')
+        return ErrorResponse(error='method_unavailable')
+    logger.debug('get_episodes called with BICAMERAL_DEBUG_TOOLS=1')
 
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
@@ -2012,6 +2350,115 @@ async def get_status() -> StatusResponse:
             status='error',
             message=f'Graphiti MCP server is running but database connection failed: {error_msg}',
         )
+
+
+@mcp.tool()
+async def get_tools() -> list[dict[str, Any]]:
+    """Return all available MCP methods with runtime schema, tooltips, and mode hints.
+
+    Each tool entry includes:
+    - name: method name
+    - description: human-readable purpose
+    - mode_hint: "typed", "facts", or "both" indicating result_format support
+    - schema: JSON schema summary for inputs/outputs
+    - examples: usage examples
+
+    The mode_hint distinguishes legacy graph-edge methods ("facts") from
+    typed ledger methods ("typed"). Use "typed" methods for current-state
+    and structured queries; use "facts" for broad historical recall.
+
+    Debug-only tools (get_entity_edge, get_episodes) are omitted unless
+    BICAMERAL_DEBUG_TOOLS=1 is set.
+    """
+    tools = list(_GET_TOOLS_RESPONSE)
+    if _BICAMERAL_DEBUG_TOOLS:
+        tools.append({
+            'name': 'get_entity_edge',
+            'description': '[DEBUG] Get a raw entity edge by UUID',
+            'mode_hint': 'facts',
+            'schema': {
+                'inputs': {'uuid': 'string'},
+                'output': 'dict | ErrorResponse',
+            },
+            'examples': [{'uuid': 'some-uuid'}],
+        })
+        tools.append({
+            'name': 'get_episodes',
+            'description': '[DEBUG] Get raw episodes from the graph by group IDs',
+            'mode_hint': 'facts',
+            'schema': {
+                'inputs': {
+                    'group_ids': 'list[string] | null',
+                    'max_episodes': 'integer (default 10)',
+                },
+                'output': 'EpisodeSearchResponse | ErrorResponse',
+            },
+            'examples': [{'group_ids': None, 'max_episodes': 10}],
+        })
+    return tools
+
+
+def _phase0_public_tool_callables() -> dict[str, Any]:
+    return {
+        'add_memory': add_memory,
+        'search_nodes': search_nodes,
+        'search_memory_facts': search_memory_facts,
+        **_REGISTERED_ROUTER_TOOLS,
+        'delete_entity_edge': delete_entity_edge,
+        'delete_episode': delete_episode,
+        'clear_graph': clear_graph,
+        'get_status': get_status,
+        'get_tools': get_tools,
+    }
+
+
+def _callable_input_names(tool_fn: Any) -> list[str]:
+    return [
+        name
+        for name, parameter in inspect.signature(tool_fn).parameters.items()
+        if parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+        and name != 'ctx'
+    ]
+
+
+def _assert_get_tools_contract_consistency(
+    tools: list[dict[str, Any]],
+    *,
+    callables_by_name: dict[str, Any],
+) -> None:
+    tool_entries = {tool['name']: tool for tool in tools}
+
+    declared_names = set(tool_entries)
+    callable_names = set(callables_by_name)
+    if declared_names != callable_names:
+        missing_from_contract = sorted(callable_names - declared_names)
+        missing_from_runtime = sorted(declared_names - callable_names)
+        raise RuntimeError(
+            'get_tools contract drift detected: '
+            f'missing_from_contract={missing_from_contract}, '
+            f'missing_from_runtime={missing_from_runtime}'
+        )
+
+    for tool_name, tool_fn in callables_by_name.items():
+        declared_inputs = tool_entries[tool_name]['schema']['inputs']
+        callable_inputs = _callable_input_names(tool_fn)
+        if callable_inputs != list(declared_inputs.keys()):
+            raise RuntimeError(
+                f'get_tools input drift detected for {tool_name}: '
+                f'contract={list(declared_inputs.keys())}, runtime={callable_inputs}'
+            )
+
+
+_PHASE0_PUBLIC_TOOL_CALLABLES: dict[str, Any] = _phase0_public_tool_callables()
+_GET_TOOLS_RESPONSE: list[dict[str, Any]] = _build_get_tools_response()
+_assert_get_tools_contract_consistency(
+    _GET_TOOLS_RESPONSE,
+    callables_by_name=_PHASE0_PUBLIC_TOOL_CALLABLES,
+)
 
 
 @mcp.custom_route('/health', methods=['GET'])
