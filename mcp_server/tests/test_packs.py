@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 from mcp_server.src.routers import packs
+from mcp_server.src.routers.packs import MAX_PACK_MATERIALIZED_FACTS
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.pack_registry import PackRegistryService
 from mcp_server.src.services.schema_validation import _validate_typed_object
@@ -488,3 +489,47 @@ def test_create_workflow_pack_requires_steps(registry_path: Path):
     result = asyncio.run(packs.create_workflow_pack(definition))
     assert result.get('error') == 'validation_error'
     assert 'definition.steps' in result.get('message', '')
+
+
+def test_get_context_pack_materialization_is_capped_at_max(ledger_path: Path, registry_path: Path):
+    """Materialized fact sets are bounded by MAX_PACK_MATERIALIZED_FACTS regardless of ledger size.
+
+    Mirrors the _MAX_FACTS_CAP = 200 defence-in-depth pattern in graphiti_mcp_server.py.
+    Uses a monkeypatched cap of 5 to keep the test fast.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ledger = ChangeLedger(ledger_path)
+
+    # Seed more facts than the (test-overridden) cap.
+    overflow_count = 8
+    for index in range(overflow_count):
+        fact = _make_state_fact(
+            subject=f'company_{index}',
+            predicate='industry',
+            value=f'sector_{index}',
+            ts=now + timedelta(seconds=index),
+        )
+        ledger.append_event(
+            'assert',
+            actor_id='unit-test',
+            reason='seed',
+            payload=fact,
+            object_id=fact.object_id,
+        )
+
+    # Temporarily lower the cap so the test runs without seeding 200+ facts.
+    original_cap = packs.MAX_PACK_MATERIALIZED_FACTS
+    packs.MAX_PACK_MATERIALIZED_FACTS = 5
+    try:
+        result = asyncio.run(packs.get_context_pack('context-vc-deal-brief'))
+    finally:
+        packs.MAX_PACK_MATERIALIZED_FACTS = original_cap
+
+    assert result.get('pack_id') == 'context-vc-deal-brief'
+    facts = result.get('facts', [])
+    # Cap applied: at most 5 facts returned even though 8 matched.
+    assert len(facts) <= 5
+    # Returned facts are the most recent ones (highest index = latest ts).
+    returned_subjects = {f['subject'] for f in facts}
+    # The 5 most recent are company_3 through company_7.
+    assert returned_subjects == {f'company_{i}' for i in range(3, 8)}

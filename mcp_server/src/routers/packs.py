@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Defense-in-depth cap: materialized fact result sets are bounded regardless of
+# how many matching facts exist in the ledger.  Mirrors _MAX_FACTS_CAP in
+# graphiti_mcp_server.py.
+MAX_PACK_MATERIALIZED_FACTS = 200
+
 try:
     from ._phase0 import (
         error_response,
@@ -166,7 +171,8 @@ def _materialize_pack_facts(
         selected.append((selected_ts, _fact_confidence(_serialise_fact(fact)), getattr(fact, 'object_id', ''), fact))
 
     selected.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-    return [_serialise_fact(item[3]) for item in selected]
+    # Apply defence-in-depth cap: return only the most recent/confident facts.
+    return [_serialise_fact(item[3]) for item in selected[:MAX_PACK_MATERIALIZED_FACTS]]
 
 
 def _pack_metadata(row: dict[str, Any]) -> dict[str, Any]:
