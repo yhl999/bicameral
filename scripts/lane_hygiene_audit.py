@@ -32,6 +32,7 @@ DECISIONS_BY_LANE: dict[str, str] = {
     's1_observational_memory': 'keep',
     's1_chatgpt_history': 'keep',           # promoted: global retrieval (was keep-scoped)
     's1_curated_refs': 'keep',              # promoted: global retrieval (was keep-corroboration-only)
+    'learning_self_audit': 'keep',          # separate-domain procedural lane, but intentionally globally retrievable
     's1_memory_day1': 'deprecate-after-migration',
 }
 
