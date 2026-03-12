@@ -2,76 +2,151 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "PackDefinition",
   "title": "PackDefinition",
-  "description": "Full pack schema including registry metadata and rules",
+  "description": "Detailed pack descriptor returned by describe_pack",
   "type": "object",
   "required": [
     "pack_id",
-    "scope",
-    "intent",
-    "consumer",
-    "version"
+    "pack_registry",
+    "predicates",
+    "schema",
+    "examples",
+    "definition"
   ],
   "properties": {
     "pack_id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "^[a-z0-9_-]+$"
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
     },
-    "scope": {
-      "type": "string",
-      "enum": [
-        "context",
-        "workflow",
-        "both"
+    "pack_registry": {
+      "type": "object",
+      "required": [
+        "id",
+        "scope",
+        "intent",
+        "description",
+        "consumer",
+        "version",
+        "predicates",
+        "created_at",
+        "last_updated"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "context",
+            "workflow"
+          ]
+        },
+        "intent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "consumer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(\\d+)\\.(\\d+)\\.(\\d+)$"
+        },
+        "predicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_updated": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "predicates": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    },
+    "schema": {
+      "type": "object"
+    },
+    "examples": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "instructions": {
+      "type": [
+        "string",
+        "null"
       ]
     },
-    "intent": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 512
-    },
-    "consumer": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128
-    },
-    "version": {
-      "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
-      "default": "1.0"
-    },
-    "context_rules": {
-      "type": "array",
-      "maxItems": 64,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 2048
-      },
-      "description": "Rules for what facts to include as context"
-    },
-    "workflow_steps": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 64,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 2048
-      },
-      "description": "Ordered steps for the workflow"
-    },
-    "prerequisites": {
-      "type": "array",
-      "maxItems": 32,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 128,
-        "pattern": "^[a-z0-9_-]+$"
-      },
-      "description": "Other pack IDs that must be loaded first"
+    "definition": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "step",
+              "action"
+            ],
+            "properties": {
+              "step": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              },
+              "action": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
     }
   },
   "additionalProperties": false,
@@ -79,53 +154,29 @@
     {
       "if": {
         "properties": {
-          "scope": {
-            "const": "context"
+          "pack_registry": {
+            "properties": {
+              "scope": {
+                "const": "workflow"
+              }
+            },
+            "required": [
+              "scope"
+            ]
           }
         },
         "required": [
-          "scope"
+          "pack_registry"
         ]
       },
       "then": {
-        "required": [
-          "context_rules"
-        ]
-      }
-    },
-    {
-      "if": {
         "properties": {
-          "scope": {
-            "const": "workflow"
+          "definition": {
+            "required": [
+              "steps"
+            ]
           }
-        },
-        "required": [
-          "scope"
-        ]
-      },
-      "then": {
-        "required": [
-          "workflow_steps"
-        ]
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "scope": {
-            "const": "both"
-          }
-        },
-        "required": [
-          "scope"
-        ]
-      },
-      "then": {
-        "required": [
-          "context_rules",
-          "workflow_steps"
-        ]
+        }
       }
     }
   ]

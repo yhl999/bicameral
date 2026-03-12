@@ -1106,7 +1106,7 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
             description='List available context and workflow packs',
             mode_hint='typed',
             inputs={'filter': 'object | null'},
-            output='list[PackRegistry]',
+            output='list[PackRegistry] | ErrorResponse',
             examples=[{'filter': {'scope': 'workflow'}}],
             phase0_behavior='Returns the registered pack metadata list after input validation.',
         ),
@@ -1141,7 +1141,9 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
             name='create_workflow_pack',
             description='Create a new workflow pack from a definition',
             mode_hint='typed',
-            inputs={'definition': 'dict with id|pack_id, scope=workflow, predicates, definition'},
+            inputs={
+                'definition': 'dict with id|pack_id, scope=workflow, predicates, and definition.steps'
+            },
             output='PackRegistry | ErrorResponse',
             examples=[{
                 'definition': {

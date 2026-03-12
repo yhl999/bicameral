@@ -234,29 +234,50 @@ class TestSchemaValidation:
         assert ok is False
         assert 'candidate_id' in (err or '')
 
-    def test_pack_definition_requires_workflow_fields(self):
+    def test_pack_definition_requires_definition_for_workflow_scope(self):
         obj = {
             'pack_id': 'deploy-workflow',
-            'scope': 'workflow',
-            'intent': 'deploy',
-            'consumer': 'archibald',
-            'version': '1.0',
+            'pack_registry': {
+                'id': 'deploy-workflow',
+                'scope': 'workflow',
+                'intent': 'deploy',
+                'description': 'Deploy workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['deploy'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['deploy'],
+            'schema': {'type': 'object'},
+            'examples': [],
         }
         ok, err = self.validate(obj, 'PackDefinition')
         assert ok is False
-        assert 'workflow_steps' in (err or '')
+        assert 'definition' in (err or '')
 
-    def test_pack_definition_requires_context_rules_for_context_scope(self):
+    def test_pack_definition_requires_steps_for_workflow_scope(self):
         obj = {
             'pack_id': 'coding-context',
-            'scope': 'context',
-            'intent': 'coding defaults',
-            'consumer': 'archibald',
-            'version': '1.0',
+            'pack_registry': {
+                'id': 'coding-context',
+                'scope': 'workflow',
+                'intent': 'coding defaults',
+                'description': 'Coding defaults workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['rule'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['rule'],
+            'schema': {'type': 'object'},
+            'examples': [],
+            'definition': {},
         }
         ok, err = self.validate(obj, 'PackDefinition')
         assert ok is False
-        assert 'context_rules' in (err or '')
+        assert 'steps' in (err or '')
 
     def test_load_schemas_is_atomic_on_failure(self, tmp_path, monkeypatch):
         good_schema = json.dumps(self.registry['TypedFact'])
@@ -311,11 +332,21 @@ class TestSchemaValidation:
     def test_pattern_validation(self):
         obj = {
             'pack_id': 'Bad Pack Id',
-            'scope': 'workflow',
-            'intent': 'deploy',
-            'consumer': 'archibald',
-            'version': '1.0',
-            'workflow_steps': ['ship it'],
+            'pack_registry': {
+                'id': 'deploy-workflow',
+                'scope': 'workflow',
+                'intent': 'deploy',
+                'description': 'Deploy workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['deploy'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['deploy'],
+            'schema': {'type': 'object'},
+            'examples': [],
+            'definition': {'steps': [{'step': 'ship', 'action': 'ship it'}]},
         }
         ok, err = self.validate(obj, 'PackDefinition')
         assert ok is False
@@ -324,20 +355,31 @@ class TestSchemaValidation:
     def test_pack_id_length_matches_schema_bound(self):
         valid_obj = {
             'pack_id': 'a' * 128,
-            'scope': 'workflow',
-            'intent': 'deploy',
-            'consumer': 'archibald',
-            'version': '1.0',
-            'workflow_steps': ['ship it'],
+            'pack_registry': {
+                'id': 'a' * 128,
+                'scope': 'workflow',
+                'intent': 'deploy',
+                'description': 'Deploy workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['deploy'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['deploy'],
+            'schema': {'type': 'object'},
+            'examples': [],
+            'definition': {'steps': [{'step': 'ship', 'action': 'ship it'}]},
         }
         ok, err = self.validate(valid_obj, 'PackDefinition')
         assert ok is True, err
 
-        too_long_obj = valid_obj.copy()
+        too_long_obj = json.loads(json.dumps(valid_obj))
         too_long_obj['pack_id'] = 'a' * 129
+        too_long_obj['pack_registry']['id'] = 'a' * 129
         ok, err = self.validate(too_long_obj, 'PackDefinition')
         assert ok is False
-        assert 'pack_id' in (err or '')
+        assert 'pack_id' in (err or '') or 'pack_registry.id' in (err or '')
 
     def test_episode_id_pattern_validation(self):
         obj = {

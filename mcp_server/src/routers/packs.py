@@ -9,8 +9,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from ._phase0 import (
+        error_response,
+        require_dict,
+        require_optional_dict,
+        require_optional_non_empty_string,
+        require_pack_id,
+    )
+except ImportError:  # pragma: no cover - script/top-level import fallback
+    from _phase0 import (  # type: ignore[no-redef]
+        error_response,
+        require_dict,
+        require_optional_dict,
+        require_optional_non_empty_string,
+        require_pack_id,
+    )
+
 from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
-from ..services.pack_registry import PackRegistryService
+from ..services.pack_registry import (
+    PackRegistryError,
+    PackRegistryOperationalError,
+    PackRegistryService,
+)
 
 
 def _to_iso_ts(value: Any) -> str:
@@ -177,24 +198,47 @@ def _infer_schema(definition: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-async def list_packs(filter: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _pack_service_error(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, PackRegistryOperationalError):
+        return error_response('operational_error', message=str(exc))
+    if isinstance(exc, PackRegistryError):
+        return error_response('validation_error', message=str(exc))
+    return error_response('operational_error', message=str(exc))
+
+
+async def list_packs(filter: dict[str, Any] | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     """List all registered packs filtered by scope/intent/consumer."""
+    filter_error = require_optional_dict('filter', filter)
+    if filter_error is not None:
+        return filter_error
+
     try:
         service = PackRegistryService()
         return [_pack_metadata(pack) for pack in service.list_packs(filter=filter)]
-    except Exception:
-        return []
+    except Exception as exc:
+        return _pack_service_error(exc)
 
 
 async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
     """Resolve context pack definition and materialized facts."""
+    pack_id_error = require_pack_id('pack_id', pack_id)
+    if pack_id_error is not None:
+        return pack_id_error
+
+    task_error = require_optional_non_empty_string('task', task)
+    if task_error is not None:
+        return task_error
+
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
         if not pack:
-            return {'error': f'pack not found: {pack_id!r}'}
+            return error_response('not_found', message=f'pack not found: {pack_id!r}')
         if pack.get('scope') != 'context':
-            return {'error': f'pack {pack_id!r} is not a context pack'}
+            return error_response(
+                'validation_error',
+                message=f'pack {pack_id!r} is not a context pack',
+            )
 
         facts = _materialize_pack_facts(pack=pack, task=task)
         return {
@@ -206,18 +250,29 @@ async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, A
             'fact_count': len(facts),
         }
     except Exception as exc:
-        return {'error': f'get_context_pack failed: {exc}'}
+        return _pack_service_error(exc)
 
 
 async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
     """Resolve workflow pack definition and materialized trigger facts."""
+    pack_id_error = require_pack_id('pack_id', pack_id)
+    if pack_id_error is not None:
+        return pack_id_error
+
+    task_error = require_optional_non_empty_string('task', task)
+    if task_error is not None:
+        return task_error
+
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
         if not pack:
-            return {'error': f'pack not found: {pack_id!r}'}
+            return error_response('not_found', message=f'pack not found: {pack_id!r}')
         if pack.get('scope') != 'workflow':
-            return {'error': f'pack {pack_id!r} is not a workflow pack'}
+            return error_response(
+                'validation_error',
+                message=f'pack {pack_id!r} is not a workflow pack',
+            )
 
         facts = _materialize_pack_facts(pack=pack, task=task)
         return {
@@ -230,16 +285,20 @@ async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, 
             'fact_count': len(facts),
         }
     except Exception as exc:
-        return {'error': f'get_workflow_pack failed: {exc}'}
+        return _pack_service_error(exc)
 
 
 async def describe_pack(pack_id: str) -> dict[str, Any]:
     """Return schema/definition metadata for a pack."""
+    pack_id_error = require_pack_id('pack_id', pack_id)
+    if pack_id_error is not None:
+        return pack_id_error
+
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
         if not pack:
-            return {'error': f'pack not found: {pack_id!r}'}
+            return error_response('not_found', message=f'pack not found: {pack_id!r}')
 
         definition = pack.get('definition')
         if not isinstance(definition, dict):
@@ -256,17 +315,21 @@ async def describe_pack(pack_id: str) -> dict[str, Any]:
             'definition': definition,
         }
     except Exception as exc:
-        return {'error': f'describe_pack failed: {exc}'}
+        return _pack_service_error(exc)
 
 
 async def create_workflow_pack(definition: dict[str, Any]) -> dict[str, Any]:
     """Create a new workflow pack definition and persist it."""
+    definition_error = require_dict('definition', definition)
+    if definition_error is not None:
+        return definition_error
+
     try:
         service = PackRegistryService()
         row = service.create_pack(definition)
         return _pack_metadata(row)
     except Exception as exc:
-        return {'error': f'create_workflow_pack failed: {exc}'}
+        return _pack_service_error(exc)
 
 
 def register_tools(mcp: Any) -> dict[str, Any]:

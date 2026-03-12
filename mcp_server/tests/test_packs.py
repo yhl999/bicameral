@@ -202,10 +202,12 @@ def test_create_workflow_pack_rejects_duplicate_ids_and_builtin_hijack(registry_
     assert original.get('id') == 'workflow-earnings-review'
 
     duplicate = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-earnings-review')))
-    assert 'already exists' in duplicate.get('error', '')
+    assert duplicate.get('error') == 'validation_error'
+    assert 'already exists' in duplicate.get('message', '')
 
     hijack_attempt = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='context-vc-deal-brief')))
-    assert 'already exists' in hijack_attempt.get('error', '')
+    assert hijack_attempt.get('error') == 'validation_error'
+    assert 'already exists' in hijack_attempt.get('message', '')
 
     service = PackRegistryService(registry_path)
     resolved = service.get_pack('workflow-earnings-review')
@@ -218,7 +220,8 @@ def test_create_workflow_pack_rejects_empty_predicates(registry_path: Path):
     definition['predicates'] = []
 
     result = asyncio.run(packs.create_workflow_pack(definition))
-    assert 'non-empty' in result.get('error', '')
+    assert result.get('error') == 'validation_error'
+    assert 'non-empty' in result.get('message', '')
 
 
 def test_create_workflow_pack_requires_private_registry_path(monkeypatch: pytest.MonkeyPatch):
@@ -226,7 +229,8 @@ def test_create_workflow_pack_requires_private_registry_path(monkeypatch: pytest
     monkeypatch.delenv('BICAMERAL_PACK_REGISTRY_PATH', raising=False)
 
     result = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-public-fallback')))
-    assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('error', '')
+    assert result.get('error') == 'validation_error'
+    assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('message', '')
 
 
 def test_create_workflow_pack_rejects_overly_nested_definitions(registry_path: Path):
@@ -239,7 +243,8 @@ def test_create_workflow_pack_rejects_overly_nested_definitions(registry_path: P
     }
 
     result = asyncio.run(packs.create_workflow_pack(definition))
-    assert 'max nesting depth' in result.get('error', '')
+    assert result.get('error') == 'validation_error'
+    assert 'max nesting depth' in result.get('message', '')
 
 
 def test_concurrent_creates_preserve_both_packs(registry_path: Path):
@@ -261,5 +266,27 @@ def test_concurrent_creates_preserve_both_packs(registry_path: Path):
     assert user_ids == set(pack_ids)
 
 
-def test_list_packs_invalid_filter_returns_empty_list(registry_path: Path):
-    assert asyncio.run(packs.list_packs({'scope': 'not-a-scope'})) == []
+def test_list_packs_invalid_filter_returns_validation_error(registry_path: Path):
+    result = asyncio.run(packs.list_packs({'scope': 'not-a-scope'}))
+    assert result.get('error') == 'validation_error'
+    assert 'scope' in result.get('message', '')
+
+
+def test_list_packs_registry_load_failure_surfaces_operational_error(registry_path: Path):
+    registry_path.write_text('{"packs": [', encoding='utf-8')
+
+    result = asyncio.run(packs.list_packs())
+    assert result.get('error') == 'operational_error'
+    assert 'failed to load registry file' in result.get('message', '')
+
+
+def test_create_workflow_pack_requires_steps(registry_path: Path):
+    definition = _workflow_definition(pack_id='workflow-missing-steps')
+    definition['definition'] = {
+        'trigger': 'quarter_end',
+        'instructions': 'Collect the latest financial facts before summarizing.',
+    }
+
+    result = asyncio.run(packs.create_workflow_pack(definition))
+    assert result.get('error') == 'validation_error'
+    assert 'definition.steps' in result.get('message', '')

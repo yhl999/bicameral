@@ -159,7 +159,9 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
         result = await fn()
-        assert isinstance(result, list)
+        assert result['candidates'] == []
+        assert 'status' not in result
+        assert 'message' in result
 
     @pytest.mark.anyio
     async def test_candidates_promote_stub(self):
@@ -200,6 +202,16 @@ class TestAllStubsReturnValidTypes:
         fn = mock_mcp._tools['list_packs']
         result = await fn()
         assert isinstance(result, list)
+
+    @pytest.mark.anyio
+    async def test_packs_list_packs_invalid_filter_returns_validation_error(self):
+        from mcp_server.src.routers.packs import register_tools
+
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['list_packs']
+        result = await fn(filter={'scope': 'not-a-scope'})
+        assert result['error'] == 'validation_error'
 
     @pytest.mark.anyio
     async def test_packs_get_context_pack_stub(self):
@@ -272,7 +284,30 @@ class TestAllStubsReturnValidTypes:
                 'definition': {'steps': [{'step': 'review', 'action': 'inspect risk facts'}]},
             }
         )
-        assert 'scope=workflow' in result.get('error', '')
+        assert result['error'] == 'validation_error'
+        assert 'scope=workflow' in result.get('message', '')
+
+    @pytest.mark.anyio
+    async def test_packs_create_workflow_pack_stub_requires_steps(self, tmp_path, monkeypatch):
+        from mcp_server.src.routers.packs import register_tools
+
+        monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(tmp_path / 'runtime_user_pack_registry.json'))
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['create_workflow_pack']
+        result = await fn(
+            definition={
+                'pack_id': 'workflow-missing-steps',
+                'scope': 'workflow',
+                'intent': 'verifier',
+                'consumer': 'planner',
+                'version': '1.0.0',
+                'predicates': ['risk'],
+                'definition': {'instructions': 'Review the risk facts.'},
+            }
+        )
+        assert result['error'] == 'validation_error'
+        assert 'definition.steps' in result.get('message', '')
 
     @pytest.mark.anyio
     async def test_episodes_procedures_search_episodes_stub(self):

@@ -166,7 +166,11 @@ DEFAULT_REGISTRY: dict[str, Any] = {
 
 
 class PackRegistryError(ValueError):
-    """Raised when a registry payload cannot be normalised."""
+    """Raised when caller-supplied pack inputs fail validation."""
+
+
+class PackRegistryOperationalError(PackRegistryError):
+    """Raised when registry files cannot be loaded or persisted safely."""
 
 
 def _now_iso() -> str:
@@ -317,10 +321,12 @@ def _normalise_definition(raw_definition: Any, *, scope: str) -> dict[str, Any]:
     if 'examples' in raw_definition and not isinstance(raw_definition['examples'], list):
         raise PackRegistryError('definition.examples must be a list when provided')
 
-    if scope == 'workflow' and 'steps' in raw_definition:
-        steps = raw_definition['steps']
+    if scope == 'workflow':
+        steps = raw_definition.get('steps')
         if not isinstance(steps, list) or not steps:
-            raise PackRegistryError('definition.steps must be a non-empty list when provided')
+            raise PackRegistryError(
+                'definition.steps is required and must be a non-empty list for workflow packs'
+            )
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
                 raise PackRegistryError(f'definition.steps[{index}] must be an object')
@@ -536,7 +542,7 @@ class PackRegistryService:
                 'packs': packs,
             }
         except (OSError, json.JSONDecodeError, PackRegistryError) as exc:
-            raise PackRegistryError(f'failed to load registry file {path}: {exc}') from exc
+            raise PackRegistryOperationalError(f'failed to load registry file {path}: {exc}') from exc
 
     def _merge_registries(self, base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
         merged_packs: list[dict[str, Any]] = []
@@ -560,12 +566,17 @@ class PackRegistryService:
         }
 
     def _load(self) -> dict[str, Any]:
-        if self._is_public_registry():
-            return self._load_file(self.public_path, include_builtin_packs=True)
+        try:
+            if self._is_public_registry():
+                return self._load_file(self.public_path, include_builtin_packs=True)
 
-        base = self._load_file(self.public_path, include_builtin_packs=True)
-        overlay = self._load_file(self.path, include_builtin_packs=False)
-        return self._merge_registries(base, overlay)
+            base = self._load_file(self.public_path, include_builtin_packs=True)
+            overlay = self._load_file(self.path, include_builtin_packs=False)
+            return self._merge_registries(base, overlay)
+        except PackRegistryOperationalError:
+            raise
+        except PackRegistryError as exc:
+            raise PackRegistryOperationalError(str(exc)) from exc
 
     def _ensure_loaded(self) -> dict[str, Any]:
         if self._registry is None:
@@ -627,7 +638,12 @@ class PackRegistryService:
 
             overlay.setdefault('packs', []).append(normalized)
             self._update_meta(overlay)
-            self._write_atomic(self.path, overlay)
+            try:
+                self._write_atomic(self.path, overlay)
+            except OSError as exc:
+                raise PackRegistryOperationalError(
+                    f'failed to write registry file {self.path}: {exc}'
+                ) from exc
 
         self.refresh()
         return dict(normalized)
