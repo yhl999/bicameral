@@ -36,9 +36,24 @@ class FactSearchResponse(TypedDict):
     facts: list[dict[str, Any]]
 
 
-class EpisodeSearchResponse(TypedDict):
+class EpisodeSearchResponse(TypedDict, total=False):
     message: str
     episodes: list[dict[str, Any]]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+    next_offset: int | None
+
+
+class ProcedureSearchResponse(TypedDict, total=False):
+    message: str
+    procedures: list[dict[str, Any]]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+    next_offset: int | None
 
 
 class StatusResponse(TypedDict):

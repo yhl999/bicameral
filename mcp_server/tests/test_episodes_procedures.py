@@ -256,8 +256,13 @@ def _episode(
     title: str,
     summary: str,
     created_at: str,
+    source_lane: str = 'default',
     started_at: str | None = None,
     ended_at: str | None = None,
+    policy_scope: str = 'private',
+    visibility_scope: str = 'private',
+    annotations: list[str] | None = None,
+    history_meta: dict[str, object] | None = None,
 ) -> Episode:
     return Episode.model_validate(
         {
@@ -266,8 +271,11 @@ def _episode(
             'object_type': 'episode',
             'title': title,
             'summary': summary,
-            'policy_scope': 'private',
-            'visibility_scope': 'private',
+            'source_lane': source_lane,
+            'policy_scope': policy_scope,
+            'visibility_scope': visibility_scope,
+            'annotations': annotations or [],
+            'history_meta': history_meta or {},
             'created_at': created_at,
             'started_at': started_at,
             'ended_at': ended_at,
@@ -284,6 +292,9 @@ def _procedure(
     trigger: str,
     steps: list[str],
     expected_outcome: str,
+    source_lane: str = 'default',
+    policy_scope: str = 'private',
+    visibility_scope: str = 'private',
     success_count: int = 0,
 ) -> Procedure:
     return Procedure.model_validate(
@@ -295,8 +306,9 @@ def _procedure(
             'trigger': trigger,
             'steps': steps,
             'expected_outcome': expected_outcome,
-            'policy_scope': 'private',
-            'visibility_scope': 'private',
+            'source_lane': source_lane,
+            'policy_scope': policy_scope,
+            'visibility_scope': visibility_scope,
             'success_count': success_count,
             'evidence_refs': [_evidence_ref(object_id)],
         }
@@ -306,19 +318,34 @@ def _procedure(
 @pytest.fixture
 def ledger(monkeypatch, tmp_path):
     temp_ledger = ChangeLedger(tmp_path / 'change_ledger.db')
+    test_config = types.SimpleNamespace(
+        graphiti=types.SimpleNamespace(group_id='default', lane_aliases=None),
+        database=types.SimpleNamespace(provider='neo4j'),
+    )
+    monkeypatch.setattr(server, 'config', test_config)
     monkeypatch.setattr(server, 'change_ledger', temp_ledger)
     monkeypatch.setattr(server, 'procedure_service', None)
     return temp_ledger
 
 
 @pytest.mark.anyio
-async def test_search_episodes_returns_empty_with_no_data(ledger):
-    assert await server.search_episodes('anything') == []
-    assert await server.search_procedures('anything') == []
+async def test_search_tools_return_wrapped_empty_results(ledger):
+    episodes = await server.search_episodes('anything')
+    procedures = await server.search_procedures('anything')
+
+    assert episodes['episodes'] == []
+    assert episodes['total'] == 0
+    assert episodes['limit'] == 10
+    assert episodes['offset'] == 0
+    assert episodes['has_more'] is False
+
+    assert procedures['procedures'] == []
+    assert procedures['total'] == 0
+    assert procedures['has_more'] is False
 
 
 @pytest.mark.anyio
-async def test_search_episodes_query_and_time_range_filters(ledger):
+async def test_search_episodes_scopes_filters_provisional_and_paginates(ledger):
     ledger.append_event(
         'assert',
         payload=_episode(
@@ -345,17 +372,95 @@ async def test_search_episodes_query_and_time_range_filters(ledger):
         root_id='root-2',
         recorded_at='2026-01-02T09:00:00Z',
     )
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-other-lane',
+            root_id='root-other-lane',
+            title='Wrong lane',
+            summary='Should not leak',
+            created_at='2026-01-03T09:00:00Z',
+            source_lane='other',
+            started_at='2026-01-03T09:00:00Z',
+        ),
+        root_id='root-other-lane',
+        recorded_at='2026-01-03T09:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-provisional',
+            root_id='root-provisional',
+            title='Observed preference',
+            summary='Should stay out of exec5 surface',
+            created_at='2026-01-04T09:00:00Z',
+            started_at='2026-01-04T09:00:00Z',
+            policy_scope='observational',
+            visibility_scope='owner',
+            annotations=['provisional', 'unpromoted'],
+            history_meta={'derivation_level': 'provisional', 'promotion_status': 'unpromoted'},
+        ),
+        root_id='root-provisional',
+        recorded_at='2026-01-04T09:00:00Z',
+    )
 
-    results = await server.search_episodes('self-audit')
-    assert len(results) == 1
-    assert results[0].title == 'Self-audit run'
+    page_one = await server.search_episodes('', limit=1)
+    assert [item['object_id'] for item in page_one['episodes']] == ['ep-2']
+    assert page_one['total'] == 2
+    assert page_one['has_more'] is True
+    assert page_one['next_offset'] == 1
 
-    results_after = await server.search_episodes('self-audit', time_range={'start': '2026-01-02T00:00:00Z'})
-    assert results_after == []
+    page_two = await server.search_episodes('', limit=1, offset=1)
+    assert [item['object_id'] for item in page_two['episodes']] == ['ep-1']
+    assert page_two['has_more'] is False
 
 
 @pytest.mark.anyio
-async def test_search_episodes_include_history_when_requested(ledger):
+async def test_search_episodes_time_range_uses_interval_overlap_for_open_ended_episodes(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-open',
+            root_id='root-open',
+            title='Long incident',
+            summary='Still ongoing',
+            created_at='2026-01-01T00:00:00Z',
+            started_at='2026-01-01T00:00:00Z',
+            ended_at=None,
+        ),
+        root_id='root-open',
+        recorded_at='2026-01-01T00:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-future',
+            root_id='root-future',
+            title='Future event',
+            summary='Starts after the queried end bound',
+            created_at='2026-01-03T00:00:00Z',
+            started_at='2026-01-03T00:00:00Z',
+            ended_at=None,
+        ),
+        root_id='root-future',
+        recorded_at='2026-01-03T00:00:00Z',
+    )
+
+    after_start = await server.search_episodes(
+        '',
+        time_range={'start': '2026-01-02T00:00:00Z'},
+    )
+    assert [item['object_id'] for item in after_start['episodes']] == ['ep-future', 'ep-open']
+
+    before_end = await server.search_episodes(
+        '',
+        time_range={'end': '2026-01-02T12:00:00Z'},
+    )
+    assert [item['object_id'] for item in before_end['episodes']] == ['ep-open']
+
+
+@pytest.mark.anyio
+async def test_search_episodes_include_history_and_validate_time_range(ledger):
     ledger.append_event(
         'assert',
         payload=_episode(
@@ -384,25 +489,66 @@ async def test_search_episodes_include_history_when_requested(ledger):
         recorded_at='2026-01-01T11:00:00Z',
     )
 
-    # Current-only excludes superseded history entries.
     current_only = await server.search_episodes('incident', include_history=False)
-    assert len(current_only) == 1
-    assert current_only[0].summary == 'second'
+    assert [item['object_id'] for item in current_only['episodes']] == ['ep-chain-2']
 
-    # include_history returns full lineage.
-    with_history = await server.search_episodes('', include_history=True)
-    assert len(with_history) == 2
+    with_history = await server.search_episodes('incident', include_history=True)
+    assert [item['object_id'] for item in with_history['episodes']] == ['ep-chain-2', 'ep-chain-1']
 
-
-@pytest.mark.anyio
-async def test_get_episode_returns_error_for_unknown_id(ledger):
-    result = await server.get_episode('nonexistent')
-    assert 'error' in result
-    assert result['error'].startswith('not_found')
+    invalid = await server.search_episodes(
+        'incident',
+        time_range={'start': '2026-01-02T00:00:00Z', 'end': '2026-01-01T00:00:00Z'},
+    )
+    assert invalid['error'] == 'validation_error'
 
 
 @pytest.mark.anyio
-async def test_search_procedures_filters_default_and_include_all(ledger):
+async def test_get_episode_supports_root_lookup_and_respects_scope(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-current',
+            root_id='root-current',
+            title='Scoped episode',
+            summary='visible',
+            created_at='2026-01-01T09:00:00Z',
+            started_at='2026-01-01T09:00:00Z',
+        ),
+        root_id='root-current',
+        recorded_at='2026-01-01T09:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_episode(
+            object_id='ep-other',
+            root_id='root-other',
+            title='Other lane',
+            summary='hidden',
+            created_at='2026-01-02T09:00:00Z',
+            source_lane='other',
+            started_at='2026-01-02T09:00:00Z',
+        ),
+        root_id='root-other',
+        recorded_at='2026-01-02T09:00:00Z',
+    )
+
+    result = await server.get_episode('root-current')
+    assert not isinstance(result, dict)
+    assert result.object_id == 'ep-current'
+
+    hidden = await server.get_episode('ep-other')
+    assert hidden['error'] == 'not_found'
+
+
+@pytest.mark.anyio
+async def test_search_requires_single_explicit_group_scope(ledger):
+    result = await server.search_episodes('', group_ids=[])
+    assert result['error'] == 'validation_error'
+    assert 'exactly one scoped group_id' in result['message']
+
+
+@pytest.mark.anyio
+async def test_search_procedures_filters_default_include_all_and_paginates(ledger):
     ledger.append_event(
         'assert',
         payload=_procedure(
@@ -417,7 +563,6 @@ async def test_search_procedures_filters_default_and_include_all(ledger):
         root_id='proc-proposed-root',
         recorded_at='2026-01-01T10:00:00Z',
     )
-
     ledger.append_event(
         'assert',
         payload=_procedure(
@@ -438,66 +583,90 @@ async def test_search_procedures_filters_default_and_include_all(ledger):
         root_id='proc-promoted-root',
         recorded_at='2026-01-01T10:05:00Z',
     )
+    ledger.append_event(
+        'assert',
+        payload=_procedure(
+            object_id='proc-other',
+            root_id='proc-other-root',
+            name='Wrong lane',
+            trigger='urgent',
+            steps=['nope'],
+            expected_outcome='hidden',
+            source_lane='other',
+            success_count=99,
+        ),
+        root_id='proc-other-root',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'promote',
+        object_id='proc-other',
+        root_id='proc-other-root',
+        recorded_at='2026-01-01T10:05:00Z',
+    )
 
     default = await server.search_procedures('urgent')
-    assert len(default) == 1
-    assert default[0].name == 'Urgent Escalation'
+    assert [item['object_id'] for item in default['procedures']] == ['proc-promoted']
+    assert default['total'] == 1
 
-    all_results = await server.search_procedures('', include_all=True)
-    assert len(all_results) == 2
+    all_results = await server.search_procedures('', include_all=True, limit=1)
+    assert [item['object_id'] for item in all_results['procedures']] == ['proc-proposed']
+    assert all_results['total'] == 2
+    assert all_results['has_more'] is True
 
-
-@pytest.mark.anyio
-async def test_search_procedures_sorts_by_success_count_desc(ledger):
-    first = _procedure(
-        object_id='p-low',
-        root_id='p-low-root',
-        name='A',
-        trigger='x',
-        steps=['a'],
-        expected_outcome='a',
-        success_count=1,
-    )
-    second = _procedure(
-        object_id='p-high',
-        root_id='p-high-root',
-        name='B',
-        trigger='x',
-        steps=['b'],
-        expected_outcome='b',
-        success_count=9,
-    )
-    ledger.append_event('assert', payload=first, root_id='p-low-root')
-    ledger.append_event('promote', object_id='p-low', root_id='p-low-root')
-    ledger.append_event('assert', payload=second, root_id='p-high-root')
-    ledger.append_event('promote', object_id='p-high', root_id='p-high-root')
-
-    ranked = await server.search_procedures('x', include_all=True)
-    assert ranked[0].object_id == 'p-high'
-    assert ranked[1].object_id == 'p-low'
+    second_page = await server.search_procedures('', include_all=True, limit=1, offset=1)
+    assert [item['object_id'] for item in second_page['procedures']] == ['proc-promoted']
 
 
 @pytest.mark.anyio
-async def test_get_procedure_returns_error_for_unknown_id(ledger):
-    result = await server.get_procedure('missing-procedure')
-    assert 'error' in result
-    assert result['error'].startswith('not_found')
-
-
-@pytest.mark.anyio
-async def test_get_procedure_returns_current_by_id(ledger):
-    proc = _procedure(
-        object_id='proc-hit',
+async def test_get_procedure_supports_trigger_lookup_and_hides_non_promoted(ledger):
+    ledger.append_event(
+        'assert',
+        payload=_procedure(
+            object_id='proc-hit',
+            root_id='proc-hit-root',
+            name='Recovery',
+            trigger='recover cluster',
+            steps=['stabilize'],
+            expected_outcome='ok',
+        ),
         root_id='proc-hit-root',
-        name='Recovery',
-        trigger='red',
-        steps=['stabilize'],
-        expected_outcome='ok',
     )
-    ledger.append_event('assert', payload=proc, root_id='proc-hit-root')
     ledger.append_event('promote', object_id='proc-hit', root_id='proc-hit-root')
+    ledger.append_event(
+        'assert',
+        payload=_procedure(
+            object_id='proc-proposed-hidden',
+            root_id='proc-proposed-hidden-root',
+            name='Draft plan',
+            trigger='recover cluster draft',
+            steps=['draft'],
+            expected_outcome='maybe',
+        ),
+        root_id='proc-proposed-hidden-root',
+    )
 
-    result = await server.get_procedure('proc-hit')
-    assert not isinstance(result, dict) or 'error' not in result
-    assert result.object_id == 'proc-hit'
+    by_trigger = await server.get_procedure('recover cluster')
+    assert not isinstance(by_trigger, dict)
+    assert by_trigger.object_id == 'proc-hit'
 
+    hidden = await server.get_procedure('proc-proposed-hidden')
+    assert hidden['error'] == 'not_found'
+
+
+@pytest.mark.anyio
+async def test_get_procedure_does_not_flatten_operational_failures(monkeypatch, ledger):
+    class _ExplodingEvolution:
+        def resolve_current(self, _identifier):
+            raise RuntimeError('sqlite locked')
+
+    class _FakeProcedureService:
+        evolution = _ExplodingEvolution()
+
+        def list_current_procedures(self, include_proposed=False):
+            return []
+
+    monkeypatch.setattr(server, '_procedure_service', lambda: _FakeProcedureService())
+
+    with pytest.raises(RuntimeError, match='sqlite locked'):
+        await server.get_procedure('proc-hit')

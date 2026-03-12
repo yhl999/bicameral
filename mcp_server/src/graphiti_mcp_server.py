@@ -35,9 +35,11 @@ try:
         FactSearchResponse,
         NodeResult,
         NodeSearchResponse,
+        ProcedureSearchResponse,
         StatusResponse,
         SuccessResponse,
     )
+    from .models.typed_memory import Episode, Procedure
     from .services.change_ledger import ChangeLedger
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from .services.om_group_scope import (
@@ -50,7 +52,6 @@ try:
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
-    from .models.typed_memory import Episode, Procedure
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 except ImportError:  # pragma: no cover - script/top-level import fallback
@@ -61,9 +62,11 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         FactSearchResponse,
         NodeResult,
         NodeSearchResponse,
+        ProcedureSearchResponse,
         StatusResponse,
         SuccessResponse,
     )
+    from models.typed_memory import Episode, Procedure
     from services.change_ledger import ChangeLedger
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
     from services.om_group_scope import (
@@ -76,7 +79,6 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
-    from models.typed_memory import Episode, Procedure
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
@@ -2149,6 +2151,27 @@ def _normalize_text(value: str | None) -> str:
     return str(value or '').strip().lower()
 
 
+_TYPED_RETRIEVAL_LIMIT_DEFAULT = 10
+_TYPED_RETRIEVAL_LIMIT_MAX = 50
+
+
+def _validation_error(message: str, *, field: str | None = None, details: dict[str, Any] | None = None) -> ErrorResponse:
+    payload: ErrorResponse = {'error': 'validation_error', 'message': message}
+    if field is not None or details is not None:
+        payload['details'] = {
+            **({'field': field} if field is not None else {}),
+            **(details or {}),
+        }
+    return payload
+
+
+def _not_found_error(kind: str, identifier: str) -> ErrorResponse:
+    return {
+        'error': 'not_found',
+        'message': f'No {kind} with id {identifier}',
+    }
+
+
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -2157,10 +2180,104 @@ def _parse_time(value: str | None) -> datetime | None:
     if not text:
         return None
 
+    return datetime.fromisoformat(text.replace('Z', '+00:00'))
+
+
+def _parse_time_range(
+    time_range: dict[str, Any] | None,
+) -> tuple[tuple[datetime | None, datetime | None] | None, ErrorResponse | None]:
+    if time_range is None:
+        return None, None
+    if not isinstance(time_range, dict):
+        return None, _validation_error('time_range must be an object/dict when provided', field='time_range')
+
+    unexpected_keys = sorted(set(time_range) - {'start', 'end'})
+    if unexpected_keys:
+        return None, _validation_error(
+            'time_range only supports start/end keys',
+            field='time_range',
+            details={'unexpected_keys': unexpected_keys},
+        )
+
+    parsed: dict[str, datetime | None] = {'start': None, 'end': None}
+    for key in ('start', 'end'):
+        if key not in time_range:
+            continue
+        raw_value = time_range[key]
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return None, _validation_error(
+                f'time_range.{key} must be a non-empty ISO-8601 string',
+                field=f'time_range.{key}',
+            )
+        try:
+            parsed[key] = _parse_time(raw_value)
+        except ValueError:
+            return None, _validation_error(
+                f'time_range.{key} must be a valid ISO-8601 timestamp',
+                field=f'time_range.{key}',
+            )
+
+    if parsed['start'] is not None and parsed['end'] is not None and parsed['start'] > parsed['end']:
+        return None, _validation_error(
+            'time_range.start must be before or equal to time_range.end',
+            field='time_range',
+        )
+
+    return (parsed['start'], parsed['end']), None
+
+
+def _coerce_limit(limit: int | None) -> tuple[int, ErrorResponse | None]:
+    if limit is None:
+        return _TYPED_RETRIEVAL_LIMIT_DEFAULT, None
     try:
-        return datetime.fromisoformat(text.replace('Z', '+00:00'))
-    except ValueError:
-        return None
+        normalized = int(limit)
+    except (TypeError, ValueError):
+        return 0, _validation_error('limit must be a positive integer', field='limit')
+    if normalized <= 0:
+        return 0, _validation_error('limit must be a positive integer', field='limit')
+    return min(normalized, _TYPED_RETRIEVAL_LIMIT_MAX), None
+
+
+def _coerce_offset(offset: int | None) -> tuple[int, ErrorResponse | None]:
+    if offset is None:
+        return 0, None
+    try:
+        normalized = int(offset)
+    except (TypeError, ValueError):
+        return 0, _validation_error('offset must be a non-negative integer', field='offset')
+    if normalized < 0:
+        return 0, _validation_error('offset must be a non-negative integer', field='offset')
+    return normalized, None
+
+
+def _resolve_typed_single_group_scope(
+    *,
+    group_ids: list[str] | None,
+    lane_alias: list[str] | None,
+) -> tuple[str | None, ErrorResponse | None]:
+    try:
+        effective_group_ids, invalid_aliases = _resolve_effective_group_ids(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
+        )
+    except ValueError as exc:
+        return None, _validation_error(str(exc), field='group_ids')
+
+    if invalid_aliases:
+        return None, _validation_error(
+            f'Unknown lane_alias: {invalid_aliases[0]}',
+            field='lane_alias',
+            details={'invalid_aliases': invalid_aliases},
+        )
+
+    if len(effective_group_ids) != 1:
+        return None, _validation_error(
+            'Episode/procedure retrieval requires exactly one scoped group_id or lane_alias',
+            field='group_ids',
+            details={'effective_group_ids': effective_group_ids},
+        )
+
+    return effective_group_ids[0], None
 
 
 def _match_text(subject: str | None, query: str) -> bool:
@@ -2170,50 +2287,145 @@ def _match_text(subject: str | None, query: str) -> bool:
     return query in normalized
 
 
-def _episode_within_time_range(
+def _has_private_typed_visibility(obj: Episode | Procedure) -> bool:
+    return (
+        _normalize_text(getattr(obj, 'policy_scope', None)) == 'private'
+        and _normalize_text(getattr(obj, 'visibility_scope', None)) == 'private'
+    )
+
+
+def _is_provisional_episode(obj: Episode) -> bool:
+    annotations = {_normalize_text(item) for item in (obj.annotations or [])}
+    derivation_level = _normalize_text(str((obj.history_meta or {}).get('derivation_level') or ''))
+    promotion_status = _normalize_text(str((obj.history_meta or {}).get('promotion_status') or ''))
+    return bool(
+        {'provisional', 'unpromoted'} & annotations
+        or derivation_level == 'provisional'
+        or promotion_status in {'proposed', 'unpromoted'}
+    )
+
+
+def _episode_visible_in_scope(episode: Episode, *, group_id: str) -> bool:
+    return (
+        str(episode.source_lane or '').strip() == group_id
+        and _has_private_typed_visibility(episode)
+        and not _is_provisional_episode(episode)
+    )
+
+
+def _procedure_visible_in_scope(
+    procedure: Procedure,
+    *,
+    group_id: str,
+    include_all: bool,
+) -> bool:
+    if str(procedure.source_lane or '').strip() != group_id:
+        return False
+    if not _has_private_typed_visibility(procedure):
+        return False
+    return include_all or procedure.promotion_status == 'promoted'
+
+
+def _episode_overlaps_time_range(
     episode: Episode,
     *,
-    time_range: dict[str, str] | None,
+    bounds: tuple[datetime | None, datetime | None] | None,
 ) -> bool:
-    if not time_range:
+    if bounds is None:
         return True
 
-    start_text = str(time_range.get('start') or '').strip()
-    end_text = str(time_range.get('end') or '').strip()
+    window_start, window_end = bounds
+    episode_start = _parse_time(episode.started_at) or _parse_time(episode.created_at)
+    if episode_start is None:
+        return False
 
-    start_at = _parse_time(start_text)
-    end_at = _parse_time(end_text)
+    episode_end = _parse_time(episode.ended_at)
 
-    if start_at is not None:
-        episode_started = _parse_time(episode.started_at) or _parse_time(episode.created_at)
-        if episode_started is None:
-            return False
-        if episode_started < start_at:
-            return False
+    return not (
+        (window_start is not None and episode_end is not None and episode_end < window_start)
+        or (window_end is not None and episode_start > window_end)
+    )
 
-    if end_at is not None:
-        if episode.ended_at is None:
-            return True
 
-        episode_ended = _parse_time(episode.ended_at) or _parse_time(episode.created_at)
-        if episode_ended is not None and episode_ended > end_at:
-            return False
+def _paginate_items(items: list[Any], *, offset: int, limit: int) -> tuple[list[Any], dict[str, Any]]:
+    total = len(items)
+    page = items[offset:offset + limit]
+    has_more = offset + len(page) < total
+    return page, {
+        'limit': limit,
+        'offset': offset,
+        'total': total,
+        'has_more': has_more,
+        'next_offset': offset + len(page) if has_more else None,
+    }
 
-    return True
+
+def _episode_search_response(
+    episodes: list[Episode],
+    *,
+    limit: int,
+    offset: int,
+) -> EpisodeSearchResponse:
+    page, page_meta = _paginate_items(episodes, offset=offset, limit=limit)
+    response: EpisodeSearchResponse = {
+        'message': 'Episodes retrieved successfully',
+        'episodes': [episode.model_dump(mode='json') for episode in page],
+        **page_meta,
+    }
+    return response
+
+
+def _procedure_search_response(
+    procedures: list[Procedure],
+    *,
+    limit: int,
+    offset: int,
+) -> ProcedureSearchResponse:
+    page, page_meta = _paginate_items(procedures, offset=offset, limit=limit)
+    response: ProcedureSearchResponse = {
+        'message': 'Procedures retrieved successfully',
+        'procedures': [procedure.model_dump(mode='json') for procedure in page],
+        **page_meta,
+    }
+    return response
 
 
 @mcp.tool()
 async def search_episodes(
     query: str,
-    time_range: dict[str, str] | None = None,
+    time_range: dict[str, Any] | None = None,
     include_history: bool = False,
-) -> list[Episode]:
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+) -> EpisodeSearchResponse | ErrorResponse:
     # Return episode snapshots from typed ChangeLedger state.
+    # TODO(typed-retrieval-v2): replace with embedding/typed search once index exists.
+    if not isinstance(query, str):
+        return _validation_error('query must be a string', field='query')
+
+    group_id, scope_error = _resolve_typed_single_group_scope(group_ids=group_ids, lane_alias=lane_alias)
+    if scope_error is not None:
+        return scope_error
+    assert group_id is not None
+
+    limit_value, limit_error = _coerce_limit(limit)
+    if limit_error is not None:
+        return limit_error
+    offset_value, offset_error = _coerce_offset(offset)
+    if offset_error is not None:
+        return offset_error
+
+    time_bounds, time_error = _parse_time_range(time_range)
+    if time_error is not None:
+        return time_error
+
     q = _normalize_text(query)
     ledger = _change_ledger()
-
     rows = ledger.conn.execute(
-        "SELECT DISTINCT root_id FROM typed_roots WHERE object_type = 'episode' ORDER BY root_id"
+        "SELECT DISTINCT root_id FROM typed_roots WHERE object_type = 'episode' AND source_lane = ? ORDER BY latest_recorded_at DESC, root_id",
+        (group_id,),
     ).fetchall()
 
     matches: list[Episode] = []
@@ -2231,30 +2443,44 @@ async def search_episodes(
                 objects.append(current)
 
         for episode in objects:
-            if not _episode_within_time_range(episode, time_range=time_range):
+            if not _episode_visible_in_scope(episode, group_id=group_id):
                 continue
-
-            if not q:
-                matches.append(episode)
+            if not _episode_overlaps_time_range(episode, bounds=time_bounds):
                 continue
+            if q and not (_match_text(episode.title, q) or _match_text(episode.summary, q)):
+                continue
+            matches.append(episode)
 
-            if _match_text(episode.title, q) or _match_text(episode.summary, q):
-                matches.append(episode)
-
-    # TODO(typed-retrieval-v2): replace with embedding/typed search once index exists.
-    matches.sort(key=lambda item: item.created_at, reverse=True)
-    return matches[:50]
+    matches.sort(key=lambda item: (item.created_at, item.object_id), reverse=True)
+    return _episode_search_response(matches, limit=limit_value, offset=offset_value)
 
 
 @mcp.tool()
-async def get_episode(episode_id: str) -> Episode | ErrorResponse:
-    # Return a typed episode by object id or root id.
-    if not str(episode_id or '').strip():
-        return ErrorResponse(error='not_found: episode_id is required')
+async def get_episode(
+    episode_id: str,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> Episode | ErrorResponse:
+    # Return a typed episode by object id or current root id.
+    if not isinstance(episode_id, str) or not episode_id.strip():
+        return _validation_error('episode_id must be a non-empty string', field='episode_id')
 
-    episode = _change_ledger().materialize_object(str(episode_id).strip())
+    group_id, scope_error = _resolve_typed_single_group_scope(group_ids=group_ids, lane_alias=lane_alias)
+    if scope_error is not None:
+        return scope_error
+    assert group_id is not None
+
+    normalized = episode_id.strip()
+    ledger = _change_ledger()
+
+    episode = ledger.materialize_object(normalized)
     if not isinstance(episode, Episode):
-        return ErrorResponse(error=f'not_found: No episode with id {episode_id}')
+        current = ledger.current_object(normalized)
+        if isinstance(current, Episode):
+            episode = current
+
+    if not isinstance(episode, Episode) or not _episode_visible_in_scope(episode, group_id=group_id):
+        return _not_found_error('episode', normalized)
 
     return episode
 
@@ -2263,36 +2489,83 @@ async def get_episode(episode_id: str) -> Episode | ErrorResponse:
 async def search_procedures(
     query: str,
     include_all: bool = False,
-) -> list[Procedure]:
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+) -> ProcedureSearchResponse | ErrorResponse:
     # Return procedures from ProcedureService with simple case-insensitive filter.
     # TODO(typed-retrieval-v2): replace with vector/semantic search once indexing is in place.
+    if not isinstance(query, str):
+        return _validation_error('query must be a string', field='query')
+
+    group_id, scope_error = _resolve_typed_single_group_scope(group_ids=group_ids, lane_alias=lane_alias)
+    if scope_error is not None:
+        return scope_error
+    assert group_id is not None
+
+    limit_value, limit_error = _coerce_limit(limit)
+    if limit_error is not None:
+        return limit_error
+    offset_value, offset_error = _coerce_offset(offset)
+    if offset_error is not None:
+        return offset_error
+
     q = _normalize_text(query)
     procedures = _procedure_service().list_current_procedures(include_proposed=include_all)
     matches = [
         procedure
         for procedure in procedures
-        if not q or _match_text(procedure.name, q) or _match_text(procedure.trigger, q)
+        if _procedure_visible_in_scope(procedure, group_id=group_id, include_all=include_all)
+        and (not q or _match_text(procedure.name, q) or _match_text(procedure.trigger, q))
     ]
 
-    return sorted(matches, key=lambda item: item.success_count, reverse=True)
+    matches.sort(key=lambda item: (item.success_count, item.created_at, item.object_id), reverse=True)
+    return _procedure_search_response(matches, limit=limit_value, offset=offset_value)
 
 
 @mcp.tool()
-async def get_procedure(procedure_id: str) -> Procedure | ErrorResponse:
-    # Return current procedure by identifier from ProcedureService evolution.
-    normalized = str(procedure_id or '').strip()
-    if not normalized:
-        return ErrorResponse(error='not_found: procedure_id is required')
+async def get_procedure(
+    trigger_or_id: str,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> Procedure | ErrorResponse:
+    # Return the current promoted procedure by identifier or exact trigger/name match.
+    if not isinstance(trigger_or_id, str) or not trigger_or_id.strip():
+        return _validation_error('trigger_or_id must be a non-empty string', field='trigger_or_id')
+
+    group_id, scope_error = _resolve_typed_single_group_scope(group_ids=group_ids, lane_alias=lane_alias)
+    if scope_error is not None:
+        return scope_error
+    assert group_id is not None
+
+    normalized = trigger_or_id.strip()
+    normalized_query = _normalize_text(normalized)
+    service = _procedure_service()
 
     try:
-        procedure = _procedure_service().evolution.resolve_current(normalized)
-    except Exception as exc:  # pragma: no cover - delegated error path
-        return ErrorResponse(error=f'not_found: No procedure with id {procedure_id}')
+        procedure = service.evolution.resolve_current(normalized)
+    except ValueError:
+        procedure = None
 
-    if not isinstance(procedure, Procedure):
-        return ErrorResponse(error=f'not_found: No procedure with id {procedure_id}')
+    if isinstance(procedure, Procedure) and _procedure_visible_in_scope(procedure, group_id=group_id, include_all=False):
+        return procedure
 
-    return procedure
+    candidates = [
+        item
+        for item in service.list_current_procedures(include_proposed=False)
+        if _procedure_visible_in_scope(item, group_id=group_id, include_all=False)
+    ]
+    exact_matches = [
+        item
+        for item in candidates
+        if normalized_query in {_normalize_text(item.trigger), _normalize_text(item.name)}
+    ]
+    exact_matches.sort(key=lambda item: (item.success_count, item.created_at, item.object_id), reverse=True)
+    if exact_matches:
+        return exact_matches[0]
+
+    return _not_found_error('procedure', normalized)
 
 
 @mcp.tool()
