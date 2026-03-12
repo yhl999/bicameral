@@ -197,6 +197,22 @@ def test_create_workflow_pack_is_persistent_in_private_registry(registry_path: P
     assert persisted_ids == {'workflow-earnings-review'}
 
 
+def test_dotted_pack_ids_round_trip_across_create_describe_and_get(registry_path: Path):
+    pack_id = 'workflow.earnings.review'
+
+    created = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id=pack_id)))
+    assert created.get('id') == pack_id
+
+    described = asyncio.run(packs.describe_pack(pack_id))
+    assert described.get('pack_id') == pack_id
+    assert described.get('pack_registry', {}).get('id') == pack_id
+
+    materialized = asyncio.run(packs.get_workflow_pack(pack_id))
+    assert materialized.get('pack_id') == pack_id
+    assert materialized.get('pack_metadata', {}).get('id') == pack_id
+    assert materialized.get('error') is None
+
+
 def test_create_workflow_pack_rejects_duplicate_ids_and_builtin_hijack(registry_path: Path):
     original = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-earnings-review')))
     assert original.get('id') == 'workflow-earnings-review'
@@ -231,6 +247,15 @@ def test_create_workflow_pack_requires_private_registry_path(monkeypatch: pytest
     result = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-public-fallback')))
     assert result.get('error') == 'validation_error'
     assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('message', '')
+
+
+def test_create_workflow_pack_rejects_invalid_scope_literal_type(registry_path: Path):
+    definition = _workflow_definition(pack_id='workflow-invalid-scope')
+    definition['scope'] = 'type'
+
+    result = asyncio.run(packs.create_workflow_pack(definition))
+    assert result.get('error') == 'validation_error'
+    assert "invalid scope 'type'" in result.get('message', '')
 
 
 def test_create_workflow_pack_rejects_overly_nested_definitions(registry_path: Path):

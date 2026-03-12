@@ -236,8 +236,6 @@ def _normalize_version(value: Any) -> str:
 
 def _normalize_scope(value: Any) -> str:
     scope = str(value or '').strip().lower()
-    if scope == 'type':
-        scope = 'workflow'
     if scope not in DEFAULT_PACK_SCOPES:
         raise PackRegistryError(f'invalid scope {scope!r}; expected context|workflow')
     return scope
