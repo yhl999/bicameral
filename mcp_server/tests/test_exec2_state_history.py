@@ -51,6 +51,7 @@ def _state_fact(
     predicate: str,
     value: str,
     created_at: str,
+    scope: str = 'private',
     source_lane: str = 's1_sessions_main',
     policy_scope: str = 'private',
     visibility_scope: str = 'private',
@@ -64,7 +65,7 @@ def _state_fact(
             'subject': subject,
             'predicate': predicate,
             'value': value,
-            'scope': 'private',
+            'scope': scope,
             'source_lane': source_lane,
             'policy_scope': policy_scope,
             'visibility_scope': visibility_scope,
@@ -149,6 +150,7 @@ async def test_get_current_state_returns_scoped_fact_envelope(ledger: ChangeLedg
     assert result['metadata'] == {
         'subject': 'UI',
         'predicate': None,
+        'scope': None,
         'group_ids': ['s1_sessions_main'],
         'lane_alias': ['sessions_main'],
         'limit': 100,
@@ -170,12 +172,68 @@ async def test_get_current_state_empty_match_returns_empty_envelope(ledger: Chan
         'metadata': {
             'subject': 'missing',
             'predicate': None,
+            'scope': None,
             'group_ids': ['s1_sessions_main'],
             'lane_alias': None,
             'limit': 100,
             'result_count': 0,
             'truncated': False,
         },
+    }
+
+
+@pytest.mark.anyio
+async def test_get_current_state_can_filter_same_subject_predicate_by_scope(ledger: ChangeLedger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='theme-private',
+            root_id='r-theme-private',
+            subject='UI',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T10:00:00Z',
+            scope='private',
+        ),
+        root_id='r-theme-private',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='theme-team',
+            root_id='r-theme-team',
+            subject='UI',
+            predicate='theme',
+            value='light',
+            created_at='2026-01-01T10:05:00Z',
+            scope='team',
+        ),
+        root_id='r-theme-team',
+        recorded_at='2026-01-01T10:05:00Z',
+    )
+
+    unfiltered = await server.get_current_state('UI', predicate='theme', group_ids=['s1_sessions_main'])
+    assert 'error' not in unfiltered
+    assert [fact['scope'] for fact in unfiltered['facts']] == ['team', 'private']
+
+    filtered = await server.get_current_state(
+        'UI',
+        predicate='theme',
+        scope='private',
+        group_ids=['s1_sessions_main'],
+    )
+    assert 'error' not in filtered
+    assert [fact['value'] for fact in filtered['facts']] == ['dark']
+    assert filtered['metadata'] == {
+        'subject': 'UI',
+        'predicate': 'theme',
+        'scope': 'private',
+        'group_ids': ['s1_sessions_main'],
+        'lane_alias': None,
+        'limit': 100,
+        'result_count': 1,
+        'truncated': False,
     }
 
 
@@ -260,12 +318,112 @@ async def test_get_history_returns_scoped_history_envelope_with_recent_limit(led
     assert result['metadata'] == {
         'subject': 'Workspace',
         'predicate': 'theme',
+        'scope': None,
         'group_ids': ['s1_sessions_main'],
         'lane_alias': None,
         'limit': 2,
         'result_count': 2,
         'truncated': True,
     }
+
+
+@pytest.mark.anyio
+async def test_get_history_can_filter_same_subject_predicate_by_scope(ledger: ChangeLedger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='theme-private-1',
+            root_id='r-theme-private',
+            subject='Workspace',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T10:00:00Z',
+            scope='private',
+        ),
+        root_id='r-theme-private',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='theme-team-1',
+            root_id='r-theme-team',
+            subject='Workspace',
+            predicate='theme',
+            value='light',
+            created_at='2026-01-01T10:05:00Z',
+            scope='team',
+        ),
+        root_id='r-theme-team',
+        recorded_at='2026-01-01T10:05:00Z',
+    )
+
+    unfiltered = await server.get_history('Workspace', predicate='theme', group_ids=['s1_sessions_main'])
+    assert 'error' not in unfiltered
+    assert [event['scope'] for event in unfiltered['history']] == ['private', 'team']
+
+    filtered = await server.get_history(
+        'Workspace',
+        predicate='theme',
+        scope='team',
+        group_ids=['s1_sessions_main'],
+    )
+    assert 'error' not in filtered
+    assert [event['value'] for event in filtered['history']] == ['light']
+    assert filtered['metadata'] == {
+        'subject': 'Workspace',
+        'predicate': 'theme',
+        'scope': 'team',
+        'group_ids': ['s1_sessions_main'],
+        'lane_alias': None,
+        'limit': 200,
+        'result_count': 1,
+        'truncated': False,
+    }
+
+
+@pytest.mark.anyio
+async def test_get_history_preserves_invalidated_status_on_wire(ledger: ChangeLedger):
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='theme-1',
+            root_id='r-theme',
+            subject='Workspace',
+            predicate='theme',
+            value='dark',
+            created_at='2026-01-01T10:00:00Z',
+        ),
+        root_id='r-theme',
+        recorded_at='2026-01-01T10:00:00Z',
+    )
+    ledger.append_event(
+        'invalidate',
+        object_id='theme-1',
+        target_object_id='theme-1',
+        root_id='r-theme',
+        recorded_at='2026-01-01T12:00:00Z',
+    )
+
+    result = await server.get_history('Workspace', predicate='theme', group_ids=['s1_sessions_main'])
+
+    assert 'error' not in result
+    assert result['history'] == [
+        {
+            'uuid': 'theme-1',
+            'type': 'preference',
+            'subject': 'Workspace',
+            'predicate': 'theme',
+            'scope': 'private',
+            'value': 'dark',
+            'timestamp': '2026-01-01T10:00:00Z',
+            'source': 'owner_asserted',
+            'source_lane': 's1_sessions_main',
+            'status': 'invalidated',
+            'supersedes': None,
+            'superseded_by': None,
+        }
+    ]
 
 
 @pytest.mark.anyio

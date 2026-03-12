@@ -44,6 +44,7 @@ class EpisodeSearchResponse(TypedDict):
 class TypedMemoryQueryMetadata(TypedDict):
     subject: str
     predicate: str | None
+    scope: str | None
     group_ids: list[str]
     lane_alias: list[str] | None
     limit: int

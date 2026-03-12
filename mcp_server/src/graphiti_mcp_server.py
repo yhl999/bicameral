@@ -2145,6 +2145,7 @@ class ChangeEvent(BaseModel):
     type: str
     subject: str
     predicate: str
+    scope: str
     value: Any
     timestamp: str
     source: str
@@ -2163,6 +2164,10 @@ def _change_ledger() -> ChangeLedger:
 
 
 def _normalize_subject_or_predicate(value: str | None) -> str:
+    return str(value or '').strip()
+
+
+def _normalize_state_scope(value: str | None) -> str:
     return str(value or '').strip()
 
 
@@ -2244,6 +2249,7 @@ def _state_current_root_ids(
     *,
     subject: str,
     predicate: str | None,
+    scope: str | None,
     effective_group_ids: list[str],
 ) -> list[str]:
     clauses = [
@@ -2258,6 +2264,10 @@ def _state_current_root_ids(
     if predicate is not None:
         clauses.append("json_extract(current_payload_json, '$.predicate') = ?")
         params.append(predicate)
+
+    if scope is not None:
+        clauses.append("json_extract(current_payload_json, '$.scope') = ?")
+        params.append(scope)
 
     placeholders = ', '.join('?' for _ in effective_group_ids)
     clauses.append(f'source_lane IN ({placeholders})')
@@ -2289,6 +2299,7 @@ def _current_state_candidates(
     *,
     subject: str,
     predicate: str | None,
+    scope: str | None,
     effective_group_ids: list[str],
 ) -> list[StateFact]:
     ledger = _change_ledger()
@@ -2296,6 +2307,7 @@ def _current_state_candidates(
         ledger,
         subject=subject,
         predicate=predicate,
+        scope=scope,
         effective_group_ids=effective_group_ids,
     )
 
@@ -2320,6 +2332,8 @@ def _current_state_candidates(
             continue
         if predicate is not None and current.predicate != predicate:
             continue
+        if scope is not None and current.scope != scope:
+            continue
         if not _state_fact_is_visible(current, effective_group_ids=effective_group_ids):
             continue
         matches.append(current)
@@ -2341,6 +2355,7 @@ def _state_history_root_ids(
     *,
     subject: str,
     predicate: str | None,
+    scope: str | None,
     effective_group_ids: list[str],
 ) -> list[str]:
     clauses = [
@@ -2356,6 +2371,10 @@ def _state_history_root_ids(
     if predicate is not None:
         clauses.append("json_extract(payload_json, '$.predicate') = ?")
         params.append(predicate)
+
+    if scope is not None:
+        clauses.append("json_extract(payload_json, '$.scope') = ?")
+        params.append(scope)
 
     placeholders = ', '.join('?' for _ in effective_group_ids)
     clauses.append(f"json_extract(payload_json, '$.source_lane') IN ({placeholders})")
@@ -2388,6 +2407,7 @@ def _change_history_events_for_subject(
     *,
     subject: str,
     predicate: str | None,
+    scope: str | None,
     effective_group_ids: list[str],
 ) -> list[StateFact]:
     ledger = _change_ledger()
@@ -2395,6 +2415,7 @@ def _change_history_events_for_subject(
         ledger,
         subject=subject,
         predicate=predicate,
+        scope=scope,
         effective_group_ids=effective_group_ids,
     )
 
@@ -2419,6 +2440,8 @@ def _change_history_events_for_subject(
                 continue
             if predicate is not None and fact.predicate != predicate:
                 continue
+            if scope is not None and fact.scope != scope:
+                continue
             if not _state_fact_is_visible(fact, effective_group_ids=effective_group_ids):
                 continue
             matching.append(fact)
@@ -2435,6 +2458,7 @@ def _build_typed_query_metadata(
     *,
     subject: str,
     predicate: str | None,
+    scope: str | None,
     effective_group_ids: list[str],
     lane_alias: list[str] | None,
     limit: int,
@@ -2444,6 +2468,7 @@ def _build_typed_query_metadata(
     return TypedMemoryQueryMetadata(
         subject=subject,
         predicate=predicate,
+        scope=scope,
         group_ids=list(effective_group_ids),
         lane_alias=list(lane_alias) if lane_alias is not None else None,
         limit=limit,
@@ -2504,11 +2529,12 @@ def _infer_event_sources(
 async def get_current_state(
     subject: str,
     predicate: str | None = None,
+    scope: str | None = None,
     group_ids: list[str] | None = None,
     lane_alias: list[str] | None = None,
     limit: int = _MAX_STATE_FACTS_CAP,
 ) -> CurrentStateResponse | ErrorResponse:
-    # Return scoped current state facts for a subject and optional predicate.
+    # Return scoped current state facts for a subject and optional predicate/scope.
     normalized_subject = _normalize_subject_or_predicate(subject)
     if not normalized_subject:
         return ErrorResponse(error='invalid_input', message='subject must be a non-empty string')
@@ -2518,6 +2544,12 @@ async def get_current_state(
         normalized_predicate = _normalize_subject_or_predicate(predicate)
         if not normalized_predicate:
             return ErrorResponse(error='invalid_input', message='predicate must be a non-empty string')
+
+    normalized_scope: str | None = None
+    if scope is not None:
+        normalized_scope = _normalize_state_scope(scope)
+        if not normalized_scope:
+            return ErrorResponse(error='invalid_input', message='scope must be a non-empty string')
 
     if limit <= 0:
         return ErrorResponse(error='invalid_input', message='limit must be a positive integer')
@@ -2534,6 +2566,7 @@ async def get_current_state(
         matches = _current_state_candidates(
             subject=normalized_subject,
             predicate=normalized_predicate,
+            scope=normalized_scope,
             effective_group_ids=effective_group_ids,
         )
     except Exception as exc:
@@ -2545,6 +2578,7 @@ async def get_current_state(
     metadata = _build_typed_query_metadata(
         subject=normalized_subject,
         predicate=normalized_predicate,
+        scope=normalized_scope,
         effective_group_ids=effective_group_ids,
         lane_alias=lane_alias,
         limit=limit,
@@ -2566,6 +2600,7 @@ async def get_current_state(
 async def get_history(
     subject: str,
     predicate: str | None = None,
+    scope: str | None = None,
     group_ids: list[str] | None = None,
     lane_alias: list[str] | None = None,
     limit: int = _MAX_HISTORY_EVENTS_CAP,
@@ -2580,6 +2615,12 @@ async def get_history(
         normalized_predicate = _normalize_subject_or_predicate(predicate)
         if not normalized_predicate:
             return ErrorResponse(error='invalid_input', message='predicate must be a non-empty string')
+
+    normalized_scope: str | None = None
+    if scope is not None:
+        normalized_scope = _normalize_state_scope(scope)
+        if not normalized_scope:
+            return ErrorResponse(error='invalid_input', message='scope must be a non-empty string')
 
     if limit <= 0:
         return ErrorResponse(error='invalid_input', message='limit must be a positive integer')
@@ -2596,6 +2637,7 @@ async def get_history(
         facts = _change_history_events_for_subject(
             subject=normalized_subject,
             predicate=normalized_predicate,
+            scope=normalized_scope,
             effective_group_ids=effective_group_ids,
         )
 
@@ -2615,11 +2657,12 @@ async def get_history(
             type=str(f.fact_type),
             subject=f.subject,
             predicate=f.predicate,
+            scope=f.scope,
             value=f.value,
             timestamp=f.created_at,
             source=source_map.get(f.object_id, 'owner_asserted'),
             source_lane=f.source_lane,
-            status='active' if f.is_current else 'superseded',
+            status='active' if f.is_current else str(f.lifecycle_status),
             supersedes=f.parent_id,
             superseded_by=f.superseded_by,
         ).model_dump(mode='json')
@@ -2628,6 +2671,7 @@ async def get_history(
     metadata = _build_typed_query_metadata(
         subject=normalized_subject,
         predicate=normalized_predicate,
+        scope=normalized_scope,
         effective_group_ids=effective_group_ids,
         lane_alias=lane_alias,
         limit=limit,
