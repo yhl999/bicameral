@@ -330,6 +330,36 @@ def test_create_workflow_pack_requires_private_registry_path(monkeypatch: pytest
     assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('message', '')
 
 
+@pytest.mark.parametrize(
+    ('field', 'value', 'message_fragment'),
+    [
+        ('pack_id', 'Bad Pack Id', 'invalid pack_id'),
+        ('id', 'Bad Pack Id', 'invalid id'),
+        ('pack_id', 123, 'pack_id must be a string'),
+        ('id', 123, 'id must be a string'),
+    ],
+)
+def test_create_workflow_pack_rejects_malformed_ids_instead_of_normalizing(
+    registry_path: Path,
+    field: str,
+    value: object,
+    message_fragment: str,
+):
+    definition = _workflow_definition(pack_id='workflow-valid-create-id-check')
+    definition[field] = value
+
+    result = asyncio.run(packs.create_workflow_pack(definition))
+    assert result.get('error') == 'validation_error'
+    assert message_fragment in result.get('message', '')
+
+    normalized_alias = 'bad-pack-id'
+    assert asyncio.run(packs.describe_pack(normalized_alias)).get('error') == 'not_found'
+
+    if registry_path.exists():
+        persisted = json.loads(registry_path.read_text(encoding='utf-8'))
+        assert persisted['packs'] == []
+
+
 def test_create_workflow_pack_rejects_invalid_scope_literal_type(registry_path: Path):
     definition = _workflow_definition(pack_id='workflow-invalid-scope')
     definition['scope'] = 'type'

@@ -27,6 +27,7 @@ MAX_DEFINITION_ITEMS = 256
 MAX_DEFINITION_STRING_LENGTH = 8_192
 MAX_DEFINITION_JSON_BYTES = 128 * 1024
 
+_PACK_ID_RE = re.compile(r'^[a-z0-9][a-z0-9._-]{0,127}$')
 
 DEFAULT_REGISTRY: dict[str, Any] = {
     'schema_version': PACK_REGISTRY_SCHEMA_VERSION,
@@ -217,14 +218,17 @@ def _as_list(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _normalize_pack_id(value: Any) -> str:
-    pack_id = (str(value or '').strip().lower()).replace(' ', '-')
-    if not pack_id:
-        raise PackRegistryError('pack id is required')
+def _normalize_pack_id(value: Any, *, field_name: str = 'pack id') -> str:
+    if not isinstance(value, str):
+        raise PackRegistryError(f'{field_name} must be a string')
+
+    pack_id = value
+    if not pack_id.strip():
+        raise PackRegistryError(f'{field_name} is required')
     if len(pack_id) > MAX_PACK_ID_LENGTH:
-        raise PackRegistryError(f'pack id exceeds max length ({MAX_PACK_ID_LENGTH})')
-    if not re.match(r'^[a-z0-9][a-z0-9._-]*$', pack_id):
-        raise PackRegistryError(f'invalid pack id: {pack_id!r}')
+        raise PackRegistryError(f'{field_name} exceeds max length ({MAX_PACK_ID_LENGTH})')
+    if not _PACK_ID_RE.fullmatch(pack_id):
+        raise PackRegistryError(f'invalid {field_name}: {pack_id!r}')
     return pack_id
 
 
@@ -374,15 +378,15 @@ def _pack_id_from_row(row: dict[str, Any]) -> str:
     raw_pack_id = row.get('pack_id')
 
     if raw_id is not None and raw_pack_id is not None:
-        normalized_id = _normalize_pack_id(raw_id)
-        normalized_pack_id = _normalize_pack_id(raw_pack_id)
+        normalized_id = _normalize_pack_id(raw_id, field_name='id')
+        normalized_pack_id = _normalize_pack_id(raw_pack_id, field_name='pack_id')
         if normalized_id != normalized_pack_id:
             raise PackRegistryError('id and pack_id must match when both are provided')
         return normalized_id
 
     if raw_id is not None:
-        return _normalize_pack_id(raw_id)
-    return _normalize_pack_id(raw_pack_id)
+        return _normalize_pack_id(raw_id, field_name='id')
+    return _normalize_pack_id(raw_pack_id, field_name='pack_id')
 
 
 def _normalise_row(raw: dict[str, Any]) -> dict[str, Any]:
@@ -642,7 +646,7 @@ class PackRegistryService:
         return [dict(pack) for pack in registry.get('packs', []) if _match_filter(pack, filter_payload)]
 
     def get_pack(self, pack_id: str) -> dict[str, Any] | None:
-        normalized_pack_id = _normalize_pack_id(pack_id)
+        normalized_pack_id = _normalize_pack_id(pack_id, field_name='pack_id')
         for pack in self._ensure_loaded().get('packs', []):
             if pack['id'] == normalized_pack_id:
                 return dict(pack)
@@ -669,7 +673,6 @@ class PackRegistryService:
             raise PackRegistryError('create_workflow_pack requires scope=workflow')
 
         row = dict(definition)
-        row.setdefault('id', row.get('pack_id'))
         row.setdefault('version', PACK_REGISTRY_SCHEMA_VERSION)
         normalized = _normalise_row(row)
 
