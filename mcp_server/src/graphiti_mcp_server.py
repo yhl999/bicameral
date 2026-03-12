@@ -1079,7 +1079,7 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
             description='List quarantined fact candidates awaiting promotion review',
             mode_hint='typed',
             inputs={'status': '"pending" | "promoted" | "rejected" | null'},
-            output='{"message": string, "candidates": list[Candidate]} | ErrorResponse',
+            output='list[Candidate]',
             examples=[{'status': 'pending'}],
             phase0_behavior='Returns an empty candidate list after input validation.',
         ),

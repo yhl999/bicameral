@@ -445,22 +445,18 @@ class ChangeLedger:
         candidate_id: str,
         fact: dict[str, Any],
         conflict_with_fact_id: str | None = None,
-        seeded_supersede_ok: bool = False,  # kept for API compat; gate removed — manual approval always supersedes
+        seeded_supersede_ok: bool = False,  # kept for API compat
+        allow_parallel: bool = False,
         recorded_at: str | None = None,
     ) -> CandidatePromotionResult:
         """Promote a candidate fact into the ledger.
 
         Atomicity guarantee: the create/supersede event and the promote event
-        are inserted in a single SQLite transaction (_autocommit=False on both
-        append_event calls, followed by a single conn.commit()).  If anything
-        raises between the two inserts, neither event is committed.
+        are inserted in a single SQLite transaction. If anything raises between
+        the two inserts, neither event is committed.
 
-        One-current-object rule: when conflict_with_fact_id is provided and the
-        prior object exists in the ledger, this method ALWAYS performs a supersede
-        (regardless of seeded_supersede_ok).  Manual approval by a human actor is
-        explicit authorization to supersede; policy auto-supersede sets
-        seeded_supersede_ok=True in the trace, but the gate has been lifted for
-        both paths to avoid a second "current" fact in the same conflict set.
+        For historical compatibility, ``seeded_supersede_ok`` is accepted but no
+        longer changes behavior by itself.
         """
         recorded_at = recorded_at or _now_iso()
         typed_object = build_object_from_candidate_fact(
@@ -476,52 +472,28 @@ class ChangeLedger:
         root_id = typed_object.root_id
 
         # ── Serialize the read-currentness + write-events critical section ───
-        #
         # BEGIN IMMEDIATE acquires the write reservation (RESERVED lock) before
         # we read current state.  In WAL mode a plain DEFERRED BEGIN allows
         # another writer to slip in between our conflict-set scan and our commit,
         # which can yield two is_current=True facts in the same conflict set.
         # IMMEDIATE prevents that by forcing concurrent promotions to serialize
-        # here.  The busy_timeout pragma (set in connect()) makes the blocked
-        # writer retry for up to 5 s rather than failing immediately.
-        #
-        # This block also provides the atomicity guarantee: the create/supersede
-        # event and the promote event commit together, or neither commits.
+        # here.
         try:
             self.conn.execute('BEGIN IMMEDIATE')
 
-            # ── Central enforcement: one current object per conflict set ─────
-            # Architecture lock (Phase 0): there must be exactly one
-            # is_current=True object per (subject, predicate, scope) triple at
-            # all times.
-            #
-            # The caller's conflict_with_fact_id is unreliable in two ways:
-            #   - missing: caller omitted it entirely (upstream wiring gap)
-            #   - stale:   caller provided an object_id that is no longer the
-            #              current occupant of the conflict set (e.g. an
-            #              already-superseded predecessor)
-            #
-            # In either case we find the *actual* current occupant (under the
-            # IMMEDIATE lock, so no new writer can change this between read and
-            # write) and use it as the authoritative supersession target.
-            # This scan runs only for StateFact promotions (conflict sets are
-            # defined only on state facts).
-            if isinstance(typed_object, StateFact):
+            # When parallel resolution is requested, explicitly skip the
+            # legacy one-current-object enforcement.
+            if not allow_parallel and isinstance(typed_object, StateFact):
                 _conflict_set = typed_object.conflict_set
                 for _current in self.current_state_facts():
                     if (
                         _current.conflict_set == _conflict_set
                         and _current.object_id != typed_object.object_id
                     ):
-                        # Override whatever (or nothing) the caller passed — the
-                        # actual current occupant is the authoritative target.
                         conflict_with_fact_id = _current.object_id
                         break
 
-            # Always supersede when a conflicting prior fact is identified and
-            # still exists in the ledger.  This enforces the one-current-object
-            # rule regardless of whether the promotion is automated or manual.
-            if conflict_with_fact_id:
+            if not allow_parallel and conflict_with_fact_id:
                 prior = self.materialize_object(conflict_with_fact_id)
                 if prior is not None:
                     creation_type = 'supersede'
@@ -535,7 +507,6 @@ class ChangeLedger:
                         }
                     )
 
-            # Build both rows (validation happens here; no DB writes yet).
             create_row = self._build_event_row(
                 creation_type,
                 actor_id=actor_id,

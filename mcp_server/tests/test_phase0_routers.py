@@ -159,8 +159,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
         result = await fn()
-        assert result['candidates'] == []
-        assert 'status' not in result
+        assert isinstance(result, list)
 
     @pytest.mark.anyio
     async def test_candidates_promote_stub(self):
@@ -200,8 +199,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_packs']
         result = await fn()
-        assert result['packs'] == []
-        assert 'status' not in result
+        assert isinstance(result, list)
 
     @pytest.mark.anyio
     async def test_packs_get_context_pack_stub(self):
@@ -211,7 +209,8 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_context_pack']
         result = await fn(pack_id='my-pack')
-        assert result['error'] == 'not_implemented'
+        assert isinstance(result, dict)
+        assert 'facts' in result
 
     @pytest.mark.anyio
     async def test_packs_get_workflow_pack_stub(self):
@@ -221,7 +220,9 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_workflow_pack']
         result = await fn(pack_id='my-pack')
-        assert result['error'] == 'not_implemented'
+        assert isinstance(result, dict)
+        assert 'definition' in result
+        assert 'facts' in result
 
     @pytest.mark.anyio
     async def test_packs_describe_pack_stub(self):
