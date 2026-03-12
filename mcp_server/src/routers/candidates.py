@@ -79,7 +79,12 @@ def _candidate_to_fact_input(candidate: dict[str, Any]) -> dict[str, Any]:
         'subject': str(candidate.get('subject') or '').strip(),
         'predicate': str(candidate.get('predicate') or '').strip(),
         'value': candidate.get('value'),
-        'scope': raw_hint.get('scope') or raw_hint.get('policy_scope') or memory.DEFAULT_SCOPE,
+        'scope': (
+            raw_hint.get('scope')
+            or raw_hint.get('policy_scope')
+            or metadata.get('scope')
+            or memory.DEFAULT_SCOPE
+        ),
         'evidence_refs': evidence_refs,
     }
 
@@ -146,11 +151,14 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
 
     raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
     policy_version = str(raw_hint.get('policy_version') or DEFAULT_POLICY_VERSION)
+    promote_context = memory._resolve_write_context(raw_hint)
+    promotion_actor_id = str(promote_context.get('actor_id') or memory.DEFAULT_ACTOR_ID)
+    promotion_source = str(candidate.get('source') or promote_context.get('source') or memory.DEFAULT_SOURCE)
     ledger = _get_change_ledger()
 
     try:
         promotion = ledger.promote_candidate_fact(
-            actor_id=memory.DEFAULT_SOURCE,
+            actor_id=promotion_actor_id,
             reason='candidate_promotion:supersede',
             policy_version=policy_version,
             candidate_id=candidate_id,
@@ -159,13 +167,29 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
         )
     except Exception as exc:
         logger.exception('promote_candidate failed for candidate_id=%s', candidate_id)
-        memory._log_audit('candidate_promote', candidate_id=candidate_id, error=str(exc), value=candidate.get('value'), result='error')
+        memory._log_audit(
+            'candidate_promote',
+            candidate_id=candidate_id,
+            error=str(exc),
+            value=candidate.get('value'),
+            result='error',
+            actor_id=promotion_actor_id,
+            source=promotion_source,
+        )
         return _error(str(exc), error_type='ledger_write_error')
 
     promoted_obj = ledger.materialize_object(promotion.object_id)
     if not isinstance(promoted_obj, StateFact):
         message = f'candidate {candidate_id} promotion did not materialize a state fact'
-        memory._log_audit('candidate_promote', candidate_id=candidate_id, error=message, value=candidate.get('value'), result='error')
+        memory._log_audit(
+            'candidate_promote',
+            candidate_id=candidate_id,
+            error=message,
+            value=candidate.get('value'),
+            result='error',
+            actor_id=promotion_actor_id,
+            source=promotion_source,
+        )
         return _error(message, error_type='ledger_write_error')
 
     updated = store.update_candidate_status(candidate_id, 'promoted', resolution='supersede')
@@ -175,6 +199,7 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
     try:
         materialized, materialization_error = await memory._materialize_fact(
             fact=promoted_obj,
+            source=promotion_source,
             superseded_fact_id=promoted_obj.parent_id,
         )
         if not materialized and materialization_error:
@@ -191,7 +216,15 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
             exc,
         )
 
-    memory._log_audit('candidate_promote', fact=promoted_obj, candidate_id=candidate_id, value=candidate.get('value'), result='ok')
+    memory._log_audit(
+        'candidate_promote',
+        fact=promoted_obj,
+        candidate_id=candidate_id,
+        value=candidate.get('value'),
+        result='ok',
+        actor_id=promotion_actor_id,
+        source=promotion_source,
+    )
     return {
         'status': 'ok',
         'action': 'promoted',
@@ -234,7 +267,15 @@ async def reject_candidate(candidate_id: str) -> dict[str, Any]:
     }
 
 
-def register_tools(mcp: Any) -> None:
-    mcp.tool()(list_candidates)
-    mcp.tool()(promote_candidate)
-    mcp.tool()(reject_candidate)
+def register_tools(mcp: Any) -> dict[str, Any]:
+    registered_tools = {
+        'list_candidates': mcp.tool()(list_candidates),
+        'promote_candidate': mcp.tool()(promote_candidate),
+        'reject_candidate': mcp.tool()(reject_candidate),
+    }
+
+    tool_registry = getattr(mcp, '_tools', None)
+    if isinstance(tool_registry, dict):
+        tool_registry.update(registered_tools)
+
+    return registered_tools

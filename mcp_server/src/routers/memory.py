@@ -836,6 +836,24 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
                 'message': raw_hint_error,
             }
 
+        candidate_raw_hint = {**hint}
+        candidate_raw_hint['scope'] = scope
+        candidate_raw_hint['policy_scope'] = scope
+        if write_context.get('verified'):
+            trust_snapshot = dict(candidate_raw_hint.get('trust') or {})
+            trust_snapshot.update(
+                {
+                    'verified': True,
+                    'is_owner': bool(write_context.get('is_owner')),
+                    'actor_id': write_context['actor_id'],
+                    'source': write_context['source'],
+                    'scope': write_context.get('scope_override') or scope,
+                    'allow_conflict_supersede': bool(write_context.get('allow_conflict_supersede')),
+                }
+            )
+            candidate_raw_hint['trust'] = trust_snapshot
+        candidate_metadata['scope'] = scope
+
         try:
             candidate = _get_candidate_store().create_candidate(
                 payload={
@@ -848,7 +866,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
                     existing_payload.get('object_id') if isinstance(existing_payload, dict) else None
                 ),
                 source=write_context['source'],
-                raw_hint={**hint},
+                raw_hint=candidate_raw_hint,
                 metadata=candidate_metadata,
             )
             _log_audit(
@@ -1113,7 +1131,7 @@ async def get_history(subject: str, predicate: str | None = None, scope: str | N
     }
 
 
-def register_tools(mcp: FastMCP) -> None:
+def register_tools(mcp: FastMCP) -> dict[str, Any]:
     """Register all memory tools with the MCP server instance."""
 
     @mcp.tool()
@@ -1128,10 +1146,18 @@ def register_tools(mcp: FastMCP) -> None:
     async def get_history_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
         return await get_history(subject=subject, predicate=predicate, scope=scope)
 
+    registered_tools = {
+        'remember_fact': remember_fact_tool,
+        'get_current_state': get_current_state_tool,
+        'get_history': get_history_tool,
+    }
+
     # Backward compatible tool names used by external discovery.
-    mcp._tools['remember_fact'] = remember_fact_tool  # type: ignore[attr-defined]
-    mcp._tools['get_current_state'] = get_current_state_tool  # type: ignore[attr-defined]
-    mcp._tools['get_history'] = get_history_tool  # type: ignore[attr-defined]
+    tool_registry = getattr(mcp, '_tools', None)
+    if isinstance(tool_registry, dict):
+        tool_registry.update(registered_tools)
+
+    return registered_tools
 
 
 __all__ = [
