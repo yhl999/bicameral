@@ -330,6 +330,27 @@ def test_create_workflow_pack_requires_private_registry_path(monkeypatch: pytest
     assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('message', '')
 
 
+def test_create_workflow_pack_legacy_env_does_not_bypass_user_registry_requirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """BICAMERAL_PACK_REGISTRY_PATH (legacy) must NOT allow creation when BICAMERAL_USER_PACK_REGISTRY_PATH is unset.
+
+    Regression: before the fix, a non-public legacy path passed _is_public_registry() → False,
+    so _assert_user_registry_writeable() silently permitted the write.  The dedicated user-path
+    flag now closes that bypass regardless of what BICAMERAL_PACK_REGISTRY_PATH points to.
+    """
+    legacy_path = tmp_path / 'legacy-registry.json'
+    monkeypatch.delenv('BICAMERAL_USER_PACK_REGISTRY_PATH', raising=False)
+    monkeypatch.setenv('BICAMERAL_PACK_REGISTRY_PATH', str(legacy_path))
+
+    result = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-legacy-bypass')))
+
+    assert result.get('error') == 'validation_error'
+    assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('message', '')
+    # No file should have been created at the legacy path.
+    assert not legacy_path.exists()
+
+
 @pytest.mark.parametrize(
     ('field', 'value', 'message_fragment'),
     [

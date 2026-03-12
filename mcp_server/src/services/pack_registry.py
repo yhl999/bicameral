@@ -508,7 +508,21 @@ class PackRegistryService:
 
     def __init__(self, path: str | Path | None = None):
         self.public_path = _public_registry_path()
-        self.path = Path(path) if path else _default_registry_path()
+        if path is not None:
+            # Caller supplied an explicit non-default path → treat as user-private.
+            self.path = Path(path)
+            self._path_is_user_private = True
+        else:
+            user_path = _configured_user_registry_path()
+            if user_path is not None:
+                # BICAMERAL_USER_PACK_REGISTRY_PATH is set → user-private.
+                self.path = user_path
+                self._path_is_user_private = True
+            else:
+                # Neither explicit nor user-env: may fall back to legacy env or public.
+                # Mark as NOT user-private so creation is blocked.
+                self.path = _default_registry_path()
+                self._path_is_user_private = False
         self.public_path.parent.mkdir(parents=True, exist_ok=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._registry: dict[str, Any] | None = None
@@ -653,7 +667,11 @@ class PackRegistryService:
         return None
 
     def _assert_user_registry_writeable(self) -> None:
-        if self._is_public_registry():
+        # Block writes when the path was NOT explicitly configured by the caller or via
+        # BICAMERAL_USER_PACK_REGISTRY_PATH.  This closes the legacy-env bypass: if only
+        # BICAMERAL_PACK_REGISTRY_PATH is set (and BICAMERAL_USER_PACK_REGISTRY_PATH is
+        # unset), _path_is_user_private is False and creation is rejected.
+        if not self._path_is_user_private or self._is_public_registry():
             raise PackRegistryError(
                 'create_workflow_pack requires BICAMERAL_USER_PACK_REGISTRY_PATH (or an explicit '
                 'non-public registry path); refusing to write user packs into the public repo registry'
