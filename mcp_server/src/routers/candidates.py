@@ -26,6 +26,31 @@ VALID_STATUSES = frozenset({'pending', 'promoted', 'rejected'})
 VALID_PROMOTION_RESOLUTIONS = frozenset({'supersede', 'cancel'})
 DEFAULT_POLICY_VERSION = 'remember_fact_conflict_v1'
 
+
+def _authorize_candidate_action(actor_id: str | None) -> tuple[bool, str]:
+    """Fail-closed authorization gate for candidate lifecycle actions.
+
+    Returns (authorized: bool, reason: str).
+
+    An actor is authorized iff:
+    1. actor_id is a non-empty string, AND
+    2. It appears in the server-configured BICAMERAL_TRUSTED_ACTOR_IDS allowlist.
+
+    If the allowlist env var is absent or empty, returns (False, 'no_auth_configured'),
+    blocking ALL callers regardless of actor_id.  This is the correct fail-closed
+    posture for Phase 0: untrusted callers must not be able to promote, cancel, or
+    reject quarantined candidates.
+    """
+    actor = str(actor_id or '').strip()
+    if not actor:
+        return False, 'actor_id_required'
+    trusted_ids = _memory_router()._trusted_actor_ids_from_env()
+    if not trusted_ids:
+        return False, 'no_auth_configured'
+    if actor not in trusted_ids:
+        return False, 'actor_not_authorized'
+    return True, actor
+
 # Lazy singletons so importing this router does not touch SQLite.
 _change_ledger: ChangeLedger | None = None
 _candidate_store: CandidateStore | None = None
@@ -107,7 +132,7 @@ async def list_candidates(status: str | None = None) -> dict[str, Any]:
     }
 
 
-async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any]:
+async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | None = None) -> dict[str, Any]:
     """Promote a pending candidate into the typed ledger.
 
     Supported resolutions on this branch:
@@ -116,6 +141,11 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
 
     The previously-advertised "parallel" path is not implemented here and is
     rejected explicitly rather than pretending otherwise.
+
+    Authorization: actor_id must be provided and must appear in the server-side
+    BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  Untrusted callers receive an
+    'unauthorized' error regardless of the candidate state.  If the allowlist
+    is not configured, all callers are denied (fail-closed).
     """
     candidate_id = str(candidate_id or '').strip()
     if not candidate_id:
@@ -131,6 +161,11 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
             f'invalid resolution {normalized_resolution!r}; expected one of {sorted(VALID_PROMOTION_RESOLUTIONS)}',
         )
 
+    # Authorization gate: check BEFORE touching any candidate state.
+    authorized, auth_reason = _authorize_candidate_action(actor_id)
+    if not authorized:
+        return _error(f'unauthorized: {auth_reason}', error_type='unauthorized')
+
     memory = _memory_router()
     store = _get_candidate_store()
     candidate = store.get_candidate(candidate_id)
@@ -142,9 +177,21 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
             error_type='invalid_state',
         )
 
+    # The actor_id here is the identity of whoever is performing this promotion
+    # action RIGHT NOW — not the actor who originally submitted the conflicting
+    # fact at quarantine time.  Using the performing actor preserves correct
+    # audit provenance for the ledger event.
+    performing_actor_id = str(actor_id)
+
     if normalized_resolution == 'cancel':
         updated = store.update_candidate_status(candidate_id, 'rejected', resolution='cancel')
-        memory._log_audit('candidate_cancel', candidate_id=candidate_id, value=candidate.get('value'), result='ok')
+        memory._log_audit(
+            'candidate_cancel',
+            candidate_id=candidate_id,
+            value=candidate.get('value'),
+            result='ok',
+            actor_id=performing_actor_id,
+        )
         return {
             'status': 'ok',
             'action': 'cancelled',
@@ -152,15 +199,15 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
         }
 
     raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
-    promote_context = memory._resolve_write_context(raw_hint)
     policy_version = str(raw_hint.get('policy_version') or DEFAULT_POLICY_VERSION)
-    promotion_actor_id = str(promote_context.get('actor_id') or memory.DEFAULT_ACTOR_ID)
-    promotion_source = str(candidate.get('source') or promote_context.get('source') or memory.DEFAULT_SOURCE)
+    # Data provenance: the source of the fact being promoted comes from the
+    # stored candidate, not from the actor performing the promotion.
+    promotion_source = str(candidate.get('source') or memory.DEFAULT_SOURCE)
     ledger = _get_change_ledger()
 
     try:
         promotion = ledger.promote_candidate_fact(
-            actor_id=promotion_actor_id,
+            actor_id=performing_actor_id,
             reason='candidate_promotion:supersede',
             policy_version=policy_version,
             candidate_id=candidate_id,
@@ -175,7 +222,7 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
             error=str(exc),
             value=candidate.get('value'),
             result='error',
-            actor_id=promotion_actor_id,
+            actor_id=performing_actor_id,
             source=promotion_source,
         )
         return _error(str(exc), error_type='ledger_write_error')
@@ -189,7 +236,7 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
             error=message,
             value=candidate.get('value'),
             result='error',
-            actor_id=promotion_actor_id,
+            actor_id=performing_actor_id,
             source=promotion_source,
         )
         return _error(message, error_type='ledger_write_error')
@@ -224,7 +271,7 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
         candidate_id=candidate_id,
         value=candidate.get('value'),
         result='ok',
-        actor_id=promotion_actor_id,
+        actor_id=performing_actor_id,
         source=promotion_source,
     )
     return {
@@ -243,11 +290,24 @@ async def promote_candidate(candidate_id: str, resolution: str) -> dict[str, Any
     }
 
 
-async def reject_candidate(candidate_id: str) -> dict[str, Any]:
-    """Reject a pending candidate without writing it to the ledger."""
+async def reject_candidate(candidate_id: str, actor_id: str | None = None) -> dict[str, Any]:
+    """Reject a pending candidate without writing it to the ledger.
+
+    Authorization: actor_id must be provided and must appear in the server-side
+    BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  Untrusted callers receive an
+    'unauthorized' error.  If the allowlist is not configured, all callers are
+    denied (fail-closed).
+    """
     candidate_id = str(candidate_id or '').strip()
     if not candidate_id:
         return _error('candidate_id is required')
+
+    # Authorization gate: check BEFORE touching any candidate state.
+    authorized, auth_reason = _authorize_candidate_action(actor_id)
+    if not authorized:
+        return _error(f'unauthorized: {auth_reason}', error_type='unauthorized')
+
+    performing_actor_id = str(actor_id)
 
     memory = _memory_router()
     store = _get_candidate_store()
@@ -261,7 +321,13 @@ async def reject_candidate(candidate_id: str) -> dict[str, Any]:
         )
 
     updated = store.update_candidate_status(candidate_id, 'rejected', resolution='reject')
-    memory._log_audit('candidate_reject', candidate_id=candidate_id, value=candidate.get('value'), result='ok')
+    memory._log_audit(
+        'candidate_reject',
+        candidate_id=candidate_id,
+        value=candidate.get('value'),
+        result='ok',
+        actor_id=performing_actor_id,
+    )
     return {
         'status': 'ok',
         'action': 'rejected',

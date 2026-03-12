@@ -60,6 +60,9 @@ def test_conflict_quarantine_promotion_preserves_scope_and_materialization_sourc
 
     monkeypatch.setattr(memory, '_materialize_fact', fake_materialize)
 
+    # Trust elevation requires actor_id to be in the server-side allowlist.
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'caller:delegate')
+
     trusted_hint = {
         'fact_type': 'preference',
         'subject': 'coffee',
@@ -93,7 +96,9 @@ def test_conflict_quarantine_promotion_preserves_scope_and_materialization_sourc
     assert conflict['new_fact']['raw_hint']['policy_scope'] == 'internal'
     assert conflict['new_fact']['metadata']['scope'] == 'internal'
 
-    promoted = _run(candidates.promote_candidate(candidate_id, 'supersede'))
+    # Promotion requires an authorized actor_id.  The ledger event actor is the
+    # performing actor (caller:delegate), not stale hint metadata.
+    promoted = _run(candidates.promote_candidate(candidate_id, 'supersede', actor_id='caller:delegate'))
     assert promoted['status'] == 'ok'
     assert promoted['fact']['scope'] == 'internal'
     assert promoted['candidate']['status'] == 'promoted'
@@ -109,4 +114,6 @@ def test_conflict_quarantine_promotion_preserves_scope_and_materialization_sourc
 
     promote_events = [row for row in ledger.events_for_root(promoted['fact']['root_id']) if row.event_type == 'promote']
     assert len(promote_events) == 1
+    # actor_id in the ledger event is the PERFORMING actor (passed to promote_candidate),
+    # not stale metadata from the original quarantine hint.
     assert promote_events[0].actor_id == 'caller:delegate'

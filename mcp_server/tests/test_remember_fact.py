@@ -224,7 +224,8 @@ def test_remember_fact_supersede_without_privilege_is_quarantined(isolated_memor
     assert second['supersede_allowed'] is False
 
 
-def test_remember_fact_supersedes_existing_when_privileged(isolated_memory):
+def test_remember_fact_supersedes_existing_when_privileged(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
     first = _run(
         memory.remember_fact(
             'I prefer dark mode',
@@ -295,7 +296,11 @@ def test_remember_fact_does_not_default_to_owner_stamp_without_trust(isolated_me
     assert metadata['source'] == 'caller_asserted_unverified'
 
 
-def test_remember_fact_owner_stamp_requires_verified_trust(isolated_memory):
+def test_remember_fact_owner_stamp_requires_trusted_actor_in_server_allowlist(isolated_memory, monkeypatch):
+    # Trust elevation is gated on the server-side BICAMERAL_TRUSTED_ACTOR_IDS env var,
+    # not on hint.trust.verified alone.  Callers whose actor_id is in the allowlist
+    # receive elevated write context; others are silently downgraded to untrusted.
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
     result = _run(
         memory.remember_fact(
             'I prefer dark mode',
@@ -316,7 +321,8 @@ def test_remember_fact_owner_stamp_requires_verified_trust(isolated_memory):
     assert metadata['source'] == 'owner_asserted'
 
 
-def test_remember_fact_multi_hop_supersession_preserves_root_lineage(isolated_memory):
+def test_remember_fact_multi_hop_supersession_preserves_root_lineage(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
     trusted = _owner_trust(allow_conflict_supersede=True)
 
     first = _run(
@@ -403,7 +409,8 @@ def test_remember_fact_neo4j_failure_is_observable_and_non_blocking(
     assert len(current) == 1
 
 
-def test_promote_candidate_supersedes_quarantined_fact(isolated_memory):
+def test_promote_candidate_supersedes_quarantined_fact(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:scheduler')
     _run(
         memory.remember_fact(
             'I prefer dark mode',
@@ -421,6 +428,7 @@ def test_promote_candidate_supersedes_quarantined_fact(isolated_memory):
         candidates_router.promote_candidate(
             candidate_id=conflict['candidate_id'],
             resolution='supersede',
+            actor_id='system:scheduler',
         )
     )
 
@@ -436,7 +444,8 @@ def test_promote_candidate_supersedes_quarantined_fact(isolated_memory):
     assert current[0].value == 'light mode'
 
 
-def test_promote_candidate_preserves_trusted_source_and_scope(isolated_memory):
+def test_promote_candidate_preserves_trusted_source_and_scope(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
     trusted = _owner_trust()
     trusted['trust']['scope'] = 'public'
 
@@ -457,6 +466,7 @@ def test_promote_candidate_preserves_trusted_source_and_scope(isolated_memory):
         candidates_router.promote_candidate(
             candidate_id=conflict['candidate_id'],
             resolution='supersede',
+            actor_id='owner:archibald',
         )
     )
 
@@ -499,7 +509,8 @@ def test_promote_candidate_rejects_parallel_resolution(isolated_memory):
     assert current[0].value == 'dark mode'
 
 
-def test_promote_candidate_cancel_rejects_candidate(isolated_memory):
+def test_promote_candidate_cancel_rejects_candidate(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:scheduler')
     _run(
         memory.remember_fact(
             'I prefer dark mode',
@@ -517,6 +528,7 @@ def test_promote_candidate_cancel_rejects_candidate(isolated_memory):
         candidates_router.promote_candidate(
             candidate_id=conflict['candidate_id'],
             resolution='cancel',
+            actor_id='system:scheduler',
         )
     )
 
@@ -525,7 +537,8 @@ def test_promote_candidate_cancel_rejects_candidate(isolated_memory):
     assert cancelled['candidate']['status'] == 'rejected'
 
 
-def test_reject_candidate_marks_candidate_rejected(isolated_memory):
+def test_reject_candidate_marks_candidate_rejected(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:scheduler')
     _run(
         memory.remember_fact(
             'I prefer dark mode',
@@ -539,7 +552,12 @@ def test_reject_candidate_marks_candidate_rejected(isolated_memory):
         )
     )
 
-    rejected = _run(candidates_router.reject_candidate(candidate_id=conflict['candidate_id']))
+    rejected = _run(
+        candidates_router.reject_candidate(
+            candidate_id=conflict['candidate_id'],
+            actor_id='system:scheduler',
+        )
+    )
 
     assert rejected['status'] == 'ok'
     assert rejected['action'] == 'rejected'
@@ -570,7 +588,8 @@ def test_get_history_returns_event_summaries_for_current_roots(isolated_memory):
     assert all('root_id' in row for row in history['history'])
 
 
-def test_get_history_includes_supersede_event_for_current_root(isolated_memory):
+def test_get_history_includes_supersede_event_for_current_root(isolated_memory, monkeypatch):
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
     trusted = _owner_trust(allow_conflict_supersede=True)
 
     _run(
@@ -596,3 +615,141 @@ def test_get_history_includes_supersede_event_for_current_root(isolated_memory):
     assert history['status'] == 'ok'
     assert [row['event_type'] for row in history['history']] == ['assert', 'supersede']
     assert len(history['roots_considered']) == 1
+
+
+# ---------------------------------------------------------------------------
+# Security: trust spoofing and authorization enforcement tests
+# ---------------------------------------------------------------------------
+
+def test_trust_verified_flag_alone_does_not_elevate_privileges(isolated_memory):
+    """hint.trust.verified=True alone must NOT elevate write privileges.
+
+    Without the actor_id appearing in BICAMERAL_TRUSTED_ACTOR_IDS, the write
+    context must fall back to the default untrusted context regardless of what
+    the caller puts in hint.trust.
+    """
+    result = _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {
+                'type': 'Preference',
+                'subject': 'UI preferences',
+                **_owner_trust(),
+            },
+        )
+    )
+    # Write still succeeds (fail-safe for reads, safe-deny for trust escalation)
+    assert result['status'] == 'ok'
+    root_id = result['fact']['root_id']
+    rows = isolated_memory['ledger'].events_for_root(root_id)
+    # Actor must be the default untrusted identity, not 'owner:archibald'
+    assert rows[0].actor_id == 'caller:unverified'
+    metadata = json.loads(rows[0].metadata_json or '{}')
+    assert metadata['source'] == 'caller_asserted_unverified'
+
+
+def test_hint_trust_cannot_unlock_supersede_without_server_allowlist(isolated_memory):
+    """hint.trust.allow_conflict_supersede must not work without server allowlist.
+
+    Without BICAMERAL_TRUSTED_ACTOR_IDS configured, a caller claiming
+    allow_conflict_supersede=True must still be quarantined.
+    """
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences'},
+        )
+    )
+    result = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {
+                'type': 'Preference',
+                'subject': 'UI preferences',
+                'supersede': True,
+                **_owner_trust(allow_conflict_supersede=True),
+            },
+        )
+    )
+    # Must be quarantined (conflict), NOT directly superseded
+    assert result['status'] == 'conflict'
+    assert result['supersede_allowed'] is False
+
+
+def test_promote_candidate_requires_authorized_actor(isolated_memory, monkeypatch):
+    """promote_candidate must return unauthorized when no actor_id is provided."""
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    conflict = _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    # No actor_id provided
+    result = _run(candidates_router.promote_candidate(candidate_id=conflict['candidate_id'], resolution='supersede'))
+    assert result['status'] == 'error'
+    assert result['error_type'] == 'unauthorized'
+
+
+def test_promote_candidate_rejects_unknown_actor(isolated_memory, monkeypatch):
+    """promote_candidate must reject actor_ids not in the server allowlist."""
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:trusted')
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    conflict = _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    result = _run(
+        candidates_router.promote_candidate(
+            candidate_id=conflict['candidate_id'],
+            resolution='supersede',
+            actor_id='attacker:evil',
+        )
+    )
+    assert result['status'] == 'error'
+    assert result['error_type'] == 'unauthorized'
+
+
+def test_reject_candidate_requires_authorized_actor(isolated_memory):
+    """reject_candidate must return unauthorized when no actor_id is provided."""
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    conflict = _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    result = _run(candidates_router.reject_candidate(candidate_id=conflict['candidate_id']))
+    assert result['status'] == 'error'
+    assert result['error_type'] == 'unauthorized'
+
+
+def test_promote_candidate_audit_records_performing_actor_not_hint_actor(isolated_memory, monkeypatch):
+    """Ledger promotion event must record the actor who performed the promotion,
+    not the actor from the original quarantine hint metadata.
+    """
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald,reviewer:bot')
+    # Original fact written by owner
+    _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {'type': 'Preference', 'subject': 'UI preferences', **_owner_trust()},
+        )
+    )
+    # Conflict written by owner too (so raw_hint stores owner actor)
+    conflict = _run(
+        memory.remember_fact(
+            'I prefer light mode',
+            {'type': 'Preference', 'subject': 'UI preferences', **_owner_trust()},
+        )
+    )
+    assert conflict['status'] == 'conflict'
+    candidate_id = conflict['candidate_id']
+
+    # Promotion performed by a DIFFERENT actor (reviewer:bot)
+    promoted = _run(
+        candidates_router.promote_candidate(
+            candidate_id=candidate_id,
+            resolution='supersede',
+            actor_id='reviewer:bot',
+        )
+    )
+    assert promoted['status'] == 'ok'
+
+    root_id = promoted['fact']['root_id']
+    ledger = isolated_memory['ledger']
+    promote_events = [row for row in ledger.events_for_root(root_id) if row.event_type == 'promote']
+    assert len(promote_events) == 1
+    # Must record reviewer:bot (the actor who called promote_candidate),
+    # NOT owner:archibald (the actor who submitted the conflicting hint).
+    assert promote_events[0].actor_id == 'reviewer:bot'

@@ -54,6 +54,13 @@ TRUSTED_SOURCE_ALLOWLIST = frozenset(
     }
 )
 DEFAULT_ACTION = 'remember_fact'
+
+# Server-side allowlist of actor IDs that are permitted to receive elevated
+# write privileges.  Populated exclusively from the runtime environment — never
+# from caller-supplied tool arguments.  An empty or absent value means NO
+# caller can receive elevated trust (fail-closed).
+_TRUSTED_ACTOR_IDS_ENV = 'BICAMERAL_TRUSTED_ACTOR_IDS'
+
 _ALLOWED_HINT_KEYS = frozenset(
     {
         'type',
@@ -70,6 +77,10 @@ _ALLOWED_HINT_KEYS = frozenset(
         'trust',
     }
 )
+# NOTE: 'verified', 'is_owner', and 'allow_conflict_supersede' are accepted for
+# schema validation and forward-compat purposes but have NO security effect on
+# their own.  Privilege elevation is gated exclusively on whether the caller's
+# actor_id appears in the server-side BICAMERAL_TRUSTED_ACTOR_IDS allowlist.
 _ALLOWED_TRUST_KEYS = frozenset(
     {
         'verified',
@@ -293,9 +304,60 @@ def _validate_hint_contract(hint: dict[str, Any]) -> tuple[bool, str | None]:
     return True, None
 
 
+def _trusted_actor_ids_from_env() -> frozenset[str]:
+    """Return the server-configured set of trusted actor IDs.
+
+    Reads BICAMERAL_TRUSTED_ACTOR_IDS (comma-separated list) from the runtime
+    environment.  An absent or empty value returns an empty set, which causes
+    _resolve_write_context to fail closed for ALL callers.
+
+    This is the SOLE trust gate for privilege elevation.  Caller-supplied
+    hint.trust fields are NOT sufficient on their own; the caller's actor_id
+    must appear in this allowlist.
+    """
+    raw = (os.environ.get(_TRUSTED_ACTOR_IDS_ENV) or '').strip()
+    if not raw:
+        return frozenset()
+    return frozenset(part.strip() for part in raw.split(',') if part.strip())
+
+
 def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
-    trust = hint.get('trust')
-    if not isinstance(trust, dict) or trust.get('verified') is not True:
+    """Resolve write context from caller hint.
+
+    Security contract
+    -----------------
+    Privilege elevation (verified=True, is_owner, allow_conflict_supersede) is
+    NEVER derived solely from caller-supplied hint.trust fields.  Untrusted
+    tool-call arguments MUST NOT be able to elevate their own privileges.
+
+    Trust is only granted when the caller's hint.trust.actor_id appears in the
+    server-side BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  If the env var is unset
+    or empty, ALL callers are treated as untrusted (fail-closed).
+
+    hint.trust.verified is accepted for schema validation but has NO security
+    effect; it is silently ignored for privilege decisions.
+    """
+    trust = hint.get('trust') if isinstance(hint, dict) else None
+
+    # Extract caller-supplied actor hint (informational — not a security gate).
+    hint_actor_id = ''
+    hint_source = ''
+    hint_scope = None
+    hint_is_owner = False
+    hint_allow_supersede = False
+    if isinstance(trust, dict):
+        hint_actor_id = str(trust.get('actor_id') or '').strip()
+        hint_source = str(trust.get('source') or '').strip().lower()
+        hint_scope = str(trust.get('scope') or '').strip() or None
+        hint_is_owner = bool(trust.get('is_owner') is True)
+        hint_allow_supersede = bool(trust.get('allow_conflict_supersede') is True)
+
+    # Trust gate: actor_id must appear in the server-configured allowlist.
+    trusted_ids = _trusted_actor_ids_from_env()
+    is_trusted = bool(hint_actor_id and hint_actor_id in trusted_ids)
+
+    if not is_trusted:
+        # Fail closed: untrusted or unconfigured → use default safe context.
         return {
             'verified': False,
             'is_owner': False,
@@ -306,25 +368,25 @@ def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
             'allow_conflict_supersede': False,
         }
 
-    is_owner = bool(trust.get('is_owner') is True)
-    actor_id = str(trust.get('actor_id') or '').strip() or 'caller:verified'
-    source = str(trust.get('source') or '').strip().lower() or 'caller_asserted_verified'
+    # Trusted path: actor_id validated against server allowlist.
+    # hint.trust.is_owner and hint.trust.allow_conflict_supersede are honored
+    # ONLY because the actor already passed the server-side allowlist check.
+    is_owner = hint_is_owner
+    source = hint_source or 'caller_asserted_verified'
     if source not in TRUSTED_SOURCE_ALLOWLIST:
         source = 'caller_asserted_verified'
-
     if source == VERIFIED_OWNER_SOURCE and not is_owner:
         source = 'caller_asserted_verified'
 
-    allow_conflict_supersede = bool(trust.get('allow_conflict_supersede') is True and is_owner)
-    scope_override = str(trust.get('scope') or '').strip() or None
+    allow_conflict_supersede = hint_allow_supersede and is_owner
 
     return {
         'verified': True,
         'is_owner': is_owner,
-        'actor_id': actor_id,
+        'actor_id': hint_actor_id,
         'source': source,
         'source_key': source,
-        'scope_override': scope_override,
+        'scope_override': hint_scope,
         'allow_conflict_supersede': allow_conflict_supersede,
     }
 
@@ -1168,4 +1230,5 @@ __all__ = [
     'get_current_state',
     'get_history',
     '_change_ledger',
+    '_trusted_actor_ids_from_env',
 ]
