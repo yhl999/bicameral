@@ -5,8 +5,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any
 
 try:
     from ..models.typed_memory import StateFact
@@ -23,6 +24,7 @@ class Neo4jMaterializationService:
         self,
         *,
         fact: StateFact,
+        source: str = 'caller_asserted_unverified',
         superseded_fact_id: str | None = None,
         graphiti_client: Any | None = None,
     ) -> tuple[bool, str | None]:
@@ -56,7 +58,7 @@ class Neo4jMaterializationService:
                 'value_text': _coerce_json_scalar(value),
                 'fact_type': fact_type,
                 'status': 'active',
-                'source': 'owner_asserted',
+                'source': source,
                 'timestamp': timestamp,
             }
 

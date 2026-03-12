@@ -36,9 +36,50 @@ from ..services.schema_validation import _validate_typed_object, detect_conflict
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_LEN = 4096
+MAX_HINT_JSON_BYTES = 16_384
+MAX_HINT_DEPTH = 4
+MAX_AUX_PAYLOAD_JSON_BYTES = 8_192
+MAX_AUX_PAYLOAD_DEPTH = 4
 DEFAULT_SCOPE = 'private'
-DEFAULT_SOURCE = 'owner'
+DEFAULT_SOURCE = 'caller_asserted_unverified'
+DEFAULT_ACTOR_ID = 'caller:unverified'
+DEFAULT_EVIDENCE_SOURCE_KEY = 'caller_asserted_unverified'
+VERIFIED_OWNER_SOURCE = 'owner_asserted'
+TRUSTED_SOURCE_ALLOWLIST = frozenset(
+    {
+        VERIFIED_OWNER_SOURCE,
+        'delegate_asserted',
+        'system_asserted',
+        'caller_asserted_verified',
+    }
+)
 DEFAULT_ACTION = 'remember_fact'
+_ALLOWED_HINT_KEYS = frozenset(
+    {
+        'type',
+        'type_hint',
+        'fact_type',
+        'subject',
+        'predicate',
+        'value',
+        'scope',
+        'policy_scope',
+        'supersede',
+        'policy_version',
+        'metadata',
+        'trust',
+    }
+)
+_ALLOWED_TRUST_KEYS = frozenset(
+    {
+        'verified',
+        'is_owner',
+        'actor_id',
+        'source',
+        'scope',
+        'allow_conflict_supersede',
+    }
+)
 
 # Stable module-level dependencies so tests can monkeypatch these easily.
 _change_ledger = ChangeLedger(
@@ -96,11 +137,22 @@ def _truncate_value_for_log(value: Any, max_len: int = 180) -> str:
     return f'{text[: max_len - 3]}...'
 
 
-def _log_audit(action: str, *, fact: StateFact | None = None, candidate_id: str | None = None, error: str | None = None, value: Any | None = None, result: str | None = None) -> None:
+def _log_audit(
+    action: str,
+    *,
+    fact: StateFact | None = None,
+    candidate_id: str | None = None,
+    error: str | None = None,
+    value: Any | None = None,
+    result: str | None = None,
+    actor_id: str | None = None,
+    source: str | None = None,
+) -> None:
     payload = {
         'action': action,
         'result': result,
-        'actor': DEFAULT_SOURCE,
+        'actor': actor_id or DEFAULT_ACTOR_ID,
+        'source': source or DEFAULT_SOURCE,
     }
     if fact is not None:
         payload.update(
@@ -120,6 +172,141 @@ def _log_audit(action: str, *, fact: StateFact | None = None, candidate_id: str 
     if value is not None:
         payload['value_preview'] = _truncate_value_for_log(value)
     logger.info('memory.audit %s', json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _payload_json_size(value: Any) -> int:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    except Exception:
+        encoded = str(value)
+    return len(encoded.encode('utf-8'))
+
+
+def _payload_depth(value: Any, _seen: set[int] | None = None) -> int:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return 0
+
+    if _seen is None:
+        _seen = set()
+
+    value_id = id(value)
+    if value_id in _seen:
+        return 0
+    _seen.add(value_id)
+
+    if isinstance(value, dict):
+        children = list(value.values())
+    elif isinstance(value, (list, tuple)):
+        children = list(value)
+    else:
+        _seen.discard(value_id)
+        return 0
+
+    if not children:
+        _seen.discard(value_id)
+        return 1
+
+    max_child_depth = max(_payload_depth(child, _seen) for child in children)
+    _seen.discard(value_id)
+    return 1 + max_child_depth
+
+
+def _validate_payload_bounds(
+    payload: Any,
+    *,
+    label: str,
+    max_json_bytes: int,
+    max_depth: int,
+) -> tuple[bool, str | None]:
+    if payload is None:
+        return True, None
+
+    payload_size = _payload_json_size(payload)
+    if payload_size > max_json_bytes:
+        return False, f'{label} exceeds max size {max_json_bytes} bytes'
+
+    depth = _payload_depth(payload)
+    if depth > max_depth:
+        return False, f'{label} exceeds max depth {max_depth}'
+
+    return True, None
+
+
+def _validate_hint_contract(hint: dict[str, Any]) -> tuple[bool, str | None]:
+    unexpected_keys = sorted(set(hint) - _ALLOWED_HINT_KEYS)
+    if unexpected_keys:
+        return False, f'hint has unknown field(s): {unexpected_keys}'
+
+    for field in (
+        'type',
+        'type_hint',
+        'fact_type',
+        'subject',
+        'predicate',
+        'scope',
+        'policy_scope',
+        'policy_version',
+    ):
+        if field in hint and hint[field] is not None and not isinstance(hint[field], str):
+            return False, f'hint.{field} must be a string when provided'
+
+    if 'metadata' in hint and hint['metadata'] is not None and not isinstance(hint['metadata'], dict):
+        return False, 'hint.metadata must be an object when provided'
+
+    trust = hint.get('trust')
+    if trust is not None:
+        if not isinstance(trust, dict):
+            return False, 'hint.trust must be an object when provided'
+
+        unexpected_trust_keys = sorted(set(trust) - _ALLOWED_TRUST_KEYS)
+        if unexpected_trust_keys:
+            return False, f'hint.trust has unknown field(s): {unexpected_trust_keys}'
+
+        for field in ('verified', 'is_owner', 'allow_conflict_supersede'):
+            if field in trust and trust[field] is not None and not isinstance(trust[field], bool):
+                return False, f'hint.trust.{field} must be a boolean when provided'
+
+        for field in ('actor_id', 'source', 'scope'):
+            if field in trust and trust[field] is not None and not isinstance(trust[field], str):
+                return False, f'hint.trust.{field} must be a string when provided'
+
+    return True, None
+
+
+def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
+    trust = hint.get('trust')
+    if not isinstance(trust, dict) or trust.get('verified') is not True:
+        return {
+            'verified': False,
+            'is_owner': False,
+            'actor_id': DEFAULT_ACTOR_ID,
+            'source': DEFAULT_SOURCE,
+            'source_key': DEFAULT_EVIDENCE_SOURCE_KEY,
+            'scope_override': None,
+            'allow_conflict_supersede': False,
+        }
+
+    is_owner = bool(trust.get('is_owner') is True)
+    actor_id = str(trust.get('actor_id') or '').strip() or 'caller:verified'
+    source = str(trust.get('source') or '').strip().lower() or 'caller_asserted_verified'
+    if source not in TRUSTED_SOURCE_ALLOWLIST:
+        source = 'caller_asserted_verified'
+
+    if source == VERIFIED_OWNER_SOURCE and not is_owner:
+        source = 'caller_asserted_verified'
+
+    allow_conflict_supersede = bool(trust.get('allow_conflict_supersede') is True and is_owner)
+    scope_override = str(trust.get('scope') or '').strip() or None
+
+    return {
+        'verified': True,
+        'is_owner': is_owner,
+        'actor_id': actor_id,
+        'source': source,
+        'source_key': source,
+        'scope_override': scope_override,
+        'allow_conflict_supersede': allow_conflict_supersede,
+    }
 
 
 def _coerce_scope(raw_scope: Any) -> str:
@@ -270,11 +457,11 @@ def _resolve_schema_name(fact_type: str, raw_hint_present: bool) -> str:
     return 'TypedFact'
 
 
-def _build_evidence_ref() -> list[EvidenceRef]:
+def _build_evidence_ref(source_key: str) -> list[EvidenceRef]:
     return [
         EvidenceRef.from_legacy_ref(
             {
-                'source_key': 'owner_asserted',
+                'source_key': source_key,
                 'source_system': 'user',
                 'evidence_id': uuid4().hex,
                 'observed_at': _now_iso(),
@@ -368,11 +555,13 @@ def _get_graphiti_client() -> Any | None:
 def _materialize_fact(
     *,
     fact: StateFact,
+    source: str,
     superseded_fact_id: str | None = None,
 ) -> tuple[bool, str | None]:
     graphiti_client = _get_graphiti_client()
     return _materializer.materialize_typed_fact(
         fact=fact,
+        source=source,
         superseded_fact_id=superseded_fact_id,
         graphiti_client=graphiti_client,
     )
@@ -385,11 +574,12 @@ def _build_state_fact(
     value: Any,
     fact_type: str,
     scope: str,
+    source_key: str,
     parent: StateFact | None = None,
     version: int = 1,
 ) -> StateFact:
     object_id = _stable_object_id(str(uuid4()))
-    root_id = parent.object_id if parent is not None else object_id
+    root_id = parent.root_id if parent is not None else object_id
     parent_id = parent.object_id if parent is not None else None
     fact = StateFact.model_validate(
         {
@@ -405,7 +595,8 @@ def _build_state_fact(
             'scope': scope,
             'policy_scope': scope,
             'visibility_scope': scope,
-            'evidence_refs': _build_evidence_ref(),
+            'source_key': source_key,
+            'evidence_refs': _build_evidence_ref(source_key),
         }
     )
     return fact
@@ -450,8 +641,31 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             'message': 'hint must be a dict when provided',
         }
 
-    schema_requested = 'type' in hint or 'type_hint' in hint
-    raw_type = hint.get('type') or hint.get('type_hint')
+    hint_ok, hint_error = _validate_hint_contract(hint)
+    if not hint_ok:
+        return {
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': hint_error,
+        }
+
+    hint_bounds_ok, hint_bounds_error = _validate_payload_bounds(
+        hint,
+        label='hint',
+        max_json_bytes=MAX_HINT_JSON_BYTES,
+        max_depth=MAX_HINT_DEPTH,
+    )
+    if not hint_bounds_ok:
+        return {
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': hint_bounds_error,
+        }
+
+    write_context = _resolve_write_context(hint)
+
+    schema_requested = 'type' in hint or 'type_hint' in hint or 'fact_type' in hint
+    raw_type = hint.get('type') or hint.get('type_hint') or hint.get('fact_type')
 
     if raw_type is not None:
         fact_type = _normalize_fact_type(str(raw_type))
@@ -459,7 +673,11 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
     else:
         fact_type, confidence = _infer_fact_type(clean)
 
-    scope = _coerce_scope(hint.get('scope') or hint.get('policy_scope'))
+    scope = _coerce_scope(
+        hint.get('scope')
+        or hint.get('policy_scope')
+        or write_context.get('scope_override')
+    )
 
     subject = str(hint.get('subject') or '').strip()
     if not subject:
@@ -500,7 +718,15 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
     }
 
     schema_name = _resolve_schema_name(fact_type, raw_hint_present=schema_requested)
-    valid, error = _validate_typed_object(typed_candidate, schema_name)
+    schema_candidate = typed_candidate
+    if schema_name != 'TypedFact':
+        schema_candidate = {
+            'subject': typed_candidate['subject'],
+            'predicate': typed_candidate['predicate'],
+            'value': typed_candidate['value'],
+        }
+
+    valid, error = _validate_typed_object(schema_candidate, schema_name, strict=True)
     if not valid:
         return {
             'status': 'error',
@@ -509,7 +735,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
         }
 
     # Even when specific schema validation passed, enforce core typed schema.
-    valid, error = _validate_typed_object(typed_candidate, 'TypedFact')
+    valid, error = _validate_typed_object(typed_candidate, 'TypedFact', strict=True)
     if not valid:
         return {
             'status': 'error',
@@ -539,7 +765,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
                 'root_id': existing_payload.get('root_id', ''),
                 'policy_scope': existing_payload.get('policy_scope', scope),
                 'visibility_scope': existing_payload.get('visibility_scope', scope),
-                'evidence_refs': _build_evidence_ref(),
+                'evidence_refs': _build_evidence_ref(write_context['source_key']),
                 'version': int(existing_payload.get('version', 1) or 1),
             }
         ))
@@ -550,9 +776,46 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
         }
 
     supersede_requested = _coerce_bool(hint.get('supersede'))
+    supersede_allowed = bool(
+        supersede_requested and write_context.get('allow_conflict_supersede')
+    )
 
-    if is_conflict and not supersede_requested:
-        # quarantine + ConflictDialog (3-option).
+    if is_conflict and not supersede_allowed:
+        # Conflict is quarantined by default; `hint.supersede` is gated by trusted authz.
+        candidate_metadata = {
+            'fact_type': fact_type,
+            'confidence': confidence,
+            'input_text': clean,
+        }
+        if isinstance(hint.get('metadata'), dict):
+            candidate_metadata['hint_metadata'] = hint['metadata']
+
+        metadata_ok, metadata_error = _validate_payload_bounds(
+            candidate_metadata,
+            label='candidate_metadata',
+            max_json_bytes=MAX_AUX_PAYLOAD_JSON_BYTES,
+            max_depth=MAX_AUX_PAYLOAD_DEPTH,
+        )
+        if not metadata_ok:
+            return {
+                'status': 'error',
+                'error_type': 'validation_error',
+                'message': metadata_error,
+            }
+
+        raw_hint_ok, raw_hint_error = _validate_payload_bounds(
+            hint,
+            label='hint',
+            max_json_bytes=MAX_AUX_PAYLOAD_JSON_BYTES,
+            max_depth=MAX_AUX_PAYLOAD_DEPTH,
+        )
+        if not raw_hint_ok:
+            return {
+                'status': 'error',
+                'error_type': 'validation_error',
+                'message': raw_hint_error,
+            }
+
         try:
             candidate = _candidate_store.create_candidate(
                 payload={
@@ -561,25 +824,45 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
                     'value': value,
                     'fact_type': fact_type,
                 },
-                conflict_with_fact_id=existing_payload.get('object_id') if isinstance(existing_payload, dict) else None,
-                source=DEFAULT_SOURCE,
+                conflict_with_fact_id=(
+                    existing_payload.get('object_id') if isinstance(existing_payload, dict) else None
+                ),
+                source=write_context['source'],
                 raw_hint={**hint},
-                metadata={
-                    'fact_type': fact_type,
-                    'confidence': confidence,
-                    'input_text': clean,
-                },
+                metadata=candidate_metadata,
             )
-            _log_audit('quarantine_conflict', candidate_id=candidate.get('candidate_id'), value=value, result='ok')
+            _log_audit(
+                'quarantine_conflict',
+                candidate_id=candidate.get('candidate_id'),
+                value=value,
+                result='ok',
+                actor_id=write_context['actor_id'],
+                source=write_context['source'],
+            )
         except Exception as exc:
-            _log_audit('quarantine_conflict', error=str(exc), value=value, result='error')
+            _log_audit(
+                'quarantine_conflict',
+                error=str(exc),
+                value=value,
+                result='error',
+                actor_id=write_context['actor_id'],
+                source=write_context['source'],
+            )
             return {
                 'status': 'error',
                 'error_type': 'candidate_error',
                 'message': str(exc),
             }
 
-        conflict_existing = _serialize_fact(existing_fact) if existing_fact else (_state_fact_as_dict(existing_payload) if isinstance(existing_payload, dict) else existing_payload or {})
+        conflict_existing = (
+            _serialize_fact(existing_fact)
+            if existing_fact
+            else (
+                _state_fact_as_dict(existing_payload)
+                if isinstance(existing_payload, dict)
+                else existing_payload or {}
+            )
+        )
         return {
             'type': 'ConflictDialog',
             'status': 'conflict',
@@ -590,9 +873,11 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             'resolve_via': 'promote_candidate(candidate_id, resolution="supersede"|"parallel"|"cancel")',
             'candidate_id': candidate.get('candidate_id'),
             'candidate_uuid': candidate.get('candidate_id'),
+            'supersede_requested': supersede_requested,
+            'supersede_allowed': supersede_allowed,
         }
 
-    parent = existing_fact if existing_fact and is_conflict and supersede_requested else None
+    parent = existing_fact if existing_fact and is_conflict and supersede_allowed else None
     version = int(parent.version + 1) if parent is not None else 1
     event_type = 'supersede' if parent is not None else 'assert'
 
@@ -602,14 +887,44 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
         value=value,
         fact_type=fact_type,
         scope=scope,
+        source_key=write_context['source_key'],
         parent=parent,
         version=version,
     )
 
+    event_metadata = {
+        'source': write_context['source'],
+        'scope': scope,
+        'fact_type': fact_type,
+        'input_text': clean,
+        'confidence': confidence,
+        'input_hint_keys': sorted(k for k in hint) if isinstance(hint, dict) else [],
+        'superseded_fact_id': parent.object_id if parent is not None else None,
+        'trust': {
+            'verified': bool(write_context.get('verified')),
+            'is_owner': bool(write_context.get('is_owner')),
+        },
+    }
+    if isinstance(hint.get('metadata'), dict):
+        event_metadata['hint_metadata'] = hint['metadata']
+
+    metadata_ok, metadata_error = _validate_payload_bounds(
+        event_metadata,
+        label='event_metadata',
+        max_json_bytes=MAX_AUX_PAYLOAD_JSON_BYTES,
+        max_depth=MAX_AUX_PAYLOAD_DEPTH,
+    )
+    if not metadata_ok:
+        return {
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': metadata_error,
+        }
+
     try:
         _change_ledger.append_event(
             event_type,
-            actor_id=DEFAULT_SOURCE,
+            actor_id=write_context['actor_id'],
             reason='supersede' if parent is not None else DEFAULT_ACTION,
             recorded_at=_now_iso(),
             object_type='state_fact',
@@ -618,19 +933,19 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             root_id=fact.root_id,
             parent_id=fact.parent_id,
             policy_version=hint.get('policy_version') if isinstance(hint, dict) else None,
-            metadata={
-                'source': DEFAULT_SOURCE,
-                'scope': scope,
-                'fact_type': fact_type,
-                'input_text': clean,
-                'confidence': confidence,
-                'input_hint_keys': sorted(k for k in hint.keys()) if isinstance(hint, dict) else [],
-                'superseded_fact_id': parent.object_id if parent is not None else None,
-            },
+            metadata=event_metadata,
             payload=fact,
         )
     except Exception as exc:
-        _log_audit('ledger_write_failed', fact=fact, error=str(exc), value=value, result='error')
+        _log_audit(
+            'ledger_write_failed',
+            fact=fact,
+            error=str(exc),
+            value=value,
+            result='error',
+            actor_id=write_context['actor_id'],
+            source=write_context['source'],
+        )
         return {
             'status': 'error',
             'error_type': 'ledger_write_error',
@@ -642,6 +957,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
     try:
         materialized, materialization_error = await _materialize_fact(
             fact=fact,
+            source=write_context['source'],
             superseded_fact_id=parent.object_id if parent is not None else None,
         )
         if not materialized and materialization_error:
@@ -650,28 +966,73 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
                 fact.object_id,
                 materialization_error,
             )
+            _log_audit(
+                'neo4j_write_failed',
+                fact=fact,
+                error=materialization_error,
+                value=value,
+                result='error',
+                actor_id=write_context['actor_id'],
+                source=write_context['source'],
+            )
+        elif materialized:
+            _log_audit(
+                'neo4j_write',
+                fact=fact,
+                value=value,
+                result='ok',
+                actor_id=write_context['actor_id'],
+                source=write_context['source'],
+            )
     except Exception as exc:
         materialization_error = str(exc)
         logger.warning('Neo4j materialization threw for fact=%s: %s', fact.object_id, exc)
+        _log_audit(
+            'neo4j_write_failed',
+            fact=fact,
+            error=materialization_error,
+            value=value,
+            result='error',
+            actor_id=write_context['actor_id'],
+            source=write_context['source'],
+        )
 
     _log_audit(
         'ledger_write',
         fact=fact,
         value=value,
         result='ok',
+        actor_id=write_context['actor_id'],
+        source=write_context['source'],
     )
 
-    return {
+    response = {
         'status': 'ok',
         'fact': _serialize_fact(fact),
         'materialized': materialized,
         'materialization_error': materialization_error,
+        'neo4j_materialization': {
+            'status': 'ok' if materialized else 'failed',
+            'error': materialization_error,
+        },
         'audit': {
             'path': 'ledger_primary',
             'action': event_type,
+            'actor_id': write_context['actor_id'],
+            'source': write_context['source'],
             'neo4j_status': 'ok' if materialized else 'deferred_or_failed',
         },
     }
+
+    if not materialized:
+        response['warnings'] = [
+            {
+                'code': 'neo4j_materialization_failed',
+                'message': materialization_error or 'Neo4j materialization failed',
+            }
+        ]
+
+    return response
 
 
 async def get_current_state(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
