@@ -2,26 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import os
 
 import pytest
-import asyncio
-
+from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 from mcp_server.src.routers import packs
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.pack_registry import PackRegistryService
-from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 
 
 @pytest.fixture
 def registry_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Create an isolated registry file for the test and point the service to it."""
-    path = tmp_path / 'pack_registry.json'
-    svc = PackRegistryService(path)
-    svc.refresh()
+    """Create an isolated user-pack registry and point the service to it."""
+    path = tmp_path / 'runtime_user_pack_registry.json'
     monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(path))
+    monkeypatch.delenv('BICAMERAL_PACK_REGISTRY_PATH', raising=False)
     return path
 
 
@@ -65,26 +65,52 @@ def _make_state_fact(*, subject: str, predicate: str, value, ts: datetime) -> St
     )
 
 
+def _workflow_definition(*, pack_id: str) -> dict[str, object]:
+    return {
+        'pack_id': pack_id,
+        'scope': 'workflow',
+        'intent': 'verifier',
+        'consumer': 'planner',
+        'version': '1.2.0',
+        'description': f'Workflow for {pack_id}',
+        'predicates': ['earnings', 'revenue', 'expense'],
+        'definition': {
+            'trigger': 'quarter_end',
+            'steps': [{'step': 'ingest', 'action': 'collect facts', 'target': 'facts'}],
+            'examples': [{'step': 'ingest', 'action': 'collect facts'}],
+            'instructions': 'Collect the latest financial facts before summarizing.',
+        },
+    }
+
+
+def _nested_mapping(depth: int) -> dict[str, object]:
+    current: dict[str, object] = {'leaf': 'x'}
+    for index in range(depth):
+        current = {f'level_{index}': current}
+    return current
+
+
 def test_list_packs_supports_filtering(registry_path: Path):
-    # Contextual packs should be discoverable by scope and intent filters.
     result = asyncio.run(packs.list_packs())
     assert isinstance(result, list)
     ids = {item['id'] for item in result}
     assert {'context-vc-deal-brief', 'context-crypto-constraints'} <= ids
     assert {'workflow-deal-review', 'workflow-standup'} <= ids
+    assert all('definition' not in item for item in result)
 
     context_only = asyncio.run(packs.list_packs({'scope': 'context'}))
+    assert context_only
     assert all(item['scope'] == 'context' for item in context_only)
 
     by_intent = asyncio.run(packs.list_packs({'intent': 'decision_maker'}))
-    assert by_intent == [] or len(by_intent) >= 1
+    assert by_intent
+    assert all(item['intent'] == 'decision_maker' for item in by_intent)
 
 
 def test_get_context_pack_materializes_matching_facts(ledger_path: Path, registry_path: Path):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     ledger = ChangeLedger(ledger_path)
 
-    # Facts older -> lower precedence than newer in final output.
     old_fact = _make_state_fact(
         subject='coinbase',
         predicate='industry',
@@ -115,12 +141,11 @@ def test_get_context_pack_materializes_matching_facts(ledger_path: Path, registr
     )
 
     result = asyncio.run(packs.get_context_pack('context-vc-deal-brief'))
-    assert isinstance(result, dict)
     assert result.get('pack_id') == 'context-vc-deal-brief'
+    assert result['pack_metadata']['id'] == 'context-vc-deal-brief'
     facts = result.get('facts', [])
 
-    assert [f['predicate'] for f in facts] == ['industry', 'industry']
-    # newer fact should be materialized first
+    assert [fact['predicate'] for fact in facts] == ['industry', 'industry']
     assert facts[0]['subject'] == 'a16z'
     assert result['fact_count'] == 2
 
@@ -152,38 +177,88 @@ def test_get_context_pack_task_filter_reduces_matches(ledger_path: Path, registr
 def test_describe_pack_returns_schema_and_examples(registry_path: Path):
     result = asyncio.run(packs.describe_pack('context-vc-deal-brief'))
     assert result.get('pack_id') == 'context-vc-deal-brief'
+    assert result.get('pack_registry', {}).get('id') == 'context-vc-deal-brief'
     assert isinstance(result.get('schema'), dict)
     assert isinstance(result.get('examples'), list)
     assert result.get('instructions')
 
 
-def test_create_workflow_pack_is_persistent(registry_path: Path):
-    created = asyncio.run(
-        packs.create_workflow_pack(
-            {
-                'id': 'workflow-earnings-review',
-                'scope': 'workflow',
-                'intent': 'verifier',
-                'consumer': 'planner',
-                'version': '1.2.0',
-                'description': 'Workflow for review of quarterly earnings call notes',
-                'predicates': ['earnings', 'revenue', 'expense'],
-                'definition': {
-                    'trigger': 'quarter_end',
-                    'steps': [{'step': 'ingest', 'action': 'collect', 'target': 'facts'}],
-                    'examples': [{'step': 'ingest', 'action': 'collect facts'}],
-                },
-            }
-        )
-    )
-    assert created.get('pack', {}).get('id') == 'workflow-earnings-review'
+def test_create_workflow_pack_is_persistent_in_private_registry(registry_path: Path):
+    created = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-earnings-review')))
+    assert created.get('id') == 'workflow-earnings-review'
+    assert created.get('scope') == 'workflow'
+    assert 'definition' not in created
 
     service = PackRegistryService(os.environ['BICAMERAL_USER_PACK_REGISTRY_PATH'])
     assert service.get_pack('workflow-earnings-review') is not None
 
-    # Reloading should preserve the newly created pack.
-    service2 = PackRegistryService(os.environ['BICAMERAL_USER_PACK_REGISTRY_PATH'])
-    assert service2.get_pack('workflow-earnings-review') is not None
+    persisted = json.loads(registry_path.read_text(encoding='utf-8'))
+    persisted_ids = {item['id'] for item in persisted['packs']}
+    assert persisted_ids == {'workflow-earnings-review'}
+
+
+def test_create_workflow_pack_rejects_duplicate_ids_and_builtin_hijack(registry_path: Path):
+    original = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-earnings-review')))
+    assert original.get('id') == 'workflow-earnings-review'
+
+    duplicate = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-earnings-review')))
+    assert 'already exists' in duplicate.get('error', '')
+
+    hijack_attempt = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='context-vc-deal-brief')))
+    assert 'already exists' in hijack_attempt.get('error', '')
+
+    service = PackRegistryService(registry_path)
+    resolved = service.get_pack('workflow-earnings-review')
+    assert resolved is not None
+    assert resolved['id'] == 'workflow-earnings-review'
+
+
+def test_create_workflow_pack_rejects_empty_predicates(registry_path: Path):
+    definition = _workflow_definition(pack_id='workflow-empty-preds')
+    definition['predicates'] = []
+
+    result = asyncio.run(packs.create_workflow_pack(definition))
+    assert 'non-empty' in result.get('error', '')
+
+
+def test_create_workflow_pack_requires_private_registry_path(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv('BICAMERAL_USER_PACK_REGISTRY_PATH', raising=False)
+    monkeypatch.delenv('BICAMERAL_PACK_REGISTRY_PATH', raising=False)
+
+    result = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id='workflow-public-fallback')))
+    assert 'BICAMERAL_USER_PACK_REGISTRY_PATH' in result.get('error', '')
+
+
+def test_create_workflow_pack_rejects_overly_nested_definitions(registry_path: Path):
+    definition = _workflow_definition(pack_id='workflow-too-deep')
+    definition['definition'] = {
+        'trigger': 'quarter_end',
+        'steps': [{'step': 'ingest', 'action': 'collect facts'}],
+        'instructions': 'Keep it sane.',
+        'nested': _nested_mapping(12),
+    }
+
+    result = asyncio.run(packs.create_workflow_pack(definition))
+    assert 'max nesting depth' in result.get('error', '')
+
+
+def test_concurrent_creates_preserve_both_packs(registry_path: Path):
+    def create(pack_id: str) -> dict[str, object]:
+        return PackRegistryService(registry_path).create_pack(_workflow_definition(pack_id=pack_id))
+
+    pack_ids = ['workflow-concurrent-a', 'workflow-concurrent-b']
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create, pack_ids))
+
+    assert {result['id'] for result in results} == set(pack_ids)
+
+    service = PackRegistryService(registry_path)
+    persisted = {pack['id'] for pack in service.list_packs(filter={'scope': 'workflow'})}
+    assert set(pack_ids) <= persisted
+
+    user_payload = json.loads(registry_path.read_text(encoding='utf-8'))
+    user_ids = {pack['id'] for pack in user_payload['packs']}
+    assert user_ids == set(pack_ids)
 
 
 def test_list_packs_invalid_filter_returns_empty_list(registry_path: Path):

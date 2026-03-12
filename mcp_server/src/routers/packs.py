@@ -10,10 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
-from ..services.pack_registry import (
-    PackRegistryError,
-    PackRegistryService,
-)
+from ..services.pack_registry import PackRegistryService
 
 
 def _to_iso_ts(value: Any) -> str:
@@ -51,7 +48,6 @@ def _parse_event_time(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     try:
-        # datetime.fromisoformat does not accept trailing Z pre-3.11.
         normalized = str(value)
         if normalized.endswith('Z'):
             normalized = normalized[:-1] + '+00:00'
@@ -91,14 +87,8 @@ def _predicates_for_pack(pack: dict[str, Any]) -> list[str]:
 
 
 def _matches_predicate(predicate: str, patterns: list[str]) -> bool:
-    if not patterns:
-        return False
-
     normalized = str(predicate or '').lower()
-    for pattern in patterns:
-        if fnmatch.fnmatch(normalized, str(pattern).strip().lower()):
-            return True
-    return False
+    return any(fnmatch.fnmatch(normalized, str(pattern).strip().lower()) for pattern in patterns)
 
 
 def _matches_task(fact: Any, task: str | None) -> bool:
@@ -113,18 +103,17 @@ def _matches_task(fact: Any, task: str | None) -> bool:
         str(getattr(fact, 'subject', '')),
         str(getattr(fact, 'predicate', '')),
         _to_text(getattr(fact, 'value', None)),
-        _to_text(_serialise_fact(fact).get('value')),  # fallback if value is nested
+        _to_text(_serialise_fact(fact).get('value')),
     ]
     blob = ' '.join(serialised).lower()
-
     return all(token in blob for token in tokens)
 
 
 def _resolve_ledger_path(override: str | Path | None = None) -> Path:
     if override:
         return Path(override)
-    override = os.getenv('BICAMERAL_CHANGE_LEDGER_PATH', '').strip()
-    return Path(override) if override else Path(DB_PATH_DEFAULT)
+    env_override = os.getenv('BICAMERAL_CHANGE_LEDGER_PATH', '').strip()
+    return Path(env_override) if env_override else Path(DB_PATH_DEFAULT)
 
 
 def _materialize_pack_facts(
@@ -188,21 +177,16 @@ def _infer_schema(definition: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-async def list_packs(
-    filter: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
+async def list_packs(filter: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """List all registered packs filtered by scope/intent/consumer."""
     try:
         service = PackRegistryService()
-        return service.list_packs(filter=filter)
+        return [_pack_metadata(pack) for pack in service.list_packs(filter=filter)]
     except Exception:
         return []
 
 
-async def get_context_pack(
-    pack_id: str,
-    task: str | None = None,
-) -> dict[str, Any]:
+async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
     """Resolve context pack definition and materialized facts."""
     try:
         service = PackRegistryService()
@@ -225,10 +209,7 @@ async def get_context_pack(
         return {'error': f'get_context_pack failed: {exc}'}
 
 
-async def get_workflow_pack(
-    pack_id: str,
-    task: str | None = None,
-) -> dict[str, Any]:
+async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
     """Resolve workflow pack definition and materialized trigger facts."""
     try:
         service = PackRegistryService()
@@ -264,9 +245,10 @@ async def describe_pack(pack_id: str) -> dict[str, Any]:
         if not isinstance(definition, dict):
             definition = {}
 
+        pack_registry = _pack_metadata(pack)
         return {
             'pack_id': pack['id'],
-            'metadata': _pack_metadata(pack),
+            'pack_registry': pack_registry,
             'predicates': pack.get('predicates', []),
             'schema': _infer_schema(definition),
             'examples': definition.get('examples', []),
@@ -282,7 +264,7 @@ async def create_workflow_pack(definition: dict[str, Any]) -> dict[str, Any]:
     try:
         service = PackRegistryService()
         row = service.create_pack(definition)
-        return {'pack': row}
+        return _pack_metadata(row)
     except Exception as exc:
         return {'error': f'create_workflow_pack failed: {exc}'}
 
