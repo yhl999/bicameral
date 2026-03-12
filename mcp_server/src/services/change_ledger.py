@@ -436,6 +436,32 @@ class ChangeLedger:
             )
         return EntityRegistry(list(entries.values()))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection.
+
+        Safe to call multiple times; subsequent calls after the first are no-ops.
+        Callers that open a ledger for a short-lived read (e.g. pack
+        materialization inside the MCP server process) should call this when done,
+        or use the context-manager form::
+
+            with ChangeLedger(path) as ledger:
+                facts = ledger.current_state_facts()
+        """
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> ChangeLedger:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
     def promote_candidate_fact(
         self,
         *,

@@ -14,6 +14,11 @@ from typing import Any
 # graphiti_mcp_server.py.
 MAX_PACK_MATERIALIZED_FACTS = 200
 
+# Defense-in-depth cap for the `task` query input accepted by get_context_pack
+# and get_workflow_pack.  Prevents unbounded string processing / DoS via the
+# _matches_task token-scan path in a long-lived MCP server process.
+MAX_TASK_QUERY_LENGTH = 2048
+
 try:
     from ._phase0 import (
         error_response,
@@ -152,8 +157,8 @@ def _materialize_pack_facts(
     if not patterns:
         return []
 
-    ledger = ChangeLedger(_resolve_ledger_path(ledger_path))
-    current_facts = ledger.current_state_facts()
+    with ChangeLedger(_resolve_ledger_path(ledger_path)) as ledger:
+        current_facts = ledger.current_state_facts()
 
     selected: list[tuple[float, float, str, Any]] = []
     for fact in current_facts:
@@ -248,6 +253,13 @@ async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, A
     if task_error is not None:
         return task_error
 
+    if task is not None and len(task) > MAX_TASK_QUERY_LENGTH:
+        return error_response(
+            'validation_error',
+            message=f'task must not exceed {MAX_TASK_QUERY_LENGTH} characters',
+            details={'field': 'task', 'max_length': MAX_TASK_QUERY_LENGTH},
+        )
+
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
@@ -281,6 +293,13 @@ async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, 
     task_error = require_optional_non_empty_string('task', task)
     if task_error is not None:
         return task_error
+
+    if task is not None and len(task) > MAX_TASK_QUERY_LENGTH:
+        return error_response(
+            'validation_error',
+            message=f'task must not exceed {MAX_TASK_QUERY_LENGTH} characters',
+            details={'field': 'task', 'max_length': MAX_TASK_QUERY_LENGTH},
+        )
 
     try:
         service = PackRegistryService()

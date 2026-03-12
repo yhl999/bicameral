@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from mcp_server.src.models.typed_memory import EvidenceRef, StateFact
 from mcp_server.src.routers import packs
-from mcp_server.src.routers.packs import MAX_PACK_MATERIALIZED_FACTS
+from mcp_server.src.routers.packs import MAX_PACK_MATERIALIZED_FACTS, MAX_TASK_QUERY_LENGTH
 from mcp_server.src.services.change_ledger import ChangeLedger
 from mcp_server.src.services.pack_registry import PackRegistryService
 from mcp_server.src.services.schema_validation import _validate_typed_object
@@ -533,3 +533,95 @@ def test_get_context_pack_materialization_is_capped_at_max(ledger_path: Path, re
     returned_subjects = {f['subject'] for f in facts}
     # The 5 most recent are company_3 through company_7.
     assert returned_subjects == {f'company_{i}' for i in range(3, 8)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ChangeLedger connection lifecycle — fd-leak regression tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_materialize_pack_closes_ledger_connection(ledger_path: Path, registry_path: Path):
+    """_materialize_pack_facts must close the SQLite connection after materialization.
+
+    Regression guard for the fd-leak introduced when ChangeLedger was
+    instantiated without explicit cleanup inside the long-lived MCP server
+    process.  We verify that the connection is closed (attempting a query on
+    it afterwards raises ProgrammingError) without patching internals.
+    """
+    import sqlite3
+
+    import unittest.mock as mock
+
+    opened_ledgers: list[ChangeLedger] = []
+    original_init = ChangeLedger.__init__
+
+    def _capturing_init(self: ChangeLedger, *args: object, **kwargs: object) -> None:
+        original_init(self, *args, **kwargs)
+        opened_ledgers.append(self)
+
+    with mock.patch.object(ChangeLedger, '__init__', _capturing_init):
+        result = asyncio.run(packs.get_context_pack('context-vc-deal-brief'))
+
+    assert result.get('pack_id') == 'context-vc-deal-brief', result
+
+    # At least one ledger must have been opened during materialization.
+    assert opened_ledgers, 'expected _materialize_pack_facts to open a ChangeLedger'
+
+    for ledger in opened_ledgers:
+        # A closed connection raises ProgrammingError on any further operation.
+        with pytest.raises(Exception):
+            ledger.conn.execute('SELECT 1')
+
+
+def test_change_ledger_context_manager_closes_connection():
+    """ChangeLedger.__exit__ must close the underlying connection."""
+    import sqlite3
+
+    with ChangeLedger(':memory:') as ledger:
+        # Verify it works while open.
+        result = ledger.conn.execute('SELECT 1').fetchone()
+        assert result[0] == 1
+
+    # After __exit__ the connection must be closed.
+    with pytest.raises(Exception):
+        ledger.conn.execute('SELECT 1')
+
+
+def test_change_ledger_close_is_idempotent():
+    """close() called multiple times must not raise."""
+    ledger = ChangeLedger(':memory:')
+    ledger.close()
+    ledger.close()  # should be a no-op, not an exception
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# task max-length guard — DoS / unbounded-input regression tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_get_context_pack_rejects_task_exceeding_max_length(registry_path: Path):
+    """get_context_pack must reject task strings longer than MAX_TASK_QUERY_LENGTH."""
+    oversized_task = 'x' * (MAX_TASK_QUERY_LENGTH + 1)
+    result = asyncio.run(packs.get_context_pack('context-vc-deal-brief', task=oversized_task))
+    assert result.get('error') == 'validation_error'
+    assert 'task' in result.get('message', '').lower()
+    assert result.get('details', {}).get('max_length') == MAX_TASK_QUERY_LENGTH
+
+
+def test_get_context_pack_accepts_task_at_max_length(ledger_path: Path, registry_path: Path):
+    """get_context_pack must accept task strings exactly at MAX_TASK_QUERY_LENGTH."""
+    exact_task = 'a' * MAX_TASK_QUERY_LENGTH
+    result = asyncio.run(packs.get_context_pack('context-vc-deal-brief', task=exact_task))
+    # No validation error — may return empty facts but must not error on length.
+    assert result.get('error') != 'validation_error' or 'task' not in result.get('message', '').lower()
+
+
+def test_get_workflow_pack_rejects_task_exceeding_max_length(registry_path: Path):
+    """get_workflow_pack must reject task strings longer than MAX_TASK_QUERY_LENGTH."""
+    pack_id = 'workflow-ledger-task-len-test'
+    created = asyncio.run(packs.create_workflow_pack(_workflow_definition(pack_id=pack_id)))
+    assert 'error' not in created, created
+
+    oversized_task = 'z' * (MAX_TASK_QUERY_LENGTH + 1)
+    result = asyncio.run(packs.get_workflow_pack(pack_id, task=oversized_task))
+    assert result.get('error') == 'validation_error'
+    assert 'task' in result.get('message', '').lower()
+    assert result.get('details', {}).get('max_length') == MAX_TASK_QUERY_LENGTH
