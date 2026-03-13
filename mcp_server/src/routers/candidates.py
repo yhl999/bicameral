@@ -62,7 +62,7 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'min_confidence': 'float | null',
                 'max_age_days': 'int | null',
             },
-            'output': 'list[Candidate]',
+            'output': '{"status": "ok", "candidates": list[Candidate], "reviewer": string} | ErrorResponse',
         },
         'examples': [{'status': 'quarantine'}],
     },
@@ -92,7 +92,7 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'actor_id': 'string | null (informational audit hint only; never used for authorization)',
                 'reason': 'string | null',
             },
-            'output': '{"status": "ok", "action": "rejected", "candidate": Candidate} | ErrorResponse',
+            'output': '{"status": "ok", "action": "rejected", "candidate": Candidate, "reviewer": string, "reason": string | null} | ErrorResponse',
         },
     },
 ]
@@ -242,6 +242,26 @@ def _candidate_to_public(candidate: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _candidate_source_lane(candidate: dict[str, Any]) -> str | None:
+    """Extract the canonical source_lane (lane/group id) from candidate storage.
+
+    Resolution order:
+    1. ``raw_hint['source_lane']`` — set by ``remember_fact`` during quarantine
+       (populated from the server's configured ``group_id`` via ``_derive_source_lane()``).
+    2. ``None`` — no lane identity available.
+
+    Does NOT fall back to ``_candidate_scope()`` (visibility scope).  The two
+    concepts are distinct:
+      - ``scope``       = visibility/policy boundary (``'private'``, ``'public'``, etc.)
+      - ``source_lane`` = canonical lane/group identifier (a real group_id).
+    Conflating them causes promoted candidates to become invisible on subsequent
+    lane-scoped reads when an authorized_group_id restriction is active.
+    """
+    raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
+    lane = str(raw_hint.get('source_lane') or '').strip()
+    return lane or None
+
+
 def _candidate_evidence_refs(candidate: dict[str, Any]) -> list[EvidenceRef]:
     raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
     existing = raw_hint.get('evidence_refs')
@@ -277,6 +297,9 @@ def _candidate_to_fact_input(candidate: dict[str, Any]) -> dict[str, Any]:
         'predicate': candidate.get('predicate'),
         'value': candidate.get('value'),
         'scope': _candidate_scope(candidate),
+        # Preserve canonical lane identity so build_object_from_candidate_fact
+        # uses the real group_id, not the visibility scope.
+        'source_lane': _candidate_source_lane(candidate),
         'evidence_refs': [ref.model_dump(mode='json') for ref in _candidate_evidence_refs(candidate)],
     }
 
@@ -532,7 +555,8 @@ async def reject_candidate(
     ctx: _McpContext | None = None,
 ) -> dict[str, Any]:
     del actor_id  # caller-controlled audit hint only; never the auth source
-    del reason
+    # Preserve normalized reason for audit trail / response.  Do NOT del reason.
+    normalized_reason = _normalize_reason(reason)
 
     normalized_candidate_id = str(candidate_id or '').strip()
     if not normalized_candidate_id:
@@ -555,7 +579,10 @@ async def reject_candidate(
         store.update_candidate_status(normalized_candidate_id, 'promoted', resolution='supersede')
         return _candidate_status_error(normalized_candidate_id, 'promoted')
 
-    updated = store.update_candidate_status(normalized_candidate_id, 'rejected')
+    # Write reason into resolution so it is durably stored in candidates.db.
+    # Format: 'rejected' when no reason supplied, 'rejected: <reason>' when one is.
+    resolution = f'rejected: {normalized_reason}' if normalized_reason else 'rejected'
+    updated = store.update_candidate_status(normalized_candidate_id, 'rejected', resolution=resolution)
     if not updated:
         refreshed = store.get_candidate(normalized_candidate_id)
         if refreshed is None:
@@ -567,6 +594,7 @@ async def reject_candidate(
         'action': 'rejected',
         'candidate': _candidate_to_public(store.get_candidate(normalized_candidate_id) or candidate),
         'reviewer': reviewer,
+        'reason': normalized_reason,
     }
 
 

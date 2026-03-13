@@ -857,7 +857,11 @@ def build_object_from_candidate_fact(
     if not evidence_refs:
         raise ValueError('candidate promotion requires evidence_refs')
 
-    source_lane = _source_lane_from_legacy_refs(fact.get('evidence_refs') or [])
+    # Prefer explicit source_lane from the fact dict (set during candidate creation
+    # in remember_fact); fall back to evidence refs for legacy callers.
+    source_lane = str(fact.get('source_lane') or '').strip() or None
+    if source_lane is None:
+        source_lane = _source_lane_from_legacy_refs(fact.get('evidence_refs') or [])
     source_key = _source_key_from_legacy_refs(fact.get('evidence_refs') or [])
     base = {
         'object_id': _stable_object_id(candidate_id),
@@ -1052,6 +1056,24 @@ def _state_fact_type(assertion_type: str, predicate: str) -> str:
 
 
 def _source_lane_from_legacy_refs(refs: list[dict[str, Any]]) -> str | None:
+    """Return source_lane from legacy evidence ref dicts.
+
+    Reads the ``scope`` field from each ref as a lane/group identifier.  This
+    is correct for the ``truth.candidates`` path where evidence refs store the
+    real group_id in ``scope`` (e.g., ``'s1_observational_memory'``).
+
+    For the ``mcp_server`` router path, callers that need to preserve a real
+    group_id should pass it as ``source_lane`` in the top-level fact dict
+    instead, since there the ``scope`` field carries visibility policy
+    (``'private'``, ``'public'``) rather than a group identifier.
+    ``build_object_from_candidate_fact`` therefore checks ``fact['source_lane']``
+    before calling this function.
+
+    Note: serialised ``EvidenceRef`` model dicts (from ``.model_dump(mode='json')``)
+    do not carry a ``scope`` field, so this function correctly returns ``None``
+    for those callers and the top-level check in
+    ``build_object_from_candidate_fact`` takes priority.
+    """
     for ref in refs:
         scope = ref.get('scope')
         if isinstance(scope, str) and scope.strip():

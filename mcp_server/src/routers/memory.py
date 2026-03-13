@@ -1072,6 +1072,13 @@ async def remember_fact(
         candidate_raw_hint = {**hint}
         candidate_raw_hint['scope'] = scope
         candidate_raw_hint['policy_scope'] = scope
+        # Preserve canonical lane identity so the promoted candidate is visible
+        # to the same authorized lane-scoped surfaces as a direct ledger write.
+        # _derive_source_lane() reads the server's configured group_id; it returns
+        # None when no default group is configured (no-op for non-lane deployments).
+        _candidate_source_lane = _derive_source_lane()
+        if _candidate_source_lane:
+            candidate_raw_hint['source_lane'] = _candidate_source_lane
         if write_context.get('verified'):
             trust_snapshot = dict(candidate_raw_hint.get('trust') or {})
             trust_snapshot.update(
