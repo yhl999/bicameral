@@ -241,6 +241,59 @@ async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | 
     promotion_source = str(candidate.get('source') or memory.DEFAULT_SOURCE)
     ledger = _get_change_ledger()
 
+    # ── Crash-safety / split-brain reconciliation ────────────────────────────
+    # If a prior promote_candidate call committed the ledger write (promote_
+    # candidate_fact) but then crashed before store.update_candidate_status
+    # completed, the candidates DB is still 'pending' while the ledger has the
+    # promotion event.  A naive retry would wedge on the UNIQUE index in the
+    # ledger (object_id is deterministic from candidate_id).
+    #
+    # Detect this by querying for an existing promote event with this
+    # candidate_id.  If one exists, skip the duplicate ledger write and just
+    # sync the candidates DB status (the only thing that didn't complete).
+    existing_promotion = ledger.promotion_event_for_candidate(candidate_id)
+    if existing_promotion is not None:
+        updated = store.update_candidate_status(candidate_id, 'promoted', resolution='supersede')
+        reconciled_obj = ledger.materialize_object(existing_promotion.object_id)
+        if not isinstance(reconciled_obj, StateFact):
+            reconcile_error = (
+                f'candidate {candidate_id} reconcile: promotion did not materialize a state fact'
+            )
+            memory._log_audit(
+                'candidate_promote',
+                candidate_id=candidate_id,
+                error=reconcile_error,
+                value=candidate.get('value'),
+                result='error',
+                actor_id=performing_actor_id,
+                source=promotion_source,
+            )
+            return _error(reconcile_error, error_type='ledger_write_error')
+        memory._log_audit(
+            'candidate_promote',
+            fact=reconciled_obj,
+            candidate_id=candidate_id,
+            value=candidate.get('value'),
+            result='ok',
+            actor_id=performing_actor_id,
+            source=promotion_source,
+        )
+        return {
+            'status': 'ok',
+            'action': 'promoted',
+            'candidate': memory._candidate_payload(updated or candidate),
+            'fact': memory._serialize_fact(reconciled_obj),
+            'materialized': False,
+            'materialization_error': None,
+            'promotion': {
+                'object_id': existing_promotion.object_id,
+                'root_id': existing_promotion.root_id or existing_promotion.object_id,
+                'event_id': existing_promotion.event_id,
+                'event_ids': [existing_promotion.event_id],
+            },
+        }
+    # ─────────────────────────────────────────────────────────────────────────
+
     try:
         promotion = ledger.promote_candidate_fact(
             actor_id=performing_actor_id,

@@ -987,3 +987,97 @@ def test_register_tools_required_params_correct():
     rc_params = set(tools_by_name['reject_candidate'].parameters.get('properties', {}).keys())
     assert 'candidate_id' in rc_params
     assert 'ctx' not in rc_params
+
+
+# ─── Regression: candidate_store default DB path (Exec 1 blocker) ────────────
+
+def test_candidate_store_default_db_path_is_repo_root():
+    """CandidateStore default path must resolve to repo-root state/, not mcp_server/state/.
+
+    Regression guard: the canonical path used by all tools, docs, and scripts is
+    repo-root state/candidates.db.  Previously _default_candidates_db_path() used
+    parents[2] (= mcp_server/) instead of parents[3] (= repo-root).
+    """
+    from mcp_server.src.services.candidate_store import _default_candidates_db_path
+    from mcp_server.src.services.change_ledger import DB_PATH_DEFAULT as LEDGER_DB_PATH
+
+    default = _default_candidates_db_path()
+    # Both DBs must share the same parent directory (repo-root state/).
+    assert default.parent == LEDGER_DB_PATH.parent, (
+        f"CandidateStore default dir {default.parent} != ledger dir {LEDGER_DB_PATH.parent}\n"
+        f"Both must point to repo-root state/, not mcp_server/state/"
+    )
+    assert default.name == 'candidates.db'
+    # Must NOT contain 'mcp_server' in the parent path segment immediately above 'state'
+    assert default.parent.parent.name != 'mcp_server', (
+        f"Default path {default} still resolves into mcp_server/state/ — fix parents[] index"
+    )
+
+
+# ─── Regression: promotion split-brain reconciliation (Exec 1 blocker) ───────
+
+def test_promote_candidate_reconciles_after_partial_ledger_commit(isolated_memory, monkeypatch):
+    """promote_candidate is idempotent when the ledger write succeeded but the
+    candidates-DB update did not commit (crash-safety split-brain reconciliation).
+
+    Simulates the failure mode:
+    1. promote_candidate_fact commits to the ledger (promote event recorded).
+    2. Process crashes before store.update_candidate_status runs.
+    3. Retry: promote_candidate is called again with the candidate still 'pending'.
+    Expected: the retry reconciles cleanly — no uniqueness error, status synced.
+    """
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:scheduler')
+
+    # Step 1 — create a conflict candidate via two remember_fact calls.
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI prefs'}))
+    conflict = _run(
+        memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI prefs'})
+    )
+    candidate_id = conflict['candidate_id']
+
+    ledger = isolated_memory['ledger']
+    store = isolated_memory['candidates']
+
+    # Step 2 — simulate the split-brain: write to ledger directly (as the first
+    # promote_candidate call would have done), but leave candidates DB at 'pending'.
+    cand = store.get_candidate(candidate_id)
+    raw_hint = cand.get('raw_hint') or {}
+    policy_version = str(raw_hint.get('policy_version') or candidates_router.DEFAULT_POLICY_VERSION)
+    fact_input = candidates_router._candidate_to_fact_input(cand)
+    ledger.promote_candidate_fact(
+        actor_id='system:scheduler',
+        reason='candidate_promotion:supersede',
+        policy_version=policy_version,
+        candidate_id=candidate_id,
+        fact=fact_input,
+        conflict_with_fact_id=cand.get('conflict_with_fact_id'),
+    )
+    # Confirm split-brain: ledger has the promote event, but DB still says pending.
+    assert ledger.promotion_event_for_candidate(candidate_id) is not None
+    assert store.get_candidate(candidate_id)['status'] == 'pending'
+
+    # Step 3 — retry the promotion; must reconcile without error.
+    result = _run(
+        candidates_router.promote_candidate(
+            candidate_id=candidate_id,
+            resolution='supersede',
+            ctx=_MockCtx('system:scheduler'),
+        )
+    )
+
+    assert result['status'] == 'ok', f"Expected ok, got: {result}"
+    assert result['action'] == 'promoted'
+    assert result['candidate']['status'] == 'promoted'
+    assert result['fact']['value'] == 'light mode'
+    # Candidates DB must now be synced (no longer split-brained).
+    assert store.get_candidate(candidate_id)['status'] == 'promoted'
+    # A second retry must also be idempotent (candidate is now 'promoted', not pending).
+    result2 = _run(
+        candidates_router.promote_candidate(
+            candidate_id=candidate_id,
+            resolution='supersede',
+            ctx=_MockCtx('system:scheduler'),
+        )
+    )
+    assert result2['status'] == 'error'
+    assert result2['error_type'] == 'invalid_state'

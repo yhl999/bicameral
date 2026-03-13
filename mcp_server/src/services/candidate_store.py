@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 def _default_candidates_db_path() -> Path:
-    base_dir = Path(__file__).resolve().parents[2] / 'state'
+    # parents[3] = repo root (mcp_server/src/services/ → mcp_server/src/ → mcp_server/ → repo-root)
+    # Matches the pattern used by change_ledger.py (DB_PATH_DEFAULT = parents[3] / 'state' / ...)
+    # so both DBs land in the canonical repo-root state/ directory.
+    base_dir = Path(__file__).resolve().parents[3] / 'state'
     return Path(os.environ.get('BICAMERAL_CANDIDATES_DB_PATH', base_dir / 'candidates.db'))
 
 
