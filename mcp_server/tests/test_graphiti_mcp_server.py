@@ -200,11 +200,16 @@ class TestSchemaValidation:
 
     def test_valid_candidate(self):
         obj = {
-            'candidate_id': 'cand-001',
-            'fact_type': 'preference',
+            'uuid': 'cand-001',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
+            'metadata': {},
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is True
@@ -212,27 +217,52 @@ class TestSchemaValidation:
 
     def test_string_min_length_violation(self):
         obj = {
-            'candidate_id': '',
-            'fact_type': 'preference',
+            'uuid': '',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
-        assert 'candidate_id' in (err or '')
+        assert 'uuid' in (err or '')
 
-    def test_candidate_id_pattern_validation(self):
+    def test_candidate_status_enum_tracks_quarantine_contract(self):
         obj = {
-            'candidate_id': 'Bad Candidate Id',
-            'fact_type': 'preference',
+            'uuid': 'cand-001',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'pending',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
-        assert 'candidate_id' in (err or '')
+        assert err is not None
+        assert 'status' in err
+
+    def test_candidate_uuid_pattern_validation(self):
+        obj = {
+            'uuid': 'Bad Candidate Id',
+            'type': 'preference',
+            'subject': 'user',
+            'predicate': 'editor',
+            'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
+        }
+        ok, err = self.validate(obj, 'Candidate')
+        assert ok is False
+        assert 'uuid' in (err or '')
 
     def test_pack_definition_requires_definition_for_workflow_scope(self):
         obj = {
@@ -605,6 +635,25 @@ class TestGetToolsSignature:
         ]
         assert tools_by_name['search_episodes']['schema']['output'] == 'EpisodeSearchResponse | ErrorResponse'
         assert tools_by_name['search_procedures']['schema']['output'] == 'ProcedureSearchResponse | ErrorResponse'
+    async def test_candidate_tool_metadata_matches_exec4_contract(self):
+        result = await self.module.get_tools()
+        tool_by_name = {tool['name']: tool for tool in result}
+
+        list_candidates = tool_by_name['list_candidates']
+        assert 'quarantine' in list_candidates['schema']['inputs']['status']
+        assert 'pending' not in list_candidates['schema']['inputs']['status']
+        assert list_candidates['examples'][0]['status'] == 'quarantine'
+        assert list_candidates['schema']['output'] == 'list[Candidate]'
+
+        promote_candidate = tool_by_name['promote_candidate']
+        assert 'supersede' in promote_candidate['schema']['inputs']['resolution']
+        assert 'parallel' in promote_candidate['schema']['inputs']['resolution']
+        assert 'cancel' in promote_candidate['schema']['inputs']['resolution']
+        assert promote_candidate['examples'][0]['resolution'] == 'supersede'
+
+        reject_candidate = tool_by_name['reject_candidate']
+        assert 'pending queue' not in reject_candidate['description']
+        assert reject_candidate['examples'][0]['candidate_id'] == 'cand-002'
 
     @pytest.mark.anyio
     async def test_debug_tools_absent_without_flag(self):

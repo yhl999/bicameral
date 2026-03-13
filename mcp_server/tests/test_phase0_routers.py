@@ -167,9 +167,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
         result = await fn()
-        assert result['candidates'] == []
-        assert 'status' not in result
-        assert 'message' in result
+        assert isinstance(result, list)
 
     @pytest.mark.anyio
     async def test_candidates_promote_stub(self):
@@ -179,7 +177,7 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['promote_candidate']
         result = await fn(candidate_id='cand-001', resolution='looks good')
-        assert result['error'] == 'not_implemented'
+        assert result['error'].startswith('invalid resolution')
 
     @pytest.mark.anyio
     async def test_candidates_reject_stub(self):
@@ -189,17 +187,17 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='cand-001')
-        assert result['error'] == 'not_implemented'
+        assert result['error'] == 'Candidate not found: cand-001'
 
     @pytest.mark.anyio
-    async def test_candidates_reject_stub_validates_identifier_pattern(self):
+    async def test_candidates_reject_stub_requires_identifier(self):
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
-        result = await fn(candidate_id='Bad Candidate Id')
-        assert result['error'] == 'validation_error'
+        result = await fn(candidate_id='')
+        assert result['error'] == 'candidate_id is required'
 
     @pytest.mark.anyio
     async def test_packs_list_packs_stub(self):
