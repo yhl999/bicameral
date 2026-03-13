@@ -687,3 +687,190 @@ async def test_get_history_lifecycle_only_root_not_dropped_at_cap(
     assert 'theme' not in predicates, (
         'oldest root (by latest_recorded_at) must be the one dropped at cap'
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: invalidated roots must not consume the cap in get_current_state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_get_current_state_invalidated_roots_do_not_consume_cap(
+    ledger: ChangeLedger,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: invalidated roots have a non-NULL current_payload_json that
+    still matches the subject filter, so without an explicit is_current guard
+    they consume cap slots in _state_current_root_ids and crowd out active roots.
+
+    With the fix, only roots whose snapshot has is_current=true count against
+    the cap, so active roots are never evicted by invalidated ones.
+    """
+    # Reduce cap so 3 invalidated roots would fill it without the fix.
+    monkeypatch.setattr(server, '_MAX_STATE_CURRENT_ROOTS', 3)
+
+    subject = 'CapStateSubject'
+    lane = 's1_sessions_main'
+
+    # Create 4 invalidated roots first (recorded_at T=1..4 so they rank high).
+    for i in range(1, 5):
+        oid = f'inv-fact-{i}'
+        rid = f'r-inv-{i}'
+        ts = f'2026-01-01T0{i}:00:00Z'
+        ledger.append_event(
+            'assert',
+            payload=_state_fact(
+                object_id=oid,
+                root_id=rid,
+                subject=subject,
+                predicate=f'inv_pred_{i}',
+                value=f'val_{i}',
+                created_at=ts,
+                source_lane=lane,
+            ),
+            root_id=rid,
+            recorded_at=ts,
+        )
+        ledger.append_event(
+            'invalidate',
+            object_id=oid,
+            root_id=rid,
+            recorded_at=f'2026-01-01T0{i}:01:00Z',
+        )
+
+    # Create 2 active roots (recorded_at T=5..6, newest overall).
+    for i in range(5, 7):
+        oid = f'act-fact-{i}'
+        rid = f'r-act-{i}'
+        ts = f'2026-01-01T0{i}:00:00Z'
+        ledger.append_event(
+            'assert',
+            payload=_state_fact(
+                object_id=oid,
+                root_id=rid,
+                subject=subject,
+                predicate=f'act_pred_{i}',
+                value=f'act_val_{i}',
+                created_at=ts,
+                source_lane=lane,
+            ),
+            root_id=rid,
+            recorded_at=ts,
+        )
+
+    result = await server.get_current_state(subject, group_ids=[lane])
+
+    assert 'error' not in result, f'unexpected error: {result}'
+    predicates = {fact['predicate'] for fact in result['facts']}
+    # Both active roots must appear — they must not be crowded out by the 4
+    # invalidated roots (which, without the fix, would fill all 3 cap slots
+    # before the active roots are considered).
+    assert 'act_pred_5' in predicates, 'first active root must not be crowded out by invalidated roots'
+    assert 'act_pred_6' in predicates, 'second active root must not be crowded out by invalidated roots'
+    # No invalidated facts should appear in current-state output.
+    inv_predicates = {p for p in predicates if p.startswith('inv_pred_')}
+    assert not inv_predicates, f'invalidated facts must not appear in current state: {inv_predicates}'
+
+
+# ---------------------------------------------------------------------------
+# Regression: history truncation must preserve chronological correctness
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_get_history_chronology_preserved_under_cap_pressure(
+    ledger: ChangeLedger,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: the old early-exit cap in _change_history_events_for_subject
+    stopped collecting after N total facts (before the final sort), which could
+    drop newer facts from later-iterated roots while retaining older facts from
+    earlier-iterated roots.
+
+    Root A has the highest latest_recorded_at so it is iterated first.  It has
+    enough facts to fill the (reduced) cap on its own.  Root B is iterated
+    second and has facts with timestamps that interleave between root A's facts.
+    Without the fix, root B's newer facts are never collected and the caller's
+    [-limit:] window is filled by stale root-A facts instead.
+    """
+    monkeypatch.setattr(server, '_MAX_STATE_HISTORY_RESULTS', 3)
+
+    subject = 'ChronoSubject'
+    lane = 's1_sessions_main'
+
+    # Root A: 3 facts at T=1, T=4, T=7 — latest_recorded_at = T=7 (processed first).
+    for i, ts_hour in enumerate([1, 4, 7], start=1):
+        oid = f'chron-a-{i}'
+        rid = 'r-chron-a'
+        ts = f'2026-01-01T0{ts_hour}:00:00Z'
+        ledger.append_event(
+            'assert',
+            payload=_state_fact(
+                object_id=oid,
+                root_id=rid,
+                subject=subject,
+                predicate=f'a_pred_{i}',
+                value=f'a_val_{i}',
+                created_at=ts,
+                source_lane=lane,
+            ),
+            root_id=rid,
+            recorded_at=ts,
+        )
+
+    # Root B: 3 facts at T=5, T=6, T=8 — latest_recorded_at = T=8 > T=7.
+    # Wait — root B must be iterated SECOND to expose the bug.  Root ordering
+    # is by latest_recorded_at DESC, so root B (T=8) would be first unless
+    # we arrange otherwise.  Use a subject-scoped predicate filter to force
+    # both roots to be returned and set root A's latest event to T=9.
+    for i, ts_hour in enumerate([5, 6, 8], start=1):
+        oid = f'chron-b-{i}'
+        rid = 'r-chron-b'
+        ts = f'2026-01-01T0{ts_hour}:00:00Z'
+        ledger.append_event(
+            'assert',
+            payload=_state_fact(
+                object_id=oid,
+                root_id=rid,
+                subject=subject,
+                predicate=f'b_pred_{i}',
+                value=f'b_val_{i}',
+                created_at=ts,
+                source_lane=lane,
+            ),
+            root_id=rid,
+            recorded_at=ts,
+        )
+
+    # Add a late lifecycle event to root A (T=9) so it is iterated first.
+    ledger.append_event(
+        'invalidate',
+        object_id='chron-a-3',
+        root_id='r-chron-a',
+        recorded_at='2026-01-01T09:00:00Z',
+    )
+    # Root A latest_recorded_at = T=9, Root B = T=8 → root A first.
+
+    # With cap=3 and root A first (3 facts), the old code fills the cap on
+    # root A and never visits root B.  After sort, entries are:
+    #   a_pred_1 (T=1), a_pred_2 (T=4), a_pred_3 (T=7, now invalidated)
+    # Caller's [-3:] (limit=3): all three — root B's newer b_pred_2 (T=6)
+    # and b_pred_3 (T=8) are missing.
+    #
+    # With the fix, all 6 facts collected, sorted ascending:
+    #   T=1, T=4, T=5, T=6, T=7, T=8
+    # Truncated to newest 3: T=6 (b_pred_2), T=7 (a_pred_3), T=8 (b_pred_3).
+    # Caller limit=3 sees b_pred_2 and b_pred_3.
+
+    result = await server.get_history(subject, group_ids=[lane])
+
+    assert 'error' not in result, f'unexpected error: {result}'
+    predicates = [event['predicate'] for event in result['history']]
+    assert 'b_pred_3' in predicates, (
+        'root B newest fact (T=8) must appear; was dropped by early-exit cap'
+    )
+    assert 'b_pred_2' in predicates, (
+        'root B mid fact (T=6) must appear; was dropped by early-exit cap'
+    )
+    # The oldest root-A fact must be squeezed out.
+    assert 'a_pred_1' not in predicates, (
+        'oldest fact (T=1) must be outside the newest-3 window'
+    )

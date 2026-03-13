@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -2277,6 +2278,12 @@ def _state_current_root_ids(
     clauses = [
         "object_type = 'state_fact'",
         'current_payload_json IS NOT NULL',
+        # Only include roots whose current snapshot is active.  When a root is
+        # fully invalidated, _refresh_typed_root_row falls back to the last
+        # object (is_current=False), so current_payload_json is still non-NULL
+        # but reflects an invalidated fact.  Without this guard such roots would
+        # consume cap slots and crowd out legitimate active roots.
+        "json_extract(current_payload_json, '$.is_current') = 1",
         "json_extract(current_payload_json, '$.subject') = ?",
         "json_extract(current_payload_json, '$.policy_scope') = ?",
         "json_extract(current_payload_json, '$.visibility_scope') = ?",
@@ -2340,11 +2347,34 @@ def _current_state_candidates(
             root_id=root_id,
             max_events=_MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
         ):
+            # Graceful degradation: rather than making this root completely
+            # invisible, fall back to the pre-computed snapshot stored in
+            # typed_roots.current_payload_json.  That snapshot was produced by
+            # _refresh_typed_root_row when the last event was appended and
+            # reflects the correct current state without re-materializing the
+            # full (oversized) lineage.
             logger.warning(
-                'Skipping current-state root=%s with lineage beyond cap=%d',
+                'current-state root=%s exceeds lineage cap=%d; using typed_roots snapshot',
                 root_id,
                 _MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
             )
+            snapshot = ledger.typed_root_snapshot(root_id)
+            if snapshot and snapshot['current_payload_json']:
+                try:
+                    payload = json.loads(snapshot['current_payload_json'])
+                    current = StateFact.model_validate(payload)
+                    if (
+                        current.is_current
+                        and current.subject == subject
+                        and (predicate is None or current.predicate == predicate)
+                        and (scope is None or current.scope == scope)
+                        and _state_fact_is_visible(current, effective_group_ids=effective_group_ids)
+                    ):
+                        matches.append(current)
+                except Exception:
+                    logger.debug(
+                        'snapshot fallback parse failed for oversized root=%s', root_id
+                    )
             continue
 
         current = ledger.current_object(root_id)
@@ -2518,12 +2548,24 @@ def _change_history_events_for_subject(
                 (fact.created_at, _state_history_status_for_fact(fact)),
             )
             matching.append((fact, timestamp, status))
-            if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
-                break
-        if len(matching) >= _MAX_STATE_HISTORY_RESULTS:
-            break
 
+    # Sort before truncating so that the most-recent facts are kept when the
+    # overall collection exceeds the cap.  The old early-exit pattern applied
+    # the cap during collection (before sorting), which caused newer facts in
+    # later-iterated roots to be silently dropped while older facts from
+    # earlier roots survived — corrupting the chronological window returned to
+    # the caller.  Roots are already visited newest-first (ORDER BY
+    # latest_recorded_at DESC), but wire timestamps within a root can span a
+    # wide range, so within-root ordering is not guaranteed to match the global
+    # chronology until the final sort is applied.
     matching.sort(key=lambda item: (item[1], item[0].version, item[0].object_id))
+    if len(matching) > _MAX_STATE_HISTORY_RESULTS:
+        logger.warning(
+            'get_history result collection hit cap=%d for subject=%r; keeping newest',
+            _MAX_STATE_HISTORY_RESULTS,
+            subject,
+        )
+        matching = matching[-_MAX_STATE_HISTORY_RESULTS:]
     return matching
 
 
