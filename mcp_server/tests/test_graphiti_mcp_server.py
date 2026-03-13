@@ -421,6 +421,63 @@ class TestGetToolsSignature:
             )
 
     @pytest.mark.anyio
+    async def test_get_current_state_discovery_matches_exec2_runtime_contract(self):
+        result = await self.module.get_tools()
+        tool = next((t for t in result if t['name'] == 'get_current_state'), None)
+
+        assert tool is not None
+        assert tool['description'] == (
+            'Query current typed state facts for a subject and optional predicate/scope '
+            'within explicit lane and private-scope boundaries'
+        )
+        assert tool['schema']['inputs'] == {
+            'subject': 'string',
+            'predicate': 'string | null',
+            'scope': 'string | null',
+            'group_ids': 'list[string] | null',
+            'lane_alias': 'list[string] | null',
+            'limit': 'integer',
+        }
+        assert tool['schema']['output'] == (
+            '{"message": string, "facts": list[StateFact], "metadata": '
+            'TypedMemoryQueryMetadata} | ErrorResponse(error in '
+            '{invalid_input, group_scope_required, ledger_error})'
+        )
+        assert tool['phase0_behavior'] == (
+            'Implemented: validates subject/predicate/scope and lane scope, caps '
+            'limit, and returns an envelope {message, facts, metadata}.'
+        )
+
+    @pytest.mark.anyio
+    async def test_get_history_discovery_matches_exec2_runtime_contract(self):
+        result = await self.module.get_tools()
+        tool = next((t for t in result if t['name'] == 'get_history'), None)
+
+        assert tool is not None
+        assert tool['description'] == (
+            'Retrieve typed state history for a subject and optional predicate/scope '
+            'within explicit lane and private-scope boundaries'
+        )
+        assert tool['schema']['inputs'] == {
+            'subject': 'string',
+            'predicate': 'string | null',
+            'scope': 'string | null',
+            'group_ids': 'list[string] | null',
+            'lane_alias': 'list[string] | null',
+            'limit': 'integer',
+        }
+        assert tool['schema']['output'] == (
+            '{"message": string, "history": list[ChangeEvent], "metadata": '
+            'TypedMemoryQueryMetadata} | ErrorResponse(error in '
+            '{invalid_input, group_scope_required, ledger_error})'
+        )
+        assert tool['phase0_behavior'] == (
+            'Implemented: validates subject/predicate/scope and lane scope, caps '
+            'limit, and returns chronologically ordered envelope {message, history, '
+            'metadata}.'
+        )
+
+    @pytest.mark.anyio
     async def test_search_memory_facts_has_both_mode_hint(self):
         result = await self.module.get_tools()
         tool = next((t for t in result if t['name'] == 'search_memory_facts'), None)

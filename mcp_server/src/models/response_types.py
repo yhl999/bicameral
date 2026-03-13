@@ -56,6 +56,29 @@ class ProcedureSearchResponse(TypedDict, total=False):
     next_offset: int | None
 
 
+class TypedMemoryQueryMetadata(TypedDict):
+    subject: str
+    predicate: str | None
+    scope: str | None
+    group_ids: list[str]
+    lane_alias: list[str] | None
+    limit: int
+    result_count: int
+    truncated: bool
+
+
+class CurrentStateResponse(TypedDict):
+    message: str
+    facts: list[dict[str, Any]]
+    metadata: TypedMemoryQueryMetadata
+
+
+class HistoryResponse(TypedDict):
+    message: str
+    history: list[dict[str, Any]]
+    metadata: TypedMemoryQueryMetadata
+
+
 class StatusResponse(TypedDict):
     status: str
     message: str
