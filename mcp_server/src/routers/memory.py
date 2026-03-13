@@ -89,6 +89,7 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'inputs': {
                 'subject': 'string',
                 'predicate': 'string | null',
+                'scope': 'string | null',
             },
             'output': '{"message": string, "facts": list[TypedFact]} | ErrorResponse',
         },
@@ -103,6 +104,7 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'inputs': {
                 'subject': 'string',
                 'predicate': 'string | null',
+                'scope': 'string | null',
             },
             'output': '{"message": string, "history": list[TypedFact]} | ErrorResponse',
         },

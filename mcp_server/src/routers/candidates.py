@@ -565,36 +565,43 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
         'description': 'List quarantined fact candidates awaiting promotion review',
         'mode_hint': 'typed',
         'schema': {
-            'inputs': {'status': '"pending" | "promoted" | "rejected" | null'},
-            'output': '{"message": string, "candidates": list[Candidate]} | ErrorResponse',
+            'inputs': {
+                'status': '"quarantine" | "promoted" | "rejected" | null — defaults to "quarantine"',
+                'type_filter': 'string | null',
+                'age_days': 'int | null',
+                'min_confidence': 'float | null',
+                'max_age_days': 'int | null',
+            },
+            'output': 'list[Candidate]',
         },
-        'examples': [{'status': 'pending'}],
-        'phase0_behavior': 'Returns an empty candidate list after input validation.',
+        'examples': [{'status': 'quarantine'}],
     },
     {
         'name': 'promote_candidate',
-        'description': 'Validate promotion input for a candidate fact; Exec 4 wires the ledger integration',
+        'description': 'Promote a quarantined candidate fact into the ledger with supersede/parallel/cancel resolution',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
                 'candidate_id': 'string',
-                'resolution': 'string',
+                'resolution': '"supersede" | "parallel" | "cancel"',
+                'reason': 'string | null',
             },
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
+            'output': 'SuccessResponse | ErrorResponse',
         },
-        'examples': [{'candidate_id': 'cand-001', 'resolution': 'Verified correct'}],
-        'phase0_behavior': 'Validates candidate_id/resolution and then returns not_implemented.',
+        'examples': [{'candidate_id': 'cand-001', 'resolution': 'supersede'}],
     },
     {
         'name': 'reject_candidate',
-        'description': 'Validate rejection input for a candidate fact; Exec 4 wires the ledger integration',
+        'description': 'Reject a quarantined candidate fact and remove it from the review queue',
         'mode_hint': 'typed',
         'schema': {
-            'inputs': {'candidate_id': 'string'},
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
+            'inputs': {
+                'candidate_id': 'string',
+                'reason': 'string | null',
+            },
+            'output': 'SuccessResponse | ErrorResponse',
         },
         'examples': [{'candidate_id': 'cand-002'}],
-        'phase0_behavior': 'Validates candidate_id and then returns not_implemented.',
     },
 ]
 
