@@ -28,6 +28,7 @@ def _base_config(provider: str = 'neo4j'):
                 'sessions_main': ['s1_sessions_main'],
                 'observational_memory': ['s1_observational_memory'],
             },
+            authorized_group_ids=[],
         ),
     )
 

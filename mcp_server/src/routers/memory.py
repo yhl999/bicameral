@@ -83,33 +83,35 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
     },
     {
         'name': 'get_current_state',
-        'description': 'Query the typed-memory ledger for current non-superseded facts',
+        'description': 'Query the typed-memory ledger for current non-superseded facts, scoped by lane',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
                 'subject': 'string',
                 'predicate': 'string | null',
                 'scope': 'string | null',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
             },
-            'output': '{"status": "ok", "facts": list[TypedFact], "scope": string} | ErrorResponse',
+            'output': '{"status": "ok", "facts": list[TypedFact]} | ErrorResponse',
         },
         'examples': [{'subject': 'user', 'predicate': 'preferred_editor'}],
-        'phase0_behavior': 'Returns current typed facts from the canonical change ledger after validating subject/predicate/scope filters.',
     },
     {
         'name': 'get_history',
-        'description': 'Retrieve typed-memory change history for a subject / predicate',
+        'description': 'Retrieve typed-memory change history for a subject / predicate, scoped by lane',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
                 'subject': 'string',
                 'predicate': 'string | null',
                 'scope': 'string | null',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
             },
             'output': '{"status": "ok", "history": list[dict], "roots_considered": list[string], "scope": string} | ErrorResponse',
         },
         'examples': [{'subject': 'project-alpha', 'predicate': 'status'}],
-        'phase0_behavior': 'Returns event history for current matching roots from the canonical typed ledger after input validation.',
     },
 ]
 
@@ -689,9 +691,23 @@ def _serialize_fact(fact: StateFact) -> dict[str, Any]:
 
 
 def _candidate_payload(state_fact: dict[str, Any]) -> dict[str, Any]:
+    """Project a quarantined candidate into the public Candidate.json contract shape."""
     payload = dict(state_fact)
-    payload['candidate_uuid'] = payload.get('candidate_id')
-    payload.setdefault('id', payload.get('candidate_id'))
+    # Public contract: uuid is the primary key
+    payload['uuid'] = payload.get('candidate_id') or payload.get('uuid', '')
+    payload['type'] = payload.get('fact_type') or payload.get('type', 'TypedFact')
+    payload['conflicting_fact_uuid'] = payload.get('conflict_with_fact_id')
+    raw_status = str(payload.get('status') or 'quarantine').strip().lower()
+    if raw_status == 'pending':
+        raw_status = 'quarantine'
+    payload['status'] = raw_status
+    payload.setdefault('confidence', 0.5)
+    now = _now_iso()
+    payload.setdefault('created_at', now)
+    payload.setdefault('updated_at', now)
+    # Backward-compat aliases
+    payload['candidate_uuid'] = payload['uuid']
+    payload.setdefault('id', payload['uuid'])
     return payload
 
 
@@ -1277,14 +1293,77 @@ async def remember_fact(
     return response
 
 
-async def get_current_state(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
-    """Return currently active state facts for a subject/predicate in typed form."""
+def _resolve_lane_scope(
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> list[str] | None:
+    """Resolve caller-supplied group_ids/lane_alias into an effective lane scope.
+
+    Returns None when no lane scope is requested (all lanes visible).
+    Returns a list of lane IDs when scoping is active.
+
+    Delegates alias resolution to the main server's _resolve_effective_group_ids
+    when available; falls back to direct group_ids pass-through otherwise.
+    """
+    if group_ids is None and lane_alias is None:
+        return None
+
+    # Try to use the server-level resolver which handles alias mapping and
+    # authorized_group_ids intersection.
+    try:
+        from ..graphiti_mcp_server import _resolve_effective_group_ids
+        effective, invalid = _resolve_effective_group_ids(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
+        )
+        if invalid:
+            # Invalid aliases: treat as empty scope (no results) for safety.
+            return []
+        return effective
+    except (ImportError, Exception):
+        # Fallback: use group_ids directly when the server resolver is
+        # unavailable (e.g. in isolated unit tests).
+        if group_ids is not None:
+            return list(group_ids)
+        return None
+
+
+def _fact_passes_lane_filter(fact: Any, lane_scope: list[str] | None) -> bool:
+    """Return True if a fact's source_lane is within the allowed lane scope."""
+    if lane_scope is None:
+        return True
+    source_lane = getattr(fact, 'source_lane', None)
+    if source_lane is None:
+        # Facts with no source_lane are only visible when no lane filter is active.
+        # Since lane_scope is not None here, exclude them to prevent cross-lane leakage.
+        return False
+    return source_lane in lane_scope
+
+
+async def get_current_state(
+    subject: str,
+    predicate: str | None = None,
+    scope: str | None = None,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return currently active state facts for a subject/predicate in typed form.
+
+    Args:
+        subject: The fact subject to filter on.
+        predicate: Optional predicate filter.
+        scope: Visibility scope (default 'private').
+        group_ids: Optional lane scope for filtering (intersected with server-authorized scope).
+        lane_alias: Optional lane aliases resolved via server config.
+    """
     if not subject or not str(subject).strip():
         return {'status': 'error', 'error_type': 'validation_error', 'message': 'subject is required'}
 
+    lane_scope = _resolve_lane_scope(group_ids=group_ids, lane_alias=lane_alias)
     state_facts = [
         _serialize_fact(fact)
         for fact in _current_state_facts(subject=subject, predicate=predicate, scope=_coerce_scope(scope))
+        if _fact_passes_lane_filter(fact, lane_scope)
     ]
     return {
         'status': 'ok',
@@ -1292,22 +1371,39 @@ async def get_current_state(subject: str, predicate: str | None = None, scope: s
     }
 
 
-async def get_history(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
+async def get_history(
+    subject: str,
+    predicate: str | None = None,
+    scope: str | None = None,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> dict[str, Any]:
     """Return ledger event history for the currently active root(s).
 
     This intentionally follows Phase-0 semantics: it does not scan every historic
     root ever associated with a subject. Instead it returns change-event summaries
     for the root lineage(s) of the current state facts matching the query.
+
+    Args:
+        subject: The fact subject to filter on.
+        predicate: Optional predicate filter.
+        scope: Visibility scope (default 'private').
+        group_ids: Optional lane scope for filtering (intersected with server-authorized scope).
+        lane_alias: Optional lane aliases resolved via server config.
     """
     if not subject or not str(subject).strip():
         return {'status': 'error', 'error_type': 'validation_error', 'message': 'subject is required'}
 
     scope_value = _coerce_scope(scope)
+    lane_scope = _resolve_lane_scope(group_ids=group_ids, lane_alias=lane_alias)
     ledger = _get_change_ledger()
     history: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
 
     for fact in _current_state_facts(subject=subject, predicate=predicate, scope=scope_value):
+        # Lane-scope filter: skip facts not in the caller's authorized lane scope
+        if not _fact_passes_lane_filter(fact, lane_scope):
+            continue
         if fact.root_id in seen_roots:
             continue
         seen_roots.add(fact.root_id)
@@ -1352,12 +1448,30 @@ def register_tools(mcp: FastMCP) -> dict[str, Any]:
         return await remember_fact(text=text, hint=hint, _server_principal=server_principal)
 
     @mcp.tool(name='get_current_state')
-    async def get_current_state_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
-        return await get_current_state(subject=subject, predicate=predicate, scope=scope)
+    async def get_current_state_tool(
+        subject: str,
+        predicate: str | None = None,
+        scope: str | None = None,
+        group_ids: list[str] | None = None,
+        lane_alias: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return await get_current_state(
+            subject=subject, predicate=predicate, scope=scope,
+            group_ids=group_ids, lane_alias=lane_alias,
+        )
 
     @mcp.tool(name='get_history')
-    async def get_history_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
-        return await get_history(subject=subject, predicate=predicate, scope=scope)
+    async def get_history_tool(
+        subject: str,
+        predicate: str | None = None,
+        scope: str | None = None,
+        group_ids: list[str] | None = None,
+        lane_alias: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return await get_history(
+            subject=subject, predicate=predicate, scope=scope,
+            group_ids=group_ids, lane_alias=lane_alias,
+        )
 
     tool_map = {
         'remember_fact': remember_fact_tool,

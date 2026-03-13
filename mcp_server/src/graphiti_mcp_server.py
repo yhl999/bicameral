@@ -781,6 +781,16 @@ def _resolve_effective_group_ids(
     for gid in effective_group_ids:
         if not SAFE_GROUP_ID_RE.match(gid):
             raise ValueError(f'Invalid group_id: {_sanitize_for_error(gid)!r}')
+
+    # Server-authorized scope intersection: if the server config defines an
+    # authorized_group_ids allowlist, intersect the caller-resolved groups with
+    # it.  This prevents an untrusted caller from escaping its authorized lane
+    # scope by supplying arbitrary group_ids or lane_alias values.
+    authorized = config.graphiti.authorized_group_ids
+    if authorized:
+        authorized_set = set(authorized)
+        effective_group_ids = [gid for gid in effective_group_ids if gid in authorized_set]
+
     return effective_group_ids, invalid_aliases
 
 

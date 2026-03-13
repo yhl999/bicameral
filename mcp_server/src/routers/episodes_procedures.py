@@ -147,6 +147,34 @@ def _load_typed_models() -> tuple[Any, Any]:
     return Episode, Procedure
 
 
+def _resolve_effective_group_ids(
+    group_ids: list[str] | None,
+    lane_alias: list[str] | None,
+) -> list[str] | None:
+    """Resolve group_ids + lane_alias into an effective lane scope.
+
+    Delegates to the main server resolver (which also intersects with
+    authorized_group_ids). Returns None when no lane scoping is active.
+    """
+    if group_ids is None and lane_alias is None:
+        return None
+
+    try:
+        from ..graphiti_mcp_server import _resolve_effective_group_ids as _server_resolve
+        effective, invalid = _server_resolve(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
+        )
+        if invalid:
+            return []
+        return effective
+    except (ImportError, Exception):
+        # Fallback: use group_ids directly
+        if group_ids is not None:
+            return list(group_ids)
+        return None
+
+
 def _build_metadata_filters(
     group_ids: list[str] | None,
     time_range: dict[str, Any] | None = None,
@@ -265,8 +293,12 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 'search_episodes', 'episodes', limit=limit_value, offset=offset_value
             )
 
+        # Resolve lane_alias into effective group IDs (includes server-authorized
+        # scope intersection when the server resolver is available).
+        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
+
         history_mode = 'all' if include_history else 'current'
-        metadata_filters = _build_metadata_filters(group_ids, time_range)
+        metadata_filters = _build_metadata_filters(effective_groups, time_range)
 
         try:
             service = TypedRetrievalService(ledger_path=DB_PATH_DEFAULT)
@@ -278,7 +310,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 current_only=not include_history,
                 max_results=limit_value + offset_value + 1,
                 max_evidence=1,
-                effective_group_ids=group_ids,
+                effective_group_ids=effective_groups,
             )
         except Exception as e:
             logger.error('search_episodes: retrieval error: %s', e)
@@ -289,8 +321,8 @@ def register_tools(mcp: Any) -> dict[str, Any]:
 
         raw_episodes = result.get('episodes', [])
         # Apply lane filter (defence-in-depth in case service returned cross-lane data)
-        if group_ids:
-            raw_episodes = [ep for ep in raw_episodes if _passes_lane_filter(ep, group_ids)]
+        if effective_groups:
+            raw_episodes = [ep for ep in raw_episodes if _passes_lane_filter(ep, effective_groups)]
 
         total = len(raw_episodes)
         page = raw_episodes[offset_value:offset_value + limit_value]
@@ -368,8 +400,10 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 'message': f'Object {episode_id!r} is not an episode (type: {type(obj).__name__})',
             }
 
-        # Lane access check: if group_ids are specified, verify the episode belongs
-        if not _passes_lane_filter(obj, group_ids):
+        # Resolve lane_alias into effective group IDs for access check
+        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
+        # Lane access check: if lane scope is active, verify the episode belongs
+        if not _passes_lane_filter(obj, effective_groups):
             return {
                 'error': 'access_denied',
                 'message': f'Episode {episode_id!r} is not in the requested lane scope',
@@ -448,9 +482,11 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 'message': f'Procedure search failed: {e}',
             }
 
+        # Resolve lane_alias into effective group IDs
+        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
         # Apply lane filter
-        if group_ids:
-            matches = [m for m in matches if _passes_lane_filter(m.procedure, group_ids)]
+        if effective_groups:
+            matches = [m for m in matches if _passes_lane_filter(m.procedure, effective_groups)]
 
         total = len(matches)
         page = matches[offset_value:offset_value + limit_value]
@@ -545,11 +581,13 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 'message': f'No procedure found for trigger or ID: {trigger_or_id!r}',
             }
 
+        # Resolve lane_alias into effective group IDs for access check
+        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
         # Lane access check
-        if not _passes_lane_filter(proc, group_ids):
+        if not _passes_lane_filter(proc, effective_groups):
             return {
                 'error': 'access_denied',
-                'message': f'Procedure is not in the requested lane scope',
+                'message': 'Procedure is not in the requested lane scope',
             }
 
         return _procedure_to_dict(proc)

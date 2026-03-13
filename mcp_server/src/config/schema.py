@@ -222,6 +222,15 @@ class GraphitiAppConfig(BaseModel):
         default_factory=dict,
         description='Alias -> group_id list mapping for lane-targeted manual search',
     )
+    authorized_group_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Server-side allowlist of group IDs the caller is permitted to access. '
+            'When non-empty, all resolved group_ids/lane_alias values are intersected '
+            'with this allowlist before query execution.  An empty list means '
+            '"all lanes are permitted" (backward-compatible default).'
+        ),
+    )
     entity_types: list[EntityTypeConfig] = Field(default_factory=list)
 
     def model_post_init(self, __context) -> None:

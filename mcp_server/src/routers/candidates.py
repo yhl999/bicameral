@@ -202,9 +202,43 @@ def _candidate_confidence(candidate: dict[str, Any]) -> float | None:
 
 
 def _candidate_to_public(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Project internal candidate storage into the public Candidate.json contract.
+
+    Public contract fields (Candidate.json):
+        uuid, type, subject, predicate, value, status, confidence,
+        created_at, updated_at, conflicting_fact_uuid, reviewed_at,
+        reviewed_by, promoted_at, promoted_by, reason, resolution, metadata
+
+    Internal storage may use different field names; this function maps them.
+    """
     payload = dict(candidate)
-    payload['id'] = payload.get('candidate_id')
-    payload['candidate_uuid'] = payload.get('candidate_id')
+
+    # Map candidate_id -> uuid (public contract primary key)
+    payload['uuid'] = payload.get('candidate_id') or payload.get('uuid', '')
+    # Map fact_type -> type (public contract assertion type)
+    payload['type'] = _candidate_assertion_type(candidate)
+    # Map conflict_with_fact_id -> conflicting_fact_uuid
+    payload['conflicting_fact_uuid'] = payload.get('conflict_with_fact_id') or payload.get('conflicting_fact_uuid')
+
+    # Ensure status uses external vocabulary (not internal 'pending')
+    raw_status = str(payload.get('status') or 'quarantine').strip().lower()
+    if raw_status == 'pending':
+        raw_status = 'quarantine'
+    payload['status'] = raw_status
+
+    # Ensure confidence is a top-level number (public contract requires it)
+    confidence = _candidate_confidence(candidate)
+    payload['confidence'] = confidence if confidence is not None else 0.5
+
+    # Ensure timestamps
+    now = _now_iso()
+    payload.setdefault('created_at', now)
+    payload.setdefault('updated_at', now)
+
+    # Retain backward-compat aliases for callers that may still reference them
+    payload['id'] = payload['uuid']
+    payload['candidate_uuid'] = payload['uuid']
+
     return payload
 
 

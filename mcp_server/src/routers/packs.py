@@ -202,11 +202,29 @@ def _fact_source_lane(fact: Any) -> str | None:
     return None
 
 
-def _matches_pack_access(pack: dict[str, Any], fact: Any) -> bool:
+def _matches_pack_access(
+    pack: dict[str, Any],
+    fact: Any,
+    *,
+    caller_authorized_lanes: list[str] | None = None,
+) -> bool:
     if _fact_scope(fact) not in _allowed_fact_scopes(pack):
         return False
+    # Pack-defined lane restriction
     allowed_lanes = _allowed_source_lanes(pack)
+    # Caller-authorized lane restriction (intersect with server-authorized scope)
+    if caller_authorized_lanes is not None:
+        caller_set = set(caller_authorized_lanes)
+        if allowed_lanes is not None:
+            # Intersect pack lanes with caller-authorized lanes
+            allowed_lanes = allowed_lanes & caller_set
+        else:
+            allowed_lanes = caller_set
     if not allowed_lanes:
+        if caller_authorized_lanes is not None:
+            # Caller has lane restrictions but no intersection with pack — block access
+            fact_lane = _fact_source_lane(fact)
+            return fact_lane is not None and fact_lane in set(caller_authorized_lanes)
         return True
     fact_lane = _fact_source_lane(fact)
     return fact_lane in allowed_lanes
@@ -219,11 +237,38 @@ def _resolve_ledger_path(override: str | Path | None = None) -> Path:
     return Path(env_override) if env_override else Path(DB_PATH_DEFAULT)
 
 
+def _resolve_caller_lanes(
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> list[str] | None:
+    """Resolve caller-supplied group_ids/lane_alias into effective lane scope for packs.
+
+    Returns None when no lane scope is requested (all lanes visible).
+    """
+    if group_ids is None and lane_alias is None:
+        return None
+
+    try:
+        from ..graphiti_mcp_server import _resolve_effective_group_ids
+        effective, invalid = _resolve_effective_group_ids(
+            group_ids=group_ids,
+            lane_alias=lane_alias,
+        )
+        if invalid:
+            return []
+        return effective
+    except (ImportError, Exception):
+        if group_ids is not None:
+            return list(group_ids)
+        return None
+
+
 def _materialize_pack_facts(
     *,
     pack: dict[str, Any],
     task: str | None,
     ledger_path: str | Path | None = None,
+    caller_authorized_lanes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     patterns = _predicates_for_pack(pack)
     if not patterns:
@@ -236,7 +281,7 @@ def _materialize_pack_facts(
     for fact in current_facts:
         if not _matches_predicate(fact.predicate, patterns):
             continue
-        if not _matches_pack_access(pack, fact):
+        if not _matches_pack_access(pack, fact, caller_authorized_lanes=caller_authorized_lanes):
             continue
         if not _matches_task(fact, task):
             continue
@@ -317,8 +362,20 @@ async def list_packs(filter: dict[str, Any] | None = None) -> list[dict[str, Any
         return _pack_service_error(exc)
 
 
-async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
-    """Resolve context pack definition and materialized facts."""
+async def get_context_pack(
+    pack_id: str,
+    task: str | None = None,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve context pack definition and materialized facts.
+
+    Args:
+        pack_id: ID of the context pack to resolve.
+        task: Optional task description to filter materialized facts.
+        group_ids: Optional caller lane scope (intersected with server-authorized scope).
+        lane_alias: Optional lane aliases resolved via server config.
+    """
     pack_id_error = require_pack_id('pack_id', pack_id)
     if pack_id_error is not None:
         return pack_id_error
@@ -333,6 +390,8 @@ async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, A
             message=f'task must not exceed {MAX_TASK_QUERY_LENGTH} characters',
             details={'field': 'task', 'max_length': MAX_TASK_QUERY_LENGTH},
         )
+
+    caller_lanes = _resolve_caller_lanes(group_ids=group_ids, lane_alias=lane_alias)
 
     try:
         service = PackRegistryService()
@@ -345,7 +404,9 @@ async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, A
                 message=f'pack {pack_id!r} is not a context pack',
             )
 
-        facts = _materialize_pack_facts(pack=pack, task=task)
+        facts = _materialize_pack_facts(
+            pack=pack, task=task, caller_authorized_lanes=caller_lanes,
+        )
         return {
             'pack_id': pack['id'],
             'pack_metadata': _pack_metadata(pack),
@@ -358,8 +419,20 @@ async def get_context_pack(pack_id: str, task: str | None = None) -> dict[str, A
         return _pack_service_error(exc)
 
 
-async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, Any]:
-    """Resolve workflow pack definition and materialized trigger facts."""
+async def get_workflow_pack(
+    pack_id: str,
+    task: str | None = None,
+    group_ids: list[str] | None = None,
+    lane_alias: list[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve workflow pack definition and materialized trigger facts.
+
+    Args:
+        pack_id: ID of the workflow pack to resolve.
+        task: Optional task description to filter materialized facts.
+        group_ids: Optional caller lane scope (intersected with server-authorized scope).
+        lane_alias: Optional lane aliases resolved via server config.
+    """
     pack_id_error = require_pack_id('pack_id', pack_id)
     if pack_id_error is not None:
         return pack_id_error
@@ -375,6 +448,8 @@ async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, 
             details={'field': 'task', 'max_length': MAX_TASK_QUERY_LENGTH},
         )
 
+    caller_lanes = _resolve_caller_lanes(group_ids=group_ids, lane_alias=lane_alias)
+
     try:
         service = PackRegistryService()
         pack = service.get_pack(pack_id)
@@ -386,7 +461,9 @@ async def get_workflow_pack(pack_id: str, task: str | None = None) -> dict[str, 
                 message=f'pack {pack_id!r} is not a workflow pack',
             )
 
-        facts = _materialize_pack_facts(pack=pack, task=task)
+        facts = _materialize_pack_facts(
+            pack=pack, task=task, caller_authorized_lanes=caller_lanes,
+        )
         return {
             'pack_id': pack['id'],
             'pack_metadata': _pack_metadata(pack),
@@ -453,7 +530,6 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'output': 'list[PackRegistry] | ErrorResponse',
         },
         'examples': [{'filter': {'scope': 'context'}}],
-        'phase0_behavior': 'Returns matching pack registry entries after validating optional scope/intent/consumer filters.',
     },
     {
         'name': 'get_context_pack',
@@ -463,11 +539,12 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'inputs': {
                 'pack_id': 'string',
                 'task': 'string | null',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
             },
             'output': 'PackMaterialized | ErrorResponse',
         },
         'examples': [{'pack_id': 'context-vc-deal-brief', 'task': 'write a venture summary for a16z'}],
-        'phase0_behavior': 'Validates pack_id/task, loads the pack registry entry, and materializes matching facts with fact-scope filtering (default private-only unless the pack opts in).',
     },
     {
         'name': 'get_workflow_pack',
@@ -477,11 +554,12 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'inputs': {
                 'pack_id': 'string',
                 'task': 'string | null',
+                'group_ids': 'list[string] | null',
+                'lane_alias': 'list[string] | null',
             },
             'output': 'WorkflowPackMaterialized | ErrorResponse',
         },
         'examples': [{'pack_id': 'workflow-deal-review', 'task': 'review the latest deal candidate'}],
-        'phase0_behavior': 'Validates pack_id/task, loads the workflow pack, and materializes matching facts with fact-scope filtering (default private-only unless the pack opts in).',
     },
     {
         'name': 'describe_pack',
@@ -492,7 +570,6 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'output': 'PackDefinition | ErrorResponse',
         },
         'examples': [{'pack_id': 'context-vc-deal-brief'}],
-        'phase0_behavior': 'Validates pack_id and returns the persisted registry entry plus derived schema/example metadata.',
     },
     {
         'name': 'create_workflow_pack',
@@ -512,21 +589,23 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'workflow_steps': ['run tests', 'deploy to staging'],
             }
         }],
-        'phase0_behavior': 'Validates the workflow definition and persists it to the user-private pack registry when allowed.',
     },
 ]
 
 
 def register_tools(mcp: Any) -> dict[str, Any]:
-    mcp.tool()(list_packs)
-    mcp.tool()(get_context_pack)
-    mcp.tool()(get_workflow_pack)
-    mcp.tool()(describe_pack)
-    mcp.tool()(create_workflow_pack)
-    return {
+    mcp.tool(name='list_packs')(list_packs)
+    mcp.tool(name='get_context_pack')(get_context_pack)
+    mcp.tool(name='get_workflow_pack')(get_workflow_pack)
+    mcp.tool(name='describe_pack')(describe_pack)
+    mcp.tool(name='create_workflow_pack')(create_workflow_pack)
+    tool_map = {
         'list_packs': list_packs,
         'get_context_pack': get_context_pack,
         'get_workflow_pack': get_workflow_pack,
         'describe_pack': describe_pack,
         'create_workflow_pack': create_workflow_pack,
     }
+    if hasattr(mcp, '_tools') and isinstance(mcp._tools, dict):
+        mcp._tools.update(tool_map)
+    return tool_map
