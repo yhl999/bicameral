@@ -874,3 +874,74 @@ async def test_get_history_chronology_preserved_under_cap_pressure(
     assert 'a_pred_1' not in predicates, (
         'oldest fact (T=1) must be outside the newest-3 window'
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: get_history must emit truncated=True when the INTERNAL root cap
+# clips roots, even when the caller's limit is not reached.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_history_truncated_true_when_root_cap_clips_under_caller_limit(
+    ledger: ChangeLedger,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: _state_history_root_ids clips at _MAX_STATE_HISTORY_ROOTS
+    but returned no signal about the clipping.  get_history() only checked
+    ``len(entries) > limit``, so when the caller's limit=200 was larger than
+    the ~50 surviving entries (from 128 roots instead of 129), truncated was
+    emitted as False — lying about the completeness of the response.
+
+    Minimal repro: set root cap to 3, assert 4 single-fact roots (1 fact each
+    → at most 3 facts returned from 3 roots), call with limit=200.
+    The returned entry count (3) < limit (200), so the old code sets
+    truncated=False.  The fix ORs the internal root-cap signal in and must
+    set truncated=True.
+    """
+    # Reduce to a cap of 3 roots so 4 roots trigger internal clipping.
+    monkeypatch.setattr(server, '_MAX_STATE_HISTORY_ROOTS', 3)
+
+    subject = 'RootCapTruncSubject'
+    lane = 's1_sessions_main'
+
+    # Create 4 roots, each with exactly 1 fact.  Timestamps T=1..4 ensure
+    # the 4th root (T=4) is the one excluded when cap=3.
+    for i in range(1, 5):
+        oid = f'rct-fact-{i}'
+        rid = f'r-rct-{i}'
+        ts = f'2026-01-0{i}T10:00:00Z'
+        ledger.append_event(
+            'assert',
+            payload=_state_fact(
+                object_id=oid,
+                root_id=rid,
+                subject=subject,
+                predicate=f'pred_{i}',
+                value=f'val_{i}',
+                created_at=ts,
+                source_lane=lane,
+            ),
+            root_id=rid,
+            recorded_at=ts,
+        )
+
+    # With cap=3 and 4 roots, the oldest root (T=1, pred_1) is excluded.
+    # Entries from the 3 kept roots: 3 facts.  Caller limit=200 >> 3.
+    # Old code: truncated = (3 > 200) = False  ← BUG
+    # New code: truncated = root_cap_hit OR (3 > 200) = True OR False = True
+    result = await server.get_history(subject, group_ids=[lane], limit=200)
+
+    assert 'error' not in result, f'unexpected error: {result}'
+    assert result['metadata']['truncated'] is True, (
+        'truncated must be True when root cap clips data even if caller limit '
+        'is not reached (got False — internal root-cap signal not propagated)'
+    )
+    # Confirm only the 3 most-recent roots were returned (pred_2, pred_3, pred_4).
+    predicates = {event['predicate'] for event in result['history']}
+    assert 'pred_1' not in predicates, (
+        'oldest root (T=1) must have been clipped by the root cap'
+    )
+    assert {'pred_2', 'pred_3', 'pred_4'} == predicates, (
+        f'expected pred_2/pred_3/pred_4 from the 3 kept roots; got {predicates}'
+    )

@@ -2409,7 +2409,12 @@ def _state_history_root_ids(
     predicate: str | None,
     scope: str | None,
     effective_group_ids: list[str],
-) -> list[str]:
+) -> tuple[list[str], bool]:
+    # Returns (root_ids, root_cap_hit).  root_cap_hit is True when the query
+    # returned more roots than _MAX_STATE_HISTORY_ROOTS, meaning at least one
+    # root was silently excluded; callers must propagate this as a truncation
+    # signal so the API contract is truthful even when the caller's own limit
+    # is larger than the number of entries that survived internal clipping.
     # Query typed_roots instead of change_events so that the ordering key
     # (latest_recorded_at) reflects the true latest event for each root —
     # including lifecycle-only events such as `invalidate` and `promote` that
@@ -2453,6 +2458,7 @@ def _state_history_root_ids(
         [*params, _MAX_STATE_HISTORY_ROOTS + 1],
     ).fetchall()
 
+    root_cap_hit = False
     if len(rows) > _MAX_STATE_HISTORY_ROOTS:
         logger.warning(
             'get_history root selection hit cap=%d for subject=%r; truncating',
@@ -2460,8 +2466,9 @@ def _state_history_root_ids(
             subject,
         )
         rows = rows[:_MAX_STATE_HISTORY_ROOTS]
+        root_cap_hit = True
 
-    return [str(row['root_id']) for row in rows if row['root_id']]
+    return [str(row['root_id']) for row in rows if row['root_id']], root_cap_hit
 
 
 def _state_history_status_for_fact(fact: StateFact) -> str:
@@ -2503,9 +2510,13 @@ def _change_history_events_for_subject(
     predicate: str | None,
     scope: str | None,
     effective_group_ids: list[str],
-) -> list[tuple[StateFact, str, str]]:
+) -> tuple[list[tuple[StateFact, str, str]], bool]:
+    # Returns (entries, internally_truncated).  internally_truncated is True
+    # whenever any internal cap (root cap or result-collection cap) discarded
+    # data — regardless of the caller's own limit.  get_history() must OR this
+    # with its own caller-limit check to produce a truthful truncated flag.
     ledger = _change_ledger()
-    root_ids = _state_history_root_ids(
+    root_ids, internally_truncated = _state_history_root_ids(
         ledger,
         subject=subject,
         predicate=predicate,
@@ -2566,7 +2577,8 @@ def _change_history_events_for_subject(
             subject,
         )
         matching = matching[-_MAX_STATE_HISTORY_RESULTS:]
-    return matching
+        internally_truncated = True
+    return matching, internally_truncated
 
 
 def _build_typed_query_metadata(
@@ -2749,7 +2761,7 @@ async def get_history(
         return scope_error or ErrorResponse(error='group_scope_required')
 
     try:
-        entries = _change_history_events_for_subject(
+        entries, internally_truncated = _change_history_events_for_subject(
             subject=normalized_subject,
             predicate=normalized_predicate,
             scope=normalized_scope,
@@ -2764,8 +2776,14 @@ async def get_history(
         logger.exception('get_history failed for subject=%r', normalized_subject)
         return ErrorResponse(error='ledger_error', message=str(exc))
 
-    truncated = len(entries) > limit
-    selected_entries = entries[-limit:] if truncated else entries
+    caller_truncated = len(entries) > limit
+    # truncated is True if EITHER the caller's limit clipped the entries OR any
+    # internal cap (root-selection cap or result-collection cap) discarded data
+    # that was not returned.  Without this OR, a caller with limit=200 seeing
+    # only 50 entries from a 129-root subject would incorrectly receive
+    # truncated=False even though 1 root's history was silently excluded.
+    truncated = internally_truncated or caller_truncated
+    selected_entries = entries[-limit:] if caller_truncated else entries
     history = [
         ChangeEvent(
             uuid=fact.object_id,
