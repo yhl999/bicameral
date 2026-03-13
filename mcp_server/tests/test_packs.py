@@ -48,18 +48,27 @@ def _evidence() -> EvidenceRef:
     )
 
 
-def _make_state_fact(*, subject: str, predicate: str, value, ts: datetime) -> StateFact:
+def _make_state_fact(
+    *,
+    subject: str,
+    predicate: str,
+    value,
+    ts: datetime,
+    scope: str = 'private',
+    source_lane: str | None = None,
+) -> StateFact:
     return StateFact.model_validate(
         {
-            'object_id': f'{subject}:{predicate}',
-            'root_id': f'{subject}:{predicate}',
+            'object_id': f'{subject}:{predicate}:{scope}',
+            'root_id': f'{subject}:{predicate}:{scope}',
             'fact_type': 'world_state',
             'subject': subject,
             'predicate': predicate,
             'value': value,
-            'scope': 'private',
-            'policy_scope': 'private',
-            'visibility_scope': 'private',
+            'scope': scope,
+            'policy_scope': scope,
+            'visibility_scope': scope,
+            'source_lane': source_lane,
             'evidence_refs': [_evidence()],
             'created_at': ts.replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
             'valid_at': ts.replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
@@ -193,6 +202,35 @@ def test_get_context_pack_task_filter_reduces_matches(ledger_path: Path, registr
     filtered = asyncio.run(packs.get_context_pack('context-vc-deal-brief', task='a16z'))
     assert filtered.get('fact_count') == 1
     assert filtered['facts'][0]['subject'] == 'a16z'
+
+
+def test_get_context_pack_filters_out_non_private_facts_by_default(ledger_path: Path, registry_path: Path):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ledger = ChangeLedger(ledger_path)
+
+    private_fact = _make_state_fact(
+        subject='a16z',
+        predicate='industry',
+        value='ai',
+        ts=now,
+        scope='private',
+    )
+    internal_fact = _make_state_fact(
+        subject='a16z',
+        predicate='industry',
+        value='internal-only-ai',
+        ts=now + timedelta(seconds=1),
+        scope='internal',
+    )
+
+    ledger.append_event('assert', actor_id='unit-test', reason='seed', payload=private_fact, object_id=private_fact.object_id)
+    ledger.append_event('assert', actor_id='unit-test', reason='seed', payload=internal_fact, object_id=internal_fact.object_id)
+
+    result = asyncio.run(packs.get_context_pack('context-vc-deal-brief'))
+
+    assert result.get('fact_count') == 1
+    assert [fact['scope'] for fact in result['facts']] == ['private']
+    assert [fact['value'] for fact in result['facts']] == ['ai']
 
 
 def test_describe_pack_returns_schema_and_examples(registry_path: Path):

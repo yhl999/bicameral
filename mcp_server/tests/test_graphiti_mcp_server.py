@@ -600,24 +600,27 @@ class TestGetToolsSignature:
         ]
         assert tools_by_name['search_episodes']['schema']['output'] == 'EpisodeSearchResponse | ErrorResponse'
         assert tools_by_name['search_procedures']['schema']['output'] == 'ProcedureSearchResponse | ErrorResponse'
-    async def test_candidate_tool_metadata_matches_exec4_contract(self):
+    @pytest.mark.anyio
+    async def test_candidate_tool_metadata_matches_integrated_contract(self):
         result = await self.module.get_tools()
         tool_by_name = {tool['name']: tool for tool in result}
 
         list_candidates = tool_by_name['list_candidates']
+        assert 'pending' in list_candidates['schema']['inputs']['status']
         assert 'quarantine' in list_candidates['schema']['inputs']['status']
-        assert 'pending' not in list_candidates['schema']['inputs']['status']
-        assert list_candidates['examples'][0]['status'] == 'quarantine'
-        assert list_candidates['schema']['output'] == 'list[Candidate]'
+        assert list_candidates['examples'][0]['status'] == 'pending'
+        assert 'candidates' in list_candidates['schema']['output']
 
         promote_candidate = tool_by_name['promote_candidate']
         assert 'supersede' in promote_candidate['schema']['inputs']['resolution']
         assert 'parallel' in promote_candidate['schema']['inputs']['resolution']
-        assert 'cancel' in promote_candidate['schema']['inputs']['resolution']
+        assert 'unsupported' in promote_candidate['schema']['inputs']['resolution']
+        assert 'actor_id' in promote_candidate['schema']['inputs']
         assert promote_candidate['examples'][0]['resolution'] == 'supersede'
 
         reject_candidate = tool_by_name['reject_candidate']
-        assert 'pending queue' not in reject_candidate['description']
+        assert 'server-derived reviewer auth' in reject_candidate['description']
+        assert 'actor_id' in reject_candidate['schema']['inputs']
         assert reject_candidate['examples'][0]['candidate_id'] == 'cand-002'
 
     @pytest.mark.anyio

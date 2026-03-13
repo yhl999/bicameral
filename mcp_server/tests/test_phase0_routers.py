@@ -177,13 +177,13 @@ class TestAllStubsReturnValidTypes:
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
-        # No ctx → anonymous → unauthorized (auth gate added in Exec 1 boundary fix).
         result = await fn()
-        assert isinstance(result, list)
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'unauthorized'
 
     @pytest.mark.anyio
     async def test_candidates_list_candidates_authorized_contract(self, monkeypatch):
-        """list_candidates returns candidates list for authenticated trusted caller."""
+        """list_candidates returns an authenticated wrapper response."""
         from mcp_server.src.routers import memory as memory_router
         from mcp_server.src.routers.candidates import register_tools
 
@@ -193,20 +193,20 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
         result = await fn()
-        # exec4 implementation returns plain list (not dict wrapper)
-        assert isinstance(result, list)
-        assert result == []
+        assert result['status'] == 'ok'
+        assert result['candidates'] == []
 
     @pytest.mark.anyio
     async def test_candidates_promote_requires_actor_id(self):
-        """promote_candidate without actor_id returns unauthorized (auth gate fires first)."""
+        """promote_candidate without authenticated context returns unauthorized."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['promote_candidate']
-        result = await fn(candidate_id='cand-001', resolution='looks good')
-        assert result['error'].startswith('invalid resolution')
+        result = await fn(candidate_id='cand-001', resolution='supersede')
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'unauthorized'
 
     @pytest.mark.anyio
     async def test_candidates_promote_contract(self, monkeypatch):
@@ -215,27 +215,25 @@ class TestAllStubsReturnValidTypes:
         from mcp_server.src.routers.candidates import register_tools
 
         monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
-        # Inject server principal via mock ctx — NOT via caller-supplied actor_id.
         monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['promote_candidate']
         result = await fn(candidate_id='cand-001', resolution='supersede')
-        # exec4: candidate not found returns error dict
-        assert 'error' in result or ('status' in result and result['status'] == 'error')
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'not_found'
 
     @pytest.mark.anyio
     async def test_candidates_reject_requires_actor_id(self):
-        """reject_candidate without authenticated context returns unauthorized (auth gate fires first)."""
+        """reject_candidate without authenticated context returns unauthorized."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
-        # No ctx, no server principal → __anon__ → unauthorized
         result = await fn(candidate_id='cand-001')
-        # exec4: no auth gate, returns 'Candidate not found' error
-        assert 'error' in result
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'unauthorized'
 
     @pytest.mark.anyio
     async def test_candidates_reject_stub_requires_identifier(self):
@@ -243,18 +241,18 @@ class TestAllStubsReturnValidTypes:
 
     @pytest.mark.anyio
     async def test_candidates_reject_contract(self, monkeypatch):
-        """reject_candidate with server-derived principal in allowlist returns not_found for unknown candidate."""
+        """reject_candidate validates the candidate identifier before proceeding."""
         from mcp_server.src.routers import memory as memory_router
         from mcp_server.src.routers.candidates import register_tools
 
         monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
-        # Inject server principal via mock ctx — NOT via caller-supplied actor_id.
         monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='')
-        assert result['error'] == 'candidate_id is required'
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'validation_error'
 
     @pytest.mark.anyio
     async def test_candidates_reject_contract_treats_unmatched_identifier_as_not_found(self, monkeypatch):
@@ -263,14 +261,13 @@ class TestAllStubsReturnValidTypes:
         from mcp_server.src.routers.candidates import register_tools
 
         monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
-        # Inject server principal via mock ctx — NOT via caller-supplied actor_id.
         monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='Bad Candidate Id')
-        # exec4: returns error dict for not_found candidate
-        assert 'error' in result
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'not_found'
 
     @pytest.mark.anyio
     async def test_packs_list_packs_stub(self):

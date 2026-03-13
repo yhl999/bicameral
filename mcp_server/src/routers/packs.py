@@ -18,6 +18,7 @@ MAX_PACK_MATERIALIZED_FACTS = 200
 # and get_workflow_pack.  Prevents unbounded string processing / DoS via the
 # _matches_task token-scan path in a long-lived MCP server process.
 MAX_TASK_QUERY_LENGTH = 2048
+_DEFAULT_ALLOWED_FACT_SCOPES = frozenset({'private'})
 
 try:
     from ._phase0 import (
@@ -140,6 +141,77 @@ def _matches_task(fact: Any, task: str | None) -> bool:
     return all(token in blob for token in tokens)
 
 
+def _allowed_fact_scopes(pack: dict[str, Any]) -> set[str]:
+    candidates: list[Any] = []
+    definition = pack.get('definition')
+    for source in (
+        pack.get('fact_scopes'),
+        pack.get('allowed_fact_scopes'),
+        definition.get('fact_scopes') if isinstance(definition, dict) else None,
+        definition.get('allowed_fact_scopes') if isinstance(definition, dict) else None,
+    ):
+        if isinstance(source, str):
+            candidates.append(source)
+        elif isinstance(source, list):
+            candidates.extend(source)
+
+    scopes = {str(item).strip().lower() for item in candidates if str(item).strip()}
+    return scopes or set(_DEFAULT_ALLOWED_FACT_SCOPES)
+
+
+def _allowed_source_lanes(pack: dict[str, Any]) -> set[str] | None:
+    candidates: list[Any] = []
+    definition = pack.get('definition')
+    for source in (
+        pack.get('source_lanes'),
+        pack.get('lanes'),
+        definition.get('source_lanes') if isinstance(definition, dict) else None,
+        definition.get('lanes') if isinstance(definition, dict) else None,
+    ):
+        if isinstance(source, str):
+            candidates.append(source)
+        elif isinstance(source, list):
+            candidates.extend(source)
+
+    lanes = {str(item).strip().lower() for item in candidates if str(item).strip()}
+    return lanes or None
+
+
+def _fact_scope(fact: Any) -> str:
+    for field in ('policy_scope', 'visibility_scope', 'scope'):
+        value = getattr(fact, field, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    payload = _serialise_fact(fact)
+    for field in ('policy_scope', 'visibility_scope', 'scope'):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return 'private'
+
+
+def _fact_source_lane(fact: Any) -> str | None:
+    for field in ('source_lane',):
+        value = getattr(fact, field, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    payload = _serialise_fact(fact)
+    value = payload.get('source_lane')
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def _matches_pack_access(pack: dict[str, Any], fact: Any) -> bool:
+    if _fact_scope(fact) not in _allowed_fact_scopes(pack):
+        return False
+    allowed_lanes = _allowed_source_lanes(pack)
+    if not allowed_lanes:
+        return True
+    fact_lane = _fact_source_lane(fact)
+    return fact_lane in allowed_lanes
+
+
 def _resolve_ledger_path(override: str | Path | None = None) -> Path:
     if override:
         return Path(override)
@@ -163,6 +235,8 @@ def _materialize_pack_facts(
     selected: list[tuple[float, float, str, Any]] = []
     for fact in current_facts:
         if not _matches_predicate(fact.predicate, patterns):
+            continue
+        if not _matches_pack_access(pack, fact):
             continue
         if not _matches_task(fact, task):
             continue
@@ -376,57 +450,57 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
         'mode_hint': 'typed',
         'schema': {
             'inputs': {'filter': 'object | null'},
-            'output': '{"message": string, "packs": list[PackRegistry]} | ErrorResponse',
+            'output': 'list[PackRegistry] | ErrorResponse',
         },
-        'examples': [{'filter': {'scope': 'private'}}],
-        'phase0_behavior': 'Returns an empty pack list after input validation.',
+        'examples': [{'filter': {'scope': 'context'}}],
+        'phase0_behavior': 'Returns matching pack registry entries after validating optional scope/intent/consumer filters.',
     },
     {
         'name': 'get_context_pack',
-        'description': 'Validate lookup input for a materialized context pack',
+        'description': 'Resolve a context pack and materialize matching facts from the typed ledger',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
                 'pack_id': 'string',
                 'task': 'string | null',
             },
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
+            'output': 'PackMaterialized | ErrorResponse',
         },
-        'examples': [{'pack_id': 'coding-defaults', 'task': 'write a Python function'}],
-        'phase0_behavior': 'Validates pack_id/task and then returns not_implemented.',
+        'examples': [{'pack_id': 'context-vc-deal-brief', 'task': 'write a venture summary for a16z'}],
+        'phase0_behavior': 'Validates pack_id/task, loads the pack registry entry, and materializes matching facts with fact-scope filtering (default private-only unless the pack opts in).',
     },
     {
         'name': 'get_workflow_pack',
-        'description': 'Validate lookup input for a materialized workflow pack',
+        'description': 'Resolve a workflow pack definition and materialize matching trigger facts',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
                 'pack_id': 'string',
                 'task': 'string | null',
             },
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
+            'output': 'WorkflowPackMaterialized | ErrorResponse',
         },
-        'examples': [{'pack_id': 'deploy-workflow', 'task': 'deploy to staging'}],
-        'phase0_behavior': 'Validates pack_id/task and then returns not_implemented.',
+        'examples': [{'pack_id': 'workflow-deal-review', 'task': 'review the latest deal candidate'}],
+        'phase0_behavior': 'Validates pack_id/task, loads the workflow pack, and materializes matching facts with fact-scope filtering (default private-only unless the pack opts in).',
     },
     {
         'name': 'describe_pack',
-        'description': 'Validate lookup input for a full pack definition',
+        'description': 'Return the schema, examples, instructions, and persisted metadata for a pack',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {'pack_id': 'string'},
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackDefinition | ErrorResponse',
+            'output': 'PackDefinition | ErrorResponse',
         },
-        'examples': [{'pack_id': 'coding-defaults'}],
-        'phase0_behavior': 'Validates pack_id and then returns not_implemented.',
+        'examples': [{'pack_id': 'context-vc-deal-brief'}],
+        'phase0_behavior': 'Validates pack_id and returns the persisted registry entry plus derived schema/example metadata.',
     },
     {
         'name': 'create_workflow_pack',
-        'description': 'Validate a PackDefinition payload for workflow-pack creation',
+        'description': 'Create and persist a workflow pack definition in the user-private registry',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {'definition': 'PackDefinition object'},
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackRegistry | ErrorResponse',
+            'output': 'PackRegistry | ErrorResponse',
         },
         'examples': [{
             'definition': {
@@ -438,7 +512,7 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'workflow_steps': ['run tests', 'deploy to staging'],
             }
         }],
-        'phase0_behavior': 'Validates definition against PackDefinition, requires workflow/both scope, and then returns not_implemented.',
+        'phase0_behavior': 'Validates the workflow definition and persists it to the user-private pack registry when allowed.',
     },
 ]
 

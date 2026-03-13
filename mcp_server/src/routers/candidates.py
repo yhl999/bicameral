@@ -1,306 +1,283 @@
 """Candidate lifecycle MCP tools.
 
-These tools expose quarantine/promotion/rejection operations against a persisted
-`candidates` table and promote accepted items into the main change ledger.
+Integrated candidate review surface for quarantined facts created by
+``remember_fact``. This router intentionally uses the same CandidateStore and
+ChangeLedger paths/models as the memory router so the conflict lifecycle is:
+
+``remember_fact(conflict) -> list_candidates -> promote_candidate/reject_candidate``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import sqlite3
-from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-# Import the real FastMCP Context type so register_tools wrappers receive the
-# transport-injected auth context (path-2 of _extract_server_principal).
-# If the mcp package is not installed (standalone test import), fall back to a
-# plain stub — FastMCP's find_context_parameter won't match the stub, which is
-# the safe degraded behaviour (ctx=None, auth falls to OAuth contextvar only).
 try:
-    from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
-except ImportError:  # pragma: no cover - top-level import fallback
-    from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger  # type: ignore[no-redef]
+    from fastmcp import FastMCP
+except ImportError:  # pragma: no cover - optional for test envs without fastmcp installed
+    class FastMCP:
+        def tool(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
 
+try:
+    from mcp.server.fastmcp import Context as _McpContext
+except ImportError:  # pragma: no cover - fallback for minimal test envs
+    class _McpContext:  # type: ignore[no-redef]
+        """Stub used when the mcp package is unavailable."""
+
+from ..models.typed_memory import EvidenceRef, StateFact
+from ..services.candidate_store import CandidateStore
+from ..services.change_ledger import ChangeLedger
+from . import memory as memory_router
 
 logger = logging.getLogger(__name__)
 
-VALID_STATUSES = frozenset({'quarantine', 'promoted', 'rejected'})
+VALID_CANDIDATE_STATUSES = frozenset({'pending', 'promoted', 'rejected', 'quarantine'})
 VALID_RESOLUTIONS = frozenset({'supersede', 'parallel', 'cancel'})
-_POLICY_VERSION = 'candidate_lifecycle_v1'
+DEFAULT_POLICY_VERSION = 'candidate_lifecycle_v1'
+_MAX_REASON_LENGTH = 512
 
-CANDIDATES_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS candidates (
-    uuid TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    predicate TEXT NOT NULL,
-    value TEXT NOT NULL,
-    conflicting_fact_uuid TEXT,
-    status TEXT NOT NULL DEFAULT 'quarantine',
-    resolution TEXT,
-    confidence REAL NOT NULL DEFAULT 0.0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    reviewed_at TEXT,
-    reviewed_by TEXT,
-    promoted_at TEXT,
-    promoted_by TEXT,
-    reason TEXT,
-    metadata_json TEXT
-);
-"""
+# Lazily initialized shared dependencies; tests monkeypatch these directly.
+_change_ledger: ChangeLedger | None = None
+_candidate_store: CandidateStore | None = None
 
 
-CANDIDATES_INDEXES_SQL = """
-CREATE INDEX IF NOT EXISTS idx_candidates_status_created
-    ON candidates(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_candidates_type_confidence
-    ON candidates(type, confidence DESC);
-"""
+TOOL_CONTRACTS: list[dict[str, Any]] = [
+    {
+        'name': 'list_candidates',
+        'description': 'List quarantined/promoted/rejected typed-memory fact candidates for authenticated trusted reviewers',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'status': '"pending" | "promoted" | "rejected" | "quarantine" | null (default "pending"; "quarantine" is an alias for "pending")',
+                'type_filter': 'string | null',
+                'age_days': 'int | null',
+                'min_confidence': 'float | null',
+                'max_age_days': 'int | null',
+            },
+            'output': '{"status": "ok", "candidates": list[Candidate]} | ErrorResponse',
+        },
+        'examples': [{'status': 'pending'}],
+        'phase0_behavior': 'Requires a trusted server-derived caller identity; on success returns candidate rows from the canonical CandidateStore.',
+    },
+    {
+        'name': 'promote_candidate',
+        'description': 'Promote a pending candidate into the typed ledger (supersede) or cancel it, using server-derived reviewer auth',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'candidate_id': 'string',
+                'resolution': '"supersede" | "cancel" | "parallel" (reserved; currently rejected as unsupported)',
+                'actor_id': 'string | null (informational audit hint only; never used for authorization)',
+                'reason': 'string | null',
+            },
+            'output': '{"status": "ok", "action": string, "candidate": Candidate, "fact": TypedFact | null} | ErrorResponse',
+        },
+        'examples': [{'candidate_id': 'cand-001', 'resolution': 'supersede'}],
+        'phase0_behavior': 'Authenticates via transport context, promotes through ChangeLedger, reconciles split-brain retries, and materializes the resulting fact best-effort.',
+    },
+    {
+        'name': 'reject_candidate',
+        'description': 'Reject a pending candidate using server-derived reviewer auth',
+        'mode_hint': 'typed',
+        'schema': {
+            'inputs': {
+                'candidate_id': 'string',
+                'actor_id': 'string | null (informational audit hint only; never used for authorization)',
+                'reason': 'string | null',
+            },
+            'output': '{"status": "ok", "action": "rejected", "candidate": Candidate} | ErrorResponse',
+        },
+        'examples': [{'candidate_id': 'cand-002'}],
+        'phase0_behavior': 'Requires a trusted server-derived caller identity and transitions the canonical CandidateStore row to rejected.',
+    },
+]
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
-def _ledger_path() -> Path:
-    override = os.getenv('BICAMERAL_CHANGE_LEDGER_PATH', '').strip()
-    return Path(override) if override else Path(DB_PATH_DEFAULT)
-
-
-def _actor_id() -> str:
-    return (
-        os.getenv('BICAMERAL_MCP_ACTOR_ID', os.getenv('BICAMERAL_ACTOR_ID', 'system')).strip()
-        or 'system'
-    )
-
-
 def _normalize_reason(reason: str | None) -> str | None:
     normalized = str(reason or '').strip()
-    return normalized or None
-
-
-def _connect_db(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA foreign_keys=ON')
-    conn.execute('PRAGMA busy_timeout=5000')
-    return conn
-
-
-def _ensure_columns(conn: sqlite3.Connection) -> None:
-    existing = {
-        row['name']
-        for row in conn.execute("PRAGMA table_info('candidates')").fetchall()
-    }
-
-    missing_to_sql = {
-        'conflicting_fact_uuid': 'ALTER TABLE candidates ADD COLUMN conflicting_fact_uuid TEXT',
-        'resolution': 'ALTER TABLE candidates ADD COLUMN resolution TEXT',
-        'confidence': 'ALTER TABLE candidates ADD COLUMN confidence REAL NOT NULL DEFAULT 0.0',
-        'reviewed_at': 'ALTER TABLE candidates ADD COLUMN reviewed_at TEXT',
-        'reviewed_by': 'ALTER TABLE candidates ADD COLUMN reviewed_by TEXT',
-        'promoted_at': 'ALTER TABLE candidates ADD COLUMN promoted_at TEXT',
-        'promoted_by': 'ALTER TABLE candidates ADD COLUMN promoted_by TEXT',
-        'reason': 'ALTER TABLE candidates ADD COLUMN reason TEXT',
-        'metadata_json': 'ALTER TABLE candidates ADD COLUMN metadata_json TEXT',
-    }
-
-    for col, statement in missing_to_sql.items():
-        if col not in existing:
-            conn.execute(statement)
-
-    conn.execute(
-        "UPDATE candidates SET status = 'quarantine' WHERE status = 'pending'"
-    )
-    conn.commit()
-
-
-def _resolution_from_promotion_reason(reason: str | None) -> str | None:
-    if not reason:
+    if not normalized:
         return None
-    prefix = 'candidate_promotion:'
-    if not reason.startswith(prefix):
-        return None
-    resolution = reason[len(prefix) :].strip().lower()
-    if resolution in VALID_RESOLUTIONS:
-        return resolution
-    return None
+    if len(normalized) > _MAX_REASON_LENGTH:
+        return normalized[:_MAX_REASON_LENGTH]
+    return normalized
+
+
+def _get_change_ledger() -> ChangeLedger:
+    global _change_ledger
+    if _change_ledger is None:
+        _change_ledger = ChangeLedger()
+    return _change_ledger
+
+
+def _get_candidate_store() -> CandidateStore:
+    global _candidate_store
+    if _candidate_store is None:
+        _candidate_store = CandidateStore()
+    return _candidate_store
+
+
+def _status_alias(status: str | None) -> str:
+    normalized = str(status or 'pending').strip().lower() or 'pending'
+    if normalized == 'quarantine':
+        return 'pending'
+    return normalized
+
+
+def _error(error_type: str, message: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        'status': 'error',
+        'error_type': error_type,
+        'message': message,
+    }
+    if details is not None:
+        payload['details'] = details
+    return payload
+
+
+def _require_reviewer(ctx: _McpContext | None) -> str | dict[str, Any]:
+    server_principal = memory_router._extract_server_principal(ctx)
+    trusted = memory_router._trusted_actor_ids_from_env()
+    if server_principal == memory_router._ANON_PRINCIPAL or server_principal not in trusted:
+        return _error(
+            'unauthorized',
+            'candidate review requires an authenticated trusted caller',
+        )
+    return server_principal
 
 
 def _candidate_status_error(candidate_id: str, candidate_status: str) -> dict[str, Any]:
-    return {'error': f'Candidate {candidate_id} is already {candidate_status}'}
+    return _error(
+        'invalid_state',
+        f'candidate {candidate_id} is already {candidate_status}',
+        details={'candidate_id': candidate_id, 'status': candidate_status},
+    )
 
 
-class CandidatesDB:
-    """Persistence for candidate quarantine rows."""
+def _candidate_scope(candidate: dict[str, Any]) -> str:
+    raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
+    metadata = candidate.get('metadata') if isinstance(candidate.get('metadata'), dict) else {}
+    return str(
+        raw_hint.get('policy_scope')
+        or raw_hint.get('scope')
+        or metadata.get('scope')
+        or 'private'
+    ).strip().lower() or 'private'
 
-    def __init__(self, conn_or_path: sqlite3.Connection | str | Path = DB_PATH_DEFAULT):
-        if isinstance(conn_or_path, sqlite3.Connection):
-            self.conn = conn_or_path
-        else:
-            db_path = Path(conn_or_path)
-            self.conn = _connect_db(db_path)
-        self.conn.row_factory = sqlite3.Row
-        self.ensure_schema()
 
-    def ensure_schema(self) -> None:
-        self.conn.executescript(CANDIDATES_SCHEMA_SQL)
-        _ensure_columns(self.conn)
-        self.conn.executescript(CANDIDATES_INDEXES_SQL)
-        self.conn.commit()
+def _candidate_source(candidate: dict[str, Any]) -> str:
+    raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
+    trust = raw_hint.get('trust') if isinstance(raw_hint.get('trust'), dict) else {}
+    return str(
+        candidate.get('source')
+        or trust.get('source')
+        or memory_router.DEFAULT_SOURCE
+    ).strip() or memory_router.DEFAULT_SOURCE
 
-    def list_candidates(
-        self,
-        *,
-        status: str,
-        type_filter: str | None = None,
-        min_confidence: float | None = None,
-        max_age_days: int | None = None,
-        age_days: int | None = None,
-    ) -> list[dict[str, Any]]:
-        clauses: list[str] = ['status = ?']
-        params: list[Any] = [status]
 
-        if type_filter:
-            clauses.append('type = ?')
-            params.append(type_filter)
-        if min_confidence is not None:
-            clauses.append('confidence >= ?')
-            params.append(float(min_confidence))
+def _candidate_assertion_type(candidate: dict[str, Any]) -> str:
+    raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
+    return str(
+        raw_hint.get('type')
+        or raw_hint.get('type_hint')
+        or candidate.get('fact_type')
+        or 'TypedFact'
+    ).strip().lower() or 'typedfact'
 
-        effective_age = age_days if age_days is not None else max_age_days
-        if effective_age is not None:
-            cutoff = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=effective_age)
-            clauses.append('created_at >= ?')
-            params.append(cutoff.isoformat().replace('+00:00', 'Z'))
 
-        where = ' AND '.join(clauses)
-        rows = self.conn.execute(
-            f"""
-            SELECT *
-              FROM candidates
-             WHERE {where}
-             ORDER BY created_at DESC
-            """,
-            params,
-        ).fetchall()
-        return [_row_to_dict(row) for row in rows]
+def _candidate_confidence(candidate: dict[str, Any]) -> float | None:
+    metadata = candidate.get('metadata') if isinstance(candidate.get('metadata'), dict) else {}
+    confidence = metadata.get('confidence')
+    if isinstance(confidence, (int, float)):
+        return max(0.0, min(1.0, float(confidence)))
+    return None
 
-    def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute('SELECT * FROM candidates WHERE uuid = ?', (candidate_id,)).fetchone()
-        return _row_to_dict(row) if row else None
 
-    def update_status(
-        self,
-        candidate_id: str,
-        *,
-        status: str,
-        resolution: str | None = None,
-        actor: str | None = None,
-        reason: str | None = None,
-        expected_current_status: str | None = None,
-        commit: bool = True,
-    ) -> bool:
-        now = _now_iso()
-        payload = {
-            'status': status,
-            'updated_at': now,
-            'reviewed_by': actor,
-            'reviewed_at': now,
-            'reason': reason,
-        }
+def _candidate_to_public(candidate: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(candidate)
+    payload['id'] = payload.get('candidate_id')
+    payload['candidate_uuid'] = payload.get('candidate_id')
+    return payload
 
-        if status == 'promoted':
-            payload.update({'promoted_by': actor, 'promoted_at': now})
 
-        if resolution is not None:
-            payload['resolution'] = resolution
+def _candidate_evidence_refs(candidate: dict[str, Any]) -> list[EvidenceRef]:
+    raw_hint = candidate.get('raw_hint') if isinstance(candidate.get('raw_hint'), dict) else {}
+    existing = raw_hint.get('evidence_refs')
+    refs: list[EvidenceRef] = []
+    if isinstance(existing, list):
+        for item in existing:
+            if isinstance(item, EvidenceRef):
+                refs.append(item)
+            elif isinstance(item, dict):
+                refs.append(EvidenceRef.from_legacy_ref(item))
+    if refs:
+        return refs
 
-        set_clause = ', '.join([f'{key} = ?' for key in payload])
-        where_clause = 'uuid = ?'
-        params: list[Any] = list(payload.values()) + [candidate_id]
-        if expected_current_status is not None:
-            where_clause += ' AND status = ?'
-            params.append(expected_current_status)
-
-        updated = self.conn.execute(
-            f"""
-            UPDATE candidates
-               SET {set_clause}
-             WHERE {where_clause}
-            """,
-            params,
+    scope = _candidate_scope(candidate)
+    source_key = _candidate_source(candidate)
+    return [
+        EvidenceRef.from_legacy_ref(
+            {
+                'source_key': source_key,
+                'scope': scope,
+                'source_system': 'candidate_review',
+                'evidence_id': candidate.get('candidate_id') or uuid4().hex,
+                'observed_at': _now_iso(),
+            }
         )
-        if commit:
-            self.conn.commit()
-        return updated.rowcount > 0
-
-    def insert_candidate(
-        self,
-        *,
-        uuid: str,
-        type: str,
-        subject: str,
-        predicate: str,
-        value: Any,
-        conflicting_fact_uuid: str | None = None,
-        confidence: float = 0.0,
-        status: str = 'quarantine',
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        now = _now_iso()
-        payload = {
-            'uuid': uuid,
-            'type': type,
-            'subject': subject,
-            'predicate': predicate,
-            'value': json.dumps(value),
-            'conflicting_fact_uuid': conflicting_fact_uuid,
-            'status': status,
-            'confidence': confidence,
-            'created_at': now,
-            'updated_at': now,
-            'metadata_json': json.dumps(metadata or {}, sort_keys=True),
-        }
-        self.conn.execute(
-            '''
-            INSERT OR REPLACE INTO candidates(
-                uuid, type, subject, predicate, value, conflicting_fact_uuid,
-                status, confidence, created_at, updated_at, metadata_json
-            ) VALUES (
-                :uuid, :type, :subject, :predicate, :value, :conflicting_fact_uuid,
-                :status, :confidence, :created_at, :updated_at, :metadata_json
-            )
-            ''',
-            payload,
-        )
-        self.conn.commit()
+    ]
 
 
-def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    item = dict(row)
+def _candidate_to_fact_input(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'assertion_type': _candidate_assertion_type(candidate),
+        'subject': candidate.get('subject'),
+        'predicate': candidate.get('predicate'),
+        'value': candidate.get('value'),
+        'scope': _candidate_scope(candidate),
+        'evidence_refs': [ref.model_dump(mode='json') for ref in _candidate_evidence_refs(candidate)],
+    }
 
-    metadata_json = item.pop('metadata_json', None)
-    if metadata_json:
+
+def _matches_filters(
+    candidate: dict[str, Any],
+    *,
+    type_filter: str | None,
+    min_confidence: float | None,
+    max_age_days: int | None,
+    age_days: int | None,
+) -> bool:
+    if type_filter and str(candidate.get('fact_type') or '').strip().lower() != str(type_filter).strip().lower():
+        return False
+
+    confidence = _candidate_confidence(candidate)
+    if min_confidence is not None:
+        if confidence is None or confidence < min_confidence:
+            return False
+
+    effective_age = age_days if age_days is not None else max_age_days
+    if effective_age is not None:
+        created_at = str(candidate.get('created_at') or '').strip()
+        if not created_at:
+            return False
+        normalized = created_at[:-1] + '+00:00' if created_at.endswith('Z') else created_at
         try:
-            item['metadata'] = json.loads(metadata_json)
-        except (json.JSONDecodeError, TypeError):
-            item['metadata'] = None
-    else:
-        item['metadata'] = None
+            created_dt = datetime.fromisoformat(normalized)
+        except ValueError:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(days=effective_age)
+        if created_dt.astimezone(timezone.utc) < cutoff:
+            return False
 
-    raw_value = item.get('value')
-    if isinstance(raw_value, str):
-        with suppress(json.JSONDecodeError):
-            item['value'] = json.loads(raw_value)
-    return item
+    return True
 
 
 async def list_candidates(
@@ -309,314 +286,324 @@ async def list_candidates(
     age_days: int | None = None,
     min_confidence: float | None = None,
     max_age_days: int | None = None,
-) -> list[dict[str, Any]]:
-    effective_status = (status or 'quarantine').strip().lower()
-    if effective_status and effective_status not in VALID_STATUSES:
-        return []
+    ctx: _McpContext | None = None,
+) -> dict[str, Any]:
+    reviewer = _require_reviewer(ctx)
+    if isinstance(reviewer, dict):
+        return reviewer
+
+    effective_status = _status_alias(status)
+    if effective_status not in {'pending', 'promoted', 'rejected'}:
+        return _error(
+            'validation_error',
+            f'invalid status {status!r}; expected one of ["pending", "promoted", "rejected", "quarantine"]',
+        )
 
     if min_confidence is not None:
         try:
             min_confidence = float(min_confidence)
         except (TypeError, ValueError):
-            return []
+            return _error('validation_error', 'min_confidence must be a float between 0.0 and 1.0')
         if not (0.0 <= min_confidence <= 1.0):
-            return []
+            return _error('validation_error', 'min_confidence must be a float between 0.0 and 1.0')
 
-    for value in (age_days, max_age_days):
+    for field_name, value in (('age_days', age_days), ('max_age_days', max_age_days)):
         if value is None:
             continue
         try:
-            if int(value) <= 0:
-                return []
+            value = int(value)
         except (TypeError, ValueError):
-            return []
+            return _error('validation_error', f'{field_name} must be a positive integer')
+        if value <= 0:
+            return _error('validation_error', f'{field_name} must be a positive integer')
 
-    conn = _connect_db(_ledger_path())
-    try:
-        db = CandidatesDB(conn)
-        return db.list_candidates(
-            status=effective_status,
-            type_filter=(type_filter or None),
-            age_days=age_days,
+    rows = _get_candidate_store().list_candidates(status=effective_status)
+    candidates = [
+        _candidate_to_public(candidate)
+        for candidate in rows
+        if _matches_filters(
+            candidate,
+            type_filter=type_filter,
             min_confidence=min_confidence,
             max_age_days=max_age_days,
+            age_days=age_days,
         )
-    finally:
-        conn.close()
-
-
-def _build_candidate_fact(candidate: dict[str, Any]) -> dict[str, Any]:
-    metadata = candidate.get('metadata')
-    if metadata is None:
-        metadata = {}
-    elif not isinstance(metadata, dict):
-        metadata = {'metadata': metadata}
-
+    ]
     return {
-        'assertion_type': candidate['type'],
-        'subject': candidate['subject'],
-        'predicate': candidate['predicate'],
-        'value': candidate['value'],
-        'scope': 'private',
-        'evidence_refs': metadata.get('evidence_refs')
-        or [
-            {
-                'evidence_id': candidate['uuid'],
-                'source_key': f"candidate:{candidate['uuid']}",
-                'scope': 'private',
-            }
-        ],
+        'status': 'ok',
+        'candidates': candidates,
+        'reviewer': reviewer,
     }
 
 
 async def promote_candidate(
     candidate_id: str,
     resolution: str,
+    actor_id: str | None = None,
     reason: str | None = None,
+    ctx: _McpContext | None = None,
 ) -> dict[str, Any]:
-    candidate_id = str(candidate_id or '').strip()
-    resolution = str(resolution or '').strip().lower()
-    reason = _normalize_reason(reason)
+    del actor_id  # caller-controlled audit hint only; never the auth source
 
-    if not candidate_id:
-        return {'error': 'candidate_id is required'}
-    if resolution not in VALID_RESOLUTIONS:
-        return {'error': f'invalid resolution {resolution!r}; expected one of {sorted(VALID_RESOLUTIONS)}'}
+    normalized_candidate_id = str(candidate_id or '').strip()
+    normalized_resolution = str(resolution or '').strip().lower()
+    normalized_reason = _normalize_reason(reason)
 
-    conn = _connect_db(_ledger_path())
-    db = CandidatesDB(conn)
-    ledger = ChangeLedger(conn)
-    actor = _actor_id()
+    if not normalized_candidate_id:
+        return _error('validation_error', 'candidate_id is required')
+    if normalized_resolution not in VALID_RESOLUTIONS:
+        return _error(
+            'validation_error',
+            f'invalid resolution {normalized_resolution!r}; expected one of {sorted(VALID_RESOLUTIONS)}',
+        )
+    if normalized_resolution == 'parallel':
+        return _error('validation_error', 'parallel resolution is not supported on the integrated surface')
+
+    reviewer = _require_reviewer(ctx)
+    if isinstance(reviewer, dict):
+        return reviewer
+
+    store = _get_candidate_store()
+    ledger = _get_change_ledger()
+    candidate = store.get_candidate(normalized_candidate_id)
+    if candidate is None:
+        return _error('not_found', f'candidate not found: {normalized_candidate_id}')
+    if candidate.get('status') != 'pending':
+        return _candidate_status_error(normalized_candidate_id, str(candidate.get('status')))
+
+    existing_promotion = ledger.promotion_event_for_candidate(normalized_candidate_id)
+    if existing_promotion is not None:
+        store.update_candidate_status(
+            normalized_candidate_id,
+            'promoted',
+            resolution='supersede',
+        )
+        promoted_fact = ledger.materialize_object(str(existing_promotion.object_id or ''))
+        return {
+            'status': 'ok',
+            'action': 'promoted',
+            'candidate': _candidate_to_public(store.get_candidate(normalized_candidate_id) or candidate),
+            'fact': memory_router._serialize_fact(promoted_fact) if isinstance(promoted_fact, StateFact) else None,
+            'promotion': {
+                'object_id': existing_promotion.object_id,
+                'root_id': existing_promotion.root_id,
+                'event_id': existing_promotion.event_id,
+                'event_ids': [existing_promotion.event_id],
+                'reconciled': True,
+            },
+            'reviewer': reviewer,
+            'materialized': False,
+        }
+
+    if normalized_resolution == 'cancel':
+        updated = store.update_candidate_status(
+            normalized_candidate_id,
+            'rejected',
+            resolution='cancel',
+        )
+        if not updated:
+            refreshed = store.get_candidate(normalized_candidate_id)
+            if refreshed is None:
+                return _error('not_found', f'candidate not found: {normalized_candidate_id}')
+            return _candidate_status_error(normalized_candidate_id, str(refreshed.get('status')))
+        return {
+            'status': 'ok',
+            'action': 'cancelled',
+            'candidate': _candidate_to_public(store.get_candidate(normalized_candidate_id) or candidate),
+            'reviewer': reviewer,
+        }
 
     try:
-        conn.execute('BEGIN IMMEDIATE')
-
-        candidate = db.get_candidate(candidate_id)
-        if candidate is None:
-            conn.rollback()
-            return {'error': f'Candidate not found: {candidate_id}'}
-
-        if candidate['status'] != 'quarantine':
-            conn.rollback()
-            return _candidate_status_error(candidate_id, candidate['status'])
-
-        existing_promotion = ledger.promotion_event_for_candidate(candidate_id)
-        if existing_promotion is not None:
-            reconciled_resolution = _resolution_from_promotion_reason(existing_promotion.reason)
-            db.update_status(
-                candidate_id,
-                status='promoted',
-                resolution=reconciled_resolution,
-                actor=actor,
-                reason=reason or 'candidate_promoted_reconciled',
-                expected_current_status='quarantine',
-                commit=False,
-            )
-            conn.commit()
-            return {
-                'candidate': db.get_candidate(candidate_id),
-                'promotion': {
-                    'object_id': existing_promotion.object_id,
-                    'root_id': existing_promotion.root_id,
-                    'event_id': existing_promotion.event_id,
-                    'event_ids': [existing_promotion.event_id],
-                    'reconciled': True,
-                },
-            }
-
-        if resolution == 'cancel':
-            transitioned = db.update_status(
-                candidate_id,
-                status='rejected',
-                resolution='cancel',
-                actor=actor,
-                reason=reason or 'candidate_cancelled',
-                expected_current_status='quarantine',
-                commit=False,
-            )
-            if not transitioned:
-                conn.rollback()
-                candidate = db.get_candidate(candidate_id)
-                if candidate is None:
-                    return {'error': f'Candidate not found: {candidate_id}'}
-                return _candidate_status_error(candidate_id, candidate['status'])
-
-            conn.commit()
-            return {
-                'candidate': db.get_candidate(candidate_id),
-                'action': 'cancelled',
-            }
-
-        conflict_with = candidate.get('conflicting_fact_uuid')
-        if resolution == 'parallel':
-            conflict_with = None
-
         promotion = ledger.promote_candidate_fact(
-            actor_id=actor,
-            reason=f'candidate_promotion:{resolution}',
-            policy_version=_POLICY_VERSION,
-            candidate_id=candidate_id,
-            fact=_build_candidate_fact(candidate),
-            conflict_with_fact_id=conflict_with,
-            allow_parallel=(resolution == 'parallel'),
-            require_supersede=(resolution == 'supersede'),
-            manage_transaction=False,
+            actor_id=reviewer,
+            reason=f'candidate_promotion:{normalized_resolution}',
+            policy_version=str(
+                (
+                    (candidate.get('raw_hint') or {}).get('policy_version')
+                    if isinstance(candidate.get('raw_hint'), dict)
+                    else None
+                )
+                or DEFAULT_POLICY_VERSION
+            ),
+            candidate_id=normalized_candidate_id,
+            fact=_candidate_to_fact_input(candidate),
+            conflict_with_fact_id=candidate.get('conflict_with_fact_id'),
+            allow_parallel=False,
+            require_supersede=True,
         )
-
-        transitioned = db.update_status(
-            candidate_id,
-            status='promoted',
-            resolution=resolution,
-            actor=actor,
-            reason=reason or f'candidate_promoted_{resolution}',
-            expected_current_status='quarantine',
-            commit=False,
-        )
-        if not transitioned:
-            raise RuntimeError('candidate status transition failed after ledger promotion')
-
-        conn.commit()
-        return {
-            'candidate': db.get_candidate(candidate_id),
-            'promotion': {
-                'object_id': promotion.object_id,
-                'root_id': promotion.root_id,
-                'event_id': promotion.event_id,
-                'event_ids': promotion.event_ids,
-            },
-        }
-    except Exception as exc:
-        if conn.in_transaction:
-            conn.rollback()
+    except ValueError as exc:
+        return _error('validation_error', str(exc))
+    except Exception as exc:  # pragma: no cover - defensive operational guard
         logger.exception('promote_candidate failed')
-        return {'error': f'promote_candidate failed: {exc}'}
-    finally:
-        conn.close()
+        return _error('operational_error', f'promote_candidate failed: {exc}')
+
+    store.update_candidate_status(
+        normalized_candidate_id,
+        'promoted',
+        resolution=normalized_resolution,
+    )
+    promoted_candidate = store.get_candidate(normalized_candidate_id) or candidate
+    promoted_fact = ledger.materialize_object(promotion.object_id)
+
+    materialized = False
+    materialization_error: str | None = None
+    neo4j_materialization: dict[str, Any] = {'status': 'skipped'}
+    if isinstance(promoted_fact, StateFact):
+        try:
+            materialized, materialization_error = await memory_router._materialize_fact(
+                fact=promoted_fact,
+                source=_candidate_source(candidate),
+                superseded_fact_id=candidate.get('conflict_with_fact_id'),
+            )
+            neo4j_materialization = {
+                'status': 'ok' if materialized else 'failed',
+                'source': _candidate_source(candidate),
+            }
+            if materialization_error:
+                neo4j_materialization['error'] = materialization_error
+        except Exception as exc:  # pragma: no cover - defensive only
+            materialization_error = str(exc)
+            neo4j_materialization = {'status': 'failed', 'error': materialization_error}
+
+    response: dict[str, Any] = {
+        'status': 'ok',
+        'action': 'promoted',
+        'candidate': _candidate_to_public(promoted_candidate),
+        'fact': memory_router._serialize_fact(promoted_fact) if isinstance(promoted_fact, StateFact) else None,
+        'promotion': {
+            'object_id': promotion.object_id,
+            'root_id': promotion.root_id,
+            'event_id': promotion.event_id,
+            'event_ids': promotion.event_ids,
+        },
+        'reviewer': reviewer,
+        'materialized': materialized,
+        'neo4j_materialization': neo4j_materialization,
+    }
+    if materialization_error:
+        response['materialization_error'] = materialization_error
+        response['warnings'] = [
+            {
+                'code': 'neo4j_materialization_failed',
+                'message': materialization_error,
+            }
+        ]
+    return response
 
 
 async def reject_candidate(
     candidate_id: str,
+    actor_id: str | None = None,
     reason: str | None = None,
+    ctx: _McpContext | None = None,
 ) -> dict[str, Any]:
-    candidate_id = str(candidate_id or '').strip()
-    reason = _normalize_reason(reason)
-    if not candidate_id:
-        return {'error': 'candidate_id is required'}
+    del actor_id  # caller-controlled audit hint only; never the auth source
+    del reason
 
-    conn = _connect_db(_ledger_path())
-    db = CandidatesDB(conn)
-    ledger = ChangeLedger(conn)
-    actor = _actor_id()
+    normalized_candidate_id = str(candidate_id or '').strip()
+    if not normalized_candidate_id:
+        return _error('validation_error', 'candidate_id is required')
 
-    try:
-        conn.execute('BEGIN IMMEDIATE')
+    reviewer = _require_reviewer(ctx)
+    if isinstance(reviewer, dict):
+        return reviewer
 
-        candidate = db.get_candidate(candidate_id)
-        if candidate is None:
-            conn.rollback()
-            return {'error': f'Candidate not found: {candidate_id}'}
+    store = _get_candidate_store()
+    ledger = _get_change_ledger()
+    candidate = store.get_candidate(normalized_candidate_id)
+    if candidate is None:
+        return _error('not_found', f'candidate not found: {normalized_candidate_id}')
+    if candidate.get('status') != 'pending':
+        return _candidate_status_error(normalized_candidate_id, str(candidate.get('status')))
 
-        if candidate['status'] != 'quarantine':
-            conn.rollback()
-            return _candidate_status_error(candidate_id, candidate['status'])
+    existing_promotion = ledger.promotion_event_for_candidate(normalized_candidate_id)
+    if existing_promotion is not None:
+        store.update_candidate_status(normalized_candidate_id, 'promoted', resolution='supersede')
+        return _candidate_status_error(normalized_candidate_id, 'promoted')
 
-        existing_promotion = ledger.promotion_event_for_candidate(candidate_id)
-        if existing_promotion is not None:
-            db.update_status(
-                candidate_id,
-                status='promoted',
-                resolution=_resolution_from_promotion_reason(existing_promotion.reason),
-                actor=actor,
-                reason='candidate_promoted_reconciled',
-                expected_current_status='quarantine',
-                commit=False,
-            )
-            conn.commit()
-            return _candidate_status_error(candidate_id, 'promoted')
+    updated = store.update_candidate_status(normalized_candidate_id, 'rejected')
+    if not updated:
+        refreshed = store.get_candidate(normalized_candidate_id)
+        if refreshed is None:
+            return _error('not_found', f'candidate not found: {normalized_candidate_id}')
+        return _candidate_status_error(normalized_candidate_id, str(refreshed.get('status')))
 
-        transitioned = db.update_status(
-            candidate_id,
-            status='rejected',
-            actor=actor,
-            reason=reason or 'candidate_rejected',
-            expected_current_status='quarantine',
-            commit=False,
-        )
-        if not transitioned:
-            conn.rollback()
-            candidate = db.get_candidate(candidate_id)
-            if candidate is None:
-                return {'error': f'Candidate not found: {candidate_id}'}
-            return _candidate_status_error(candidate_id, candidate['status'])
-
-        conn.commit()
-        return {'candidate': db.get_candidate(candidate_id), 'action': 'rejected'}
-    except Exception as exc:
-        if conn.in_transaction:
-            conn.rollback()
-        logger.exception('reject_candidate failed')
-        return {'error': f'reject_candidate failed: {exc}'}
-    finally:
-        conn.close()
-
-TOOL_CONTRACTS: list[dict[str, Any]] = [
-    {
-        'name': 'list_candidates',
-        'description': 'List quarantined fact candidates awaiting promotion review',
-        'mode_hint': 'typed',
-        'schema': {
-            'inputs': {
-                'status': '"quarantine" | "promoted" | "rejected" | null — defaults to "quarantine"',
-                'type_filter': 'string | null',
-                'age_days': 'int | null',
-                'min_confidence': 'float | null',
-                'max_age_days': 'int | null',
-            },
-            'output': 'list[Candidate]',
-        },
-        'examples': [{'status': 'quarantine'}],
-    },
-    {
-        'name': 'promote_candidate',
-        'description': 'Promote a quarantined candidate fact into the ledger with supersede/parallel/cancel resolution',
-        'mode_hint': 'typed',
-        'schema': {
-            'inputs': {
-                'candidate_id': 'string',
-                'resolution': '"supersede" | "parallel" | "cancel"',
-                'reason': 'string | null',
-            },
-            'output': 'SuccessResponse | ErrorResponse',
-        },
-        'examples': [{'candidate_id': 'cand-001', 'resolution': 'supersede'}],
-    },
-    {
-        'name': 'reject_candidate',
-        'description': 'Reject a quarantined candidate fact and remove it from the review queue',
-        'mode_hint': 'typed',
-        'schema': {
-            'inputs': {
-                'candidate_id': 'string',
-                'reason': 'string | null',
-            },
-            'output': 'SuccessResponse | ErrorResponse',
-        },
-        'examples': [{'candidate_id': 'cand-002'}],
-    },
-]
-
-
-def register_tools(mcp: Any) -> dict[str, Any]:
-    mcp.tool()(list_candidates)
-    mcp.tool()(promote_candidate)
-    mcp.tool()(reject_candidate)
     return {
-        'list_candidates': list_candidates,
-        'promote_candidate': promote_candidate,
-        'reject_candidate': reject_candidate,
+        'status': 'ok',
+        'action': 'rejected',
+        'candidate': _candidate_to_public(store.get_candidate(normalized_candidate_id) or candidate),
+        'reviewer': reviewer,
+    }
+
+
+def register_tools(mcp: FastMCP) -> dict[str, Any]:
+    @mcp.tool(name='list_candidates')
+    async def list_candidates_tool(
+        status: str | None = None,
+        type_filter: str | None = None,
+        age_days: int | None = None,
+        min_confidence: float | None = None,
+        max_age_days: int | None = None,
+        ctx: _McpContext | None = None,
+    ) -> dict[str, Any]:
+        return await list_candidates(
+            status=status,
+            type_filter=type_filter,
+            age_days=age_days,
+            min_confidence=min_confidence,
+            max_age_days=max_age_days,
+            ctx=ctx,
+        )
+
+    @mcp.tool(name='promote_candidate')
+    async def promote_candidate_tool(
+        candidate_id: str,
+        resolution: str,
+        actor_id: str | None = None,
+        reason: str | None = None,
+        ctx: _McpContext | None = None,
+    ) -> dict[str, Any]:
+        return await promote_candidate(
+            candidate_id=candidate_id,
+            resolution=resolution,
+            actor_id=actor_id,
+            reason=reason,
+            ctx=ctx,
+        )
+
+    @mcp.tool(name='reject_candidate')
+    async def reject_candidate_tool(
+        candidate_id: str,
+        actor_id: str | None = None,
+        reason: str | None = None,
+        ctx: _McpContext | None = None,
+    ) -> dict[str, Any]:
+        return await reject_candidate(
+            candidate_id=candidate_id,
+            actor_id=actor_id,
+            reason=reason,
+            ctx=ctx,
+        )
+
+    tool_map = {
+        'list_candidates': list_candidates_tool,
+        'promote_candidate': promote_candidate_tool,
+        'reject_candidate': reject_candidate_tool,
     }
 
     if hasattr(mcp, '_tools') and isinstance(mcp._tools, dict):  # type: ignore[attr-defined]
         mcp._tools.update(tool_map)  # type: ignore[attr-defined]
 
     return tool_map
+
+
+__all__ = [
+    'register_tools',
+    'list_candidates',
+    'promote_candidate',
+    'reject_candidate',
+    '_change_ledger',
+    '_candidate_store',
+    '_candidate_to_fact_input',
+    'DEFAULT_POLICY_VERSION',
+]

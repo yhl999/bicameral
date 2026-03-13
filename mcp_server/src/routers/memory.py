@@ -69,17 +69,17 @@ DEFAULT_ACTION = 'remember_fact'
 TOOL_CONTRACTS: list[dict[str, Any]] = [
     {
         'name': 'remember_fact',
-        'description': 'Validate typed-memory write input for Phase 0; Exec 1 implements the ledger write',
+        'description': 'Parse a caller-provided fact hint/text, write it into the typed ledger, or quarantine conflicts for review',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
                 'text': 'string',
                 'hint': 'object | null',
             },
-            'output': 'ErrorResponse(error="not_implemented") in Phase 0 after validation; future: TypedFact | ConflictDialog | ErrorResponse',
+            'output': '{"status": "ok", "fact": TypedFact} | {"status": "conflict", "candidate_id": string, "new_fact": TypedFact} | ErrorResponse',
         },
         'examples': [{'text': 'I prefer tabs over spaces', 'hint': {'fact_type': 'preference'}}],
-        'phase0_behavior': 'Validates text/hint and then returns not_implemented.',
+        'phase0_behavior': 'Validates text/hint, derives trusted scope/policy from the server-side principal, writes directly to the ledger when safe, and quarantines conflicts into CandidateStore for explicit review.',
     },
     {
         'name': 'get_current_state',
@@ -91,10 +91,10 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'predicate': 'string | null',
                 'scope': 'string | null',
             },
-            'output': '{"message": string, "facts": list[TypedFact]} | ErrorResponse',
+            'output': '{"status": "ok", "facts": list[TypedFact], "scope": string} | ErrorResponse',
         },
         'examples': [{'subject': 'user', 'predicate': 'preferred_editor'}],
-        'phase0_behavior': 'Returns an empty facts list after input validation.',
+        'phase0_behavior': 'Returns current typed facts from the canonical change ledger after validating subject/predicate/scope filters.',
     },
     {
         'name': 'get_history',
@@ -106,10 +106,10 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'predicate': 'string | null',
                 'scope': 'string | null',
             },
-            'output': '{"message": string, "history": list[TypedFact]} | ErrorResponse',
+            'output': '{"status": "ok", "history": list[dict], "roots_considered": list[string], "scope": string} | ErrorResponse',
         },
         'examples': [{'subject': 'project-alpha', 'predicate': 'status'}],
-        'phase0_behavior': 'Returns an empty history list after input validation.',
+        'phase0_behavior': 'Returns event history for current matching roots from the canonical typed ledger after input validation.',
     },
 ]
 
