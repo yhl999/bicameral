@@ -608,12 +608,21 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
         },
         'examples': [{
             'definition': {
-                'pack_id': 'my-workflow',
-                'scope': 'workflow',
-                'intent': 'deploy service safely',
-                'consumer': 'archibald',
-                'version': '1.0',
-                'workflow_steps': ['run tests', 'deploy to staging'],
+                # Top-level pack-record fields (processed by PackRegistryService.create_pack)
+                'id': 'my-workflow',              # pack ID: lowercase alphanum/dots/dashes
+                'scope': 'workflow',              # must be 'context' or 'workflow'
+                'intent': 'deploy-service',       # snake/kebab-case, max 512 chars
+                'consumer': 'archibald',          # who uses this pack
+                'version': '1.0.0',               # semver X.Y.Z (required three-part)
+                'predicates': ['deploy', 'service', 'status'],  # non-empty list, required
+                # Inner 'definition' sub-object (workflow packs MUST include non-empty 'steps')
+                'definition': {
+                    'steps': [
+                        {'step': 'test', 'action': 'run all tests before deploying'},
+                        {'step': 'deploy', 'action': 'push artifact to staging environment'},
+                    ],
+                    'instructions': 'Run steps in order; abort on any step failure.',
+                },
             }
         }],
     },

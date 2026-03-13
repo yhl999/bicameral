@@ -427,7 +427,13 @@ class TestLaneScoping:
 
     @pytest.mark.anyio
     async def test_get_episode_denies_cross_lane_access(self, tmp_path):
-        """get_episode with a lane scope denies access to episodes in a different lane."""
+        """get_episode with a lane scope denies access to episodes in a different lane.
+
+        Security design: cross-lane denial returns 'not_found' (not 'access_denied') so
+        callers cannot distinguish "exists but forbidden" from "truly absent".  This is an
+        intentional existence-leak prevention measure — the uniform not_found contract is
+        documented in the router implementation and must not be changed to access_denied.
+        """
         from mcp_server.src.routers.episodes_procedures import register_tools
         from mcp_server.src.services.change_ledger import ChangeLedger
 
@@ -447,13 +453,20 @@ class TestLaneScoping:
             mock_mcp = _make_mock_mcp()
             register_tools(mock_mcp)
             fn = mock_mcp._tools['get_episode']
-            # Accessing with wrong lane scope
+            # Accessing with wrong lane scope: uniform not_found prevents existence leak.
             result = await fn(episode_id='ep-private-001', group_ids=['lane_other'])
         finally:
             cl_module.DB_PATH_DEFAULT = original_path
 
-        assert result.get('error') == 'access_denied', (
-            f"Cross-lane access should be denied, but got: {result}"
+        # Cross-lane access uses uniform not_found (security: no existence leak).
+        # Do NOT assert 'access_denied' — that would reveal the object exists in another lane.
+        assert result.get('error') == 'not_found', (
+            f"Cross-lane access should return uniform not_found (existence-leak prevention), "
+            f"got: {result}"
+        )
+        # Sanity: response must not contain episode content
+        assert 'Private episode' not in str(result), (
+            f"Cross-lane denial leaked episode content: {result}"
         )
 
     @pytest.mark.anyio

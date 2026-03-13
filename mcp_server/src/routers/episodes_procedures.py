@@ -74,6 +74,11 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'lane_alias': 'list[string] | null',
             },
             'output': 'Episode dict | ErrorResponse',
+            'security_note': (
+                'Cross-lane access returns {"error": "not_found"} (not "access_denied") to '
+                'prevent existence leaks — callers cannot distinguish a forbidden episode '
+                'from a truly absent one.'
+            ),
         },
         'examples': [{'episode_id': 'ep-001', 'group_ids': None, 'lane_alias': None}],
     },
@@ -422,8 +427,8 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             return phase0_not_implemented('get_episode')
 
         try:
-            ledger = ChangeLedger(_resolve_ledger())
-            obj = ledger.materialize_object(episode_id)
+            with ChangeLedger(_resolve_ledger()) as ledger:
+                obj = ledger.materialize_object(episode_id)
         except Exception as e:
             logger.error('get_episode: ledger error for %r: %s', episode_id, e)
             return {'error': 'retrieval_error', 'message': f'Ledger access failed: {e}'}
@@ -510,17 +515,17 @@ def register_tools(mcp: Any) -> dict[str, Any]:
         effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
 
         try:
-            ledger = ChangeLedger(_resolve_ledger())
-            svc = ProcedureService(ledger)
-            # Fetch enough to satisfy pagination; retrieve_procedures returns top-k by score.
-            # Lane filtering happens inside retrieve_procedures via effective_group_ids.
-            fetch_limit = max(limit_value + offset_value + 1, 50)
-            matches = svc.retrieve_procedures(
-                query,
-                limit=fetch_limit,
-                include_proposed=bool(include_all),
-                effective_group_ids=effective_groups,
-            )
+            with ChangeLedger(_resolve_ledger()) as ledger:
+                svc = ProcedureService(ledger)
+                # Fetch enough to satisfy pagination; retrieve_procedures returns top-k by score.
+                # Lane filtering happens inside retrieve_procedures via effective_group_ids.
+                fetch_limit = max(limit_value + offset_value + 1, 50)
+                matches = svc.retrieve_procedures(
+                    query,
+                    limit=fetch_limit,
+                    include_proposed=bool(include_all),
+                    effective_group_ids=effective_groups,
+                )
         except Exception as e:
             logger.error('search_procedures: retrieval error: %s', e)
             return {
@@ -592,7 +597,6 @@ def register_tools(mcp: Any) -> dict[str, Any]:
 
         _EpisodeModel, ProcedureModel = _load_typed_models()
 
-        ledger = None
         try:
             ledger = ChangeLedger(_resolve_ledger())
         except Exception as e:
@@ -608,42 +612,45 @@ def register_tools(mcp: Any) -> dict[str, Any]:
 
         proc: Any = None
 
-        # First: try to resolve as a direct object ID (with lane check)
-        try:
-            candidate = ledger.materialize_object(trigger_or_id)
-            if ProcedureModel is not None and isinstance(candidate, ProcedureModel):
-                if _passes_lane_filter(candidate, effective_groups):
-                    proc = candidate
-        except Exception:
-            pass  # Not an object ID — try trigger search
-
-        # Second: search by trigger phrase with lane-scoped retrieval.
-        # Lane filtering happens inside retrieve_procedures so forbidden-lane
-        # matches never consume top-K slots (no shadowing, no magic-number hack).
-        if proc is None:
+        # Use ledger as context manager to guarantee the SQLite connection is
+        # closed on exit regardless of which return path is taken.
+        with ledger:
+            # First: try to resolve as a direct object ID (with lane check)
             try:
-                svc = ProcedureService(ledger)
-                matches = svc.retrieve_procedures(
-                    trigger_or_id,
-                    limit=5,
-                    include_proposed=True,
-                    effective_group_ids=effective_groups,
-                )
-                if matches:
-                    proc = matches[0].procedure
-            except Exception as e:
-                logger.error('get_procedure: search error for %r: %s', trigger_or_id, e)
-                return {'error': 'retrieval_error', 'message': f'Procedure lookup failed: {e}'}
+                candidate = ledger.materialize_object(trigger_or_id)
+                if ProcedureModel is not None and isinstance(candidate, ProcedureModel):
+                    if _passes_lane_filter(candidate, effective_groups):
+                        proc = candidate
+            except Exception:
+                pass  # Not an object ID — try trigger search
 
-        if proc is None:
-            # Uniform not_found: caller cannot distinguish "exists but
-            # forbidden" from "truly absent" (no existence leak).
-            return {
-                'error': 'not_found',
-                'message': f'No procedure found for trigger or ID: {trigger_or_id!r}',
-            }
+            # Second: search by trigger phrase with lane-scoped retrieval.
+            # Lane filtering happens inside retrieve_procedures so forbidden-lane
+            # matches never consume top-K slots (no shadowing, no magic-number hack).
+            if proc is None:
+                try:
+                    svc = ProcedureService(ledger)
+                    matches = svc.retrieve_procedures(
+                        trigger_or_id,
+                        limit=5,
+                        include_proposed=True,
+                        effective_group_ids=effective_groups,
+                    )
+                    if matches:
+                        proc = matches[0].procedure
+                except Exception as e:
+                    logger.error('get_procedure: search error for %r: %s', trigger_or_id, e)
+                    return {'error': 'retrieval_error', 'message': f'Procedure lookup failed: {e}'}
 
-        return _procedure_to_dict(proc)
+            if proc is None:
+                # Uniform not_found: caller cannot distinguish "exists but
+                # forbidden" from "truly absent" (no existence leak).
+                return {
+                    'error': 'not_found',
+                    'message': f'No procedure found for trigger or ID: {trigger_or_id!r}',
+                }
+
+            return _procedure_to_dict(proc)
 
     return {
         'search_episodes': search_episodes,
