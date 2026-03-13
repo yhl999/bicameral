@@ -43,7 +43,8 @@ def test_candidate_tool_metadata_matches_runtime_contract():
     assert 'quarantine' in source
     assert 'pending' not in source[source.index("'name': 'list_candidates'"):source.index("'name': 'promote_candidate'")]
     # examples are in dict form; check via list_block below
-    assert "'output': 'list[Candidate]'" in source
+    # list_candidates output now includes the full {'status': 'ok', 'candidates': list[Candidate], ...} envelope.
+    assert '"candidates": list[Candidate]' in source
 
     # Verify examples are present (dict form used in router TOOL_CONTRACTS)
     list_block = source[source.index("'name': 'list_candidates'"):source.index("'name': 'promote_candidate'")]

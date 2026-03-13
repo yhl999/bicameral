@@ -99,7 +99,15 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
     },
     {
         'name': 'get_history',
-        'description': 'Retrieve typed-memory change history for a subject / predicate, scoped by lane',
+        'description': (
+            'Retrieve typed-memory change history for the root lineage(s) of currently active '
+            'facts matching subject/predicate. '
+            'NOTE: This method walks roots of current (non-superseded) facts only — '
+            'it does NOT scan every historical root ever associated with the subject. '
+            'Superseded-and-replaced lineages that are no longer active are not returned. '
+            'The response includes roots_considered so callers can see which root IDs were walked. '
+            'Use get_current_state to inspect only the latest fact values without history.'
+        ),
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
@@ -110,6 +118,14 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'lane_alias': 'list[string] | null',
             },
             'output': '{"status": "ok", "history": list[dict], "roots_considered": list[string], "scope": string} | ErrorResponse',
+            'semantics_note': (
+                'Phase-0 semantics: walks root lineages of currently active (non-superseded) '
+                'facts only. Superseded fact lineages that are no longer active are excluded '
+                'even if previously associated with the same subject/predicate. '
+                'roots_considered lists the root IDs that were walked to build the history list. '
+                'This is a narrower scope than a full audit-log scan; it is optimised for '
+                'inspecting the evolution of currently active facts.'
+            ),
         },
         'examples': [{'subject': 'project-alpha', 'predicate': 'status'}],
     },
@@ -1427,11 +1443,17 @@ async def get_history(
     group_ids: list[str] | None = None,
     lane_alias: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Return ledger event history for the currently active root(s).
+    """Return ledger event history for the currently active root lineage(s).
 
-    This intentionally follows Phase-0 semantics: it does not scan every historic
-    root ever associated with a subject. Instead it returns change-event summaries
-    for the root lineage(s) of the current state facts matching the query.
+    Phase-0 semantics: walks roots of currently active (non-superseded) facts only.
+    It does NOT scan every historical root ever associated with a subject.  Superseded
+    lineages that are no longer active are excluded; callers must not expect a full
+    audit-log scan across all past versions.
+
+    ``roots_considered`` in the response lists the root IDs that were walked, so
+    callers can see the exact scope of the history returned.
+
+    Use ``get_current_state`` to inspect only the latest fact values without history.
 
     Args:
         subject: The fact subject to filter on.

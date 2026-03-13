@@ -494,12 +494,39 @@ async def promote_candidate(
         logger.exception('promote_candidate failed')
         return _error('operational_error', f'promote_candidate failed: {exc}')
 
-    store.update_candidate_status(
+    # Skew mitigation: capture the return value so we can detect the failure case
+    # where the ledger succeeded but the candidate-store update did not.  The
+    # existing reconcile path (promotion_event_for_candidate check at the top of
+    # this function) will re-apply the store update on the next call, so this is
+    # a log-and-continue rather than a hard error.
+    store_updated = store.update_candidate_status(
         normalized_candidate_id,
         'promoted',
         resolution=normalized_resolution,
     )
+    if store_updated is None:
+        # Candidate not found in store after successful ledger promotion.
+        # Possible concurrent deletion or ephemeral DB issue.  The reconcile
+        # path (promotion_event_for_candidate) will heal on next call.
+        logger.warning(
+            'promote_candidate: ledger promotion succeeded for %r but candidate-store '
+            'update returned None (skew state; candidate may have been concurrently '
+            'deleted). Reconcile path will re-apply on next promote_candidate call.',
+            normalized_candidate_id,
+        )
+
+    # Readback: verify store reflects the new 'promoted' status.  A stale
+    # readback indicates persistent skew (e.g. DB write delayed or failed
+    # after commit); log for operator visibility; reconcile will heal.
     promoted_candidate = store.get_candidate(normalized_candidate_id) or candidate
+    if promoted_candidate is not candidate and promoted_candidate.get('status') in ('pending', 'quarantine'):
+        logger.warning(
+            'promote_candidate: readback for %r still shows status=%r after successful '
+            'ledger promotion — persisted skew detected. Reconcile path will heal on '
+            'next call via promotion_event_for_candidate check.',
+            normalized_candidate_id, promoted_candidate.get('status'),
+        )
+
     promoted_fact = ledger.materialize_object(promotion.object_id)
 
     materialized = False

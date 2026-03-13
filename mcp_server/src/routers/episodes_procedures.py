@@ -51,7 +51,10 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'limit': 'integer | null (default 10)',
                 'offset': 'integer | null (default 0)',
             },
-            'output': 'EpisodeSearchResponse | ErrorResponse',
+            'output': (
+                '{"status": "ok", "episodes": list[Episode], "limit": int, "offset": int, '
+                '"total": int, "has_more": bool, "next_offset": int | null} | ErrorResponse'
+            ),
         },
         'examples': [{
             'query': 'last deployment',
@@ -95,7 +98,19 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
                 'limit': 'integer | null (default 10)',
                 'offset': 'integer | null (default 0)',
             },
-            'output': 'ProcedureSearchResponse | ErrorResponse',
+            'output': (
+                '{"status": "ok", "procedures": list[Procedure], "limit": int, "offset": int, '
+                '"total": int, "has_more": bool, "next_offset": int | null} | ErrorResponse'
+            ),
+            'fetch_window_note': (
+                'The service fetches max(limit+offset+1, 50) candidates and applies lane '
+                'filtering inside retrieve_procedures() before top-K truncation, so forbidden-lane '
+                'entries never consume top-K slots. The post-hoc lane filter in the router is '
+                'defence-in-depth. Tradeoff: a flat floor of 50 may under-fetch on very deep '
+                'offset pages (e.g. offset>50) when lane filtering removes many candidates. '
+                'Callers should treat has_more=True / next_offset as the authoritative '
+                'pagination signal rather than assuming the first page is exhaustive.'
+            ),
         },
         'examples': [{
             'query': 'how to run tests',
@@ -381,6 +396,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 episodes_out.append(_episode_to_dict(ep))
 
         return {
+            'status': 'ok',
             'episodes': episodes_out,
             'limit': limit_value,
             'offset': offset_value,
@@ -517,8 +533,20 @@ def register_tools(mcp: Any) -> dict[str, Any]:
         try:
             with ChangeLedger(_resolve_ledger()) as ledger:
                 svc = ProcedureService(ledger)
-                # Fetch enough to satisfy pagination; retrieve_procedures returns top-k by score.
-                # Lane filtering happens inside retrieve_procedures via effective_group_ids.
+                # Fetch-window heuristic: retrieve enough candidates to answer the
+                # pagination question AND provide a quality ranking pool before slicing.
+                # retrieve_procedures() applies lane filtering BEFORE top-K truncation
+                # (prevents forbidden-lane entries from consuming top-K slots).
+                # The post-hoc lane filter below is defence-in-depth and a no-op in
+                # normal operation when effective_group_ids is fully honoured by the service.
+                #
+                # Formula: limit+offset+1 ensures has_more detection is accurate.
+                # Floor of 50 provides a candidate pool for quality ranking on small requests.
+                #
+                # Tradeoff: a flat floor of 50 may under-fetch on very deep offset pages
+                # (e.g. offset>50) when post-hoc lane attrition is non-trivial.  A cursor-
+                # based server-side pagination fix is the proper remedy; this heuristic is a
+                # pragmatic compromise.  See TOOL_CONTRACTS['fetch_window_note'] for details.
                 fetch_limit = max(limit_value + offset_value + 1, 50)
                 matches = svc.retrieve_procedures(
                     query,
@@ -550,6 +578,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             procedures_out.append(proc_dict)
 
         return {
+            'status': 'ok',
             'procedures': procedures_out,
             'limit': limit_value,
             'offset': offset_value,
