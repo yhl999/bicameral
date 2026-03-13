@@ -945,3 +945,104 @@ async def test_get_history_truncated_true_when_root_cap_clips_under_caller_limit
     assert {'pred_2', 'pred_3', 'pred_4'} == predicates, (
         f'expected pred_2/pred_3/pred_4 from the 3 kept roots; got {predicates}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: get_history must emit truncated=True when an oversized lineage
+# causes a root to be silently skipped, even when the caller limit is not hit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_history_truncated_true_when_oversized_lineage_skips_root(
+    ledger: ChangeLedger,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: _change_history_events_for_subject() skips roots whose
+    lineage exceeds _MAX_STATE_LINEAGE_EVENTS_PER_ROOT via ``continue`` but
+    previously never set internally_truncated=True for that path.  When the
+    caller's limit was large enough that len(entries) <= limit, get_history()
+    emitted truncated=False — lying about completeness even though an entire
+    root's history was discarded.
+
+    Minimal repro: cap lineage to 2 events, create one root with 3 events
+    (triggers too-large check) and one normal root with 1 event.  Call
+    get_history with limit=200.  Only 1 entry (from the normal root) is
+    returned; without the fix truncated=False because 1 <= 200.  With the fix
+    internally_truncated is set on the oversized skip and truncated=True.
+    """
+    # Reduce the per-root lineage cap so 3 events trigger the too-large check.
+    monkeypatch.setattr(server, '_MAX_STATE_LINEAGE_EVENTS_PER_ROOT', 2)
+
+    subject = 'OversizedLineageSub'
+    lane = 's1_sessions_main'
+    oversized_root = 'r-oversized-lin'
+    normal_root = 'r-normal-lin'
+
+    # Build the oversized root: 3 assert events, each with a distinct object_id.
+    # lineage_event_count will be 3 (> cap=2).
+    for i in range(1, 4):
+        oid = f'ol-fact-{i}'
+        ts = f'2026-01-01T10:0{i}:00Z'
+        ledger.append_event(
+            'assert',
+            payload=_state_fact(
+                object_id=oid,
+                root_id=oversized_root,
+                subject=subject,
+                predicate=f'oversized_pred_{i}',
+                value=f'val_{i}',
+                created_at=ts,
+                source_lane=lane,
+            ),
+            root_id=oversized_root,
+            recorded_at=ts,
+        )
+
+    # Build the normal root: 1 assert event, lineage_event_count=1 (≤ cap=2).
+    ledger.append_event(
+        'assert',
+        payload=_state_fact(
+            object_id='nl-fact-1',
+            root_id=normal_root,
+            subject=subject,
+            predicate='normal_pred',
+            value='normal_val',
+            created_at='2026-01-02T10:00:00Z',
+            source_lane=lane,
+        ),
+        root_id=normal_root,
+        recorded_at='2026-01-02T10:00:00Z',
+    )
+
+    # Sanity: confirm lineage_event_count of oversized root really exceeds cap.
+    snapshot = ledger.typed_root_snapshot(oversized_root)
+    assert snapshot is not None
+    assert int(snapshot['lineage_event_count']) > 2, (
+        f'test setup error: expected lineage_event_count > 2 for the oversized '
+        f'root, got {snapshot["lineage_event_count"]}'
+    )
+
+    # limit=200 >> 1 returned fact, so caller-limit truncation would NOT fire.
+    # Old code: truncated = internally_truncated(False) OR (1 > 200) = False  ← BUG
+    # New code: internally_truncated=True (set on oversized-skip) → truncated=True
+    result = await server.get_history(subject, group_ids=[lane], limit=200)
+
+    assert 'error' not in result, f'unexpected error: {result}'
+    assert result['metadata']['truncated'] is True, (
+        'truncated must be True when an oversized-lineage root is skipped, '
+        'even if the caller limit is not reached (got False — the lineage-skip '
+        'path did not propagate internally_truncated=True)'
+    )
+
+    # The normal root's fact must still appear.
+    predicates = {event['predicate'] for event in result['history']}
+    assert 'normal_pred' in predicates, (
+        f'expected normal root fact to be included; got predicates={predicates}'
+    )
+    # The oversized root's facts must be absent (lineage was too large to walk).
+    for i in range(1, 4):
+        assert f'oversized_pred_{i}' not in predicates, (
+            f'oversized root fact oversized_pred_{i} must be excluded by '
+            f'the lineage cap (was unexpectedly returned)'
+        )

@@ -2536,6 +2536,7 @@ def _change_history_events_for_subject(
                 root_id,
                 _MAX_STATE_LINEAGE_EVENTS_PER_ROOT,
             )
+            internally_truncated = True
             continue
 
         visible_facts: list[StateFact] = []
