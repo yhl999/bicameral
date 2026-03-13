@@ -182,11 +182,15 @@ class TestAllStubsReturnValidTypes:
         assert result['error_type'] == 'unauthorized'
 
     @pytest.mark.anyio
-    async def test_candidates_list_candidates_authorized_contract(self, monkeypatch):
+    async def test_candidates_list_candidates_authorized_contract(self, tmp_path, monkeypatch):
         """list_candidates returns an authenticated wrapper response."""
+        from mcp_server.src.routers import candidates as candidates_router
         from mcp_server.src.routers import memory as memory_router
         from mcp_server.src.routers.candidates import register_tools
 
+        # Isolate candidates DB to avoid contamination from other tests
+        monkeypatch.setenv('BICAMERAL_CANDIDATES_DB_PATH', str(tmp_path / 'candidates.db'))
+        monkeypatch.setattr(candidates_router, '_candidate_store', None)
         monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
         monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
@@ -209,11 +213,15 @@ class TestAllStubsReturnValidTypes:
         assert result['error_type'] == 'unauthorized'
 
     @pytest.mark.anyio
-    async def test_candidates_promote_contract(self, monkeypatch):
+    async def test_candidates_promote_contract(self, tmp_path, monkeypatch):
         """promote_candidate with server-derived principal in allowlist returns not_found for unknown candidate."""
+        from mcp_server.src.routers import candidates as candidates_router
         from mcp_server.src.routers import memory as memory_router
         from mcp_server.src.routers.candidates import register_tools
 
+        # Isolate candidates DB
+        monkeypatch.setenv('BICAMERAL_CANDIDATES_DB_PATH', str(tmp_path / 'candidates.db'))
+        monkeypatch.setattr(candidates_router, '_candidate_store', None)
         monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
         monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
@@ -452,7 +460,8 @@ class TestAllStubsReturnValidTypes:
         assert result['total'] == 0
         assert result['has_more'] is False
         assert result['next_offset'] is None
-        assert 'status' not in result
+        # Fully-integrated implementation: result includes status:ok envelope
+        assert result.get('status') == 'ok'
 
     @pytest.mark.anyio
     async def test_episodes_procedures_search_episodes_rejects_invalid_time_range(self):
@@ -540,7 +549,8 @@ class TestAllStubsReturnValidTypes:
         assert result['total'] == 0
         assert result['has_more'] is False
         assert result['next_offset'] is None
-        assert 'status' not in result
+        # Fully-integrated implementation: result includes status:ok envelope
+        assert result.get('status') == 'ok'
 
     @pytest.mark.anyio
     async def test_episodes_procedures_stub_validates_bad_query_instead_of_raising(self):

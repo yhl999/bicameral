@@ -52,7 +52,13 @@ _candidate_store: CandidateStore | None = None
 TOOL_CONTRACTS: list[dict[str, Any]] = [
     {
         'name': 'list_candidates',
-        'description': 'List quarantined/promoted/rejected typed-memory fact candidates for authenticated trusted reviewers',
+        'description': (
+            'List quarantined/promoted/rejected typed-memory fact candidates for authenticated trusted reviewers. '
+            'Lane-scope invariant: when the server has a configured lane (group_id), only candidates '
+            'whose source_lane matches the server lane are returned. When no server lane is configured '
+            '(global/unscoped deployment), all candidates are visible (global-owner review semantics). '
+            'This invariant prevents cross-lane candidate metadata disclosure in lane-partitioned deployments.'
+        ),
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
@@ -375,6 +381,17 @@ async def list_candidates(
             return _error('validation_error', f'{field_name} must be a positive integer')
 
     rows = _get_candidate_store().list_candidates(status=effective_status)
+
+    # Lane-scope invariant: when the server has a configured lane (group_id),
+    # only show candidates from the same lane to prevent cross-lane metadata
+    # disclosure in lane-partitioned deployments.  When no server lane is
+    # configured (global/unscoped deployment), all candidates are visible
+    # (global-owner review semantics — the intended invariant for single-lane
+    # or trusted-owner deployments).
+    _server_lane = memory_router._derive_source_lane()
+    if _server_lane is not None:
+        rows = [r for r in rows if _candidate_source_lane(r) == _server_lane]
+
     candidates = [
         _candidate_to_public(candidate)
         for candidate in rows
@@ -490,7 +507,20 @@ async def promote_candidate(
         )
     except ValueError as exc:
         return _error('validation_error', str(exc))
-    except Exception as exc:  # pragma: no cover - defensive operational guard
+    except Exception as exc:
+        # Detect concurrent-promotion race: a UNIQUE constraint on object_id means
+        # another writer already committed a promotion for this candidate.  Re-read
+        # the candidate to surface the correct invalid_state response rather than an
+        # opaque operational_error.  This tightens the post-promotion store/ledger
+        # skew window by giving callers a meaningful error instead of an internal
+        # integrity failure.
+        exc_str = str(exc)
+        if 'UNIQUE constraint' in exc_str or 'unique constraint' in exc_str.lower():
+            refreshed = store.get_candidate(normalized_candidate_id)
+            if refreshed is not None and refreshed.get('status') not in ('pending', None):
+                return _candidate_status_error(
+                    normalized_candidate_id, str(refreshed.get('status', 'promoted'))
+                )
         logger.exception('promote_candidate failed')
         return _error('operational_error', f'promote_candidate failed: {exc}')
 

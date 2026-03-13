@@ -598,17 +598,22 @@ class TestGetToolsSignature:
             'limit',
             'offset',
         ]
-        assert tools_by_name['search_episodes']['schema']['output'] == 'EpisodeSearchResponse | ErrorResponse'
-        assert tools_by_name['search_procedures']['schema']['output'] == 'ProcedureSearchResponse | ErrorResponse'
+        # Output contracts use inline envelope format (runtime-truthful, not short-alias form)
+        assert '"status": "ok"' in tools_by_name['search_episodes']['schema']['output']
+        assert 'episodes' in tools_by_name['search_episodes']['schema']['output']
+        assert 'ErrorResponse' in tools_by_name['search_episodes']['schema']['output']
+        assert '"status": "ok"' in tools_by_name['search_procedures']['schema']['output']
+        assert 'procedures' in tools_by_name['search_procedures']['schema']['output']
+        assert 'ErrorResponse' in tools_by_name['search_procedures']['schema']['output']
     @pytest.mark.anyio
     async def test_candidate_tool_metadata_matches_integrated_contract(self):
         result = await self.module.get_tools()
         tool_by_name = {tool['name']: tool for tool in result}
 
         list_candidates = tool_by_name['list_candidates']
-        assert 'pending' in list_candidates['schema']['inputs']['status']
+        # External contract uses 'quarantine' (not the internal 'pending' alias)
         assert 'quarantine' in list_candidates['schema']['inputs']['status']
-        assert list_candidates['examples'][0]['status'] == 'pending'
+        assert list_candidates['examples'][0]['status'] == 'quarantine'
         assert 'candidates' in list_candidates['schema']['output']
 
         promote_candidate = tool_by_name['promote_candidate']

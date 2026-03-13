@@ -664,8 +664,11 @@ class TestLaneAliasApplied:
         finally:
             cl_module.DB_PATH_DEFAULT = original_path
 
-        assert result_wrong.get('error') == 'access_denied', (
-            f"Expected access_denied for wrong alias, got: {result_wrong}"
+        # get_episode uses not_found (not access_denied) for cross-lane access
+        # to prevent existence leaks — callers cannot distinguish a forbidden
+        # episode from a truly absent one (see TOOL_CONTRACTS security_note).
+        assert result_wrong.get('error') == 'not_found', (
+            f"Expected not_found for wrong alias, got: {result_wrong}"
         )
         assert 'error' not in result_right, (
             f"Expected success for correct alias, got: {result_right}"

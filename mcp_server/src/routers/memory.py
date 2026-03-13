@@ -1013,7 +1013,15 @@ async def remember_fact(
         }
 
     # Conflict / duplicate detection in current fact set.
+    # Lane-aware conflict detection: only compare against facts in the same lane
+    # as the incoming fact to prevent cross-lane fact metadata from leaking via
+    # the conflict/duplicate response fields (existing_fact disclosure).
+    # If _derive_source_lane() returns None (unscoped/global deployment), all facts
+    # are in the same implicit lane, so no filtering is needed (backward compat).
     existing_all = _current_state_facts(subject=subject, scope=scope, predicate=None)
+    _incoming_lane = _derive_source_lane()
+    if _incoming_lane is not None:
+        existing_all = [f for f in existing_all if f.source_lane == _incoming_lane]
     is_conflict, is_duplicate, existing_payload, existing_fact = _get_conflicting_existing(
         current_facts=existing_all,
         candidate={

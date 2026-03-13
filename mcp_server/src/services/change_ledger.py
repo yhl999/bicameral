@@ -550,6 +550,17 @@ class ChangeLedger:
                     if (
                         _current.conflict_set == _conflict_set
                         and _current.object_id != typed_object.object_id
+                        # Lane isolation: skip cross-lane conflict resolution.
+                        # A candidate from lane A must not automatically supersede
+                        # a fact from lane B even when conflict-set keys align.
+                        # Both must have non-None source_lanes that differ to trigger
+                        # the guard; unscoped (None) facts are treated as same-lane
+                        # for backward compatibility with pre-lane-awareness data.
+                        and not (
+                            _current.source_lane is not None
+                            and typed_object.source_lane is not None
+                            and _current.source_lane != typed_object.source_lane
+                        )
                     ):
                         resolved_conflict_with_fact_id = _current.object_id
                         break
@@ -946,6 +957,22 @@ def _validate_supersede_target(*, candidate: TypedMemoryObject, prior: TypedMemo
         raise ValueError(
             'incompatible supersede target: '
             f'state_fact conflict set mismatch for target {prior.object_id}'
+        )
+
+    # Lane isolation: a candidate from lane A must never supersede or adopt
+    # lineage from a root in lane B.  Both lanes must be non-None and differ
+    # to trigger the guard; unscoped (None) facts are exempt for backward
+    # compatibility with pre-lane-awareness ledger data.
+    if (
+        candidate.source_lane is not None
+        and prior.source_lane is not None
+        and candidate.source_lane != prior.source_lane
+    ):
+        raise ValueError(
+            'cross-lane supersede rejected: '
+            f'candidate (source_lane={candidate.source_lane!r}) cannot supersede '
+            f'or adopt lineage from fact in a different lane '
+            f'(source_lane={prior.source_lane!r}, object_id={prior.object_id!r})'
         )
 
 
