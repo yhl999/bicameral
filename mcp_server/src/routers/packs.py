@@ -211,20 +211,26 @@ def _matches_pack_access(
     if _fact_scope(fact) not in _allowed_fact_scopes(pack):
         return False
     # Pack-defined lane restriction
-    allowed_lanes = _allowed_source_lanes(pack)
+    pack_lanes = _allowed_source_lanes(pack)
+    allowed_lanes = pack_lanes
     # Caller-authorized lane restriction (intersect with server-authorized scope)
     if caller_authorized_lanes is not None:
         caller_set = set(caller_authorized_lanes)
+        if not caller_set:
+            # Empty caller scope = deny all (fail closed)
+            return False
         if allowed_lanes is not None:
             # Intersect pack lanes with caller-authorized lanes
             allowed_lanes = allowed_lanes & caller_set
         else:
             allowed_lanes = caller_set
-    if not allowed_lanes:
-        if caller_authorized_lanes is not None:
-            # Caller has lane restrictions but no intersection with pack — block access
-            fact_lane = _fact_source_lane(fact)
-            return fact_lane is not None and fact_lane in set(caller_authorized_lanes)
+
+    if allowed_lanes is not None and not allowed_lanes:
+        # Empty intersection (including disjoint pack/caller lanes) = deny.
+        # Never fall back to caller-lane facts when the pack itself disallows them.
+        return False
+    if allowed_lanes is None:
+        # No lane restrictions from either pack or caller → allow all
         return True
     fact_lane = _fact_source_lane(fact)
     return fact_lane in allowed_lanes
@@ -243,11 +249,14 @@ def _resolve_caller_lanes(
 ) -> list[str] | None:
     """Resolve caller-supplied group_ids/lane_alias into effective lane scope for packs.
 
-    Returns None when no lane scope is requested (all lanes visible).
+    Fail-closed semantics:
+    - Returns ``None`` only when no lane scope is active AND the server
+      has no ``authorized_group_ids`` restriction.
+    - Returns ``[]`` when the resolved scope is empty (deny all).
+    - When scope parameters are omitted but the server has
+      ``authorized_group_ids`` configured, returns that list so omitted
+      params do not widen access beyond the server-authorized scope.
     """
-    if group_ids is None and lane_alias is None:
-        return None
-
     try:
         from ..graphiti_mcp_server import _resolve_effective_group_ids
         effective, invalid = _resolve_effective_group_ids(
@@ -255,11 +264,31 @@ def _resolve_caller_lanes(
             lane_alias=lane_alias,
         )
         if invalid:
-            return []
-        return effective
+            return []  # fail closed on invalid aliases
+
+        # If caller explicitly requested scope, respect the result
+        if group_ids is not None or lane_alias is not None:
+            return effective
+
+        # Caller omitted scope params — check if server restricts access
+        try:
+            from ..graphiti_mcp_server import config as _server_config
+            authorized = _server_config.graphiti.authorized_group_ids
+            if authorized:
+                return list(authorized)
+        except (ImportError, AttributeError, Exception):
+            pass
+
+        # No server restrictions and no explicit scope → all lanes visible
+        if effective:
+            return effective
+        return None
+
     except (ImportError, Exception):
         if group_ids is not None:
-            return list(group_ids)
+            return list(group_ids) if group_ids else []
+        if lane_alias is not None:
+            return []  # can't resolve aliases without server → fail closed
         return None
 
 

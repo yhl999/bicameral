@@ -154,11 +154,16 @@ def _resolve_effective_group_ids(
     """Resolve group_ids + lane_alias into an effective lane scope.
 
     Delegates to the main server resolver (which also intersects with
-    authorized_group_ids). Returns None when no lane scoping is active.
-    """
-    if group_ids is None and lane_alias is None:
-        return None
+    authorized_group_ids).
 
+    Fail-closed semantics:
+    - Returns ``None`` only when no lane scoping is active AND the server
+      has no ``authorized_group_ids`` restriction.
+    - Returns ``[]`` when the resolved scope is empty (deny all).
+    - When scope parameters are omitted but the server has
+      ``authorized_group_ids`` configured, returns that list so omitted
+      params do not widen access beyond the server-authorized scope.
+    """
     try:
         from ..graphiti_mcp_server import _resolve_effective_group_ids as _server_resolve
         effective, invalid = _server_resolve(
@@ -166,12 +171,34 @@ def _resolve_effective_group_ids(
             lane_alias=lane_alias,
         )
         if invalid:
-            return []
-        return effective
+            return []  # fail closed on invalid aliases
+
+        # If caller explicitly requested scope, respect the result
+        if group_ids is not None or lane_alias is not None:
+            return effective
+
+        # Caller omitted scope params — check if server restricts access
+        try:
+            from ..graphiti_mcp_server import config as _server_config
+            authorized = _server_config.graphiti.authorized_group_ids
+            if authorized:
+                # Server has authorized restrictions; scope to those lanes
+                # so omitting params doesn't widen beyond authorized scope.
+                return list(authorized)
+        except (ImportError, AttributeError, Exception):
+            pass
+
+        # No server restrictions and no explicit scope → all lanes visible
+        if effective:
+            return effective
+        return None
+
     except (ImportError, Exception):
-        # Fallback: use group_ids directly
+        # Fallback: server resolver unavailable
         if group_ids is not None:
-            return list(group_ids)
+            return list(group_ids) if group_ids else []
+        if lane_alias is not None:
+            return []  # can't resolve aliases without server → fail closed
         return None
 
 
@@ -222,9 +249,19 @@ def _procedure_to_dict(proc: Any) -> dict[str, Any]:
 
 
 def _passes_lane_filter(obj: Any, group_ids: list[str] | None) -> bool:
-    """Return True if the object's source_lane is in the allowed group_ids (or no filter set)."""
-    if not group_ids:
+    """Return True if the object's source_lane is in the allowed group_ids (or no filter set).
+
+    Fail-closed semantics:
+    - ``None`` means no lane filter is active → allow all.
+    - ``[]`` (empty list) means the resolved scope is empty → deny all.
+      This covers: invalid aliases, disallowed lanes, explicit empty scope,
+      and disjoint authorized-scope intersections.
+    """
+    if group_ids is None:
         return True
+    if not group_ids:
+        # Empty scope = deny (fail closed).  Never treat [] as "all lanes".
+        return False
     source_lane = getattr(obj, 'source_lane', None)
     return source_lane in group_ids
 
@@ -320,8 +357,10 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             }
 
         raw_episodes = result.get('episodes', [])
-        # Apply lane filter (defence-in-depth in case service returned cross-lane data)
-        if effective_groups:
+        # Apply lane filter (defence-in-depth in case service returned cross-lane data).
+        # Use ``is not None`` so that an empty list (fail-closed scope) correctly
+        # filters out ALL episodes, rather than being skipped as falsy.
+        if effective_groups is not None:
             raw_episodes = [ep for ep in raw_episodes if _passes_lane_filter(ep, effective_groups)]
 
         total = len(raw_episodes)
@@ -484,8 +523,9 @@ def register_tools(mcp: Any) -> dict[str, Any]:
 
         # Resolve lane_alias into effective group IDs
         effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
-        # Apply lane filter
-        if effective_groups:
+        # Apply lane filter.  Use ``is not None`` so that an empty list
+        # (fail-closed scope) correctly filters out ALL procedures.
+        if effective_groups is not None:
             matches = [m for m in matches if _passes_lane_filter(m.procedure, effective_groups)]
 
         total = len(matches)
@@ -555,39 +595,45 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             logger.error('get_procedure: ledger open failed: %s', e)
             return {'error': 'service_unavailable', 'message': f'Ledger unavailable: {e}'}
 
-        # First: try to resolve as a direct object ID
+        # Resolve lane scope FIRST so lane filtering is applied before
+        # selecting a match.  This prevents cross-lane existence leaks
+        # (returning access_denied for a forbidden match reveals its
+        # existence) and shadowing (a forbidden higher-ranked match
+        # hiding a permitted lower-ranked same-lane match).
+        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
+
         proc: Any = None
+
+        # First: try to resolve as a direct object ID (with lane check)
         try:
             candidate = ledger.materialize_object(trigger_or_id)
             if ProcedureModel is not None and isinstance(candidate, ProcedureModel):
-                proc = candidate
+                if _passes_lane_filter(candidate, effective_groups):
+                    proc = candidate
         except Exception:
             pass  # Not an object ID — try trigger search
 
-        # Second: search by trigger phrase
+        # Second: search by trigger phrase with lane-scoped selection.
+        # Fetch more candidates so we can skip forbidden-lane matches and
+        # find permitted lower-ranked ones (anti-shadowing).
         if proc is None:
             try:
                 svc = ProcedureService(ledger)
-                matches = svc.retrieve_procedures(trigger_or_id, limit=1, include_proposed=True)
-                if matches:
-                    proc = matches[0].procedure
+                matches = svc.retrieve_procedures(trigger_or_id, limit=20, include_proposed=True)
+                for match in matches:
+                    if _passes_lane_filter(match.procedure, effective_groups):
+                        proc = match.procedure
+                        break
             except Exception as e:
                 logger.error('get_procedure: search error for %r: %s', trigger_or_id, e)
                 return {'error': 'retrieval_error', 'message': f'Procedure lookup failed: {e}'}
 
         if proc is None:
+            # Uniform not_found: caller cannot distinguish "exists but
+            # forbidden" from "truly absent" (no existence leak).
             return {
                 'error': 'not_found',
                 'message': f'No procedure found for trigger or ID: {trigger_or_id!r}',
-            }
-
-        # Resolve lane_alias into effective group IDs for access check
-        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
-        # Lane access check
-        if not _passes_lane_filter(proc, effective_groups):
-            return {
-                'error': 'access_denied',
-                'message': 'Procedure is not in the requested lane scope',
             }
 
         return _procedure_to_dict(proc)

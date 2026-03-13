@@ -788,6 +788,23 @@ def _materialize_fact(
     )
 
 
+def _derive_source_lane() -> str | None:
+    """Derive source_lane from the server's default group_id config.
+
+    This ensures facts created via remember_fact are associated with a lane
+    and remain visible to correctly scoped reads.  Returns None only when
+    no default group_id is configured (backward-compatible).
+    """
+    try:
+        from ..graphiti_mcp_server import config as _server_config
+        gid = _server_config.graphiti.group_id
+        if gid and isinstance(gid, str) and gid.strip():
+            return gid.strip()
+    except (ImportError, AttributeError, Exception):
+        pass
+    return None
+
+
 def _build_state_fact(
     *,
     subject: str,
@@ -796,12 +813,20 @@ def _build_state_fact(
     fact_type: str,
     scope: str,
     source_key: str,
+    source_lane: str | None = None,
     parent: StateFact | None = None,
     version: int = 1,
 ) -> StateFact:
     object_id = _stable_object_id(str(uuid4()))
     root_id = parent.root_id if parent is not None else object_id
     parent_id = parent.object_id if parent is not None else None
+    # Inherit source_lane from parent when superseding; otherwise use provided
+    # or derive from server config.
+    effective_lane = source_lane
+    if effective_lane is None and parent is not None:
+        effective_lane = parent.source_lane
+    if effective_lane is None:
+        effective_lane = _derive_source_lane()
     fact = StateFact.model_validate(
         {
             'object_id': object_id,
@@ -817,6 +842,7 @@ def _build_state_fact(
             'policy_scope': scope,
             'visibility_scope': scope,
             'source_key': source_key,
+            'source_lane': effective_lane,
             'evidence_refs': _build_evidence_ref(source_key),
         }
     )
@@ -1299,17 +1325,19 @@ def _resolve_lane_scope(
 ) -> list[str] | None:
     """Resolve caller-supplied group_ids/lane_alias into an effective lane scope.
 
-    Returns None when no lane scope is requested (all lanes visible).
-    Returns a list of lane IDs when scoping is active.
+    Fail-closed semantics:
+    - Returns ``None`` only when no lane scope is active AND the server
+      has no ``authorized_group_ids`` restriction.
+    - Returns ``[]`` when the resolved scope is empty (deny all).
+    - When scope parameters are omitted but the server has
+      ``authorized_group_ids`` configured, returns that list so omitted
+      params do not widen access beyond the server-authorized scope.
 
     Delegates alias resolution to the main server's _resolve_effective_group_ids
     when available; falls back to direct group_ids pass-through otherwise.
     """
-    if group_ids is None and lane_alias is None:
-        return None
-
-    # Try to use the server-level resolver which handles alias mapping and
-    # authorized_group_ids intersection.
+    # Always try the server-level resolver so authorized_group_ids is enforced
+    # even when the caller omits explicit scope params.
     try:
         from ..graphiti_mcp_server import _resolve_effective_group_ids
         effective, invalid = _resolve_effective_group_ids(
@@ -1319,12 +1347,34 @@ def _resolve_lane_scope(
         if invalid:
             # Invalid aliases: treat as empty scope (no results) for safety.
             return []
-        return effective
+
+        # If caller explicitly requested scope, respect the result
+        if group_ids is not None or lane_alias is not None:
+            return effective
+
+        # Caller omitted scope params — check if server restricts access
+        try:
+            from ..graphiti_mcp_server import config as _server_config
+            authorized = _server_config.graphiti.authorized_group_ids
+            if authorized:
+                # Server has authorized restrictions; scope to those lanes
+                # so omitting params doesn't widen beyond authorized scope.
+                return list(authorized)
+        except (ImportError, AttributeError, Exception):
+            pass
+
+        # No server restrictions and no explicit scope → all lanes visible
+        if effective:
+            return effective
+        return None
+
     except (ImportError, Exception):
         # Fallback: use group_ids directly when the server resolver is
         # unavailable (e.g. in isolated unit tests).
         if group_ids is not None:
-            return list(group_ids)
+            return list(group_ids) if group_ids else []
+        if lane_alias is not None:
+            return []  # can't resolve aliases without server → fail closed
         return None
 
 
