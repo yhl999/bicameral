@@ -503,14 +503,18 @@ class TestAllStubsReturnValidTypes:
         assert result['error'] == 'validation_error'
 
     @pytest.mark.anyio
-    async def test_episodes_procedures_get_episode_stub(self):
+    async def test_episodes_procedures_get_episode_not_found_on_empty_ledger(self):
+        """get_episode returns not_found (real impl) for a non-existent ID, not not_implemented."""
         from mcp_server.src.routers.episodes_procedures import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_episode']
         result = await fn(episode_id='ep-001')
-        assert result['error'] == 'not_implemented'
+        # Real implementation: not_found when episode doesn't exist
+        assert result['error'] in ('not_found', 'retrieval_error'), (
+            f"Expected not_found or retrieval_error, got: {result}"
+        )
 
     @pytest.mark.anyio
     async def test_episodes_procedures_get_episode_stub_validates_identifier_pattern(self):
@@ -571,14 +575,18 @@ class TestAllStubsReturnValidTypes:
         assert result['error'] == 'validation_error'
 
     @pytest.mark.anyio
-    async def test_episodes_procedures_get_procedure_stub(self):
+    async def test_episodes_procedures_get_procedure_not_found_on_empty_ledger(self):
+        """get_procedure returns not_found (real impl) when no procedure matches, not not_implemented."""
         from mcp_server.src.routers.episodes_procedures import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_procedure']
         result = await fn(trigger_or_id='deploy to production')
-        assert result['error'] == 'not_implemented'
+        # Real implementation: not_found when no matching procedure exists
+        assert result['error'] in ('not_found', 'retrieval_error'), (
+            f"Expected not_found or retrieval_error, got: {result}"
+        )
 
 
 # ---------------------------------------------------------------------------

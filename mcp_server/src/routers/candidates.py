@@ -36,7 +36,10 @@ from . import memory as memory_router
 
 logger = logging.getLogger(__name__)
 
-VALID_CANDIDATE_STATUSES = frozenset({'pending', 'promoted', 'rejected', 'quarantine'})
+# External-facing statuses aligned with Candidate.json schema; 'pending' is an internal alias for 'quarantine'
+VALID_STATUSES = frozenset({'quarantine', 'promoted', 'rejected'})
+# Internal set that also accepts 'pending' as an alias (used by _status_alias())
+VALID_CANDIDATE_STATUSES = VALID_STATUSES | frozenset({'pending'})
 VALID_RESOLUTIONS = frozenset({'supersede', 'parallel', 'cancel'})
 DEFAULT_POLICY_VERSION = 'candidate_lifecycle_v1'
 _MAX_REASON_LENGTH = 512
@@ -53,20 +56,19 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
-                'status': '"pending" | "promoted" | "rejected" | "quarantine" | null (default "pending"; "quarantine" is an alias for "pending")',
+                'status': '"quarantine" | "promoted" | "rejected" | null (default "quarantine")',
                 'type_filter': 'string | null',
                 'age_days': 'int | null',
                 'min_confidence': 'float | null',
                 'max_age_days': 'int | null',
             },
-            'output': '{"status": "ok", "candidates": list[Candidate]} | ErrorResponse',
+            'output': 'list[Candidate]',
         },
-        'examples': [{'status': 'pending'}],
-        'phase0_behavior': 'Requires a trusted server-derived caller identity; on success returns candidate rows from the canonical CandidateStore.',
+        'examples': [{'status': 'quarantine'}],
     },
     {
         'name': 'promote_candidate',
-        'description': 'Promote a pending candidate into the typed ledger (supersede) or cancel it, using server-derived reviewer auth',
+        'description': 'Promote a quarantined candidate into the typed ledger (supersede) or cancel it, using server-derived reviewer auth',
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
@@ -78,12 +80,12 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             'output': '{"status": "ok", "action": string, "candidate": Candidate, "fact": TypedFact | null} | ErrorResponse',
         },
         'examples': [{'candidate_id': 'cand-001', 'resolution': 'supersede'}],
-        'phase0_behavior': 'Authenticates via transport context, promotes through ChangeLedger, reconciles split-brain retries, and materializes the resulting fact best-effort.',
     },
     {
         'name': 'reject_candidate',
-        'description': 'Reject a pending candidate using server-derived reviewer auth',
+        'description': 'Reject a quarantined candidate using server-derived reviewer auth',
         'mode_hint': 'typed',
+        'examples': [{'candidate_id': 'cand-002'}],
         'schema': {
             'inputs': {
                 'candidate_id': 'string',
@@ -92,8 +94,6 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
             },
             'output': '{"status": "ok", "action": "rejected", "candidate": Candidate} | ErrorResponse',
         },
-        'examples': [{'candidate_id': 'cand-002'}],
-        'phase0_behavior': 'Requires a trusted server-derived caller identity and transitions the canonical CandidateStore row to rejected.',
     },
 ]
 

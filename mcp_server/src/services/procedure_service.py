@@ -5,9 +5,14 @@ import secrets
 from dataclasses import dataclass
 from typing import Any
 
-from mcp_server.src.models.typed_memory import Episode, EvidenceRef, Procedure
-from mcp_server.src.services.change_ledger import ChangeLedger
-from mcp_server.src.services.procedure_evolution import ProcedureEvolutionService
+try:
+    from ..models.typed_memory import Episode, EvidenceRef, Procedure
+    from .change_ledger import ChangeLedger
+    from .procedure_evolution import ProcedureEvolutionService
+except ImportError:  # pragma: no cover - top-level import fallback
+    from models.typed_memory import Episode, EvidenceRef, Procedure  # type: ignore[no-redef]
+    from change_ledger import ChangeLedger  # type: ignore[no-redef]
+    from procedure_evolution import ProcedureEvolutionService  # type: ignore[no-redef]
 
 
 @dataclass(frozen=True)
