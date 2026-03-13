@@ -55,6 +55,9 @@ TRUSTED_SOURCE_ALLOWLIST = frozenset(
 )
 DEFAULT_ACTION = 'remember_fact'
 
+# Sentinel returned when no authenticated caller principal is available.
+_ANON_PRINCIPAL = '__anon__'
+
 # Server-side allowlist of actor IDs that are permitted to receive elevated
 # write privileges.  Populated exclusively from the runtime environment — never
 # from caller-supplied tool arguments.  An empty or absent value means NO
@@ -321,25 +324,79 @@ def _trusted_actor_ids_from_env() -> frozenset[str]:
     return frozenset(part.strip() for part in raw.split(',') if part.strip())
 
 
-def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
-    """Resolve write context from caller hint.
+def _extract_server_principal(ctx: Any) -> str:
+    """Extract the verified caller principal from the MCP auth context layer.
+
+    Resolution order (most → least trusted):
+    1. OAuth ``AccessToken.client_id`` from the MCP auth middleware contextvar —
+       set by ``AuthContextMiddleware`` from a verified bearer token.  This path
+       is only active when the server is running with OAuth configured.
+    2. ``Context.client_id`` from the MCP request context meta field —
+       transport-injected, NOT sourced from the raw tool-call payload.
+    3. ``_ANON_PRINCIPAL`` (``'__anon__'``) sentinel — no authenticated identity
+       is available.
+
+    The returned value is **never** derived from the caller-supplied tool
+    arguments, so callers cannot self-assign a principal to impersonate another
+    client or claim a trusted identity they do not hold.
+
+    Args:
+        ctx: The FastMCP ``Context`` for the current request, or ``None`` when
+            called outside a live MCP request (e.g. unit tests).
+
+    Returns:
+        A non-empty string identifying the authenticated caller, or ``'__anon__'``.
+    """
+    # 1. OAuth bearer-token contextvar (AuthContextMiddleware, verified server-side).
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token  # type: ignore[import-not-found]
+        access_token = get_access_token()
+        if access_token is not None and access_token.client_id:
+            return str(access_token.client_id)
+    except Exception:
+        pass
+
+    # 2. Transport-injected request context (not from the tool-call payload).
+    if ctx is not None:
+        try:
+            client_id = ctx.client_id
+            if client_id:
+                return str(client_id)
+        except Exception:
+            pass
+
+    return _ANON_PRINCIPAL
+
+
+def _resolve_write_context(hint: dict[str, Any], server_principal: str | None = None) -> dict[str, Any]:
+    """Resolve write context from caller hint and the server-derived principal.
 
     Security contract
     -----------------
     Privilege elevation (verified=True, is_owner, allow_conflict_supersede) is
-    NEVER derived solely from caller-supplied hint.trust fields.  Untrusted
-    tool-call arguments MUST NOT be able to elevate their own privileges.
+    NEVER derived solely from caller-supplied hint.trust fields or a raw
+    ``actor_id`` string argument.  Callers MUST NOT be able to elevate their
+    own privileges by supplying an actor_id that happens to match the server
+    allowlist.
 
-    Trust is only granted when the caller's hint.trust.actor_id appears in the
-    server-side BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  If the env var is unset
-    or empty, ALL callers are treated as untrusted (fail-closed).
+    Trust is only granted when the ``server_principal`` — derived from the MCP
+    auth context layer (OAuth bearer token or transport client_id), **never**
+    from the raw tool-call payload — appears in the server-side
+    BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  If the env var is unset or empty,
+    ALL callers are treated as untrusted (fail-closed).
 
-    hint.trust.verified is accepted for schema validation but has NO security
-    effect; it is silently ignored for privilege decisions.
+    hint.trust.actor_id and hint.trust.verified are accepted for schema
+    validation and audit logging purposes only; they have NO security effect.
+
+    Args:
+        hint: The caller-supplied hint dict (tool argument — untrusted).
+        server_principal: Caller identity derived from the MCP auth context
+            layer via ``_extract_server_principal(ctx)``.  When ``None`` or
+            ``_ANON_PRINCIPAL``, the caller is treated as untrusted.
     """
     trust = hint.get('trust') if isinstance(hint, dict) else None
 
-    # Extract caller-supplied actor hint (informational — not a security gate).
+    # Extract caller-supplied hint fields — informational only, NOT security gates.
     hint_actor_id = ''
     hint_source = ''
     hint_scope = None
@@ -352,12 +409,19 @@ def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
         hint_is_owner = bool(trust.get('is_owner') is True)
         hint_allow_supersede = bool(trust.get('allow_conflict_supersede') is True)
 
-    # Trust gate: actor_id must appear in the server-configured allowlist.
+    # Trust gate: server-derived principal must appear in the server-configured
+    # allowlist.  Caller-supplied hint.trust.actor_id is IGNORED for this check
+    # — it cannot be used to impersonate a trusted principal.
+    effective_principal = str(server_principal or '').strip()
     trusted_ids = _trusted_actor_ids_from_env()
-    is_trusted = bool(hint_actor_id and hint_actor_id in trusted_ids)
+    is_trusted = bool(
+        effective_principal
+        and effective_principal != _ANON_PRINCIPAL
+        and effective_principal in trusted_ids
+    )
 
     if not is_trusted:
-        # Fail closed: untrusted or unconfigured → use default safe context.
+        # Fail closed: no trusted server principal or not in allowlist.
         return {
             'verified': False,
             'is_owner': False,
@@ -368,9 +432,9 @@ def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
             'allow_conflict_supersede': False,
         }
 
-    # Trusted path: actor_id validated against server allowlist.
+    # Trusted path: server_principal validated against the server allowlist.
     # hint.trust.is_owner and hint.trust.allow_conflict_supersede are honored
-    # ONLY because the actor already passed the server-side allowlist check.
+    # ONLY because the principal already passed the server-side allowlist check.
     is_owner = hint_is_owner
     source = hint_source or 'caller_asserted_verified'
     if source not in TRUSTED_SOURCE_ALLOWLIST:
@@ -383,7 +447,7 @@ def _resolve_write_context(hint: dict[str, Any]) -> dict[str, Any]:
     return {
         'verified': True,
         'is_owner': is_owner,
-        'actor_id': hint_actor_id,
+        'actor_id': effective_principal,  # server-verified identity, not hint string
         'source': source,
         'source_key': source,
         'scope_override': hint_scope,
@@ -684,8 +748,22 @@ def _build_state_fact(
     return fact
 
 
-async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[str, Any]:
+async def remember_fact(
+    text: str,
+    hint: dict[str, Any] | None = None,
+    *,
+    _server_principal: str | None = None,
+) -> dict[str, Any]:
     """Primary owner-asserted fact memory API.
+
+    Args:
+        text: Natural-language or structured fact text.
+        hint: Optional extraction hints (fact_type, subject, scope, trust, etc.).
+        _server_principal: Server-verified caller principal derived from the MCP
+            auth context layer (set by the tool wrapper from ``ctx``).  This is
+            the ONLY source of trust for privilege elevation; caller-supplied
+            ``hint.trust.actor_id`` is informational only and does NOT affect
+            authorization.  Not part of the public MCP tool contract.
 
     Returns:
         - a typed fact dict on successful ledger write, or
@@ -744,7 +822,7 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             'message': hint_bounds_error,
         }
 
-    write_context = _resolve_write_context(hint)
+    write_context = _resolve_write_context(hint, server_principal=_server_principal)
 
     schema_requested = 'type' in hint or 'type_hint' in hint or 'fact_type' in hint
     raw_type = hint.get('type') or hint.get('type_hint') or hint.get('fact_type')
@@ -970,7 +1048,12 @@ async def remember_fact(text: str, hint: dict[str, Any] | None = None) -> dict[s
             'existing_fact': conflict_existing,
             'new_fact': _candidate_payload(candidate),
             'options': _CONFLICT_OPTIONS,
-            'resolve_via': 'promote_candidate(candidate_id, resolution="supersede", actor_id=<trusted_actor>) or reject_candidate(candidate_id, actor_id=<trusted_actor>)',
+            'resolve_via': (
+                'promote_candidate(candidate_id, resolution="supersede") '
+                'or reject_candidate(candidate_id) — '
+                'authorization is derived from the MCP auth context (OAuth bearer token / transport client_id), '
+                'not from the actor_id argument; actor_id is an optional audit hint only'
+            ),
             'candidate_id': candidate.get('candidate_id'),
             'candidate_uuid': candidate.get('candidate_id'),
             'supersede_requested': supersede_requested,
@@ -1199,9 +1282,14 @@ def register_tools(mcp: FastMCP) -> dict[str, Any]:
     # FastMCP defaults the exported tool name to the Python function name.
     # Use the public contract names explicitly so runtime discovery/invocation
     # matches get_tools() and the documented Exec 1 surface.
+    #
+    # ctx is injected by FastMCP from the MCP transport/auth layer — it is NOT
+    # a caller-supplied tool argument, so it does not appear in the public
+    # schema and is excluded from the contract consistency check.
     @mcp.tool(name='remember_fact')
-    async def remember_fact_tool(text: str, hint: dict[str, Any] | None = None) -> dict[str, Any]:
-        return await remember_fact(text=text, hint=hint)
+    async def remember_fact_tool(text: str, hint: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+        server_principal = _extract_server_principal(ctx)
+        return await remember_fact(text=text, hint=hint, _server_principal=server_principal)
 
     @mcp.tool(name='get_current_state')
     async def get_current_state_tool(subject: str, predicate: str | None = None, scope: str | None = None) -> dict[str, Any]:
@@ -1231,4 +1319,6 @@ __all__ = [
     'get_history',
     '_change_ledger',
     '_trusted_actor_ids_from_env',
+    '_extract_server_principal',
+    '_ANON_PRINCIPAL',
 ]

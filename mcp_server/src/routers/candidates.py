@@ -27,29 +27,36 @@ VALID_PROMOTION_RESOLUTIONS = frozenset({'supersede', 'cancel'})
 DEFAULT_POLICY_VERSION = 'remember_fact_conflict_v1'
 
 
-def _authorize_candidate_action(actor_id: str | None) -> tuple[bool, str]:
+def _authorize_candidate_action(server_principal: str | None) -> tuple[bool, str]:
     """Fail-closed authorization gate for candidate lifecycle actions.
 
     Returns (authorized: bool, reason: str).
 
-    An actor is authorized iff:
-    1. actor_id is a non-empty string, AND
+    Authorization requires:
+    1. ``server_principal`` is a non-empty string that is NOT the anon sentinel,
+       AND
     2. It appears in the server-configured BICAMERAL_TRUSTED_ACTOR_IDS allowlist.
 
-    If the allowlist env var is absent or empty, returns (False, 'no_auth_configured'),
-    blocking ALL callers regardless of actor_id.  This is the correct fail-closed
-    posture for Phase 0: untrusted callers must not be able to promote, cancel, or
-    reject quarantined candidates.
+    ``server_principal`` MUST be derived from the MCP auth context layer
+    (OAuth bearer token or transport client_id) via
+    ``_extract_server_principal(ctx)`` — NOT from caller-supplied tool
+    arguments such as ``actor_id``.  Passing a raw ``actor_id`` string here
+    is insufficient; callers cannot forge the server-derived principal.
+
+    If the allowlist env var is absent or empty, returns
+    (False, 'no_auth_configured'), blocking ALL callers regardless of
+    principal.  This is the correct fail-closed posture for Phase 0.
     """
-    actor = str(actor_id or '').strip()
-    if not actor:
-        return False, 'actor_id_required'
-    trusted_ids = _memory_router()._trusted_actor_ids_from_env()
+    memory = _memory_router()
+    principal = str(server_principal or '').strip()
+    if not principal or principal == memory._ANON_PRINCIPAL:
+        return False, 'no_authenticated_principal'
+    trusted_ids = memory._trusted_actor_ids_from_env()
     if not trusted_ids:
         return False, 'no_auth_configured'
-    if actor not in trusted_ids:
-        return False, 'actor_not_authorized'
-    return True, actor
+    if principal not in trusted_ids:
+        return False, 'principal_not_authorized'
+    return True, principal
 
 # Lazy singletons so importing this router does not touch SQLite.
 _change_ledger: ChangeLedger | None = None
@@ -132,7 +139,7 @@ async def list_candidates(status: str | None = None) -> dict[str, Any]:
     }
 
 
-async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | None = None) -> dict[str, Any]:
+async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | None = None, ctx: Any = None) -> dict[str, Any]:
     """Promote a pending candidate into the typed ledger.
 
     Supported resolutions on this branch:
@@ -142,10 +149,16 @@ async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | 
     The previously-advertised "parallel" path is not implemented here and is
     rejected explicitly rather than pretending otherwise.
 
-    Authorization: actor_id must be provided and must appear in the server-side
+    Authorization: the caller's identity is derived from the MCP auth context
+    layer (OAuth bearer token or transport client_id) via the ``ctx`` parameter
+    injected by FastMCP — NOT from the caller-supplied ``actor_id`` argument.
+    The derived principal must appear in the server-side
     BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  Untrusted callers receive an
     'unauthorized' error regardless of the candidate state.  If the allowlist
     is not configured, all callers are denied (fail-closed).
+
+    ``actor_id`` is accepted as an optional informational audit hint (e.g. for
+    human-readable logs) but does NOT affect the authorization decision.
     """
     candidate_id = str(candidate_id or '').strip()
     if not candidate_id:
@@ -161,12 +174,14 @@ async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | 
             f'invalid resolution {normalized_resolution!r}; expected one of {sorted(VALID_PROMOTION_RESOLUTIONS)}',
         )
 
-    # Authorization gate: check BEFORE touching any candidate state.
-    authorized, auth_reason = _authorize_candidate_action(actor_id)
+    # Authorization gate: derive principal from server auth context (NOT from the
+    # caller-supplied actor_id argument) and check BEFORE touching any state.
+    memory = _memory_router()
+    server_principal = memory._extract_server_principal(ctx)
+    authorized, auth_reason = _authorize_candidate_action(server_principal)
     if not authorized:
         return _error(f'unauthorized: {auth_reason}', error_type='unauthorized')
 
-    memory = _memory_router()
     store = _get_candidate_store()
     candidate = store.get_candidate(candidate_id)
     if candidate is None:
@@ -177,11 +192,9 @@ async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | 
             error_type='invalid_state',
         )
 
-    # The actor_id here is the identity of whoever is performing this promotion
-    # action RIGHT NOW — not the actor who originally submitted the conflicting
-    # fact at quarantine time.  Using the performing actor preserves correct
-    # audit provenance for the ledger event.
-    performing_actor_id = str(actor_id)
+    # performing_actor_id: use the server-verified principal for audit provenance.
+    # actor_id (caller-supplied) may be logged as a hint but does not affect auth.
+    performing_actor_id = server_principal
 
     if normalized_resolution == 'cancel':
         updated = store.update_candidate_status(candidate_id, 'rejected', resolution='cancel')
@@ -290,24 +303,32 @@ async def promote_candidate(candidate_id: str, resolution: str, actor_id: str | 
     }
 
 
-async def reject_candidate(candidate_id: str, actor_id: str | None = None) -> dict[str, Any]:
+async def reject_candidate(candidate_id: str, actor_id: str | None = None, ctx: Any = None) -> dict[str, Any]:
     """Reject a pending candidate without writing it to the ledger.
 
-    Authorization: actor_id must be provided and must appear in the server-side
+    Authorization: the caller's identity is derived from the MCP auth context
+    layer (OAuth bearer token or transport client_id) via the ``ctx`` parameter
+    injected by FastMCP — NOT from the caller-supplied ``actor_id`` argument.
+    The derived principal must appear in the server-side
     BICAMERAL_TRUSTED_ACTOR_IDS allowlist.  Untrusted callers receive an
     'unauthorized' error.  If the allowlist is not configured, all callers are
     denied (fail-closed).
+
+    ``actor_id`` is accepted as an optional informational audit hint but does
+    NOT affect the authorization decision.
     """
     candidate_id = str(candidate_id or '').strip()
     if not candidate_id:
         return _error('candidate_id is required')
 
-    # Authorization gate: check BEFORE touching any candidate state.
-    authorized, auth_reason = _authorize_candidate_action(actor_id)
+    # Authorization gate: derive principal from server auth context (NOT actor_id).
+    memory = _memory_router()
+    server_principal = memory._extract_server_principal(ctx)
+    authorized, auth_reason = _authorize_candidate_action(server_principal)
     if not authorized:
         return _error(f'unauthorized: {auth_reason}', error_type='unauthorized')
 
-    performing_actor_id = str(actor_id)
+    performing_actor_id = server_principal
 
     memory = _memory_router()
     store = _get_candidate_store()

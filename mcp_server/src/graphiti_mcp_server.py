@@ -1083,7 +1083,12 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
         ),
         _tool_schema_entry(
             name='promote_candidate',
-            description='Resolve a pending conflict candidate by promoting it with resolution="supersede" (or canceling it). Requires actor_id to be in the server-side BICAMERAL_TRUSTED_ACTOR_IDS allowlist.',
+            description=(
+                'Resolve a pending conflict candidate by promoting it with resolution="supersede" (or canceling it). '
+                'Authorization is derived from the server-side MCP auth context (OAuth bearer token or transport '
+                'client_id) — NOT from the actor_id argument. The server-derived caller identity must appear in '
+                'BICAMERAL_TRUSTED_ACTOR_IDS. actor_id is an optional informational audit hint only.'
+            ),
             mode_hint='typed',
             inputs={'candidate_id': 'string', 'resolution': '"supersede" | "cancel"', 'actor_id': 'string | null'},
             output='dict with candidate/fact/promotion metadata | ErrorResponse',
@@ -1091,7 +1096,12 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
         ),
         _tool_schema_entry(
             name='reject_candidate',
-            description='Reject a pending candidate and keep the current fact unchanged. Requires actor_id to be in the server-side BICAMERAL_TRUSTED_ACTOR_IDS allowlist.',
+            description=(
+                'Reject a pending candidate and keep the current fact unchanged. '
+                'Authorization is derived from the server-side MCP auth context (OAuth bearer token or transport '
+                'client_id) — NOT from the actor_id argument. The server-derived caller identity must appear in '
+                'BICAMERAL_TRUSTED_ACTOR_IDS. actor_id is an optional informational audit hint only.'
+            ),
             mode_hint='typed',
             inputs={'candidate_id': 'string', 'actor_id': 'string | null'},
             output='dict with candidate metadata | ErrorResponse',

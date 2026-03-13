@@ -75,10 +75,13 @@ def test_conflict_quarantine_promotion_preserves_scope_and_materialization_sourc
         },
     }
 
+    # Trust elevation requires the server-derived principal to be in BICAMERAL_TRUSTED_ACTOR_IDS.
+    # hint.trust.actor_id is informational only; _server_principal is the auth gate.
     first = _run(
         memory.remember_fact(
             text='Coffee temperature preference is hot',
             hint={**trusted_hint, 'value': 'hot'},
+            _server_principal='caller:delegate',
         )
     )
     assert first['status'] == 'ok'
@@ -88,6 +91,7 @@ def test_conflict_quarantine_promotion_preserves_scope_and_materialization_sourc
         memory.remember_fact(
             text='Coffee temperature preference is iced',
             hint={**trusted_hint, 'value': 'iced'},
+            _server_principal='caller:delegate',
         )
     )
     assert conflict['status'] == 'conflict'
@@ -96,9 +100,13 @@ def test_conflict_quarantine_promotion_preserves_scope_and_materialization_sourc
     assert conflict['new_fact']['raw_hint']['policy_scope'] == 'internal'
     assert conflict['new_fact']['metadata']['scope'] == 'internal'
 
-    # Promotion requires an authorized actor_id.  The ledger event actor is the
-    # performing actor (caller:delegate), not stale hint metadata.
-    promoted = _run(candidates.promote_candidate(candidate_id, 'supersede', actor_id='caller:delegate'))
+    class _MockCtx:
+        """Minimal mock for FastMCP Context — provides server-derived client_id."""
+        client_id = 'caller:delegate'
+
+    # Promotion uses server-derived principal (from ctx), not caller-supplied actor_id.
+    # The ledger event actor records the server-verified identity.
+    promoted = _run(candidates.promote_candidate(candidate_id, 'supersede', actor_id='caller:delegate', ctx=_MockCtx()))
     assert promoted['status'] == 'ok'
     assert promoted['fact']['scope'] == 'internal'
     assert promoted['candidate']['status'] == 'promoted'

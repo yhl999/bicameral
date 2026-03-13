@@ -80,6 +80,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+class _MockCtx:
+    """Minimal stand-in for the FastMCP Context used in tests.
+
+    Provides a ``client_id`` attribute so ``_extract_server_principal(ctx)``
+    returns the desired server-derived principal without needing a live MCP
+    request.  This is the ONLY legitimate way to inject a trusted principal
+    in unit tests — NOT passing ``actor_id`` as a raw string argument.
+    """
+
+    def __init__(self, client_id: str) -> None:
+        self.client_id = client_id
+
+
 def _owner_trust(*, allow_conflict_supersede: bool = False) -> dict[str, object]:
     return {
         'trust': {
@@ -198,8 +211,10 @@ def test_remember_fact_conflict_returns_dialog_and_candidate(isolated_memory):
     assert conflict['type'] == 'ConflictDialog'
     assert [option['label'] for option in conflict['options']] == ['Supersede', 'Cancel']
     assert 'promote_candidate(candidate_id, resolution="supersede"' in conflict['resolve_via']
-    assert 'actor_id=' in conflict['resolve_via']
     assert 'reject_candidate(candidate_id' in conflict['resolve_via']
+    # actor_id is now an optional audit hint only; auth is server-derived (MCP auth context)
+    assert 'actor_id' in conflict['resolve_via']
+    assert 'auth context' in conflict['resolve_via'] or 'audit hint' in conflict['resolve_via']
     assert conflict['candidate_uuid']
     assert len(isolated_memory['candidates'].list_candidates(status='pending')) == 1
 
@@ -241,7 +256,8 @@ def test_remember_fact_supersedes_existing_when_privileged(isolated_memory, monk
         'supersede': True,
         **_owner_trust(allow_conflict_supersede=True),
     }
-    second = _run(memory.remember_fact('I prefer light mode', second_hint))
+    # Privilege elevation requires a server-derived principal, not caller-supplied actor_id.
+    second = _run(memory.remember_fact('I prefer light mode', second_hint, _server_principal='owner:archibald'))
 
     assert second['status'] == 'ok'
     current = _subject_state_facts(isolated_memory['ledger'], 'UI preferences')
@@ -298,9 +314,11 @@ def test_remember_fact_does_not_default_to_owner_stamp_without_trust(isolated_me
 
 
 def test_remember_fact_owner_stamp_requires_trusted_actor_in_server_allowlist(isolated_memory, monkeypatch):
-    # Trust elevation is gated on the server-side BICAMERAL_TRUSTED_ACTOR_IDS env var,
-    # not on hint.trust.verified alone.  Callers whose actor_id is in the allowlist
-    # receive elevated write context; others are silently downgraded to untrusted.
+    # Trust elevation is gated on both:
+    # 1. The server-side BICAMERAL_TRUSTED_ACTOR_IDS env var (server config), AND
+    # 2. The server-derived principal (_server_principal, NOT caller hint.trust.actor_id).
+    # Callers whose server_principal is in the allowlist receive elevated write context;
+    # others are silently downgraded to untrusted regardless of hint.trust fields.
     monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
     result = _run(
         memory.remember_fact(
@@ -310,6 +328,7 @@ def test_remember_fact_owner_stamp_requires_trusted_actor_in_server_allowlist(is
                 'subject': 'UI preferences',
                 **_owner_trust(),
             },
+            _server_principal='owner:archibald',
         )
     )
 
@@ -343,6 +362,7 @@ def test_remember_fact_multi_hop_supersession_preserves_root_lineage(isolated_me
                 'supersede': True,
                 **trusted,
             },
+            _server_principal='owner:archibald',
         )
     )
     assert second['status'] == 'ok'
@@ -356,6 +376,7 @@ def test_remember_fact_multi_hop_supersession_preserves_root_lineage(isolated_me
                 'supersede': True,
                 **trusted,
             },
+            _server_principal='owner:archibald',
         )
     )
     assert third['status'] == 'ok'
@@ -429,7 +450,8 @@ def test_promote_candidate_supersedes_quarantined_fact(isolated_memory, monkeypa
         candidates_router.promote_candidate(
             candidate_id=conflict['candidate_id'],
             resolution='supersede',
-            actor_id='system:scheduler',
+            actor_id='system:scheduler',  # informational audit hint only — NOT the auth gate
+            ctx=_MockCtx('system:scheduler'),  # server-derived principal (auth gate)
         )
     )
 
@@ -454,12 +476,14 @@ def test_promote_candidate_preserves_trusted_source_and_scope(isolated_memory, m
         memory.remember_fact(
             'I prefer dark mode',
             {'type': 'Preference', 'subject': 'UI preferences', **trusted},
+            _server_principal='owner:archibald',  # trusted write to public scope
         )
     )
     conflict = _run(
         memory.remember_fact(
             'I prefer light mode',
             {'type': 'Preference', 'subject': 'UI preferences', **trusted},
+            _server_principal='owner:archibald',  # trusted conflict → quarantined with correct scope+source
         )
     )
 
@@ -467,7 +491,8 @@ def test_promote_candidate_preserves_trusted_source_and_scope(isolated_memory, m
         candidates_router.promote_candidate(
             candidate_id=conflict['candidate_id'],
             resolution='supersede',
-            actor_id='owner:archibald',
+            actor_id='owner:archibald',  # informational audit hint only
+            ctx=_MockCtx('owner:archibald'),  # server-derived principal (auth gate)
         )
     )
 
@@ -529,7 +554,8 @@ def test_promote_candidate_cancel_rejects_candidate(isolated_memory, monkeypatch
         candidates_router.promote_candidate(
             candidate_id=conflict['candidate_id'],
             resolution='cancel',
-            actor_id='system:scheduler',
+            actor_id='system:scheduler',  # informational audit hint only
+            ctx=_MockCtx('system:scheduler'),  # server-derived principal (auth gate)
         )
     )
 
@@ -556,7 +582,8 @@ def test_reject_candidate_marks_candidate_rejected(isolated_memory, monkeypatch)
     rejected = _run(
         candidates_router.reject_candidate(
             candidate_id=conflict['candidate_id'],
-            actor_id='system:scheduler',
+            actor_id='system:scheduler',  # informational audit hint only
+            ctx=_MockCtx('system:scheduler'),  # server-derived principal (auth gate)
         )
     )
 
@@ -608,6 +635,7 @@ def test_get_history_includes_supersede_event_for_current_root(isolated_memory, 
                 'supersede': True,
                 **trusted,
             },
+            _server_principal='owner:archibald',  # trusted supersede — server principal required
         )
     )
 
@@ -737,12 +765,13 @@ def test_promote_candidate_audit_records_performing_actor_not_hint_actor(isolate
     assert conflict['status'] == 'conflict'
     candidate_id = conflict['candidate_id']
 
-    # Promotion performed by a DIFFERENT actor (reviewer:bot)
+    # Promotion performed by a DIFFERENT actor (reviewer:bot) — verified via server context.
     promoted = _run(
         candidates_router.promote_candidate(
             candidate_id=candidate_id,
             resolution='supersede',
-            actor_id='reviewer:bot',
+            actor_id='reviewer:bot',  # informational audit hint only
+            ctx=_MockCtx('reviewer:bot'),  # server-derived principal (auth gate + audit)
         )
     )
     assert promoted['status'] == 'ok'
@@ -751,6 +780,99 @@ def test_promote_candidate_audit_records_performing_actor_not_hint_actor(isolate
     ledger = isolated_memory['ledger']
     promote_events = [row for row in ledger.events_for_root(root_id) if row.event_type == 'promote']
     assert len(promote_events) == 1
-    # Must record reviewer:bot (the actor who called promote_candidate),
-    # NOT owner:archibald (the actor who submitted the conflicting hint).
+    # Must record reviewer:bot (the server-verified actor who called promote_candidate),
+    # NOT owner:archibald (the actor from the original quarantine hint metadata).
     assert promote_events[0].actor_id == 'reviewer:bot'
+
+
+# ---------------------------------------------------------------------------
+# Regression: caller-supplied strings alone MUST NOT grant privilege
+# ---------------------------------------------------------------------------
+
+
+def test_caller_supplied_actor_id_in_hint_does_not_grant_trust(isolated_memory, monkeypatch):
+    """hint.trust.actor_id matching BICAMERAL_TRUSTED_ACTOR_IDS must NOT elevate privileges.
+
+    This is the core spoofability regression: a caller who knows (or guesses)
+    a valid entry in BICAMERAL_TRUSTED_ACTOR_IDS must NOT be able to gain
+    elevated write context by supplying that string in hint.trust.actor_id.
+    Trust elevation requires the server-derived principal (_server_principal)
+    to be in the allowlist — caller-supplied hint fields are informational only.
+    """
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
+
+    # Caller knows the allowlist value and supplies it in hint.trust.actor_id —
+    # but does NOT provide a server-derived principal (_server_principal=None).
+    result = _run(
+        memory.remember_fact(
+            'I prefer dark mode',
+            {
+                'type': 'Preference',
+                'subject': 'UI preferences',
+                **_owner_trust(),  # includes 'actor_id': 'owner:archibald'
+            },
+            # _server_principal deliberately omitted — simulates no auth context
+        )
+    )
+
+    # Write succeeds (fail-safe), but the actor is the untrusted sentinel,
+    # NOT 'owner:archibald' from the caller's hint.
+    assert result['status'] == 'ok'
+    rows = isolated_memory['ledger'].events_for_root(result['fact']['root_id'])
+    assert rows[0].actor_id == 'caller:unverified', (
+        'hint.trust.actor_id must not grant trust when no server principal is provided'
+    )
+    import json
+    metadata = json.loads(rows[0].metadata_json or '{}')
+    assert metadata['source'] == 'caller_asserted_unverified'
+
+
+def test_caller_supplied_actor_id_does_not_authorize_promote(isolated_memory, monkeypatch):
+    """promote_candidate with actor_id in allowlist but no ctx must return unauthorized.
+
+    The actor_id tool argument is caller-controlled and MUST NOT be used as the
+    authorization gate.  Only the server-derived principal from _extract_server_principal
+    (OAuth bearer token or transport client_id) counts for authorization.
+    """
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:trusted')
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    conflict = _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    # Caller supplies a matching actor_id but no ctx — server_principal = __anon__
+    result = _run(
+        candidates_router.promote_candidate(
+            candidate_id=conflict['candidate_id'],
+            resolution='supersede',
+            actor_id='system:trusted',  # matches allowlist, but is caller-supplied — should NOT grant auth
+            # ctx intentionally omitted → no server-derived principal
+        )
+    )
+    assert result['status'] == 'error', (
+        'promote_candidate must be unauthorized when server principal is absent, '
+        'even if actor_id matches the server allowlist'
+    )
+    assert result['error_type'] == 'unauthorized'
+
+
+def test_caller_supplied_actor_id_does_not_authorize_reject(isolated_memory, monkeypatch):
+    """reject_candidate with actor_id in allowlist but no ctx must return unauthorized.
+
+    Mirrors test_caller_supplied_actor_id_does_not_authorize_promote for the reject path.
+    """
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:trusted')
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    conflict = _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    # Caller supplies a matching actor_id but no ctx — server_principal = __anon__
+    result = _run(
+        candidates_router.reject_candidate(
+            candidate_id=conflict['candidate_id'],
+            actor_id='system:trusted',  # matches allowlist but caller-supplied
+            # ctx intentionally omitted → no server-derived principal
+        )
+    )
+    assert result['status'] == 'error', (
+        'reject_candidate must be unauthorized when server principal is absent, '
+        'even if actor_id matches the server allowlist'
+    )
+    assert result['error_type'] == 'unauthorized'
