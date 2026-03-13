@@ -260,10 +260,32 @@ class ProcedureService:
         limit: int = 5,
         include_proposed: bool = False,
         procedures: list[Procedure] | None = None,
+        effective_group_ids: list[str] | None = None,
     ) -> list[ProcedureMatch]:
+        """Retrieve procedures matching *query*, ranked by relevance.
+
+        When *effective_group_ids* is provided, lane filtering is applied
+        **before** scoring and top-K truncation so that forbidden-lane
+        procedures cannot crowd out allowed same-lane matches.
+
+        Args:
+            effective_group_ids: If ``None``, no lane filter.  If ``[]``
+                (empty), fail-closed — all procedures are excluded.
+        """
+        # Pre-filter candidates by lane BEFORE scoring so forbidden-lane
+        # entries never consume top-K slots (prevents cross-lane shadowing).
+        candidates = procedures if procedures is not None else self.list_current_procedures(include_proposed=include_proposed)
+        if effective_group_ids is not None:
+            if not effective_group_ids:
+                return []  # fail-closed: empty scope → no results
+            allowed = set(effective_group_ids)
+            candidates = [
+                p for p in candidates
+                if getattr(p, 'source_lane', None) in allowed
+            ]
+
         query_terms = _tokenize(query)
         matches: list[ProcedureMatch] = []
-        candidates = procedures if procedures is not None else self.list_current_procedures(include_proposed=include_proposed)
         for procedure in candidates:
             score, matched_terms = _score_procedure(procedure, query, query_terms)
             if score <= 0:

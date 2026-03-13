@@ -122,17 +122,17 @@ def _load_services() -> tuple[Any, Any, Any, Any]:
     """Lazily load service dependencies.
 
     Returns:
-        (TypedRetrievalService, ChangeLedger, ProcedureService, DB_PATH_DEFAULT)
+        (TypedRetrievalService, ChangeLedger, ProcedureService, resolve_ledger_path)
     """
     try:
-        from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
+        from ..services.change_ledger import ChangeLedger, resolve_ledger_path
         from ..services.procedure_service import ProcedureService
         from ..services.typed_retrieval import TypedRetrievalService
     except ImportError:  # pragma: no cover - top-level import fallback
-        from services.change_ledger import DB_PATH_DEFAULT, ChangeLedger  # type: ignore[no-redef]
+        from services.change_ledger import ChangeLedger, resolve_ledger_path  # type: ignore[no-redef]
         from services.procedure_service import ProcedureService  # type: ignore[no-redef]
         from services.typed_retrieval import TypedRetrievalService  # type: ignore[no-redef]
-    return TypedRetrievalService, ChangeLedger, ProcedureService, DB_PATH_DEFAULT
+    return TypedRetrievalService, ChangeLedger, ProcedureService, resolve_ledger_path
 
 
 def _load_typed_models() -> tuple[Any, Any]:
@@ -323,7 +323,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             return pagination_error
 
         try:
-            TypedRetrievalService, ChangeLedger, ProcedureService, DB_PATH_DEFAULT = _load_services()
+            TypedRetrievalService, ChangeLedger, ProcedureService, _resolve_ledger = _load_services()
         except Exception as e:
             logger.error('search_episodes: service import failed: %s', e)
             return phase0_paginated_list_response(
@@ -338,7 +338,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
         metadata_filters = _build_metadata_filters(effective_groups, time_range)
 
         try:
-            service = TypedRetrievalService(ledger_path=DB_PATH_DEFAULT)
+            service = TypedRetrievalService(ledger_path=_resolve_ledger())
             result = await service.search(
                 query=query,
                 object_types=['episode'],
@@ -416,13 +416,13 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             return lane_alias_error
 
         try:
-            TypedRetrievalService, ChangeLedger, ProcedureService, DB_PATH_DEFAULT = _load_services()
+            TypedRetrievalService, ChangeLedger, ProcedureService, _resolve_ledger = _load_services()
         except Exception as e:
             logger.error('get_episode: service import failed: %s', e)
             return phase0_not_implemented('get_episode')
 
         try:
-            ledger = ChangeLedger(DB_PATH_DEFAULT)
+            ledger = ChangeLedger(_resolve_ledger())
             obj = ledger.materialize_object(episode_id)
         except Exception as e:
             logger.error('get_episode: ledger error for %r: %s', episode_id, e)
@@ -441,11 +441,12 @@ def register_tools(mcp: Any) -> dict[str, Any]:
 
         # Resolve lane_alias into effective group IDs for access check
         effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
-        # Lane access check: if lane scope is active, verify the episode belongs
+        # Lane access check: uniform not_found so caller cannot distinguish
+        # "exists but forbidden" from "truly absent" (no existence leak).
         if not _passes_lane_filter(obj, effective_groups):
             return {
-                'error': 'access_denied',
-                'message': f'Episode {episode_id!r} is not in the requested lane scope',
+                'error': 'not_found',
+                'message': f'Episode not found: {episode_id}',
             }
 
         return _episode_to_dict(obj)
@@ -497,22 +498,28 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             return pagination_error
 
         try:
-            TypedRetrievalService, ChangeLedger, ProcedureService, DB_PATH_DEFAULT = _load_services()
+            TypedRetrievalService, ChangeLedger, ProcedureService, _resolve_ledger = _load_services()
         except Exception as e:
             logger.error('search_procedures: service import failed: %s', e)
             return phase0_paginated_list_response(
                 'search_procedures', 'procedures', limit=limit_value, offset=offset_value
             )
 
+        # Resolve lane scope BEFORE retrieval so lane filtering is applied
+        # within the candidate pool (prevents cross-lane top-K shadowing).
+        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
+
         try:
-            ledger = ChangeLedger(DB_PATH_DEFAULT)
+            ledger = ChangeLedger(_resolve_ledger())
             svc = ProcedureService(ledger)
-            # Fetch enough to satisfy pagination; retrieve_procedures returns top-k by score
+            # Fetch enough to satisfy pagination; retrieve_procedures returns top-k by score.
+            # Lane filtering happens inside retrieve_procedures via effective_group_ids.
             fetch_limit = max(limit_value + offset_value + 1, 50)
             matches = svc.retrieve_procedures(
                 query,
                 limit=fetch_limit,
                 include_proposed=bool(include_all),
+                effective_group_ids=effective_groups,
             )
         except Exception as e:
             logger.error('search_procedures: retrieval error: %s', e)
@@ -521,10 +528,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
                 'message': f'Procedure search failed: {e}',
             }
 
-        # Resolve lane_alias into effective group IDs
-        effective_groups = _resolve_effective_group_ids(group_ids, lane_alias)
-        # Apply lane filter.  Use ``is not None`` so that an empty list
-        # (fail-closed scope) correctly filters out ALL procedures.
+        # Defence-in-depth: post-hoc lane filter in case service missed any.
         if effective_groups is not None:
             matches = [m for m in matches if _passes_lane_filter(m.procedure, effective_groups)]
 
@@ -581,7 +585,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
             return lane_alias_error
 
         try:
-            TypedRetrievalService, ChangeLedger, ProcedureService, DB_PATH_DEFAULT = _load_services()
+            TypedRetrievalService, ChangeLedger, ProcedureService, _resolve_ledger = _load_services()
         except Exception as e:
             logger.error('get_procedure: service import failed: %s', e)
             return phase0_not_implemented('get_procedure')
@@ -590,7 +594,7 @@ def register_tools(mcp: Any) -> dict[str, Any]:
 
         ledger = None
         try:
-            ledger = ChangeLedger(DB_PATH_DEFAULT)
+            ledger = ChangeLedger(_resolve_ledger())
         except Exception as e:
             logger.error('get_procedure: ledger open failed: %s', e)
             return {'error': 'service_unavailable', 'message': f'Ledger unavailable: {e}'}
@@ -613,17 +617,20 @@ def register_tools(mcp: Any) -> dict[str, Any]:
         except Exception:
             pass  # Not an object ID — try trigger search
 
-        # Second: search by trigger phrase with lane-scoped selection.
-        # Fetch more candidates so we can skip forbidden-lane matches and
-        # find permitted lower-ranked ones (anti-shadowing).
+        # Second: search by trigger phrase with lane-scoped retrieval.
+        # Lane filtering happens inside retrieve_procedures so forbidden-lane
+        # matches never consume top-K slots (no shadowing, no magic-number hack).
         if proc is None:
             try:
                 svc = ProcedureService(ledger)
-                matches = svc.retrieve_procedures(trigger_or_id, limit=20, include_proposed=True)
-                for match in matches:
-                    if _passes_lane_filter(match.procedure, effective_groups):
-                        proc = match.procedure
-                        break
+                matches = svc.retrieve_procedures(
+                    trigger_or_id,
+                    limit=5,
+                    include_proposed=True,
+                    effective_group_ids=effective_groups,
+                )
+                if matches:
+                    proc = matches[0].procedure
             except Exception as e:
                 logger.error('get_procedure: search error for %r: %s', trigger_or_id, e)
                 return {'error': 'retrieval_error', 'message': f'Procedure lookup failed: {e}'}

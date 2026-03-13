@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - fallback for minimal test envs
 
 from ..models.typed_memory import EvidenceRef, StateFact
 from ..services.candidate_store import CandidateStore
-from ..services.change_ledger import ChangeLedger
+from ..services.change_ledger import ChangeLedger, resolve_ledger_path
 from . import memory as memory_router
 
 logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ def _normalize_reason(reason: str | None) -> str | None:
 def _get_change_ledger() -> ChangeLedger:
     global _change_ledger
     if _change_ledger is None:
-        _change_ledger = ChangeLedger()
+        _change_ledger = ChangeLedger(resolve_ledger_path())
     return _change_ledger
 
 

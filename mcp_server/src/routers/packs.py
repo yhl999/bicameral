@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         require_pack_id,
     )
 
-from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
+from ..services.change_ledger import ChangeLedger, resolve_ledger_path
 from ..services.pack_registry import (
     PackRegistryError,
     PackRegistryOperationalError,
@@ -237,10 +237,8 @@ def _matches_pack_access(
 
 
 def _resolve_ledger_path(override: str | Path | None = None) -> Path:
-    if override:
-        return Path(override)
-    env_override = os.getenv('BICAMERAL_CHANGE_LEDGER_PATH', '').strip()
-    return Path(env_override) if env_override else Path(DB_PATH_DEFAULT)
+    """Thin wrapper kept for backward-compat callers; delegates to shared resolver."""
+    return resolve_ledger_path(override)
 
 
 def _resolve_caller_lanes(

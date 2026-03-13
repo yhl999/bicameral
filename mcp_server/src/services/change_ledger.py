@@ -48,6 +48,32 @@ CREATE_EVENT_TYPES = frozenset({'assert', 'supersede', 'refine', 'derive'})
 DB_PATH_DEFAULT = Path(__file__).resolve().parents[3] / 'state' / 'change_ledger.db'
 
 
+def resolve_ledger_path(override: str | Path | None = None) -> Path:
+    """Return the effective ledger DB path, honoring env overrides.
+
+    Resolution order:
+    1. Explicit *override* argument (from caller / test fixture).
+    2. ``BICAMERAL_CHANGE_LEDGER_DB`` env var.
+    3. ``BICAMERAL_CHANGE_LEDGER_PATH`` env var (legacy alias).
+    4. ``DB_PATH_DEFAULT`` (repo-relative ``state/change_ledger.db``).
+
+    All integrated routers MUST use this helper (or pass the result of it)
+    so that a non-default ledger path is honoured consistently across
+    memory, candidates, episodes/procedures, and packs.
+    """
+    import os
+
+    if override:
+        return Path(override)
+    env_db = (os.environ.get('BICAMERAL_CHANGE_LEDGER_DB') or '').strip()
+    if env_db:
+        return Path(env_db)
+    env_path = (os.environ.get('BICAMERAL_CHANGE_LEDGER_PATH') or '').strip()
+    if env_path:
+        return Path(env_path)
+    return Path(DB_PATH_DEFAULT)
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS change_events (
     event_id TEXT PRIMARY KEY,

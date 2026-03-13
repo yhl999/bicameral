@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - fallback for minimal test envs
 
 from ..models.typed_memory import EvidenceRef, StateFact
 from ..services.candidate_store import CandidateStore
-from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, _stable_object_id
+from ..services.change_ledger import ChangeLedger, _stable_object_id, resolve_ledger_path
 from ..services.neo4j_materialization import Neo4jMaterializationService
 from ..services.schema_validation import _validate_typed_object, detect_conflict
 
@@ -189,18 +189,10 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
-def _ledger_db_path() -> str:
-    return str(
-        os.environ.get('BICAMERAL_CHANGE_LEDGER_DB')
-        or os.environ.get('BICAMERAL_CHANGE_LEDGER_PATH')
-        or DB_PATH_DEFAULT
-    )
-
-
 def _get_change_ledger() -> ChangeLedger:
     global _change_ledger
     if _change_ledger is None:
-        _change_ledger = ChangeLedger(_ledger_db_path())
+        _change_ledger = ChangeLedger(resolve_ledger_path())
     return _change_ledger
 
 
