@@ -1,0 +1,225 @@
+{
+  "meta": {
+    "created_at": "2026-03-11T23:45:20Z",
+    "updated_at": "2026-03-11T23:45:20Z"
+  },
+  "packs": [
+    {
+      "consumer": "planner",
+      "created_at": "2026-03-11T23:45:20Z",
+      "definition": {
+        "examples": [
+          {
+            "predicate": "industry",
+            "subject": "Yuan",
+            "value": "financial_infrastructure"
+          },
+          {
+            "predicate": "stage",
+            "subject": "DealX",
+            "value": "seed"
+          }
+        ],
+        "instructions": "Use these facts to build a concise venture-readiness snapshot.",
+        "schema": {
+          "properties": {
+            "predicate": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "object",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "subject",
+            "predicate",
+            "value"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Facts that help summarize a venture context for downstream workflow",
+      "id": "context-vc-deal-brief",
+      "intent": "vc_deal_brief",
+      "last_updated": "2026-03-11T23:45:20Z",
+      "predicates": [
+        "industry",
+        "stage",
+        "founder",
+        "investor",
+        "valuation",
+        "risk"
+      ],
+      "scope": "context",
+      "version": "1.0.0"
+    },
+    {
+      "consumer": "planner",
+      "created_at": "2026-03-11T23:45:20Z",
+      "definition": {
+        "examples": [
+          {
+            "predicate": "requires",
+            "subject": "portfolio",
+            "value": {
+              "level": "high",
+              "type": "KYC"
+            }
+          }
+        ],
+        "instructions": "Keep only high-confidence constraints relevant to the task.",
+        "schema": {
+          "properties": {
+            "predicate": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "object",
+                "array",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "subject",
+            "predicate",
+            "value"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Security/compliance constraints for memory materialization",
+      "id": "context-crypto-constraints",
+      "intent": "compliance",
+      "last_updated": "2026-03-11T23:45:20Z",
+      "predicates": [
+        "requires",
+        "forbidden",
+        "constraint",
+        "policy"
+      ],
+      "scope": "context",
+      "version": "1.0.0"
+    },
+    {
+      "consumer": "planner",
+      "created_at": "2026-03-11T23:45:20Z",
+      "definition": {
+        "examples": [
+          {
+            "action": "check latest preference facts",
+            "step": "validate"
+          }
+        ],
+        "instructions": "Use all gathered facts as inputs for each step decision.",
+        "schema": {
+          "items": {
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "step": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "step",
+              "action"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "steps": [
+          {
+            "action": "check facts with constraints",
+            "step": "validate"
+          },
+          {
+            "action": "rank by recency/confidence",
+            "step": "prioritize"
+          },
+          {
+            "action": "build short brief",
+            "step": "execute"
+          }
+        ],
+        "trigger": "new_candidate_fact"
+      },
+      "description": "Workflow sequence for deal review and escalation",
+      "id": "workflow-deal-review",
+      "intent": "decision_maker",
+      "last_updated": "2026-03-11T23:45:20Z",
+      "predicates": [
+        "decision",
+        "constraint",
+        "compliance",
+        "risk"
+      ],
+      "scope": "workflow",
+      "version": "1.0.0"
+    },
+    {
+      "consumer": "planner",
+      "created_at": "2026-03-11T23:45:20Z",
+      "definition": {
+        "instructions": "Favor recent facts with explicit priority markers.",
+        "schema": {
+          "items": {
+            "required": [
+              "step",
+              "action"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "steps": [
+          {
+            "action": "collect open items and blockers",
+            "step": "gather"
+          },
+          {
+            "action": "rank by urgency and deadline",
+            "step": "summarize"
+          },
+          {
+            "action": "emit concise status",
+            "step": "report"
+          }
+        ],
+        "trigger": "standup_requested"
+      },
+      "description": "Operational daily standup workflow",
+      "id": "workflow-standup",
+      "intent": "verifier",
+      "last_updated": "2026-03-11T23:45:20Z",
+      "predicates": [
+        "task",
+        "status",
+        "blocker",
+        "priority"
+      ],
+      "scope": "workflow",
+      "version": "1.0.0"
+    }
+  ],
+  "schema_version": "1.0.0"
+}

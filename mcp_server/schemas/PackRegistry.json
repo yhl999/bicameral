@@ -2,60 +2,69 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "PackRegistry",
   "title": "PackRegistry",
-  "description": "Pack metadata entry in the registry",
+  "description": "Pack metadata entry returned by list_packs/create_workflow_pack/describe_pack.pack_registry",
   "type": "object",
   "required": [
-    "pack_id",
+    "id",
     "scope",
     "intent",
+    "description",
     "consumer",
-    "version"
+    "version",
+    "predicates",
+    "created_at",
+    "last_updated"
   ],
   "properties": {
-    "pack_id": {
+    "id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "^[a-z0-9_-]+$"
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
     },
     "scope": {
       "type": "string",
       "enum": [
         "context",
-        "workflow",
-        "both"
-      ],
-      "description": "Whether this pack provides context, workflow steps, or both"
+        "workflow"
+      ]
     },
     "intent": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 512,
-      "description": "Human-readable description of what this pack does"
+      "maxLength": 512
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
     },
     "consumer": {
       "type": "string",
-      "description": "The agent or role this pack is designed for",
       "minLength": 1,
       "maxLength": 128
     },
     "version": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
-      "default": "1.0"
+      "pattern": "^(\\d+)\\.(\\d+)\\.(\\d+)$"
+    },
+    "predicates": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
     },
     "created_at": {
       "type": "string",
       "format": "date-time"
     },
-    "tags": {
-      "type": "array",
-      "maxItems": 32,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64
-      }
+    "last_updated": {
+      "type": "string",
+      "format": "date-time"
     }
   },
   "additionalProperties": false

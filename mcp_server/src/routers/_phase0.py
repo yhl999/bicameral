@@ -19,7 +19,7 @@ _PHASE0_EMPTY_RESULT_MESSAGE = (
 _PHASE0_NOT_IMPLEMENTED_MESSAGE = (
     '{method_name} is a Phase 0 stub and is not implemented yet.'
 )
-_PACK_ID_RE = re.compile(r'^[a-z0-9_-]{1,128}$')
+_PACK_ID_RE = re.compile(r'^[a-z0-9][a-z0-9._-]{0,127}$')
 _PHASE0_IDENTIFIER_RE = re.compile(r'^[a-z0-9][a-z0-9:_-]{0,255}$')
 
 
@@ -127,7 +127,7 @@ def require_pack_id(field_name: str, value: Any) -> ErrorResponse | None:
         field_name,
         value,
         pattern=_PACK_ID_RE,
-        pattern_description='1-128 lowercase letters, numbers, underscores, or hyphens',
+        pattern_description='1-128 lowercase letters or numbers, followed by lowercase letters, numbers, periods, underscores, or hyphens',
     )
 
 

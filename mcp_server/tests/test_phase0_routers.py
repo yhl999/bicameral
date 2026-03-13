@@ -169,6 +169,7 @@ class TestAllStubsReturnValidTypes:
         result = await fn()
         assert result['candidates'] == []
         assert 'status' not in result
+        assert 'message' in result
 
     @pytest.mark.anyio
     async def test_candidates_promote_stub(self):
@@ -208,8 +209,17 @@ class TestAllStubsReturnValidTypes:
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_packs']
         result = await fn()
-        assert result['packs'] == []
-        assert 'status' not in result
+        assert isinstance(result, list)
+
+    @pytest.mark.anyio
+    async def test_packs_list_packs_invalid_filter_returns_validation_error(self):
+        from mcp_server.src.routers.packs import register_tools
+
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['list_packs']
+        result = await fn(filter={'scope': 'not-a-scope'})
+        assert result['error'] == 'validation_error'
 
     @pytest.mark.anyio
     async def test_packs_get_context_pack_stub(self):
@@ -218,8 +228,9 @@ class TestAllStubsReturnValidTypes:
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_context_pack']
-        result = await fn(pack_id='my-pack')
-        assert result['error'] == 'not_implemented'
+        result = await fn(pack_id='missing-pack')
+        assert isinstance(result, dict)
+        assert 'error' in result
 
     @pytest.mark.anyio
     async def test_packs_get_workflow_pack_stub(self):
@@ -228,8 +239,9 @@ class TestAllStubsReturnValidTypes:
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_workflow_pack']
-        result = await fn(pack_id='my-pack')
-        assert result['error'] == 'not_implemented'
+        result = await fn(pack_id='missing-pack')
+        assert isinstance(result, dict)
+        assert 'error' in result
 
     @pytest.mark.anyio
     async def test_packs_describe_pack_stub(self):
@@ -238,23 +250,34 @@ class TestAllStubsReturnValidTypes:
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['describe_pack']
-        result = await fn(pack_id='my-pack')
-        assert result['error'] == 'not_implemented'
+        result = await fn(pack_id='context-vc-deal-brief')
+        assert result.get('pack_registry', {}).get('id') == 'context-vc-deal-brief'
 
     @pytest.mark.anyio
-    async def test_packs_create_workflow_pack_stub_validates_definition_schema(self):
+    async def test_packs_create_workflow_pack_stub(self, tmp_path, monkeypatch):
         from mcp_server.src.routers.packs import register_tools
 
+        monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(tmp_path / 'runtime_user_pack_registry.json'))
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['create_workflow_pack']
-        result = await fn(definition={'id': 'test', 'steps': []})
-        assert result['error'] == 'validation_error'
+        result = await fn(
+            definition={
+                'id': 'workflow-test-pack',
+                'scope': 'workflow',
+                'intent': 'verifier',
+                'consumer': 'planner',
+                'predicates': ['risk'],
+                'definition': {'steps': [{'step': 'review', 'action': 'inspect risk facts'}]},
+            }
+        )
+        assert result.get('id') == 'workflow-test-pack'
 
     @pytest.mark.anyio
-    async def test_packs_create_workflow_pack_stub_rejects_context_scope(self):
+    async def test_packs_create_workflow_pack_stub_rejects_context_scope(self, tmp_path, monkeypatch):
         from mcp_server.src.routers.packs import register_tools
 
+        monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(tmp_path / 'runtime_user_pack_registry.json'))
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['create_workflow_pack']
@@ -264,12 +287,88 @@ class TestAllStubsReturnValidTypes:
                 'scope': 'context',
                 'intent': 'coding defaults',
                 'consumer': 'archibald',
-                'version': '1.0',
-                'context_rules': ['prefer pytest'],
+                'version': '1.0.0',
+                'predicates': ['rule'],
+                'definition': {'steps': [{'step': 'review', 'action': 'inspect risk facts'}]},
             }
         )
         assert result['error'] == 'validation_error'
-        assert 'definition.scope' in (result.get('details') or {}).get('field', '')
+        assert 'scope=workflow' in result.get('message', '')
+
+    @pytest.mark.anyio
+    async def test_packs_router_accepts_dotted_pack_ids_for_describe_and_get(self, tmp_path, monkeypatch):
+        from mcp_server.src.routers.packs import register_tools
+
+        monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(tmp_path / 'runtime_user_pack_registry.json'))
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+
+        create = mock_mcp._tools['create_workflow_pack']
+        describe = mock_mcp._tools['describe_pack']
+        get_workflow = mock_mcp._tools['get_workflow_pack']
+
+        created = await create(
+            definition={
+                'pack_id': 'workflow.earnings.review',
+                'scope': 'workflow',
+                'intent': 'verifier',
+                'consumer': 'planner',
+                'version': '1.0.0',
+                'predicates': ['risk'],
+                'definition': {'steps': [{'step': 'review', 'action': 'inspect risk facts'}]},
+            }
+        )
+        assert created.get('id') == 'workflow.earnings.review'
+
+        described = await describe(pack_id='workflow.earnings.review')
+        assert described.get('pack_id') == 'workflow.earnings.review'
+
+        fetched = await get_workflow(pack_id='workflow.earnings.review')
+        assert fetched.get('pack_id') == 'workflow.earnings.review'
+
+    @pytest.mark.anyio
+    async def test_packs_create_workflow_pack_stub_rejects_scope_literal_type(self, tmp_path, monkeypatch):
+        from mcp_server.src.routers.packs import register_tools
+
+        monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(tmp_path / 'runtime_user_pack_registry.json'))
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['create_workflow_pack']
+        result = await fn(
+            definition={
+                'pack_id': 'workflow-invalid-scope',
+                'scope': 'type',
+                'intent': 'verifier',
+                'consumer': 'planner',
+                'version': '1.0.0',
+                'predicates': ['risk'],
+                'definition': {'steps': [{'step': 'review', 'action': 'inspect risk facts'}]},
+            }
+        )
+        assert result['error'] == 'validation_error'
+        assert "invalid scope 'type'" in result.get('message', '')
+
+    @pytest.mark.anyio
+    async def test_packs_create_workflow_pack_stub_requires_steps(self, tmp_path, monkeypatch):
+        from mcp_server.src.routers.packs import register_tools
+
+        monkeypatch.setenv('BICAMERAL_USER_PACK_REGISTRY_PATH', str(tmp_path / 'runtime_user_pack_registry.json'))
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['create_workflow_pack']
+        result = await fn(
+            definition={
+                'pack_id': 'workflow-missing-steps',
+                'scope': 'workflow',
+                'intent': 'verifier',
+                'consumer': 'planner',
+                'version': '1.0.0',
+                'predicates': ['risk'],
+                'definition': {'instructions': 'Review the risk facts.'},
+            }
+        )
+        assert result['error'] == 'validation_error'
+        assert 'definition.steps' in result.get('message', '')
 
     @pytest.mark.anyio
     async def test_episodes_procedures_search_episodes_stub(self):
