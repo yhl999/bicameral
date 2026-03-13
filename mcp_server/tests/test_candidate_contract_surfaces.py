@@ -54,6 +54,6 @@ def test_candidate_tool_metadata_matches_runtime_contract():
     assert 'supersede' in promote_block
     assert "'resolution': 'supersede'" in promote_block
 
-    reject_block = source[source.index("'name': 'reject_candidate'"):source.index("'name': 'reject_candidate'") + 500]
+    reject_block = source[source.index("'name': 'reject_candidate'"):source.index("'name': 'reject_candidate'") + 1500]
     assert 'pending queue' not in reject_block
     assert "'candidate_id': 'cand-002'" in reject_block

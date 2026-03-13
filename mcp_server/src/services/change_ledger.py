@@ -550,16 +550,25 @@ class ChangeLedger:
                     if (
                         _current.conflict_set == _conflict_set
                         and _current.object_id != typed_object.object_id
-                        # Lane isolation: skip cross-lane conflict resolution.
-                        # A candidate from lane A must not automatically supersede
-                        # a fact from lane B even when conflict-set keys align.
-                        # Both must have non-None source_lanes that differ to trigger
-                        # the guard; unscoped (None) facts are treated as same-lane
-                        # for backward compatibility with pre-lane-awareness data.
+                        # Lane isolation: skip facts that cannot be auto-superseded
+                        # by this candidate.
+                        #
+                        # When the incoming candidate has a source_lane (lane isolation
+                        # is active), it must only auto-supersede facts from the same
+                        # lane.  This covers two cases:
+                        #   1. _current.source_lane differs (cross-lane): skip.
+                        #   2. _current.source_lane is None (legacy unscoped fact):
+                        #      also skip — hard-failing here is cleaner and safer than
+                        #      silently allowing a scoped candidate to absorb an
+                        #      unscoped lineage tree (which could span multiple lanes).
+                        # When the candidate has no source_lane (unscoped/global
+                        # deployment), no lane filter is applied.
                         and not (
-                            _current.source_lane is not None
-                            and typed_object.source_lane is not None
-                            and _current.source_lane != typed_object.source_lane
+                            typed_object.source_lane is not None
+                            and (
+                                _current.source_lane is None
+                                or _current.source_lane != typed_object.source_lane
+                            )
                         )
                     ):
                         resolved_conflict_with_fact_id = _current.object_id
@@ -959,21 +968,33 @@ def _validate_supersede_target(*, candidate: TypedMemoryObject, prior: TypedMemo
             f'state_fact conflict set mismatch for target {prior.object_id}'
         )
 
-    # Lane isolation: a candidate from lane A must never supersede or adopt
-    # lineage from a root in lane B.  Both lanes must be non-None and differ
-    # to trigger the guard; unscoped (None) facts are exempt for backward
-    # compatibility with pre-lane-awareness ledger data.
-    if (
-        candidate.source_lane is not None
-        and prior.source_lane is not None
-        and candidate.source_lane != prior.source_lane
-    ):
-        raise ValueError(
-            'cross-lane supersede rejected: '
-            f'candidate (source_lane={candidate.source_lane!r}) cannot supersede '
-            f'or adopt lineage from fact in a different lane '
-            f'(source_lane={prior.source_lane!r}, object_id={prior.object_id!r})'
-        )
+    # Lane isolation: when the candidate has a source_lane (lane isolation is
+    # active), the supersede target must belong to the exact same lane.
+    #
+    # Policy (hard-fail on unscoped legacy facts):
+    #   - prior.source_lane is None  → reject: a scoped candidate must not absorb
+    #     an unscoped lineage tree; the prior predates lane awareness and its
+    #     multi-lane provenance is unknown.
+    #   - prior.source_lane != candidate.source_lane → reject: classic cross-lane
+    #     supersede.
+    # When the candidate itself has no source_lane (global/unscoped deployment),
+    # no lane check is performed (backward-compatible).
+    if candidate.source_lane is not None:
+        if prior.source_lane is None:
+            raise ValueError(
+                'unscoped-fact supersede rejected: '
+                f'candidate (source_lane={candidate.source_lane!r}) cannot supersede '
+                f'an unscoped legacy fact (source_lane=None, object_id={prior.object_id!r}); '
+                f'when lane isolation is active the supersede target must belong to the '
+                f'same lane as the candidate'
+            )
+        if candidate.source_lane != prior.source_lane:
+            raise ValueError(
+                'cross-lane supersede rejected: '
+                f'candidate (source_lane={candidate.source_lane!r}) cannot supersede '
+                f'or adopt lineage from fact in a different lane '
+                f'(source_lane={prior.source_lane!r}, object_id={prior.object_id!r})'
+            )
 
 
 def _prepare_object_for_create_event(

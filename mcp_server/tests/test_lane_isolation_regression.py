@@ -271,9 +271,14 @@ class TestCrossLaneSupersede:
         # Should not raise
         _validate_supersede_target(candidate=candidate, prior=prior)
 
-    def test_validate_supersede_target_allows_unscoped_facts(self):
-        """_validate_supersede_target allows supersede when either fact is unscoped (None)."""
-        # Candidate scoped, prior unscoped (backward compat)
+    def test_validate_supersede_target_rejects_unscoped_prior_when_candidate_is_scoped(self):
+        """_validate_supersede_target hard-fails when a scoped candidate targets an unscoped legacy fact.
+
+        Policy (chosen: hard-fail): when lane isolation is active (candidate.source_lane is not
+        None), the prior must belong to the same lane.  An unscoped prior (source_lane=None)
+        predates lane awareness; its multi-lane provenance is unknown, so allowing a scoped
+        candidate to absorb it silently is unsafe.  Hard-fail is cleaner.
+        """
         candidate = _make_state_fact(
             object_id='cand-003', subject='Yuan', predicate='prefers',
             value='pour-over', source_lane='lane_a',
@@ -282,16 +287,35 @@ class TestCrossLaneSupersede:
             object_id='prior-003', subject='Yuan', predicate='prefers',
             value='espresso', source_lane=None,
         )
-        # Should not raise (unscoped prior is backward-compat)
-        _validate_supersede_target(candidate=candidate, prior=prior_unscoped)
+        # Must raise — scoped candidate targeting unscoped legacy fact is rejected.
+        with pytest.raises(ValueError, match='unscoped-fact supersede rejected'):
+            _validate_supersede_target(candidate=candidate, prior=prior_unscoped)
 
-        # Both unscoped
+    def test_validate_supersede_target_allows_unscoped_candidate_targeting_unscoped_prior(self):
+        """Both facts unscoped (global/unscoped deployment): supersede is still allowed."""
         candidate_unscoped = _make_state_fact(
             object_id='cand-004', subject='Yuan', predicate='prefers',
             value='pour-over', source_lane=None,
         )
-        # Should not raise
+        prior_unscoped = _make_state_fact(
+            object_id='prior-004', subject='Yuan', predicate='prefers',
+            value='espresso', source_lane=None,
+        )
+        # Should not raise — both unscoped, no lane isolation active
         _validate_supersede_target(candidate=candidate_unscoped, prior=prior_unscoped)
+
+    def test_validate_supersede_target_allows_unscoped_candidate_targeting_scoped_prior(self):
+        """Unscoped candidate targeting a scoped prior is allowed (global-owner semantics)."""
+        candidate_unscoped = _make_state_fact(
+            object_id='cand-005', subject='Yuan', predicate='prefers',
+            value='pour-over', source_lane=None,
+        )
+        prior_scoped = _make_state_fact(
+            object_id='prior-005', subject='Yuan', predicate='prefers',
+            value='espresso', source_lane='lane_a',
+        )
+        # Should not raise — candidate has no source_lane, so no lane check is applied
+        _validate_supersede_target(candidate=candidate_unscoped, prior=prior_scoped)
 
     def _fact_input(self, *, subject: str = 'Yuan', predicate: str = 'prefers',
                     value: str = 'pour-over', source_lane: str = 'lane_a') -> dict:
@@ -598,4 +622,332 @@ class TestLaneIsolationLifecycle:
         assert candidate is not None
         assert candidate['status'] == 'pending', (
             f"Candidate status should remain pending after failed cross-lane supersede, got: {candidate['status']}"
+        )
+
+
+# ===========================================================================
+# Finding 1: Endpoint-level lane ownership enforcement
+# (promote_candidate, reject_candidate, cancel)
+# ===========================================================================
+
+class TestEndpointLaneOwnershipEnforcement:
+    """promote_candidate and reject_candidate must enforce lane ownership at the endpoint level.
+
+    Even if the caller somehow obtains a foreign-lane candidate_id, promotion and
+    rejection must be rejected when the server lane does not match the candidate lane.
+    The cancel path (promote_candidate with resolution='cancel') is covered too.
+    """
+
+    def _make_candidate_in_store(
+        self,
+        store: CandidateStore,
+        candidate_id: str,
+        source_lane: str | None = 'lane_a',
+    ) -> None:
+        store.create_candidate(
+            payload={
+                'subject': 'Yuan', 'predicate': 'prefers',
+                'value': 'espresso', 'fact_type': 'preference',
+            },
+            candidate_id=candidate_id,
+            raw_hint={
+                'source_lane': source_lane,
+                'scope': 'private',
+                'evidence_refs': [
+                    {
+                        'source_key': f'test-{source_lane}',
+                        'scope': 'private',
+                        'source_system': 'endpoint_lane_test',
+                        'evidence_id': f'eid-{candidate_id}',
+                        'observed_at': '2026-03-13T00:00:00Z',
+                    }
+                ],
+            },
+        )
+
+    def test_cross_lane_promote_candidate_rejected(self, candidate_env, monkeypatch):
+        """promote_candidate from lane_b server on a lane_a candidate must return unauthorized."""
+        import mcp_server.src.routers.memory as memory_router
+        store, ldr = candidate_env
+        self._make_candidate_in_store(store, 'cand-ep-promote-a', source_lane='lane_a')
+
+        # Server is configured as lane_b — must not be allowed to promote lane_a candidate
+        with patch.object(memory_router, '_derive_source_lane', return_value='lane_b'):
+            result = asyncio.run(
+                candidates_router.promote_candidate('cand-ep-promote-a', resolution='supersede')
+            )
+
+        assert result.get('status') == 'error', (
+            f'Expected error for cross-lane promote_candidate, got: {result}'
+        )
+        assert result.get('error_type') == 'unauthorized', (
+            f'Expected unauthorized error type, got: {result.get("error_type")!r}'
+        )
+        assert 'lane_a' in result.get('message', '') or 'lane_b' in result.get('message', ''), (
+            f'Error message should name the offending lanes: {result.get("message")!r}'
+        )
+        # Candidate must remain pending
+        cand = store.get_candidate('cand-ep-promote-a')
+        assert cand is not None and cand['status'] == 'pending', (
+            f'Candidate should remain pending after cross-lane rejection, got: {cand}'
+        )
+
+    def test_cross_lane_reject_candidate_rejected(self, candidate_env, monkeypatch):
+        """reject_candidate from lane_b server on a lane_a candidate must return unauthorized."""
+        import mcp_server.src.routers.memory as memory_router
+        store, ldr = candidate_env
+        self._make_candidate_in_store(store, 'cand-ep-reject-a', source_lane='lane_a')
+
+        with patch.object(memory_router, '_derive_source_lane', return_value='lane_b'):
+            result = asyncio.run(
+                candidates_router.reject_candidate('cand-ep-reject-a', reason='test cross-lane')
+            )
+
+        assert result.get('status') == 'error', (
+            f'Expected error for cross-lane reject_candidate, got: {result}'
+        )
+        assert result.get('error_type') == 'unauthorized', (
+            f'Expected unauthorized error type, got: {result.get("error_type")!r}'
+        )
+        # Candidate must remain pending (not silently rejected)
+        cand = store.get_candidate('cand-ep-reject-a')
+        assert cand is not None and cand['status'] == 'pending', (
+            f'Candidate should remain pending after cross-lane rejection, got: {cand}'
+        )
+
+    def test_cross_lane_cancel_rejected(self, candidate_env, monkeypatch):
+        """promote_candidate(resolution='cancel') from lane_b server on lane_a candidate is rejected."""
+        import mcp_server.src.routers.memory as memory_router
+        store, ldr = candidate_env
+        self._make_candidate_in_store(store, 'cand-ep-cancel-a', source_lane='lane_a')
+
+        with patch.object(memory_router, '_derive_source_lane', return_value='lane_b'):
+            result = asyncio.run(
+                candidates_router.promote_candidate('cand-ep-cancel-a', resolution='cancel')
+            )
+
+        assert result.get('status') == 'error', (
+            f'Expected error for cross-lane cancel, got: {result}'
+        )
+        assert result.get('error_type') == 'unauthorized', (
+            f'Expected unauthorized error type, got: {result.get("error_type")!r}'
+        )
+        cand = store.get_candidate('cand-ep-cancel-a')
+        assert cand is not None and cand['status'] == 'pending', (
+            f'Candidate should remain pending after cross-lane cancel rejection, got: {cand}'
+        )
+
+    def test_same_lane_promote_succeeds(self, candidate_env, monkeypatch):
+        """Baseline: same-lane promote_candidate succeeds (lane check is not over-blocking)."""
+        import mcp_server.src.routers.memory as memory_router
+        store, ldr = candidate_env
+
+        # Seed a lane_a fact in the ledger so supersede target exists
+        fact_a = _make_state_fact(
+            object_id='ep-lane-a-existing', subject='Yuan', predicate='prefers',
+            value='espresso', source_lane='lane_a',
+        )
+        ldr.append_event(
+            'assert', actor_id='seed', reason='seed', payload=fact_a,
+            object_id=fact_a.object_id, object_type=fact_a.object_type, root_id=fact_a.root_id,
+        )
+        store.create_candidate(
+            payload={'subject': 'Yuan', 'predicate': 'prefers', 'value': 'pour-over', 'fact_type': 'preference'},
+            candidate_id='cand-ep-same-lane',
+            conflict_with_fact_id='ep-lane-a-existing',
+            raw_hint={
+                'source_lane': 'lane_a',
+                'scope': 'private',
+                'evidence_refs': [
+                    {
+                        'source_key': 'test-lane-a',
+                        'scope': 'private',
+                        'source_system': 'endpoint_lane_test',
+                        'evidence_id': 'eid-ep-same-lane',
+                        'observed_at': '2026-03-13T00:00:00Z',
+                    }
+                ],
+            },
+        )
+
+        with patch.object(memory_router, '_derive_source_lane', return_value='lane_a'):
+            result = asyncio.run(
+                candidates_router.promote_candidate('cand-ep-same-lane', resolution='supersede')
+            )
+
+        assert result.get('status') == 'ok', (
+            f'Same-lane promotion should succeed, got: {result}'
+        )
+
+    def test_unscoped_server_can_act_on_any_candidate(self, candidate_env, monkeypatch):
+        """When server has no lane (global deployment), endpoint acts on candidates of any lane."""
+        import mcp_server.src.routers.memory as memory_router
+        store, ldr = candidate_env
+        self._make_candidate_in_store(store, 'cand-ep-global-a', source_lane='lane_a')
+        self._make_candidate_in_store(store, 'cand-ep-global-none', source_lane=None)
+
+        # Global server (no lane) — cancel should be permitted for any candidate
+        with patch.object(memory_router, '_derive_source_lane', return_value=None):
+            result_a = asyncio.run(
+                candidates_router.promote_candidate('cand-ep-global-a', resolution='cancel')
+            )
+            result_none = asyncio.run(
+                candidates_router.promote_candidate('cand-ep-global-none', resolution='cancel')
+            )
+
+        assert result_a.get('status') == 'ok', (
+            f'Global server should be able to cancel lane_a candidate, got: {result_a}'
+        )
+        assert result_none.get('status') == 'ok', (
+            f'Global server should be able to cancel unscoped candidate, got: {result_none}'
+        )
+
+
+# ===========================================================================
+# Finding 2: Unscoped legacy fact supersede policy (hard-fail)
+# ===========================================================================
+
+class TestUnscopedLegacyFactSupersede:
+    """When lane isolation is active, a scoped candidate must not supersede an unscoped fact.
+
+    Policy chosen: hard-fail.  The prior's multi-lane provenance is unknown;
+    silently absorbing it is unsafe.
+    """
+
+    def _fact_input(self, *, source_lane: str = 'lane_a') -> dict:
+        return {
+            'assertion_type': 'preference',
+            'subject': 'Yuan',
+            'predicate': 'prefers',
+            'value': 'pour-over',
+            'scope': 'private',
+            'source_lane': source_lane,
+            'evidence_refs': [
+                {
+                    'source_key': f'test-{source_lane}',
+                    'scope': 'private',
+                    'source_system': 'unscoped_test',
+                    'evidence_id': f'eid-unscoped-{source_lane}',
+                    'observed_at': '2026-03-13T00:00:00Z',
+                }
+            ],
+        }
+
+    def test_scoped_candidate_cannot_auto_supersede_unscoped_fact(self, ledger: ChangeLedger):
+        """promote_candidate_fact auto-resolution must not pick up an unscoped legacy fact."""
+        # Seed an unscoped legacy fact (source_lane=None)
+        unscoped_fact = _make_state_fact(
+            object_id='legacy-unscoped', subject='Yuan', predicate='prefers',
+            value='espresso', source_lane=None,
+        )
+        ledger.append_event(
+            'assert', actor_id='seed', reason='seed', payload=unscoped_fact,
+            object_id=unscoped_fact.object_id, object_type=unscoped_fact.object_type,
+            root_id=unscoped_fact.root_id,
+        )
+
+        # Scoped candidate from lane_a — auto-resolution should NOT pick up the unscoped fact
+        # (require_supersede=True means it raises when no valid target is found)
+        with pytest.raises(ValueError):
+            ledger.promote_candidate_fact(
+                actor_id='reviewer',
+                reason='test',
+                policy_version='v1',
+                candidate_id='cand-unscoped-auto',
+                fact=self._fact_input(source_lane='lane_a'),
+                conflict_with_fact_id=None,
+                allow_parallel=False,
+                require_supersede=True,
+            )
+
+        # Unscoped fact must remain current — not silently absorbed
+        current = ledger.current_state_facts()
+        assert any(f.object_id == 'legacy-unscoped' for f in current), (
+            'Unscoped legacy fact should remain current after rejected scoped auto-supersede'
+        )
+
+    def test_scoped_candidate_explicit_supersede_of_unscoped_fact_hard_fails(
+        self, ledger: ChangeLedger
+    ):
+        """Explicit conflict_with_fact_id targeting an unscoped fact raises ValueError."""
+        unscoped_fact = _make_state_fact(
+            object_id='legacy-unscoped-explicit', subject='Yuan', predicate='prefers',
+            value='espresso', source_lane=None,
+        )
+        ledger.append_event(
+            'assert', actor_id='seed', reason='seed', payload=unscoped_fact,
+            object_id=unscoped_fact.object_id, object_type=unscoped_fact.object_type,
+            root_id=unscoped_fact.root_id,
+        )
+
+        with pytest.raises(ValueError, match='unscoped-fact supersede rejected'):
+            ledger.promote_candidate_fact(
+                actor_id='reviewer',
+                reason='test',
+                policy_version='v1',
+                candidate_id='cand-unscoped-explicit',
+                fact=self._fact_input(source_lane='lane_a'),
+                conflict_with_fact_id='legacy-unscoped-explicit',
+                allow_parallel=False,
+                require_supersede=True,
+            )
+
+        # Unscoped fact must remain current (not superseded)
+        current = ledger.current_state_facts()
+        assert any(f.object_id == 'legacy-unscoped-explicit' for f in current), (
+            'Unscoped legacy fact should not have been superseded'
+        )
+
+    def test_unscoped_candidate_can_still_supersede_unscoped_fact(self, ledger: ChangeLedger):
+        """Backward compat: unscoped candidate (source_lane=None) superseding unscoped fact is still allowed.
+
+        Evidence refs must not include a ``scope`` key in this scenario — the legacy
+        ``_source_lane_from_legacy_refs`` fallback reads ``scope`` as a lane identifier,
+        which would incorrectly promote an unscoped candidate to a scoped one.  In a
+        genuine global/unscoped deployment, evidence refs carry no lane-scope value.
+        """
+        unscoped_fact = _make_state_fact(
+            object_id='legacy-unscoped-bc', subject='Yuan', predicate='prefers',
+            value='espresso', source_lane=None,
+        )
+        ledger.append_event(
+            'assert', actor_id='seed', reason='seed', payload=unscoped_fact,
+            object_id=unscoped_fact.object_id, object_type=unscoped_fact.object_type,
+            root_id=unscoped_fact.root_id,
+        )
+
+        unscoped_fact_input = {
+            'assertion_type': 'preference',
+            'subject': 'Yuan', 'predicate': 'prefers', 'value': 'pour-over',
+            # top-level scope is the visibility policy, NOT a lane identifier
+            'scope': 'private',
+            # Explicitly None — no lane isolation active
+            'source_lane': None,
+            # Omit 'scope' inside evidence_refs to avoid _source_lane_from_legacy_refs
+            # misinterpreting the visibility-scope value as a lane identifier.
+            'evidence_refs': [
+                {
+                    'source_key': 'test-unscoped',
+                    'source_system': 'unscoped_test',
+                    'evidence_id': 'eid-bc-unscoped',
+                    'observed_at': '2026-03-13T00:00:00Z',
+                }
+            ],
+        }
+
+        # Should succeed — no lane isolation active (candidate is unscoped)
+        result = ledger.promote_candidate_fact(
+            actor_id='reviewer',
+            reason='test',
+            policy_version='v1',
+            candidate_id='cand-bc-unscoped',
+            fact=unscoped_fact_input,
+            conflict_with_fact_id='legacy-unscoped-bc',
+            allow_parallel=False,
+            require_supersede=True,
+        )
+        assert result.object_id is not None
+        current = ledger.current_state_facts()
+        assert not any(f.object_id == 'legacy-unscoped-bc' for f in current), (
+            'Unscoped fact should have been superseded by unscoped candidate'
         )

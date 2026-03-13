@@ -74,7 +74,15 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
     },
     {
         'name': 'promote_candidate',
-        'description': 'Promote a quarantined candidate into the typed ledger (supersede) or cancel it, using server-derived reviewer auth',
+        'description': (
+            'Promote a quarantined candidate into the typed ledger (supersede) or cancel it, '
+            'using server-derived reviewer auth. '
+            'Lane-ownership invariant: when the server has a configured lane (group_id), the '
+            'candidate\'s source_lane must match the server lane or the call is rejected with '
+            '"unauthorized". This is enforced at the endpoint level — independently of '
+            'list_candidates filtering — so cross-lane promotion is impossible even when the '
+            'caller supplies a foreign-lane candidate_id directly.'
+        ),
         'mode_hint': 'typed',
         'schema': {
             'inputs': {
@@ -89,7 +97,14 @@ TOOL_CONTRACTS: list[dict[str, Any]] = [
     },
     {
         'name': 'reject_candidate',
-        'description': 'Reject a quarantined candidate using server-derived reviewer auth',
+        'description': (
+            'Reject a quarantined candidate using server-derived reviewer auth. '
+            'Lane-ownership invariant: when the server has a configured lane (group_id), the '
+            'candidate\'s source_lane must match the server lane or the call is rejected with '
+            '"unauthorized". This is enforced at the endpoint level — independently of '
+            'list_candidates filtering — so cross-lane rejection is impossible even when the '
+            'caller supplies a foreign-lane candidate_id directly.'
+        ),
         'mode_hint': 'typed',
         'examples': [{'candidate_id': 'cand-002'}],
         'schema': {
@@ -445,6 +460,26 @@ async def promote_candidate(
     if candidate.get('status') != 'pending':
         return _candidate_status_error(normalized_candidate_id, str(candidate.get('status')))
 
+    # Endpoint-level lane ownership check: the server's configured lane must match
+    # the candidate's source_lane.  This prevents a caller who knows (or guesses) a
+    # foreign-lane candidate_id from promoting it via this endpoint — even though
+    # list_candidates already filters by lane, promote_candidate must enforce the
+    # same boundary independently so the guarantee holds regardless of how the
+    # caller obtained the candidate_id.
+    # When no server lane is configured (global/unscoped deployment), the check is
+    # skipped — all candidates are reachable under global-owner review semantics.
+    _server_lane = memory_router._derive_source_lane()
+    if _server_lane is not None:
+        _candidate_lane = _candidate_source_lane(candidate)
+        if _candidate_lane != _server_lane:
+            return _error(
+                'unauthorized',
+                f'candidate {normalized_candidate_id!r} belongs to lane '
+                f'{_candidate_lane!r} which does not match the server lane '
+                f'{_server_lane!r}; cross-lane promotion is not permitted',
+                details={'candidate_lane': _candidate_lane, 'server_lane': _server_lane},
+            )
+
     existing_promotion = ledger.promotion_event_for_candidate(normalized_candidate_id)
     if existing_promotion is not None:
         store.update_candidate_status(
@@ -630,6 +665,21 @@ async def reject_candidate(
         return _error('not_found', f'candidate not found: {normalized_candidate_id}')
     if candidate.get('status') != 'pending':
         return _candidate_status_error(normalized_candidate_id, str(candidate.get('status')))
+
+    # Endpoint-level lane ownership check (mirrors promote_candidate): the server's
+    # configured lane must match the candidate's source_lane before rejection is
+    # allowed.  Skipped when no server lane is configured (global-owner semantics).
+    _server_lane = memory_router._derive_source_lane()
+    if _server_lane is not None:
+        _candidate_lane = _candidate_source_lane(candidate)
+        if _candidate_lane != _server_lane:
+            return _error(
+                'unauthorized',
+                f'candidate {normalized_candidate_id!r} belongs to lane '
+                f'{_candidate_lane!r} which does not match the server lane '
+                f'{_server_lane!r}; cross-lane rejection is not permitted',
+                details={'candidate_lane': _candidate_lane, 'server_lane': _server_lane},
+            )
 
     existing_promotion = ledger.promotion_event_for_candidate(normalized_candidate_id)
     if existing_promotion is not None:
