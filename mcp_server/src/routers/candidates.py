@@ -15,6 +15,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Import the real FastMCP Context type so register_tools wrappers receive the
+# transport-injected auth context (path-2 of _extract_server_principal).
+# If the mcp package is not installed (standalone test import), fall back to a
+# plain stub — FastMCP's find_context_parameter won't match the stub, which is
+# the safe degraded behaviour (ctx=None, auth falls to OAuth contextvar only).
 try:
     from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger
 except ImportError:  # pragma: no cover - top-level import fallback
@@ -603,3 +608,8 @@ def register_tools(mcp: Any) -> dict[str, Any]:
         'promote_candidate': promote_candidate,
         'reject_candidate': reject_candidate,
     }
+
+    if hasattr(mcp, '_tools') and isinstance(mcp._tools, dict):  # type: ignore[attr-defined]
+        mcp._tools.update(tool_map)  # type: ignore[attr-defined]
+
+    return tool_map

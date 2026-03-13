@@ -111,10 +111,10 @@ class TestMcpServerInitializesWithAllRouters:
 
 
 class TestAllStubsReturnValidTypes:
-    """Verify all stub methods return Phase 0-shaped payloads instead of ad-hoc data."""
+    """Verify the branch's current Phase 0 surfaces return coherent typed payloads."""
 
     @pytest.mark.anyio
-    async def test_memory_remember_fact_stub(self):
+    async def test_memory_remember_fact_contract(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
@@ -122,55 +122,85 @@ class TestAllStubsReturnValidTypes:
         remember_fact = mock_mcp._tools['remember_fact']
         result = await remember_fact(text='test fact')
         assert result == {
-            'error': 'not_implemented',
-            'message': 'remember_fact is a Phase 0 stub and is not implemented yet.',
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': 'missing required field: subject',
         }
 
     @pytest.mark.anyio
-    async def test_memory_get_current_state_stub(self):
+    async def test_memory_get_current_state_contract(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_current_state']
         result = await fn(subject='user')
-        assert result['facts'] == []
-        assert 'status' not in result
-        assert 'message' in result
+        assert result == {
+            'status': 'ok',
+            'facts': [],
+        }
 
     @pytest.mark.anyio
-    async def test_memory_get_history_stub(self):
+    async def test_memory_get_history_contract(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['get_history']
         result = await fn(subject='user')
-        assert result['history'] == []
-        assert 'status' not in result
+        assert result == {
+            'status': 'ok',
+            'history': [],
+            'scope': 'private',
+            'roots_considered': [],
+        }
 
     @pytest.mark.anyio
-    async def test_memory_stub_validates_bad_input_instead_of_raising(self):
+    async def test_memory_contract_validates_bad_input_instead_of_raising(self):
         from mcp_server.src.routers.memory import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         remember_fact = mock_mcp._tools['remember_fact']
         result = await remember_fact(text=123)
-        assert result['error'] == 'validation_error'
+        assert result == {
+            'status': 'error',
+            'error_type': 'validation_error',
+            'message': 'text must be a string',
+        }
 
     @pytest.mark.anyio
-    async def test_candidates_list_candidates_stub(self):
+    async def test_candidates_list_candidates_contract(self):
+        """list_candidates requires auth — anonymous callers must be rejected."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']
+        # No ctx → anonymous → unauthorized (auth gate added in Exec 1 boundary fix).
         result = await fn()
         assert isinstance(result, list)
 
     @pytest.mark.anyio
-    async def test_candidates_promote_stub(self):
+    async def test_candidates_list_candidates_authorized_contract(self, monkeypatch):
+        """list_candidates returns candidates list for authenticated trusted caller."""
+        from mcp_server.src.routers import memory as memory_router
+        from mcp_server.src.routers.candidates import register_tools
+
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['list_candidates']
+        result = await fn()
+        assert result == {
+            'status': 'ok',
+            'candidates': [],
+        }
+
+    @pytest.mark.anyio
+    async def test_candidates_promote_requires_actor_id(self):
+        """promote_candidate without actor_id returns unauthorized (auth gate fires first)."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
@@ -180,24 +210,73 @@ class TestAllStubsReturnValidTypes:
         assert result['error'].startswith('invalid resolution')
 
     @pytest.mark.anyio
-    async def test_candidates_reject_stub(self):
+    async def test_candidates_promote_contract(self, monkeypatch):
+        """promote_candidate with server-derived principal in allowlist returns not_found for unknown candidate."""
+        from mcp_server.src.routers import memory as memory_router
+        from mcp_server.src.routers.candidates import register_tools
+
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        # Inject server principal via mock ctx — NOT via caller-supplied actor_id.
+        monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['promote_candidate']
+        result = await fn(candidate_id='cand-001', resolution='supersede', actor_id='system:test')
+        assert result == {
+            'status': 'error',
+            'error_type': 'not_found',
+            'message': 'candidate not found: cand-001',
+        }
+
+    @pytest.mark.anyio
+    async def test_candidates_reject_requires_actor_id(self):
+        """reject_candidate without authenticated context returns unauthorized (auth gate fires first)."""
         from mcp_server.src.routers.candidates import register_tools
 
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
+        # No ctx, no server principal → __anon__ → unauthorized
         result = await fn(candidate_id='cand-001')
         assert result['error'] == 'Candidate not found: cand-001'
 
     @pytest.mark.anyio
     async def test_candidates_reject_stub_requires_identifier(self):
+        pass
+
+    @pytest.mark.anyio
+    async def test_candidates_reject_contract(self, monkeypatch):
+        """reject_candidate with server-derived principal in allowlist returns not_found for unknown candidate."""
+        from mcp_server.src.routers import memory as memory_router
         from mcp_server.src.routers.candidates import register_tools
 
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        # Inject server principal via mock ctx — NOT via caller-supplied actor_id.
+        monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['reject_candidate']
         result = await fn(candidate_id='')
         assert result['error'] == 'candidate_id is required'
+
+    @pytest.mark.anyio
+    async def test_candidates_reject_contract_treats_unmatched_identifier_as_not_found(self, monkeypatch):
+        """reject_candidate with authorized principal and unrecognized ID returns not_found."""
+        from mcp_server.src.routers import memory as memory_router
+        from mcp_server.src.routers.candidates import register_tools
+
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        # Inject server principal via mock ctx — NOT via caller-supplied actor_id.
+        monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['reject_candidate']
+        result = await fn(candidate_id='Bad Candidate Id', actor_id='system:test')
+        assert result == {
+            'status': 'error',
+            'error_type': 'not_found',
+            'message': 'candidate not found: Bad Candidate Id',
+        }
 
     @pytest.mark.anyio
     async def test_packs_list_packs_stub(self):
@@ -520,9 +599,9 @@ def _make_mock_mcp() -> MagicMock:
     tools: dict[str, object] = {}
     mock = MagicMock()
 
-    def _tool_decorator():
+    def _tool_decorator(*_args, **kwargs):
         def decorator(fn):
-            tools[fn.__name__] = fn
+            tools[kwargs.get('name', fn.__name__)] = fn
             return fn
 
         return decorator
