@@ -12,8 +12,9 @@ server:
   
 llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq
-  model: "gpt-4o-mini"
+  model: "openai/gpt-5.1-codex-mini"
   max_tokens: 16384
+  reasoning_effort: "medium"  # For models supporting extended thinking
   
   providers:
     openai:
@@ -43,9 +44,9 @@ llm:
       api_url: ${GROQ_API_URL:https://api.groq.com/openai/v1}
 
 embedder:
-  provider: "openai"  # Options: openai, azure_openai, gemini, voyage
-  model: "text-embedding-3-small"
-  dimensions: 1024
+  provider: "ollama"  # Options: openai, azure_openai, gemini, voyage, ollama
+  model: "embeddinggemma:latest"
+  dimensions: 768
   
   providers:
     openai:
@@ -69,6 +70,10 @@ embedder:
       api_key: ${VOYAGE_API_KEY}
       api_url: ${VOYAGE_API_URL:https://api.voyageai.com/v1}
       model: "voyage-3"
+      
+    ollama:
+      api_url: ${OLLAMA_API_URL:http://localhost:11434}
+      model: "embeddinggemma:latest"
 
 database:
   provider: "falkordb"  # Default: falkordb. Options: neo4j, falkordb
