@@ -786,10 +786,28 @@ def _resolve_effective_group_ids(
     # authorized_group_ids allowlist, intersect the caller-resolved groups with
     # it.  This prevents an untrusted caller from escaping its authorized lane
     # scope by supplying arbitrary group_ids or lane_alias values.
+    #
+    # Fail-closed semantics:
+    # - When the caller requested SPECIFIC lanes and the intersection is empty
+    #   (all requested lanes were denied), return [] to signal denial.
+    #   Callers MUST check for empty [] and deny, never widen to all-lanes.
+    # - When the caller requested ALL LANES (effective_group_ids == []) and
+    #   authorized_group_ids is set, scope to the authorized lanes rather than
+    #   returning the all-lanes sentinel [].  This prevents a no-scope request
+    #   from bypassing the authorized allowlist.
     authorized = config.graphiti.authorized_group_ids
     if authorized:
         authorized_set = set(authorized)
-        effective_group_ids = [gid for gid in effective_group_ids if gid in authorized_set]
+        if effective_group_ids:
+            # Caller requested specific lanes — intersect; empty intersection = deny.
+            effective_group_ids = [gid for gid in effective_group_ids if gid in authorized_set]
+            # Note: empty result here is intentional DENY sentinel.  Search handlers
+            # must not treat this [] as "all-lanes" — they must fail closed.
+        else:
+            # All-lanes request (no explicit scope) with authorized restriction:
+            # scope to the authorized lanes so the caller cannot see beyond their
+            # allowed scope simply by omitting group_ids/lane_alias.
+            effective_group_ids = list(authorized)
 
     return effective_group_ids, invalid_aliases
 
@@ -1539,6 +1557,13 @@ async def search_nodes(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
 
+        # Fail closed: authorized scope intersection denied all requested lanes.
+        # Empty [] is the DENY sentinel when authorized_group_ids is configured.
+        # Never fall back to broader (all-lanes) retrieval in this case.
+        if not effective_group_ids and config.graphiti.authorized_group_ids:
+            logger.warning('search_nodes: authorized scope intersection yielded empty — failing closed')
+            return NodeSearchResponse(message='No relevant nodes found', nodes=[])
+
         # Extract the trusted caller principal (never from raw request payload).
         caller_principal = _extract_trusted_caller_principal(ctx)
         caller_key = _derive_rate_limit_key(effective_group_ids, caller_principal)
@@ -1826,6 +1851,19 @@ async def search_memory_facts(
             return ErrorResponse(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
+
+        # Fail closed: authorized scope intersection denied all requested lanes.
+        # Empty [] is the DENY sentinel when authorized_group_ids is configured.
+        # Must never widen to all-lanes for either the legacy facts path or the
+        # typed retrieval path (both pass effective_group_ids to the backend).
+        if not effective_group_ids and config.graphiti.authorized_group_ids:
+            logger.warning('search_memory_facts: authorized scope intersection yielded empty — failing closed')
+            if normalized_result_format == 'typed':
+                return {
+                    'state_facts': [], 'episodes': [], 'procedures': [],
+                    'evidence': [], 'result_count': 0,
+                }
+            return FactSearchResponse(message='No relevant facts found', facts=[])
 
         # Extract the trusted caller principal (never from raw request payload).
         caller_principal = _extract_trusted_caller_principal(ctx)
