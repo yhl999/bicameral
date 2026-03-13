@@ -163,8 +163,25 @@ class TestAllStubsReturnValidTypes:
 
     @pytest.mark.anyio
     async def test_candidates_list_candidates_contract(self):
+        """list_candidates requires auth — anonymous callers must be rejected."""
         from mcp_server.src.routers.candidates import register_tools
 
+        mock_mcp = _make_mock_mcp()
+        register_tools(mock_mcp)
+        fn = mock_mcp._tools['list_candidates']
+        # No ctx → anonymous → unauthorized (auth gate added in Exec 1 boundary fix).
+        result = await fn()
+        assert result['status'] == 'error'
+        assert result['error_type'] == 'unauthorized'
+
+    @pytest.mark.anyio
+    async def test_candidates_list_candidates_authorized_contract(self, monkeypatch):
+        """list_candidates returns candidates list for authenticated trusted caller."""
+        from mcp_server.src.routers import memory as memory_router
+        from mcp_server.src.routers.candidates import register_tools
+
+        monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'system:test')
+        monkeypatch.setattr(memory_router, '_extract_server_principal', lambda ctx: 'system:test')
         mock_mcp = _make_mock_mcp()
         register_tools(mock_mcp)
         fn = mock_mcp._tools['list_candidates']

@@ -11,6 +11,17 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+# Import the real FastMCP Context type so register_tools wrappers receive the
+# transport-injected auth context (path-2 of _extract_server_principal).
+# If the mcp package is not installed (standalone test import), fall back to a
+# plain stub — FastMCP's find_context_parameter won't match the stub, which is
+# the safe degraded behaviour (ctx=None, auth falls to OAuth contextvar only).
+try:
+    from mcp.server.fastmcp import Context as _McpContext
+except ImportError:  # pragma: no cover - fallback for minimal test envs
+    class _McpContext:  # type: ignore[no-redef]
+        """Stub used when the mcp package is unavailable."""
+
 try:
     from ..models.typed_memory import StateFact
     from ..services.candidate_store import CandidateStore
@@ -123,15 +134,27 @@ def _candidate_to_fact_input(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def list_candidates(status: str | None = None) -> dict[str, Any]:
-    """List quarantined remember_fact candidates."""
+async def list_candidates(status: str | None = None, ctx: Any = None) -> dict[str, Any]:
+    """List quarantined remember_fact candidates.
+
+    Authorization: requires the same trusted principal as promote/reject so that
+    quarantined candidate payloads (which include raw_hint and metadata) are not
+    exposed to anonymous callers.  The principal is derived from the MCP auth
+    context layer via ``ctx`` — NOT from caller-supplied arguments.
+    """
+    # Authorization gate — fail-closed, consistent with promote/reject.
+    memory = _memory_router()
+    server_principal = memory._extract_server_principal(ctx)
+    authorized, auth_reason = _authorize_candidate_action(server_principal)
+    if not authorized:
+        return _error(f'unauthorized: {auth_reason}', error_type='unauthorized')
+
     effective_status = str(status or '').strip().lower()
     if effective_status and effective_status not in VALID_STATUSES:
         return _error(
             f'invalid status {effective_status!r}; expected one of {sorted(VALID_STATUSES)}',
         )
 
-    memory = _memory_router()
     candidates = _get_candidate_store().list_candidates(status=effective_status or None)
     return {
         'status': 'ok',
@@ -357,14 +380,59 @@ async def reject_candidate(candidate_id: str, actor_id: str | None = None, ctx: 
 
 
 def register_tools(mcp: Any) -> dict[str, Any]:
-    mcp.tool()(list_candidates)
-    mcp.tool()(promote_candidate)
-    mcp.tool()(reject_candidate)
+    """Register candidate lifecycle tools with the MCP server.
+
+    Wrapper functions are created so FastMCP recognises ``ctx`` as the
+    transport-injected :class:`mcp.server.fastmcp.Context` (not a caller-
+    supplied argument).  This is required for path-2 auth (``ctx.client_id``)
+    to work in non-OAuth transports and matches the pattern used by the rest
+    of the MCP server.
+
+    ``ctx`` is annotated as ``_McpContext | None`` — when the real
+    ``mcp`` package is available, ``_McpContext`` IS the FastMCP ``Context``
+    class, so ``find_context_parameter`` locates it and excludes it from the
+    caller-visible schema.  When the package is absent (test stub), ctx falls
+    back to ``None`` and auth relies on the OAuth bearer-token contextvar
+    (path-1).
+    """
+
+    @mcp.tool(name='list_candidates')
+    async def list_candidates_tool(
+        status: str | None = None,
+        ctx: _McpContext | None = None,
+    ) -> dict[str, Any]:
+        return await list_candidates(status=status, ctx=ctx)
+
+    @mcp.tool(name='promote_candidate')
+    async def promote_candidate_tool(
+        candidate_id: str,
+        resolution: str,
+        actor_id: str | None = None,
+        ctx: _McpContext | None = None,
+    ) -> dict[str, Any]:
+        return await promote_candidate(
+            candidate_id=candidate_id,
+            resolution=resolution,
+            actor_id=actor_id,
+            ctx=ctx,
+        )
+
+    @mcp.tool(name='reject_candidate')
+    async def reject_candidate_tool(
+        candidate_id: str,
+        actor_id: str | None = None,
+        ctx: _McpContext | None = None,
+    ) -> dict[str, Any]:
+        return await reject_candidate(
+            candidate_id=candidate_id,
+            actor_id=actor_id,
+            ctx=ctx,
+        )
 
     tool_map = {
-        'list_candidates': list_candidates,
-        'promote_candidate': promote_candidate,
-        'reject_candidate': reject_candidate,
+        'list_candidates': list_candidates_tool,
+        'promote_candidate': promote_candidate_tool,
+        'reject_candidate': reject_candidate_tool,
     }
 
     if hasattr(mcp, '_tools') and isinstance(mcp._tools, dict):  # type: ignore[attr-defined]

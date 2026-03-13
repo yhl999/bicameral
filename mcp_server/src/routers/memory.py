@@ -27,6 +27,17 @@ except ImportError:  # pragma: no cover - optional for test envs without fastmcp
                 return func
             return decorator
 
+# Import the real FastMCP Context type so the register_tools wrapper is
+# recognised by find_context_parameter and ctx is injected (not caller-supplied).
+# Fallback stub is safe: find_context_parameter won't match it so ctx=None,
+# and auth falls to the OAuth bearer-token contextvar (path-1 of
+# _extract_server_principal) which is independent of the ctx parameter.
+try:
+    from mcp.server.fastmcp import Context as _McpContext
+except ImportError:  # pragma: no cover - fallback for minimal test envs
+    class _McpContext:  # type: ignore[no-redef]
+        """Stub used when the mcp package is unavailable."""
+
 from ..models.typed_memory import EvidenceRef, StateFact
 from ..services.candidate_store import CandidateStore
 from ..services.change_ledger import DB_PATH_DEFAULT, ChangeLedger, _stable_object_id
@@ -1283,11 +1294,12 @@ def register_tools(mcp: FastMCP) -> dict[str, Any]:
     # Use the public contract names explicitly so runtime discovery/invocation
     # matches get_tools() and the documented Exec 1 surface.
     #
-    # ctx is injected by FastMCP from the MCP transport/auth layer — it is NOT
-    # a caller-supplied tool argument, so it does not appear in the public
-    # schema and is excluded from the contract consistency check.
+    # ctx is annotated as _McpContext | None so FastMCP's find_context_parameter
+    # recognises it as the transport-injected Context (not a caller-supplied
+    # argument) and excludes it from the caller-visible tool schema.  This
+    # enables path-2 auth (ctx.client_id) for non-OAuth transports.
     @mcp.tool(name='remember_fact')
-    async def remember_fact_tool(text: str, hint: dict[str, Any] | None = None, ctx: Any = None) -> dict[str, Any]:
+    async def remember_fact_tool(text: str, hint: dict[str, Any] | None = None, ctx: _McpContext | None = None) -> dict[str, Any]:
         server_principal = _extract_server_principal(ctx)
         return await remember_fact(text=text, hint=hint, _server_principal=server_principal)
 

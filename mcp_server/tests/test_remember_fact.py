@@ -876,3 +876,114 @@ def test_caller_supplied_actor_id_does_not_authorize_reject(isolated_memory, mon
         'even if actor_id matches the server allowlist'
     )
     assert result['error_type'] == 'unauthorized'
+
+
+# ---------------------------------------------------------------------------
+# list_candidates auth gate (Exec 1 boundary fix)
+# ---------------------------------------------------------------------------
+
+def test_list_candidates_requires_auth(isolated_memory, monkeypatch):
+    """list_candidates must return unauthorized for anonymous callers.
+
+    Previously list_candidates had no auth gate, exposing quarantined candidate
+    payloads (including raw_hint/metadata) to unauthenticated callers.
+    """
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    # No ctx → server_principal = __anon__ → must be rejected.
+    result = _run(candidates_router.list_candidates())
+    assert result['status'] == 'error', 'list_candidates must be unauthorized for anonymous callers'
+    assert result['error_type'] == 'unauthorized'
+
+
+def test_list_candidates_requires_auth_no_allowlist(isolated_memory):
+    """list_candidates must return unauthorized even when ctx is supplied but allowlist is empty."""
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+
+    # ctx present but BICAMERAL_TRUSTED_ACTOR_IDS not set → fail-closed.
+    result = _run(candidates_router.list_candidates(ctx=_MockCtx('owner:archibald')))
+    assert result['status'] == 'error'
+    assert result['error_type'] == 'unauthorized'
+
+
+def test_list_candidates_authorized(isolated_memory, monkeypatch):
+    """list_candidates must return candidates for an authenticated trusted caller."""
+    monkeypatch.setenv('BICAMERAL_TRUSTED_ACTOR_IDS', 'owner:archibald')
+    _run(memory.remember_fact('I prefer dark mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    conflict = _run(memory.remember_fact('I prefer light mode', {'type': 'Preference', 'subject': 'UI preferences'}))
+    assert conflict['status'] == 'conflict'
+
+    result = _run(candidates_router.list_candidates(ctx=_MockCtx('owner:archibald')))
+    assert result['status'] == 'ok'
+    assert len(result['candidates']) >= 1
+    candidate_ids = [c['candidate_id'] for c in result['candidates']]
+    assert conflict['candidate_id'] in candidate_ids
+
+
+# ---------------------------------------------------------------------------
+# FastMCP ctx-injection parity — startup / schema smoke tests
+# ---------------------------------------------------------------------------
+
+def test_register_tools_ctx_not_in_schema():
+    """ctx must NOT appear as a caller-visible parameter in registered tool schemas.
+
+    FastMCP only hides ctx when annotated as Context | None (not Any).
+    If ctx leaks into the schema, callers could supply it and the transport
+    auth layer would not inject the real Context — breaking path-2 auth.
+    """
+    from mcp.server.fastmcp import FastMCP as _RealFastMCP
+
+    mcp = _RealFastMCP('smoke-test')
+
+    # Register memory router tools
+    memory.register_tools(mcp)
+    # Register candidate router tools
+    candidates_router.register_tools(mcp)
+
+    tools_by_name = {t.name: t for t in mcp._tool_manager.list_tools()}
+
+    # Every Exec 1 tool must hide ctx (not expose it to callers).
+    privileged_tools = ['remember_fact', 'list_candidates', 'promote_candidate', 'reject_candidate']
+    for tool_name in privileged_tools:
+        assert tool_name in tools_by_name, f'tool {tool_name!r} not registered'
+        schema = tools_by_name[tool_name].parameters
+        exposed = list(schema.get('properties', {}).keys())
+        assert 'ctx' not in exposed, (
+            f'tool {tool_name!r} exposes ctx as a caller-visible parameter '
+            f'(exposed params: {exposed}); ctx must be FastMCP-injected via '
+            f'Context | None annotation, not Any'
+        )
+
+
+def test_register_tools_required_params_correct():
+    """Verify get_tools()-visible parameter sets are correct for Exec 1 tools."""
+    from mcp.server.fastmcp import FastMCP as _RealFastMCP
+
+    mcp = _RealFastMCP('param-smoke')
+    memory.register_tools(mcp)
+    candidates_router.register_tools(mcp)
+
+    tools_by_name = {t.name: t for t in mcp._tool_manager.list_tools()}
+
+    # remember_fact: text (required), hint (optional)
+    rf_params = set(tools_by_name['remember_fact'].parameters.get('properties', {}).keys())
+    assert 'text' in rf_params
+    assert 'hint' in rf_params
+    assert 'ctx' not in rf_params
+
+    # list_candidates: status (optional) — no ctx in schema
+    lc_params = set(tools_by_name['list_candidates'].parameters.get('properties', {}).keys())
+    assert 'ctx' not in lc_params
+
+    # promote_candidate: candidate_id + resolution (required), actor_id (optional)
+    pc_params = set(tools_by_name['promote_candidate'].parameters.get('properties', {}).keys())
+    assert 'candidate_id' in pc_params
+    assert 'resolution' in pc_params
+    assert 'ctx' not in pc_params
+
+    # reject_candidate: candidate_id (required), actor_id (optional)
+    rc_params = set(tools_by_name['reject_candidate'].parameters.get('properties', {}).keys())
+    assert 'candidate_id' in rc_params
+    assert 'ctx' not in rc_params

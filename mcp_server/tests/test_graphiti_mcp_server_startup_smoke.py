@@ -108,6 +108,7 @@ def test_mcp_server_starts_and_registers_runtime_tools(monkeypatch):
         remember_fact.assert_awaited_once_with(
             text='Tabs over spaces',
             hint={'subject': 'editor prefs'},
+            _server_principal='__anon__',
         )
         get_current_state.assert_awaited_once_with(
             subject='editor prefs',
