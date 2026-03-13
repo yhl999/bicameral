@@ -13,6 +13,11 @@ except ImportError:  # pragma: no cover - top-level import fallback
         LLMConfig,
     )
 
+# Valid reasoning effort values accepted by OpenAI reasoning models
+_VALID_REASONING_EFFORTS = {'low', 'medium', 'high'}
+# Models that support the reasoning/effort parameter
+_REASONING_MODEL_PREFIXES = ('o1', 'o3', 'gpt-5')
+
 # Try to import FalkorDriver if available
 try:
     from graphiti_core.driver.falkordb_driver import FalkorDriver  # noqa: F401
@@ -136,15 +141,25 @@ class LLMClientFactory:
                 )
 
                 # Check if this is a reasoning model (o1, o3, gpt-5 family)
-                reasoning_prefixes = ('o1', 'o3', 'gpt-5')
-                is_reasoning_model = config.model.startswith(reasoning_prefixes)
+                is_reasoning_model = config.model.startswith(_REASONING_MODEL_PREFIXES)
 
-                # Only pass reasoning/verbosity parameters for reasoning models (gpt-5 family)
+                # Only pass reasoning parameters for reasoning models
                 if is_reasoning_model:
+                    # Use configured reasoning_effort if provided, otherwise default to 'low'
+                    reasoning_effort = config.reasoning_effort or 'low'
+                    
+                    # Validate reasoning_effort value
+                    if reasoning_effort not in _VALID_REASONING_EFFORTS:
+                        logger.warning(
+                            f'Invalid reasoning_effort "{reasoning_effort}". '
+                            f'Must be one of {_VALID_REASONING_EFFORTS}. Defaulting to "low".'
+                        )
+                        reasoning_effort = 'low'
+                    
                     return OpenAIClient(
                         config=llm_config,
                         max_tokens=config.max_tokens,
-                        reasoning='minimal',
+                        reasoning=reasoning_effort,
                         verbosity='low',
                     )
                 else:
@@ -371,6 +386,26 @@ class EmbedderFactory:
                     embedding_dim=config.dimensions or 1024,
                 )
                 return VoyageAIEmbedder(config=voyage_config)
+
+            case 'ollama':
+                # Ollama uses OpenAI-compatible API with local endpoint
+                # Route through OpenAI provider with custom base_url
+                if not config.providers.ollama:
+                    raise ValueError('Ollama provider configuration not found')
+
+                ollama_config = config.providers.ollama
+
+                from graphiti_core.embedder.openai import OpenAIEmbedderConfig
+
+                # Ollama does not require an API key; use a dummy value
+                embedder_config = OpenAIEmbedderConfig(
+                    api_key='no-key',  # Ollama doesn't require API key
+                    embedding_model=ollama_config.model or config.model or 'embeddinggemma:latest',
+                    base_url=ollama_config.api_url or 'http://localhost:11434',
+                    embedding_dim=config.dimensions or 768,
+                )
+                logger.info(f'Creating Ollama embedder: {ollama_config.api_url}')
+                return OpenAIEmbedder(config=embedder_config)
 
             case _:
                 raise ValueError(f'Unsupported Embedder provider: {provider}')
