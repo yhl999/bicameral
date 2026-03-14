@@ -434,6 +434,7 @@ For the full sync and patch application procedure, see the [Upstream Sync Runboo
 - [Runtime Pack Overlay](docs/runbooks/runtime-pack-overlay.md) - how private packs map to agents
 
 ### Operations
+- [MCP Surface](docs/runbooks/mcp-surface.md) — typed memory MCP API (remember_fact, candidates, packs, state/history, lane isolation model, error types, test baseline)
 - [OM Operations](docs/runbooks/om-operations.md) — Observational Memory: fast-write, compressor, convergence, GC, promotion, dedupe, timeline semantics
 - [Sessions Ingestion](docs/runbooks/sessions-ingestion.md) — architecture, batch & steady-state config, high-throughput tuning, sub-chunking, retrieval benchmark, recall gate, post-processing, troubleshooting
 - [Adding Data Sources](docs/runbooks/adding-data-sources.md) — onboarding new content: group_id, ontology design, adapter patterns, cron setup

@@ -41,3 +41,9 @@ Operational boundaries and release requirements live here:
 Everything that does not belong in a stable, reusable foundation should be treated as private layering and handled as externalized workflow/context input instead of being merged into this public core.
 
 For runtime pack/profile split guidance, see `docs/runbooks/runtime-pack-overlay.md`.
+
+## MCP Surface
+
+Bicameral exposes a typed memory API via MCP. This is the primary integration path for agents and users writing to or reading from the memory runtime.
+
+- [MCP Surface Runbook](../runbooks/mcp-surface.md) — typed memory API reference: `remember_fact`, candidate management, packs, state/history queries, lane isolation model, error types, and test baseline.
