@@ -15,11 +15,18 @@ limitations under the License.
 """
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import openai
 from openai import AsyncAzureOpenAI, AsyncOpenAI
+
+if TYPE_CHECKING:
+    import numpy as np
+else:
+    try:
+        import numpy as np
+    except ImportError:
+        np = None  # type: ignore
 
 from ..helpers import semaphore_gather
 from ..llm_client import LLMConfig, OpenAIClient, RateLimitError
@@ -103,11 +110,13 @@ class OpenAIRerankerClient(CrossEncoderClient):
                 else []
                 for response in responses
             ]
+            import math as _math
+            _exp = np.exp if np is not None else _math.exp
             scores: list[float] = []
             for top_logprobs in responses_top_logprobs:
                 if len(top_logprobs) == 0:
                     continue
-                norm_logprobs = np.exp(top_logprobs[0].logprob)
+                norm_logprobs = _exp(top_logprobs[0].logprob)
                 if top_logprobs[0].token.strip().split(' ')[0].lower() == 'true':
                     scores.append(norm_logprobs)
                 else:

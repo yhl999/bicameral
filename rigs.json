@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "rigs": {
+    "bi": {
+      "git_url": "https://github.com/yhl999/bicameral.git",
+      "added_at": "2026-03-11T14:45:18.617008-04:00",
+      "beads": {
+        "repo": "",
+        "prefix": "bi"
+      }
+    }
+  }
+}
