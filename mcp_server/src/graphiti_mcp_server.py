@@ -781,6 +781,34 @@ def _resolve_effective_group_ids(
     for gid in effective_group_ids:
         if not SAFE_GROUP_ID_RE.match(gid):
             raise ValueError(f'Invalid group_id: {_sanitize_for_error(gid)!r}')
+
+    # Server-authorized scope intersection: if the server config defines an
+    # authorized_group_ids allowlist, intersect the caller-resolved groups with
+    # it.  This prevents an untrusted caller from escaping its authorized lane
+    # scope by supplying arbitrary group_ids or lane_alias values.
+    #
+    # Fail-closed semantics:
+    # - When the caller requested SPECIFIC lanes and the intersection is empty
+    #   (all requested lanes were denied), return [] to signal denial.
+    #   Callers MUST check for empty [] and deny, never widen to all-lanes.
+    # - When the caller requested ALL LANES (effective_group_ids == []) and
+    #   authorized_group_ids is set, scope to the authorized lanes rather than
+    #   returning the all-lanes sentinel [].  This prevents a no-scope request
+    #   from bypassing the authorized allowlist.
+    authorized = config.graphiti.authorized_group_ids
+    if authorized:
+        authorized_set = set(authorized)
+        if effective_group_ids:
+            # Caller requested specific lanes — intersect; empty intersection = deny.
+            effective_group_ids = [gid for gid in effective_group_ids if gid in authorized_set]
+            # Note: empty result here is intentional DENY sentinel.  Search handlers
+            # must not treat this [] as "all-lanes" — they must fail closed.
+        else:
+            # All-lanes request (no explicit scope) with authorized restriction:
+            # scope to the authorized lanes so the caller cannot see beyond their
+            # allowed scope simply by omitting group_ids/lane_alias.
+            effective_group_ids = list(authorized)
+
     return effective_group_ids, invalid_aliases
 
 
@@ -928,6 +956,13 @@ _REGISTERED_ROUTER_TOOLS.update(_candidates_router.register_tools(mcp))
 _REGISTERED_ROUTER_TOOLS.update(_packs_router.register_tools(mcp))
 _REGISTERED_ROUTER_TOOLS.update(_episodes_procedures_router.register_tools(mcp))
 
+_ROUTER_TOOL_CONTRACTS: list[dict[str, Any]] = [
+    *_memory_router.TOOL_CONTRACTS,
+    *_candidates_router.TOOL_CONTRACTS,
+    *_packs_router.TOOL_CONTRACTS,
+    *_episodes_procedures_router.TOOL_CONTRACTS,
+]
+
 # Debug flag: hide low-level tools unless explicitly enabled
 _BICAMERAL_DEBUG_TOOLS: bool = (
     os.environ.get('BICAMERAL_DEBUG_TOOLS', '').strip() == '1'
@@ -1038,162 +1073,7 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
                 'om_note': 'OM content is projected from Neo4j in both modes.',
             },
         ),
-        _tool_schema_entry(
-            name='remember_fact',
-            description='Validate typed-memory write input for Phase 0; Exec 1 implements the ledger write',
-            mode_hint='typed',
-            inputs={
-                'text': 'string',
-                'hint': 'object | null',
-            },
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: TypedFact | ConflictDialog | ErrorResponse',
-            examples=[{'text': 'I prefer tabs over spaces', 'hint': {'fact_type': 'preference'}}],
-            phase0_behavior='Validates text/hint and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='get_current_state',
-            description='Query the typed-memory ledger for current non-superseded facts',
-            mode_hint='typed',
-            inputs={
-                'subject': 'string',
-                'predicate': 'string | null',
-            },
-            output='{"message": string, "facts": list[TypedFact]} | ErrorResponse',
-            examples=[{'subject': 'user', 'predicate': 'preferred_editor'}],
-            phase0_behavior='Returns an empty facts list after input validation.',
-        ),
-        _tool_schema_entry(
-            name='get_history',
-            description='Retrieve typed-memory change history for a subject / predicate',
-            mode_hint='typed',
-            inputs={
-                'subject': 'string',
-                'predicate': 'string | null',
-            },
-            output='{"message": string, "history": list[TypedFact]} | ErrorResponse',
-            examples=[{'subject': 'project-alpha', 'predicate': 'status'}],
-            phase0_behavior='Returns an empty history list after input validation.',
-        ),
-        _tool_schema_entry(
-            name='list_candidates',
-            description='List quarantined fact candidates awaiting promotion review',
-            mode_hint='typed',
-            inputs={'status': '"pending" | "promoted" | "rejected" | null'},
-            output='{"message": string, "candidates": list[Candidate]} | ErrorResponse',
-            examples=[{'status': 'pending'}],
-            phase0_behavior='Returns an empty candidate list after input validation.',
-        ),
-        _tool_schema_entry(
-            name='promote_candidate',
-            description='Validate promotion input for a candidate fact; Exec 4 wires the ledger integration',
-            mode_hint='typed',
-            inputs={'candidate_id': 'string', 'resolution': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
-            examples=[{'candidate_id': 'cand-001', 'resolution': 'Verified correct'}],
-            phase0_behavior='Validates candidate_id/resolution and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='reject_candidate',
-            description='Validate rejection input for a candidate fact; Exec 4 wires the ledger integration',
-            mode_hint='typed',
-            inputs={'candidate_id': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: SuccessResponse | ErrorResponse',
-            examples=[{'candidate_id': 'cand-002'}],
-            phase0_behavior='Validates candidate_id and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='list_packs',
-            description='List available context and workflow packs',
-            mode_hint='typed',
-            inputs={'filter': 'object | null'},
-            output='{"message": string, "packs": list[PackRegistry]} | ErrorResponse',
-            examples=[{'filter': {'scope': 'private'}}],
-            phase0_behavior='Returns an empty pack list after input validation.',
-        ),
-        _tool_schema_entry(
-            name='get_context_pack',
-            description='Validate lookup input for a materialized context pack',
-            mode_hint='typed',
-            inputs={'pack_id': 'string', 'task': 'string | null'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
-            examples=[{'pack_id': 'coding-defaults', 'task': 'write a Python function'}],
-            phase0_behavior='Validates pack_id/task and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='get_workflow_pack',
-            description='Validate lookup input for a materialized workflow pack',
-            mode_hint='typed',
-            inputs={'pack_id': 'string', 'task': 'string | null'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackMaterialized | ErrorResponse',
-            examples=[{'pack_id': 'deploy-workflow', 'task': 'deploy to staging'}],
-            phase0_behavior='Validates pack_id/task and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='describe_pack',
-            description='Validate lookup input for a full pack definition',
-            mode_hint='typed',
-            inputs={'pack_id': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackDefinition | ErrorResponse',
-            examples=[{'pack_id': 'coding-defaults'}],
-            phase0_behavior='Validates pack_id and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='create_workflow_pack',
-            description='Validate a PackDefinition payload for workflow-pack creation',
-            mode_hint='typed',
-            inputs={'definition': 'PackDefinition object'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: PackRegistry | ErrorResponse',
-            examples=[{
-                'definition': {
-                    'pack_id': 'my-workflow',
-                    'scope': 'workflow',
-                    'intent': 'deploy service safely',
-                    'consumer': 'archibald',
-                    'version': '1.0',
-                    'workflow_steps': ['run tests', 'deploy to staging'],
-                }
-            }],
-            phase0_behavior='Validates definition against PackDefinition, requires workflow/both scope, and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='search_episodes',
-            description='Search episodic memory by semantic query and optional time range',
-            mode_hint='typed',
-            inputs={
-                'query': 'string',
-                'time_range': 'object with optional start/end ISO timestamps | null',
-            },
-            output='{"message": string, "episodes": list[Episode]} | ErrorResponse',
-            examples=[{'query': 'last deployment', 'time_range': None}],
-            phase0_behavior='Returns an empty episode list after input validation.',
-        ),
-        _tool_schema_entry(
-            name='get_episode',
-            description='Validate lookup input for a specific episode',
-            mode_hint='typed',
-            inputs={'episode_id': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: Episode | ErrorResponse',
-            examples=[{'episode_id': 'ep-001'}],
-            phase0_behavior='Validates episode_id and then returns not_implemented.',
-        ),
-        _tool_schema_entry(
-            name='search_procedures',
-            description='Search procedural memory for relevant procedures',
-            mode_hint='typed',
-            inputs={'query': 'string'},
-            output='{"message": string, "procedures": list[Procedure]} | ErrorResponse',
-            examples=[{'query': 'how to run tests'}],
-            phase0_behavior='Returns an empty procedure list after input validation.',
-        ),
-        _tool_schema_entry(
-            name='get_procedure',
-            description='Validate lookup input for a procedure by trigger or ID',
-            mode_hint='typed',
-            inputs={'trigger_or_id': 'string'},
-            output='ErrorResponse(error="not_implemented") in Phase 0 after validation; future: Procedure | ErrorResponse',
-            examples=[{'trigger_or_id': 'deploy to production'}],
-            phase0_behavior='Validates trigger_or_id and then returns not_implemented.',
-        ),
+        *_ROUTER_TOOL_CONTRACTS,
         _tool_schema_entry(
             name='delete_entity_edge',
             description='Delete an entity edge from the graph memory by UUID',
@@ -1677,6 +1557,13 @@ async def search_nodes(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
 
+        # Fail closed: authorized scope intersection denied all requested lanes.
+        # Empty [] is the DENY sentinel when authorized_group_ids is configured.
+        # Never fall back to broader (all-lanes) retrieval in this case.
+        if not effective_group_ids and config.graphiti.authorized_group_ids:
+            logger.warning('search_nodes: authorized scope intersection yielded empty — failing closed')
+            return NodeSearchResponse(message='No relevant nodes found', nodes=[])
+
         # Extract the trusted caller principal (never from raw request payload).
         caller_principal = _extract_trusted_caller_principal(ctx)
         caller_key = _derive_rate_limit_key(effective_group_ids, caller_principal)
@@ -1964,6 +1851,19 @@ async def search_memory_facts(
             return ErrorResponse(
                 error=f'Unknown lane aliases: {", ".join(invalid_aliases)}'
             )
+
+        # Fail closed: authorized scope intersection denied all requested lanes.
+        # Empty [] is the DENY sentinel when authorized_group_ids is configured.
+        # Must never widen to all-lanes for either the legacy facts path or the
+        # typed retrieval path (both pass effective_group_ids to the backend).
+        if not effective_group_ids and config.graphiti.authorized_group_ids:
+            logger.warning('search_memory_facts: authorized scope intersection yielded empty — failing closed')
+            if normalized_result_format == 'typed':
+                return {
+                    'state_facts': [], 'episodes': [], 'procedures': [],
+                    'evidence': [], 'result_count': 0,
+                }
+            return FactSearchResponse(message='No relevant facts found', facts=[])
 
         # Extract the trusted caller principal (never from raw request payload).
         caller_principal = _extract_trusted_caller_principal(ctx)
@@ -2398,6 +2298,23 @@ async def get_tools() -> list[dict[str, Any]]:
     return tools
 
 
+def _assert_router_contract_consistency(
+    router_tools: list[dict[str, Any]],
+    *,
+    registered_router_tools: dict[str, Any],
+) -> None:
+    declared_names = {tool['name'] for tool in router_tools}
+    registered_names = set(registered_router_tools)
+    if declared_names != registered_names:
+        missing_from_contract = sorted(registered_names - declared_names)
+        missing_from_runtime = sorted(declared_names - registered_names)
+        raise RuntimeError(
+            'router contract drift detected: '
+            f'missing_from_contract={missing_from_contract}, '
+            f'missing_from_runtime={missing_from_runtime}'
+        )
+
+
 def _phase0_public_tool_callables() -> dict[str, Any]:
     return {
         'add_memory': add_memory,
@@ -2455,6 +2372,10 @@ def _assert_get_tools_contract_consistency(
 
 _PHASE0_PUBLIC_TOOL_CALLABLES: dict[str, Any] = _phase0_public_tool_callables()
 _GET_TOOLS_RESPONSE: list[dict[str, Any]] = _build_get_tools_response()
+_assert_router_contract_consistency(
+    _ROUTER_TOOL_CONTRACTS,
+    registered_router_tools=_REGISTERED_ROUTER_TOOLS,
+)
 _assert_get_tools_contract_consistency(
     _GET_TOOLS_RESPONSE,
     callables_by_name=_PHASE0_PUBLIC_TOOL_CALLABLES,

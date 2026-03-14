@@ -9,11 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from importlib import import_module, reload
+from importlib import import_module
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+
+_MCP_SRC = Path(__file__).parent.parent / 'src'
+if str(_MCP_SRC) not in sys.path:
+    sys.path.insert(0, str(_MCP_SRC.parent))
+    sys.path.insert(0, str(_MCP_SRC))
+
+_REPO_TESTS = Path(__file__).resolve().parents[2] / 'tests'
+if str(_REPO_TESTS) not in sys.path:
+    sys.path.insert(0, str(_REPO_TESTS))
 
 
 class _DummyClient:
@@ -43,15 +53,22 @@ class _FakeGraphitiService:
 def _load_graphiti_module():
     pytest.importorskip('mcp')
 
-    module = import_module('mcp_server.src.graphiti_mcp_server')
-    return reload(module)
+    sys.modules.pop('mcp_server.src.graphiti_mcp_server', None)
+    return import_module('helpers_mcp_import').load_graphiti_mcp_server()
 
 
 def test_mcp_server_starts_and_registers_runtime_tools(monkeypatch):
-    """Smoke-test startup registration with real FastMCP transport setup."""
+    """Smoke-test startup registration and invocation with the real FastMCP registry."""
 
     module = _load_graphiti_module()
     monkeypatch.setattr(module, 'GraphitiService', _FakeGraphitiService)
+
+    remember_fact = AsyncMock(return_value={'status': 'ok', 'tool': 'remember_fact'})
+    get_current_state = AsyncMock(return_value={'status': 'ok', 'tool': 'get_current_state'})
+    get_history = AsyncMock(return_value={'status': 'ok', 'tool': 'get_history'})
+    monkeypatch.setattr(module._memory_router, 'remember_fact', remember_fact)
+    monkeypatch.setattr(module._memory_router, 'get_current_state', get_current_state)
+    monkeypatch.setattr(module._memory_router, 'get_history', get_history)
 
     run_stdio = AsyncMock()
     monkeypatch.setattr(module.mcp, 'run_stdio_async', run_stdio)
@@ -67,6 +84,43 @@ def test_mcp_server_starts_and_registers_runtime_tools(monkeypatch):
 
         # Public contract tools are registered with FastMCP at runtime.
         assert set(module._PHASE0_PUBLIC_TOOL_CALLABLES).issubset(registered_names)
+        assert {'remember_fact', 'get_current_state', 'get_history'}.issubset(registered_names)
+        assert 'remember_fact_tool' not in registered_names
+        assert 'get_current_state_tool' not in registered_names
+        assert 'get_history_tool' not in registered_names
+
+        remember_result = await module.mcp._tool_manager.call_tool(  # noqa: SLF001
+            'remember_fact',
+            {'text': 'Tabs over spaces', 'hint': {'subject': 'editor prefs'}},
+        )
+        current_state_result = await module.mcp._tool_manager.call_tool(  # noqa: SLF001
+            'get_current_state',
+            {'subject': 'editor prefs', 'predicate': 'theme', 'scope': 'public'},
+        )
+        history_result = await module.mcp._tool_manager.call_tool(  # noqa: SLF001
+            'get_history',
+            {'subject': 'editor prefs', 'predicate': 'theme', 'scope': 'public'},
+        )
+
+        assert remember_result == {'status': 'ok', 'tool': 'remember_fact'}
+        assert current_state_result == {'status': 'ok', 'tool': 'get_current_state'}
+        assert history_result == {'status': 'ok', 'tool': 'get_history'}
+        remember_fact.assert_awaited_once_with(
+            text='Tabs over spaces',
+            hint={'subject': 'editor prefs'},
+            _server_principal='__anon__',
+        )
+        get_current_state.assert_awaited_once_with(
+            subject='editor prefs',
+            predicate='theme',
+            scope='public',
+        )
+        get_history.assert_awaited_once_with(
+            subject='editor prefs',
+            predicate='theme',
+            scope='public',
+        )
+
         assert 'get_tools' in registered_names
         assert module.config.server.transport == 'stdio'
         assert module.graphiti_service is not None

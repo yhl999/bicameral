@@ -164,8 +164,86 @@ def detect_conflict(
     new_fact: dict[str, Any],
     existing_facts: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Return a conflict descriptor if new_fact contradicts existing_facts.
+    """Return a lightweight conflict descriptor if new_fact contradicts existing_facts.
 
-    This is a stub. Exec 1 implements full conflict detection logic.
+    Conflict is detected when there is an active fact already present for the
+    same `subject` + `predicate` + `scope` where the `value` differs.
     """
+
+    if not isinstance(new_fact, dict):
+        return {
+            'conflict': False,
+            'reason': 'new_fact_must_be_object',
+        }
+
+    new_subject = str(new_fact.get('subject') or '').strip().lower()
+    new_predicate = str(new_fact.get('predicate') or '').strip().lower()
+    new_value = new_fact.get('value')
+    new_scope = str(new_fact.get('scope') or 'private').strip().lower()
+
+    if not new_subject or not new_predicate:
+        return {
+            'conflict': False,
+            'reason': 'missing_subject_or_predicate',
+        }
+
+    for existing in existing_facts or []:
+        if not isinstance(existing, dict):
+            continue
+
+        existing_subject = str(existing.get('subject') or '').strip().lower()
+        existing_predicate = str(existing.get('predicate') or '').strip().lower()
+        if not existing_subject or not existing_predicate:
+            continue
+
+        existing_scope = str(existing.get('scope') or existing.get('policy_scope') or 'private').strip().lower()
+        if (
+            existing_subject != new_subject
+            or existing_predicate != new_predicate
+            or existing_scope != new_scope
+        ):
+            continue
+
+        existing_value = existing.get('value')
+        if _values_equivalent(existing_value, new_value):
+            return {
+                'conflict': False,
+                'existing_fact': dict(existing),
+                'reason': 'duplicate',
+            }
+
+        return {
+            'conflict': True,
+            'reason': 'contradictory_value',
+            'existing_fact': dict(existing),
+        }
+
     return None
+
+
+def _values_equivalent(a: Any, b: Any) -> bool:
+    """Compare two values for equality with normalized JSON repr fallback."""
+
+    if a is b:
+        return True
+
+    if a is None or b is None:
+        return a is b
+
+    if type(a) is type(b):
+        return a == b
+
+    try:
+        return _normalize_for_compare(a) == _normalize_for_compare(b)
+    except Exception:
+        return False
+
+
+def _normalize_for_compare(value: Any) -> str:
+    if isinstance(value, (str, int, float, bool)):
+        return str(value).strip().lower()
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value), sort_keys=True, ensure_ascii=False)
+    return str(value).strip().lower()

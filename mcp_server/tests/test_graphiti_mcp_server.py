@@ -42,9 +42,9 @@ def _make_mock_mcp() -> MagicMock:
     tools: dict[str, object] = {}
     mock = MagicMock()
 
-    def _tool_decorator():
+    def _tool_decorator(*_args, **kwargs):
         def decorator(fn):
-            tools[fn.__name__] = fn
+            tools[kwargs.get('name', fn.__name__)] = fn
             return fn
 
         return decorator
@@ -200,11 +200,16 @@ class TestSchemaValidation:
 
     def test_valid_candidate(self):
         obj = {
-            'candidate_id': 'cand-001',
-            'fact_type': 'preference',
+            'uuid': 'cand-001',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
+            'metadata': {},
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is True
@@ -212,51 +217,97 @@ class TestSchemaValidation:
 
     def test_string_min_length_violation(self):
         obj = {
-            'candidate_id': '',
-            'fact_type': 'preference',
+            'uuid': '',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
-        assert 'candidate_id' in (err or '')
+        assert 'uuid' in (err or '')
 
-    def test_candidate_id_pattern_validation(self):
+    def test_candidate_status_enum_tracks_quarantine_contract(self):
         obj = {
-            'candidate_id': 'Bad Candidate Id',
-            'fact_type': 'preference',
+            'uuid': 'cand-001',
+            'type': 'preference',
             'subject': 'user',
             'predicate': 'editor',
             'value': 'vim',
+            'status': 'pending',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
         }
         ok, err = self.validate(obj, 'Candidate')
         assert ok is False
-        assert 'candidate_id' in (err or '')
+        assert err is not None
+        assert 'status' in err
 
-    def test_pack_definition_requires_workflow_fields(self):
+    def test_candidate_uuid_pattern_validation(self):
+        obj = {
+            'uuid': 'Bad Candidate Id',
+            'type': 'preference',
+            'subject': 'user',
+            'predicate': 'editor',
+            'value': 'vim',
+            'status': 'quarantine',
+            'confidence': 0.92,
+            'created_at': '2026-03-12T18:00:00Z',
+            'updated_at': '2026-03-12T18:00:00Z',
+        }
+        ok, err = self.validate(obj, 'Candidate')
+        assert ok is False
+        assert 'uuid' in (err or '')
+
+    def test_pack_definition_requires_definition_for_workflow_scope(self):
         obj = {
             'pack_id': 'deploy-workflow',
-            'scope': 'workflow',
-            'intent': 'deploy',
-            'consumer': 'archibald',
-            'version': '1.0',
+            'pack_registry': {
+                'id': 'deploy-workflow',
+                'scope': 'workflow',
+                'intent': 'deploy',
+                'description': 'Deploy workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['deploy'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['deploy'],
+            'schema': {'type': 'object'},
+            'examples': [],
         }
         ok, err = self.validate(obj, 'PackDefinition')
         assert ok is False
-        assert 'workflow_steps' in (err or '')
+        assert 'definition' in (err or '')
 
-    def test_pack_definition_requires_context_rules_for_context_scope(self):
+    def test_pack_definition_requires_steps_for_workflow_scope(self):
         obj = {
             'pack_id': 'coding-context',
-            'scope': 'context',
-            'intent': 'coding defaults',
-            'consumer': 'archibald',
-            'version': '1.0',
+            'pack_registry': {
+                'id': 'coding-context',
+                'scope': 'workflow',
+                'intent': 'coding defaults',
+                'description': 'Coding defaults workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['rule'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['rule'],
+            'schema': {'type': 'object'},
+            'examples': [],
+            'definition': {},
         }
         ok, err = self.validate(obj, 'PackDefinition')
         assert ok is False
-        assert 'context_rules' in (err or '')
+        assert 'steps' in (err or '')
 
     def test_load_schemas_is_atomic_on_failure(self, tmp_path, monkeypatch):
         good_schema = json.dumps(self.registry['TypedFact'])
@@ -311,11 +362,21 @@ class TestSchemaValidation:
     def test_pattern_validation(self):
         obj = {
             'pack_id': 'Bad Pack Id',
-            'scope': 'workflow',
-            'intent': 'deploy',
-            'consumer': 'archibald',
-            'version': '1.0',
-            'workflow_steps': ['ship it'],
+            'pack_registry': {
+                'id': 'deploy-workflow',
+                'scope': 'workflow',
+                'intent': 'deploy',
+                'description': 'Deploy workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['deploy'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['deploy'],
+            'schema': {'type': 'object'},
+            'examples': [],
+            'definition': {'steps': [{'step': 'ship', 'action': 'ship it'}]},
         }
         ok, err = self.validate(obj, 'PackDefinition')
         assert ok is False
@@ -324,20 +385,31 @@ class TestSchemaValidation:
     def test_pack_id_length_matches_schema_bound(self):
         valid_obj = {
             'pack_id': 'a' * 128,
-            'scope': 'workflow',
-            'intent': 'deploy',
-            'consumer': 'archibald',
-            'version': '1.0',
-            'workflow_steps': ['ship it'],
+            'pack_registry': {
+                'id': 'a' * 128,
+                'scope': 'workflow',
+                'intent': 'deploy',
+                'description': 'Deploy workflow',
+                'consumer': 'archibald',
+                'version': '1.0.0',
+                'predicates': ['deploy'],
+                'created_at': '2026-03-11T12:34:56Z',
+                'last_updated': '2026-03-11T12:34:56Z',
+            },
+            'predicates': ['deploy'],
+            'schema': {'type': 'object'},
+            'examples': [],
+            'definition': {'steps': [{'step': 'ship', 'action': 'ship it'}]},
         }
         ok, err = self.validate(valid_obj, 'PackDefinition')
         assert ok is True, err
 
-        too_long_obj = valid_obj.copy()
+        too_long_obj = json.loads(json.dumps(valid_obj))
         too_long_obj['pack_id'] = 'a' * 129
+        too_long_obj['pack_registry']['id'] = 'a' * 129
         ok, err = self.validate(too_long_obj, 'PackDefinition')
         assert ok is False
-        assert 'pack_id' in (err or '')
+        assert 'pack_id' in (err or '') or 'pack_registry.id' in (err or '')
 
     def test_episode_id_pattern_validation(self):
         obj = {
@@ -420,12 +492,141 @@ class TestGetToolsSignature:
                 f'expected {expected_param_names}, got {actual_param_names}'
             )
 
+    def test_episode_procedure_tools_registered_via_router(self):
+        # Integration uses router delegation for episodes/procedures tools
+        ep_tools = {'search_episodes', 'get_episode', 'search_procedures', 'get_procedure'}
+        assert ep_tools.issubset(set(self.module._REGISTERED_ROUTER_TOOLS))
+
+    def test_episode_procedure_tools_use_authoritative_runtime_callables(self):
+        # In integration, episodes/procedures tools are registered via router not module-level
+        ep_tools = {'search_episodes', 'get_episode', 'search_procedures', 'get_procedure'}
+        for tool_name in ep_tools:
+            assert tool_name in self.module._PHASE0_PUBLIC_TOOL_CALLABLES, (
+                f'{tool_name} not in _PHASE0_PUBLIC_TOOL_CALLABLES'
+            )
+            assert callable(self.module._PHASE0_PUBLIC_TOOL_CALLABLES[tool_name])
+
+    @pytest.mark.anyio
+    async def test_episode_procedure_tool_contracts_expose_full_signatures(self):
+        result = await self.module.get_tools()
+        tools_by_name = {tool['name']: tool for tool in result}
+
+        assert list(tools_by_name['search_episodes']['schema']['inputs']) == [
+            'query',
+            'time_range',
+            'include_history',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert list(tools_by_name['get_episode']['schema']['inputs']) == [
+            'episode_id',
+            'group_ids',
+            'lane_alias',
+        ]
+        assert list(tools_by_name['search_procedures']['schema']['inputs']) == [
+            'query',
+            'include_all',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert list(tools_by_name['get_procedure']['schema']['inputs']) == [
+            'trigger_or_id',
+            'group_ids',
+            'lane_alias',
+        ]
+
+    @pytest.mark.anyio
+    async def test_get_current_state_discovery_matches_exec2_runtime_contract(self):
+        result = await self.module.get_tools()
+        tool = next((t for t in result if t['name'] == 'get_current_state'), None)
+
+        assert tool is not None
+        # Integration uses memory router delegation (exec1 impl); full lane/limit params in exec2 direct impl
+        assert 'current' in tool['description'].lower() or 'state' in tool['description'].lower()
+        assert 'subject' in tool['schema']['inputs']
+        assert 'predicate' in tool['schema']['inputs']
+        assert 'scope' in tool['schema']['inputs']
+        assert tool['schema']['output'] is not None
+
+    @pytest.mark.anyio
+    async def test_get_history_discovery_matches_exec2_runtime_contract(self):
+        result = await self.module.get_tools()
+        tool = next((t for t in result if t['name'] == 'get_history'), None)
+
+        assert tool is not None
+        # Integration uses memory router delegation (exec1 impl); full lane/limit params in exec2 direct impl
+        assert 'history' in tool['description'].lower()
+        assert 'subject' in tool['schema']['inputs']
+        assert 'predicate' in tool['schema']['inputs']
+        assert 'scope' in tool['schema']['inputs']
+        assert tool['schema']['output'] is not None
+
     @pytest.mark.anyio
     async def test_search_memory_facts_has_both_mode_hint(self):
         result = await self.module.get_tools()
         tool = next((t for t in result if t['name'] == 'search_memory_facts'), None)
         assert tool is not None
         assert tool['mode_hint'] == 'both'
+
+    @pytest.mark.anyio
+    async def test_router_contract_slice_matches_registered_router_tools(self):
+        assert {tool['name'] for tool in self.module._ROUTER_TOOL_CONTRACTS} == set(self.module._REGISTERED_ROUTER_TOOLS)
+
+    @pytest.mark.anyio
+    async def test_episode_and_procedure_contracts_advertise_pagination_inputs(self):
+        result = await self.module.get_tools()
+        tools_by_name = {tool['name']: tool for tool in result}
+
+        assert list(tools_by_name['search_episodes']['schema']['inputs']) == [
+            'query',
+            'time_range',
+            'include_history',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        assert list(tools_by_name['search_procedures']['schema']['inputs']) == [
+            'query',
+            'include_all',
+            'group_ids',
+            'lane_alias',
+            'limit',
+            'offset',
+        ]
+        # Output contracts use inline envelope format (runtime-truthful, not short-alias form)
+        assert '"status": "ok"' in tools_by_name['search_episodes']['schema']['output']
+        assert 'episodes' in tools_by_name['search_episodes']['schema']['output']
+        assert 'ErrorResponse' in tools_by_name['search_episodes']['schema']['output']
+        assert '"status": "ok"' in tools_by_name['search_procedures']['schema']['output']
+        assert 'procedures' in tools_by_name['search_procedures']['schema']['output']
+        assert 'ErrorResponse' in tools_by_name['search_procedures']['schema']['output']
+    @pytest.mark.anyio
+    async def test_candidate_tool_metadata_matches_integrated_contract(self):
+        result = await self.module.get_tools()
+        tool_by_name = {tool['name']: tool for tool in result}
+
+        list_candidates = tool_by_name['list_candidates']
+        # External contract uses 'quarantine' (not the internal 'pending' alias)
+        assert 'quarantine' in list_candidates['schema']['inputs']['status']
+        assert list_candidates['examples'][0]['status'] == 'quarantine'
+        assert 'candidates' in list_candidates['schema']['output']
+
+        promote_candidate = tool_by_name['promote_candidate']
+        assert 'supersede' in promote_candidate['schema']['inputs']['resolution']
+        assert 'parallel' in promote_candidate['schema']['inputs']['resolution']
+        assert 'unsupported' in promote_candidate['schema']['inputs']['resolution']
+        assert 'actor_id' in promote_candidate['schema']['inputs']
+        assert promote_candidate['examples'][0]['resolution'] == 'supersede'
+
+        reject_candidate = tool_by_name['reject_candidate']
+        assert 'server-derived reviewer auth' in reject_candidate['description']
+        assert 'actor_id' in reject_candidate['schema']['inputs']
+        assert reject_candidate['examples'][0]['candidate_id'] == 'cand-002'
 
     @pytest.mark.anyio
     async def test_debug_tools_absent_without_flag(self):

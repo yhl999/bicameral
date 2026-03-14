@@ -48,6 +48,32 @@ CREATE_EVENT_TYPES = frozenset({'assert', 'supersede', 'refine', 'derive'})
 DB_PATH_DEFAULT = Path(__file__).resolve().parents[3] / 'state' / 'change_ledger.db'
 
 
+def resolve_ledger_path(override: str | Path | None = None) -> Path:
+    """Return the effective ledger DB path, honoring env overrides.
+
+    Resolution order:
+    1. Explicit *override* argument (from caller / test fixture).
+    2. ``BICAMERAL_CHANGE_LEDGER_DB`` env var.
+    3. ``BICAMERAL_CHANGE_LEDGER_PATH`` env var (legacy alias).
+    4. ``DB_PATH_DEFAULT`` (repo-relative ``state/change_ledger.db``).
+
+    All integrated routers MUST use this helper (or pass the result of it)
+    so that a non-default ledger path is honoured consistently across
+    memory, candidates, episodes/procedures, and packs.
+    """
+    import os
+
+    if override:
+        return Path(override)
+    env_db = (os.environ.get('BICAMERAL_CHANGE_LEDGER_DB') or '').strip()
+    if env_db:
+        return Path(env_db)
+    env_path = (os.environ.get('BICAMERAL_CHANGE_LEDGER_PATH') or '').strip()
+    if env_path:
+        return Path(env_path)
+    return Path(DB_PATH_DEFAULT)
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS change_events (
     event_id TEXT PRIMARY KEY,
@@ -436,6 +462,32 @@ class ChangeLedger:
             )
         return EntityRegistry(list(entries.values()))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection.
+
+        Safe to call multiple times; subsequent calls after the first are no-ops.
+        Callers that open a ledger for a short-lived read (e.g. pack
+        materialization inside the MCP server process) should call this when done,
+        or use the context-manager form::
+
+            with ChangeLedger(path) as ledger:
+                facts = ledger.current_state_facts()
+        """
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> ChangeLedger:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
     def promote_candidate_fact(
         self,
         *,
@@ -445,22 +497,24 @@ class ChangeLedger:
         candidate_id: str,
         fact: dict[str, Any],
         conflict_with_fact_id: str | None = None,
-        seeded_supersede_ok: bool = False,  # kept for API compat; gate removed — manual approval always supersedes
+        seeded_supersede_ok: bool = False,  # kept for API compat
+        allow_parallel: bool = False,
+        require_supersede: bool = False,
         recorded_at: str | None = None,
+        manage_transaction: bool = True,
     ) -> CandidatePromotionResult:
         """Promote a candidate fact into the ledger.
 
         Atomicity guarantee: the create/supersede event and the promote event
-        are inserted in a single SQLite transaction (_autocommit=False on both
-        append_event calls, followed by a single conn.commit()).  If anything
-        raises between the two inserts, neither event is committed.
+        are inserted in a single SQLite transaction. If anything raises between
+        the two inserts, neither event is committed.
 
-        One-current-object rule: when conflict_with_fact_id is provided and the
-        prior object exists in the ledger, this method ALWAYS performs a supersede
-        (regardless of seeded_supersede_ok).  Manual approval by a human actor is
-        explicit authorization to supersede; policy auto-supersede sets
-        seeded_supersede_ok=True in the trace, but the gate has been lifted for
-        both paths to avoid a second "current" fact in the same conflict set.
+        For historical compatibility, ``seeded_supersede_ok`` is accepted but no
+        longer changes behavior by itself. ``require_supersede`` fails closed
+        instead of silently degrading an explicit supersede request into a plain
+        assert when no valid target can be materialized. ``manage_transaction``
+        allows callers to compose candidate-row status transitions and ledger
+        writes inside one outer transaction.
         """
         recorded_at = recorded_at or _now_iso()
         typed_object = build_object_from_candidate_fact(
@@ -474,56 +528,56 @@ class ChangeLedger:
         creation_type = 'assert'
         parent_id: str | None = None
         root_id = typed_object.root_id
+        requested_conflict_with_fact_id = str(conflict_with_fact_id or '').strip() or None
+        resolved_conflict_with_fact_id = requested_conflict_with_fact_id
 
         # ── Serialize the read-currentness + write-events critical section ───
-        #
         # BEGIN IMMEDIATE acquires the write reservation (RESERVED lock) before
         # we read current state.  In WAL mode a plain DEFERRED BEGIN allows
         # another writer to slip in between our conflict-set scan and our commit,
         # which can yield two is_current=True facts in the same conflict set.
         # IMMEDIATE prevents that by forcing concurrent promotions to serialize
-        # here.  The busy_timeout pragma (set in connect()) makes the blocked
-        # writer retry for up to 5 s rather than failing immediately.
-        #
-        # This block also provides the atomicity guarantee: the create/supersede
-        # event and the promote event commit together, or neither commits.
+        # here.
         try:
-            self.conn.execute('BEGIN IMMEDIATE')
+            if manage_transaction:
+                self.conn.execute('BEGIN IMMEDIATE')
 
-            # ── Central enforcement: one current object per conflict set ─────
-            # Architecture lock (Phase 0): there must be exactly one
-            # is_current=True object per (subject, predicate, scope) triple at
-            # all times.
-            #
-            # The caller's conflict_with_fact_id is unreliable in two ways:
-            #   - missing: caller omitted it entirely (upstream wiring gap)
-            #   - stale:   caller provided an object_id that is no longer the
-            #              current occupant of the conflict set (e.g. an
-            #              already-superseded predecessor)
-            #
-            # In either case we find the *actual* current occupant (under the
-            # IMMEDIATE lock, so no new writer can change this between read and
-            # write) and use it as the authoritative supersession target.
-            # This scan runs only for StateFact promotions (conflict sets are
-            # defined only on state facts).
-            if isinstance(typed_object, StateFact):
+            # When parallel resolution is requested, explicitly skip the
+            # legacy one-current-object enforcement.
+            if not allow_parallel and isinstance(typed_object, StateFact):
                 _conflict_set = typed_object.conflict_set
                 for _current in self.current_state_facts():
                     if (
                         _current.conflict_set == _conflict_set
                         and _current.object_id != typed_object.object_id
+                        # Lane isolation: skip facts that cannot be auto-superseded
+                        # by this candidate.
+                        #
+                        # When the incoming candidate has a source_lane (lane isolation
+                        # is active), it must only auto-supersede facts from the same
+                        # lane.  This covers two cases:
+                        #   1. _current.source_lane differs (cross-lane): skip.
+                        #   2. _current.source_lane is None (legacy unscoped fact):
+                        #      also skip — hard-failing here is cleaner and safer than
+                        #      silently allowing a scoped candidate to absorb an
+                        #      unscoped lineage tree (which could span multiple lanes).
+                        # When the candidate has no source_lane (unscoped/global
+                        # deployment), no lane filter is applied.
+                        and not (
+                            typed_object.source_lane is not None
+                            and (
+                                _current.source_lane is None
+                                or _current.source_lane != typed_object.source_lane
+                            )
+                        )
                     ):
-                        # Override whatever (or nothing) the caller passed — the
-                        # actual current occupant is the authoritative target.
-                        conflict_with_fact_id = _current.object_id
+                        resolved_conflict_with_fact_id = _current.object_id
                         break
 
-            # Always supersede when a conflicting prior fact is identified and
-            # still exists in the ledger.  This enforces the one-current-object
-            # rule regardless of whether the promotion is automated or manual.
-            if conflict_with_fact_id:
-                prior = self.materialize_object(conflict_with_fact_id)
+            if not allow_parallel and resolved_conflict_with_fact_id:
+                prior = self.materialize_object(resolved_conflict_with_fact_id)
                 if prior is not None:
+                    _validate_supersede_target(candidate=typed_object, prior=prior)
                     creation_type = 'supersede'
                     parent_id = prior.object_id
                     root_id = prior.root_id
@@ -535,7 +589,17 @@ class ChangeLedger:
                         }
                     )
 
-            # Build both rows (validation happens here; no DB writes yet).
+            if require_supersede and creation_type != 'supersede':
+                if requested_conflict_with_fact_id:
+                    raise ValueError(
+                        'explicit supersede requested but no valid supersede target '
+                        f'was materialized for {requested_conflict_with_fact_id!r}'
+                    )
+                raise ValueError(
+                    'explicit supersede requested but no current conflict-set occupant '
+                    'was found to supersede'
+                )
+
             create_row = self._build_event_row(
                 creation_type,
                 actor_id=actor_id,
@@ -560,9 +624,11 @@ class ChangeLedger:
 
             self._do_insert(create_row)
             self._do_insert(promote_row)
-            self.conn.commit()
+            if manage_transaction:
+                self.conn.commit()
         except Exception:
-            self.conn.rollback()
+            if manage_transaction:
+                self.conn.rollback()
             raise
 
         event_ids = [create_row.event_id, promote_row.event_id]
@@ -811,7 +877,11 @@ def build_object_from_candidate_fact(
     if not evidence_refs:
         raise ValueError('candidate promotion requires evidence_refs')
 
-    source_lane = _source_lane_from_legacy_refs(fact.get('evidence_refs') or [])
+    # Prefer explicit source_lane from the fact dict (set during candidate creation
+    # in remember_fact); fall back to evidence refs for legacy callers.
+    source_lane = str(fact.get('source_lane') or '').strip() or None
+    if source_lane is None:
+        source_lane = _source_lane_from_legacy_refs(fact.get('evidence_refs') or [])
     source_key = _source_key_from_legacy_refs(fact.get('evidence_refs') or [])
     base = {
         'object_id': _stable_object_id(candidate_id),
@@ -878,6 +948,53 @@ def build_object_from_candidate_fact(
             'policy_version': policy_version,
         }
     )
+
+
+def _validate_supersede_target(*, candidate: TypedMemoryObject, prior: TypedMemoryObject) -> None:
+    if candidate.object_type != prior.object_type:
+        raise ValueError(
+            'incompatible supersede target: '
+            f'{candidate.object_type} candidate cannot supersede '
+            f'{prior.object_type} object {prior.object_id}'
+        )
+
+    if (
+        isinstance(candidate, StateFact)
+        and isinstance(prior, StateFact)
+        and candidate.conflict_set != prior.conflict_set
+    ):
+        raise ValueError(
+            'incompatible supersede target: '
+            f'state_fact conflict set mismatch for target {prior.object_id}'
+        )
+
+    # Lane isolation: when the candidate has a source_lane (lane isolation is
+    # active), the supersede target must belong to the exact same lane.
+    #
+    # Policy (hard-fail on unscoped legacy facts):
+    #   - prior.source_lane is None  → reject: a scoped candidate must not absorb
+    #     an unscoped lineage tree; the prior predates lane awareness and its
+    #     multi-lane provenance is unknown.
+    #   - prior.source_lane != candidate.source_lane → reject: classic cross-lane
+    #     supersede.
+    # When the candidate itself has no source_lane (global/unscoped deployment),
+    # no lane check is performed (backward-compatible).
+    if candidate.source_lane is not None:
+        if prior.source_lane is None:
+            raise ValueError(
+                'unscoped-fact supersede rejected: '
+                f'candidate (source_lane={candidate.source_lane!r}) cannot supersede '
+                f'an unscoped legacy fact (source_lane=None, object_id={prior.object_id!r}); '
+                f'when lane isolation is active the supersede target must belong to the '
+                f'same lane as the candidate'
+            )
+        if candidate.source_lane != prior.source_lane:
+            raise ValueError(
+                'cross-lane supersede rejected: '
+                f'candidate (source_lane={candidate.source_lane!r}) cannot supersede '
+                f'or adopt lineage from fact in a different lane '
+                f'(source_lane={prior.source_lane!r}, object_id={prior.object_id!r})'
+            )
 
 
 def _prepare_object_for_create_event(
@@ -987,6 +1104,24 @@ def _state_fact_type(assertion_type: str, predicate: str) -> str:
 
 
 def _source_lane_from_legacy_refs(refs: list[dict[str, Any]]) -> str | None:
+    """Return source_lane from legacy evidence ref dicts.
+
+    Reads the ``scope`` field from each ref as a lane/group identifier.  This
+    is correct for the ``truth.candidates`` path where evidence refs store the
+    real group_id in ``scope`` (e.g., ``'s1_observational_memory'``).
+
+    For the ``mcp_server`` router path, callers that need to preserve a real
+    group_id should pass it as ``source_lane`` in the top-level fact dict
+    instead, since there the ``scope`` field carries visibility policy
+    (``'private'``, ``'public'``) rather than a group identifier.
+    ``build_object_from_candidate_fact`` therefore checks ``fact['source_lane']``
+    before calling this function.
+
+    Note: serialised ``EvidenceRef`` model dicts (from ``.model_dump(mode='json')``)
+    do not carry a ``scope`` field, so this function correctly returns ``None``
+    for those callers and the top-level check in
+    ``build_object_from_candidate_fact`` takes priority.
+    """
     for ref in refs:
         scope = ref.get('scope')
         if isinstance(scope, str) and scope.strip():
