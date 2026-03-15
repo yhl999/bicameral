@@ -19,13 +19,23 @@ import os
 import re
 from collections.abc import Coroutine
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
 from dotenv import load_dotenv
 from neo4j import time as neo4j_time
-from numpy._typing import NDArray
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy._typing import NDArray
+else:
+    try:
+        import numpy as np
+        from numpy._typing import NDArray
+    except ImportError:
+        # numpy is optional; if unavailable, stub the types
+        np = None  # type: ignore
+        NDArray = None  # type: ignore
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import GroupIdValidationError
@@ -111,7 +121,9 @@ def lucene_sanitize(query: str) -> str:
     return sanitized
 
 
-def normalize_l2(embedding: list[float]) -> NDArray:
+def normalize_l2(embedding: list[float]) -> 'NDArray':
+    if np is None:
+        raise ImportError("numpy is required for normalize_l2 but is not installed")
     embedding_array = np.array(embedding)
     norm = np.linalg.norm(embedding_array, 2, axis=0, keepdims=True)
     return np.where(norm == 0, embedding_array, embedding_array / norm)

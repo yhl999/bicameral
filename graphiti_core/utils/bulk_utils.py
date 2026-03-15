@@ -18,10 +18,18 @@ import json
 import logging
 import typing
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-import numpy as np
 from pydantic import BaseModel, Field
 from typing_extensions import Any
+
+if TYPE_CHECKING:
+    import numpy as np
+else:
+    try:
+        import numpy as np
+    except ImportError:
+        np = None  # type: ignore
 
 from graphiti_core.driver.driver import (
     GraphDriver,

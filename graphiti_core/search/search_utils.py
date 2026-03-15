@@ -17,11 +17,20 @@ limitations under the License.
 import logging
 from collections import defaultdict
 from time import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-from numpy._typing import NDArray
 from typing_extensions import LiteralString
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy._typing import NDArray
+else:
+    try:
+        import numpy as np
+        from numpy._typing import NDArray
+    except ImportError:
+        np = None  # type: ignore
+        NDArray = None  # type: ignore
 
 from graphiti_core.driver.driver import (
     GraphDriver,

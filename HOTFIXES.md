@@ -99,6 +99,21 @@ Because the velocity of upstream `getzep/graphiti` is high, we track explicit pa
   - `patches/graphiti_core/utils/env_utils.py.patch`
   - `patches/graphiti_core/utils/maintenance/closure.py.patch`
 
+### 8) Numpy Optional Import Guard
+- Purpose: Allow module-level imports of `graphiti_core` submodules without requiring `numpy` to be installed (needed for lightweight test isolation and tooling that imports these modules but never calls numpy-dependent functions at runtime).
+- Files:
+  - `graphiti_core/helpers.py`
+  - `graphiti_core/cross_encoder/openai_reranker_client.py`
+  - `graphiti_core/search/search_utils.py`
+  - `graphiti_core/utils/bulk_utils.py`
+- Behavior:
+  - All four files wrap their `import numpy` in a `try/except ImportError` guard.
+  - Numpy-dependent functions (`normalize_l2`, reranker internals, bulk embedding utils) raise `ImportError` at call time if numpy is absent, rather than at import time.
+  - No behavioral change when numpy is installed.
+- Rationale: CI and local test suites import these modules directly for unit testing. Without the guard, any test file that triggers these imports (even indirectly) fails collection on environments where numpy is not installed. This was blocking `test_tool_result_scope.py` and related MCP surface tests.
+- Added to allowlist: `graphiti_core/helpers.py`, `graphiti_core/cross_encoder/openai_reranker_client.py`, `graphiti_core/utils/bulk_utils.py` (search_utils.py was already present).
+- Patches: `patches/graphiti_core/helpers.py.patch`, `patches/graphiti_core/cross_encoder/openai_reranker_client.py.patch`, `patches/graphiti_core/utils/bulk_utils.py.patch`
+
 ## How to Sync Upstream
 
 To safely absorb upstream updates while keeping these hotfixes:

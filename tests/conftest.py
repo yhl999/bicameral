@@ -8,8 +8,6 @@ import sys
 
 import pytest
 
-# Note: Do NOT modify sys.path globally here — tests should use relative imports
-# or explicit path setup. The conftest focus is just module isolation cleanup.
 
 # Save clean module state at import time
 _CLEAN_MODULES = set(sys.modules.keys())
