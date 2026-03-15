@@ -10,9 +10,16 @@ import random
 import time
 from dataclasses import dataclass
 
-import psutil
 import pytest
+
+try:
+    import psutil
+except ImportError:
+    psutil = None  # type: ignore
+
 from test_fixtures import TestDataGenerator, graphiti_test_client
+
+pytestmark = pytest.mark.skipif(psutil is None, reason="psutil not installed")
 
 
 @dataclass

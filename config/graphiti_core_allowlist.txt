@@ -1,9 +1,12 @@
+graphiti_core/cross_encoder/openai_reranker_client.py
+graphiti_core/helpers.py
 graphiti_core/search/search.py
 graphiti_core/search/search_config.py
 graphiti_core/search/search_config_recipes.py
 graphiti_core/search/search_utils.py
 graphiti_core/edges.py
 graphiti_core/graphiti.py
+graphiti_core/utils/bulk_utils.py
 graphiti_core/utils/content_chunking.py
 graphiti_core/utils/env_utils.py
 graphiti_core/utils/maintenance/closure.py
