@@ -20,6 +20,7 @@ def _test_config():
                 'observational_memory': ['s1_observational_memory'],
                 'curated': ['s1_curated_refs'],
             },
+            authorized_group_ids=[],
         ),
     )
 

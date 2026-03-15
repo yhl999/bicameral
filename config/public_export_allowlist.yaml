@@ -23,6 +23,7 @@ allowlist:
   - "images/**"
   - "reports/publicization/**"
   - "reports/upstream-sync/**"
+  - "events/**"
 
   # Build/release/config metadata
   - "config/**"
