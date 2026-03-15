@@ -152,7 +152,17 @@ class LLMConfig(BaseModel):
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )
     max_tokens: int = Field(default=16384, description='Max tokens')
+    reasoning_effort: str | None = Field(
+        default=None, description='Reasoning effort level (low, medium, high) for extended thinking models'
+    )
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
+
+
+class OllamaEmbedderProviderConfig(BaseModel):
+    """Ollama embedder provider configuration."""
+
+    api_url: str = Field(default='http://localhost:11434', description='Ollama API URL')
+    model: str = Field(default='embeddinggemma:latest', description='Ollama embedding model name')
 
 
 class EmbedderProvidersConfig(BaseModel):
@@ -162,6 +172,7 @@ class EmbedderProvidersConfig(BaseModel):
     azure_openai: AzureOpenAIProviderConfig | None = None
     gemini: GeminiProviderConfig | None = None
     voyage: VoyageProviderConfig | None = None
+    ollama: OllamaEmbedderProviderConfig | None = None
 
 
 class EmbedderConfig(BaseModel):
