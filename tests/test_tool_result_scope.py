@@ -14,9 +14,15 @@ Validates:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
+
+# Ensure repo root is on sys.path for config imports
+_repo_root = Path(__file__).parents[1]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
 # ---------------------------------------------------------------------------
 # 1. Allowlist module
