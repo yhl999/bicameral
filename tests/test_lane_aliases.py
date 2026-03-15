@@ -16,6 +16,7 @@ def _ensure_alias_config() -> None:
                 'observational_memory': ['s1_observational_memory'],
                 'curated': ['s1_curated_refs'],
             },
+            authorized_group_ids=[],
         ),
     )
 
