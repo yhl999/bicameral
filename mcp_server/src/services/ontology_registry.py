@@ -37,9 +37,11 @@ _KNOWN_METADATA_KEYS = {"om_extractor"}
 _VALID_EXTRACTION_MODES = {"permissive", "constrained_soft"}
 
 # Hard cap on intent_guidance / extraction_emphasis length before prompt injection.
-# Prevents accidental config bloat from consuming excessive LLM context window tokens.
-# Tighter than runtime truncation — enforced at load time so callers see bounded values.
-_INTENT_GUIDANCE_MAX_CHARS: int = 2048
+# These fields are operator-authored YAML config (not user-supplied input at request time).
+# The cap prevents accidental config bloat from consuming excessive LLM context window tokens,
+# and the sanitizer below strips control characters before any LLM injection.
+# 4096 is the functional minimum: V5 intent_guidance is ~2800 chars; 2048 truncated it mid-sentence.
+_INTENT_GUIDANCE_MAX_CHARS: int = 4096
 
 # Non-printable control characters that should never appear in prompt-injected config
 # values.  Keeps standard whitespace (\t, \n, \r) which are valid in multi-line YAML.
