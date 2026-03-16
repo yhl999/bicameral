@@ -35,6 +35,15 @@ except ImportError:  # pragma: no cover - test stubs may omit the concrete error
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+class AmbiguousMergeError(ValueError):
+    """Raised when a bucket is refused *only* because homonym-merge proof is missing.
+
+    Distinguished from generic ``ValueError`` so that ``--skip-ambiguous`` can
+    catch homonym-proof refusals without swallowing structural / data-integrity
+    errors raised elsewhere in ``_merge_bucket``.
+    """
+
 CORE_ENTITY_LABEL = 'Entity'
 _SAFE_LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _CONFLICTS_JSON_KEY = '_dedupe_conflicts_json'
@@ -605,7 +614,7 @@ def _require_homonym_merge_proof(
         for record in records
     }
 
-    raise ValueError(
+    raise AmbiguousMergeError(
         'Refusing to merge same-name entities without shared identity proof. '
         f'name={bucket_name!r} group_id={group_id!r} '
         f'bucket_uuids={bucket_uuids!r} '
@@ -993,7 +1002,7 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False, skip_ambigu
             logger.info('Merging %d copies of %r...', len(bucket['nodes']), bucket['name'])
             try:
                 total_merged += await _merge_bucket(client, backend, group_id, bucket)
-            except ValueError as exc:
+            except AmbiguousMergeError as exc:
                 if not skip_ambiguous:
                     raise
                 skipped_buckets.append(
