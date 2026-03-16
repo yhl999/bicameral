@@ -30,6 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 _SESSION_CHUNK_RE = re.compile(r'session chunk:\s*([^\(]+)')
+_CONVERSATION_ID_RE = re.compile(r'conversation_id=(\S+)')
 _SUBCHUNK_SUFFIX_RE = re.compile(r':p\d+$')
 _CHUNK_SUFFIX_RE = re.compile(r':c\d+$')
 
@@ -57,17 +58,23 @@ def infer_episode_stream_key(source_description: str | None) -> str:
     if not isinstance(source_description, str) or not source_description.strip():
         return ''
 
+    # Primary: "session chunk: <key>:c0:p1 ..." → strip chunk/sub-chunk suffixes
     match = _SESSION_CHUNK_RE.search(source_description)
-    if not match:
-        return ''
+    if match:
+        chunk_key = match.group(1).strip()
+        if chunk_key:
+            chunk_key = _SUBCHUNK_SUFFIX_RE.sub('', chunk_key)
+            chunk_key = _CHUNK_SUFFIX_RE.sub('', chunk_key)
+            stripped = chunk_key.strip()
+            if stripped:
+                return stripped
 
-    chunk_key = match.group(1).strip()
-    if not chunk_key:
-        return ''
+    # Fallback: "conversation_id=<uuid>" (ChatGPT history batch imports)
+    conv_match = _CONVERSATION_ID_RE.search(source_description)
+    if conv_match:
+        return f'conversation:{conv_match.group(1)}'
 
-    chunk_key = _SUBCHUNK_SUFFIX_RE.sub('', chunk_key)
-    chunk_key = _CHUNK_SUFFIX_RE.sub('', chunk_key)
-    return chunk_key.strip()
+    return ''
 
 
 def _episode_debug(episode: dict[str, Any]) -> dict[str, Any]:
