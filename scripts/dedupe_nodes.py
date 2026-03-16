@@ -16,10 +16,12 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from typing import Any
 
 from graph_driver import add_backend_args, get_graph_client
@@ -32,6 +34,15 @@ except ImportError:  # pragma: no cover - test stubs may omit the concrete error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class AmbiguousMergeError(ValueError):
+    """Raised when a bucket is refused *only* because homonym-merge proof is missing.
+
+    Distinguished from generic ``ValueError`` so that ``--skip-ambiguous`` can
+    catch homonym-proof refusals without swallowing structural / data-integrity
+    errors raised elsewhere in ``_merge_bucket``.
+    """
 
 CORE_ENTITY_LABEL = 'Entity'
 _SAFE_LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -603,7 +614,7 @@ def _require_homonym_merge_proof(
         for record in records
     }
 
-    raise ValueError(
+    raise AmbiguousMergeError(
         'Refusing to merge same-name entities without shared identity proof. '
         f'name={bucket_name!r} group_id={group_id!r} '
         f'bucket_uuids={bucket_uuids!r} '
@@ -874,7 +885,55 @@ async def _merge_bucket(client, backend: str, group_id: str, bucket: dict) -> in
     return len(loser_uuids)
 
 
-async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
+def _build_ambiguous_record(bucket: dict, group_id: str, error: str) -> dict[str, Any]:
+    """Build a machine-readable record for one skipped ambiguous bucket."""
+    nodes = list(bucket.get('nodes') or [])
+    return {
+        'name': str(bucket.get('name') or ''),
+        'group_id': group_id,
+        'node_count': len(nodes),
+        'uuids': [str(n.get('uuid') or '') for n in nodes],
+        'typed_labels': sorted(
+            {
+                str(label)
+                for node in nodes
+                for label in _normalize_typed_labels(node.get('labels'), group_id)
+            }
+        ),
+        'error': error,
+    }
+
+
+def _write_ambiguous_report(
+    skipped: list[dict[str, Any]],
+    group_id: str,
+    report_path: str | None,
+    total_buckets: int,
+    merged_count: int,
+) -> str | None:
+    """Write a JSON report of skipped ambiguous buckets. Returns the path written, or None."""
+    if not skipped:
+        return None
+
+    report = {
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'group_id': group_id,
+        'total_buckets': total_buckets,
+        'merged_successfully': merged_count,
+        'skipped_ambiguous': len(skipped),
+        'buckets': skipped,
+    }
+
+    if report_path is None:
+        report_path = f'dedupe_ambiguous_report_{group_id}.json'
+
+    os.makedirs(os.path.dirname(report_path) if os.path.dirname(report_path) else '.', exist_ok=True)
+    with open(report_path, 'w') as fh:
+        json.dump(report, fh, indent=2, default=str)
+    return report_path
+
+
+async def dedupe_nodes(backend, host, port, group_id, dry_run=False, skip_ambiguous=False, ambiguous_report=None):
     logger.info('Connecting to %s for group_id=%s', backend, group_id)
     if backend == 'falkordb':
         logger.warning(
@@ -883,6 +942,8 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
         )
     if dry_run:
         logger.info('DRY RUN mode — no changes will be written.')
+    if skip_ambiguous:
+        logger.info('SKIP-AMBIGUOUS mode — ambiguous buckets will be skipped and reported.')
     client = await get_graph_client(backend, group_id=group_id, host=host, port=port)
 
     try:
@@ -936,11 +997,38 @@ async def dedupe_nodes(backend, host, port, group_id, dry_run=False):
             return
 
         total_merged = 0
+        skipped_buckets: list[dict[str, Any]] = []
         for bucket in buckets:
             logger.info('Merging %d copies of %r...', len(bucket['nodes']), bucket['name'])
-            total_merged += await _merge_bucket(client, backend, group_id, bucket)
+            try:
+                total_merged += await _merge_bucket(client, backend, group_id, bucket)
+            except AmbiguousMergeError as exc:
+                if not skip_ambiguous:
+                    raise
+                skipped_buckets.append(
+                    _build_ambiguous_record(bucket, group_id, str(exc))
+                )
+                logger.warning(
+                    '  [skip-ambiguous] Skipped %r (%d node(s)): %s',
+                    bucket.get('name'),
+                    len(bucket.get('nodes') or []),
+                    exc,
+                )
+                continue
 
-        logger.info('Dedup complete. Merged %d duplicate node(s).', total_merged)
+        if skipped_buckets:
+            report_path = _write_ambiguous_report(
+                skipped_buckets, group_id, ambiguous_report, len(buckets), total_merged,
+            )
+            logger.warning(
+                'Dedup complete with skips. Merged %d duplicate node(s); '
+                'skipped %d ambiguous bucket(s). Report: %s',
+                total_merged,
+                len(skipped_buckets),
+                report_path,
+            )
+        else:
+            logger.info('Dedup complete. Merged %d duplicate node(s).', total_merged)
     finally:
         await client.close()
 
@@ -968,6 +1056,20 @@ if __name__ == '__main__':
         default=False,
         help='Required flag to confirm destructive deduplication (deletes and rewires nodes).',
     )
+    parser.add_argument(
+        '--skip-ambiguous',
+        action='store_true',
+        default=False,
+        help='Continue past ambiguous same-name buckets that lack shared identity proof, '
+        'skipping them instead of aborting. Skipped buckets are logged at WARNING level '
+        'and written to a JSON report file.',
+    )
+    parser.add_argument(
+        '--ambiguous-report',
+        default=None,
+        help='Path for the JSON report of skipped ambiguous buckets. '
+        'Defaults to dedupe_ambiguous_report_<group_id>.json in the current directory.',
+    )
     args = parser.parse_args()
 
     if not args.dry_run and not args.confirm_destructive:
@@ -976,7 +1078,17 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        asyncio.run(dedupe_nodes(args.backend, args.host, args.port, args.group_id, dry_run=args.dry_run))
+        asyncio.run(
+            dedupe_nodes(
+                args.backend,
+                args.host,
+                args.port,
+                args.group_id,
+                dry_run=args.dry_run,
+                skip_ambiguous=args.skip_ambiguous,
+                ambiguous_report=args.ambiguous_report,
+            )
+        )
     except GraphDriverSetupError as exc:
         logger.error('%s', exc)
         sys.exit(2)
