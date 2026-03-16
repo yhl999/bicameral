@@ -913,3 +913,45 @@ def test_repair_timeline_refuses_ambiguous_groups_before_delete() -> None:
 
     assert len(fake_client.query_calls) == 1
     assert fake_client.closed is True
+
+
+def test_infer_episode_stream_key_extracts_conversation_id() -> None:
+    """ChatGPT history batch imports use conversation_id= in source_description."""
+    sd = 'chatgpt_history_vnext_batch mode=permissive evidence_id=651fb210c6678bf2 conversation_id=b57c90ac-f328-40ad-a493-4434d6db5395'
+    assert repair_timeline.infer_episode_stream_key(sd) == 'conversation:b57c90ac-f328-40ad-a493-4434d6db5395'
+
+
+def test_infer_episode_stream_key_prefers_session_chunk_over_conversation_id() -> None:
+    """session chunk: takes precedence when both are present."""
+    sd = 'session chunk: sessions:xyz:c0 (scope=private) conversation_id=abc123'
+    assert repair_timeline.infer_episode_stream_key(sd) == 'sessions:xyz'
+
+
+def test_build_timeline_groups_partitions_by_conversation_id() -> None:
+    """Verify conversation_id-based stream grouping works for ChatGPT batch episodes."""
+    episodes = [
+        {
+            'uuid': 'ep-conv1-a',
+            'created_at': '2024-01-04T20:00:00Z',
+            'source_description': 'chatgpt_history_vnext_batch mode=permissive evidence_id=aaa conversation_id=conv-1',
+            'saga_uuids': [],
+        },
+        {
+            'uuid': 'ep-conv1-b',
+            'created_at': '2024-01-04T20:05:00Z',
+            'source_description': 'chatgpt_history_vnext_batch mode=permissive evidence_id=bbb conversation_id=conv-1',
+            'saga_uuids': [],
+        },
+        {
+            'uuid': 'ep-conv2-a',
+            'created_at': '2024-02-01T10:00:00Z',
+            'source_description': 'chatgpt_history_vnext_batch mode=permissive evidence_id=ccc conversation_id=conv-2',
+            'saga_uuids': [],
+        },
+    ]
+
+    groups = repair_timeline.build_timeline_groups(episodes)
+
+    assert sorted(groups) == ['stream:conversation:conv-1', 'stream:conversation:conv-2']
+    assert [ep['uuid'] for ep in groups['stream:conversation:conv-1']] == ['ep-conv1-a', 'ep-conv1-b']
+    assert [ep['uuid'] for ep in groups['stream:conversation:conv-2']] == ['ep-conv2-a']
