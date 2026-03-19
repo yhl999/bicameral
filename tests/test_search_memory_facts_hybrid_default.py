@@ -1,0 +1,786 @@
+"""Tests for the Hybrid Default Surface Implementation (v1).
+
+Covers:
+- Default path uses hybrid retrieval + reranking (not graph-only stub)
+- Explicit retrieval_mode='hybrid' gives the same behaviour
+- Explicit retrieval_mode='graph' still returns graph-only FactSearchResponse
+- Explicit retrieval_mode='typed' still routes to typed-ledger path
+- Empty-result behaviour: both sources empty → deterministic empty hybrid response
+- Partial-result cases: graph empty / typed empty
+- Hybrid response shape is deterministic and testable
+- No contract regressions (graph + typed paths unchanged)
+- HybridRetrievalService.merge() and rrf_merge_hybrid() unit tests
+"""
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from tests.helpers_mcp_import import load_graphiti_mcp_server
+
+# Also import the service module directly for unit tests.
+import importlib, sys, pathlib
+
+# Make the service importable without a live Neo4j connection.
+_svc_path = str(
+    pathlib.Path(__file__).parent.parent / "mcp_server" / "src" / "services"
+)
+if _svc_path not in sys.path:
+    sys.path.insert(0, _svc_path)
+
+from mcp_server.src.services.typed_retrieval_service import (
+    HybridRetrievalService,
+    rrf_merge_hybrid,
+)
+
+server = load_graphiti_mcp_server()
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+# ── Shared fixtures ───────────────────────────────────────────────────────────
+
+
+def _test_config():
+    """Minimal config: Neo4j, no OM groups in scope, no authorized restriction."""
+    return SimpleNamespace(
+        database=SimpleNamespace(provider="neo4j"),
+        graphiti=SimpleNamespace(
+            group_id="s1_sessions_main",
+            lane_aliases={
+                "sessions_main": ["s1_sessions_main"],
+                "observational_memory": ["s1_observational_memory"],
+            },
+            authorized_group_ids=[],
+        ),
+    )
+
+
+def _fake_typed_payload(state=None, procedures=None):
+    state = state or []
+    procedures = procedures or []
+    return {
+        "message": "Typed memory retrieved successfully",
+        "retrieval_mode": "typed",
+        "result_format": "typed",
+        "query_mode": "all",
+        "state": state,
+        "episodes": [],
+        "procedures": procedures,
+        "evidence": [],
+        "counts": {
+            "state": len(state),
+            "episodes": 0,
+            "procedures": len(procedures),
+            "evidence": 0,
+        },
+        "filters_applied": {"object_types": ["state_fact", "procedure"], "metadata_filters": {}},
+        "limits_applied": {},
+    }
+
+
+class _FakeHybridRetrievalService:
+    """Test double for HybridRetrievalService.
+
+    Captures calls and returns configurable payloads without touching the
+    change ledger or any real services.
+    """
+
+    def __init__(self, typed_payload: dict | None = None, merged_override: list | None = None):
+        self.typed_payload = typed_payload or _fake_typed_payload()
+        self.merged_override = merged_override  # if set, merge() returns this list
+        self.get_typed_calls: list[dict] = []
+        self.merge_calls: list[dict] = []
+
+    async def get_typed_candidates(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_typed_calls.append(kwargs)
+        return self.typed_payload
+
+    def merge(
+        self,
+        *,
+        graph_facts: list[dict],
+        typed_results: dict,
+        max_facts: int,
+    ) -> list[dict[str, Any]]:
+        self.merge_calls.append(
+            {"graph_facts": graph_facts, "typed_results": typed_results, "max_facts": max_facts}
+        )
+        if self.merged_override is not None:
+            return self.merged_override[:max_facts]
+        # Simple deterministic merge: graph first, then typed state, then procedures.
+        state = typed_results.get("state", []) or []
+        procedures = typed_results.get("procedures", []) or []
+        combined = (
+            [{"_source": "graph", **f} for f in graph_facts]
+            + [{"_source": "typed_state", **s} for s in state]
+            + [{"_source": "typed_procedure", **p} for p in procedures]
+        )
+        return combined[:max_facts]
+
+
+class _FakeSearchResults:
+    """Fake graphiti search results (no real Neo4j edges)."""
+
+    def __init__(self, edges=None):
+        self.edges = edges or []
+        self.nodes = []
+
+
+class _FakeGraphitiClient:
+    def __init__(self, edges=None):
+        self._edges = edges or []
+
+    async def search_(self, **kwargs: Any) -> _FakeSearchResults:
+        return _FakeSearchResults(self._edges)
+
+
+class _FakeGraphitiService:
+    """Minimal fake that passes the ``is None`` check and returns no edges."""
+
+    def __init__(self, edges=None):
+        self._edges = edges or []
+
+    async def get_client_for_group(self, group_id: str) -> _FakeGraphitiClient:
+        return _FakeGraphitiClient(self._edges)
+
+
+class _FakeSearchService:
+    """Minimal fake for the module-level search_service dependency."""
+
+    def includes_observational_memory(self, group_ids: list[str]) -> bool:
+        return False
+
+
+# ── Helper: run a hybrid search call with standard mocks ─────────────────────
+
+
+def _run_hybrid(
+    query: str = "test query",
+    retrieval_mode: str | None = None,
+    group_ids: list[str] | None = None,
+    max_facts: int = 10,
+    fake_typed_payload: dict | None = None,
+    fake_merged_override: list | None = None,
+    **kwargs: Any,
+) -> dict:
+    """Run search_memory_facts with hybrid mocks, return the raw response."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
+
+    fake_hybrid = _FakeHybridRetrievalService(
+        typed_payload=fake_typed_payload,
+        merged_override=fake_merged_override,
+    )
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = _FakeGraphitiService()
+        server.HybridRetrievalService = lambda **_kw: fake_hybrid
+        server.search_service = _FakeSearchService()
+
+        return _run(
+            server.search_memory_facts(
+                query=query,
+                retrieval_mode=retrieval_mode,
+                group_ids=group_ids or ["s1_sessions_main"],
+                max_facts=max_facts,
+                ctx=None,
+                **kwargs,
+            )
+        ), fake_hybrid
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §1  Default path is hybrid (not graph-only stub)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_default_path_returns_hybrid_response_shape():
+    """No retrieval_mode supplied → default 'hybrid' → hybrid response dict."""
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01", "subject": "user", "predicate": "likes", "value": "tea"}]
+    )
+    response, fake_hybrid = _run_hybrid(fake_typed_payload=typed_payload)
+
+    assert isinstance(response, dict), f"Expected dict, got {type(response)}"
+    assert response.get("retrieval_mode") == "hybrid"
+    assert "facts" in response
+    assert "typed_candidates" in response
+    assert "merged_results" in response
+    assert "result_count" in response
+
+
+def test_default_path_calls_typed_candidates():
+    """Default hybrid path must call get_typed_candidates (typed retrieval is used)."""
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01", "subject": "user", "predicate": "likes", "value": "tea"}]
+    )
+    response, fake_hybrid = _run_hybrid(fake_typed_payload=typed_payload)
+
+    assert len(fake_hybrid.get_typed_calls) == 1, (
+        "Expected exactly one get_typed_candidates call in default hybrid path"
+    )
+
+
+def test_default_path_calls_merge():
+    """Default hybrid path must call merge to combine graph + typed results."""
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01", "subject": "user", "predicate": "likes", "value": "tea"}]
+    )
+    response, fake_hybrid = _run_hybrid(fake_typed_payload=typed_payload)
+
+    assert len(fake_hybrid.merge_calls) == 1, (
+        "Expected exactly one merge() call in default hybrid path"
+    )
+
+
+def test_default_path_typed_candidates_present_in_response():
+    """Typed state facts from the typed path appear in typed_candidates of the response."""
+    state_item = {
+        "object_id": "sf_01",
+        "object_type": "state_fact",
+        "subject": "user",
+        "predicate": "likes",
+        "value": "tea",
+    }
+    typed_payload = _fake_typed_payload(state=[state_item])
+    response, _ = _run_hybrid(fake_typed_payload=typed_payload)
+
+    typed_cands = response.get("typed_candidates", {})
+    assert typed_cands.get("counts", {}).get("state", 0) == 1, (
+        f"Expected 1 typed state candidate, got: {typed_cands}"
+    )
+    assert len(typed_cands.get("state", [])) == 1
+
+
+def test_default_path_result_count_matches_merged_list():
+    """result_count must equal len(merged_results)."""
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01"}, {"object_id": "sf_02"}]
+    )
+    response, _ = _run_hybrid(fake_typed_payload=typed_payload)
+
+    assert response["result_count"] == len(response["merged_results"]), (
+        "result_count must equal len(merged_results)"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §2  Explicit retrieval_mode='hybrid' behaves identically to default
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_explicit_hybrid_returns_same_shape_as_default():
+    """retrieval_mode='hybrid' explicit → identical response shape to default."""
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01"}]
+    )
+    response, fake_hybrid = _run_hybrid(
+        retrieval_mode="hybrid", fake_typed_payload=typed_payload
+    )
+
+    assert response.get("retrieval_mode") == "hybrid"
+    assert "merged_results" in response
+    assert len(fake_hybrid.get_typed_calls) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §3  Explicit graph path is unchanged (no typed candidates, FactSearchResponse)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_explicit_graph_does_not_call_hybrid_service():
+    """retrieval_mode='graph' must NOT invoke HybridRetrievalService."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
+
+    fake_hybrid = _FakeHybridRetrievalService()
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = _FakeGraphitiService()
+        server.HybridRetrievalService = lambda **_kw: fake_hybrid
+        server.search_service = _FakeSearchService()
+
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                retrieval_mode="graph",
+                group_ids=["s1_sessions_main"],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
+
+    assert fake_hybrid.get_typed_calls == [], (
+        "Graph path must not call get_typed_candidates"
+    )
+    assert fake_hybrid.merge_calls == [], (
+        "Graph path must not call merge()"
+    )
+
+
+def test_explicit_graph_returns_fact_search_response_shape():
+    """retrieval_mode='graph' with no edges → FactSearchResponse empty shape."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    original_search_service = server.search_service
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = _FakeGraphitiService()  # returns no edges
+        server.search_service = _FakeSearchService()
+
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                retrieval_mode="graph",
+                group_ids=["s1_sessions_main"],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+        server.search_service = original_search_service
+
+    # Empty graph → FactSearchResponse
+    assert "facts" in response or "error" in response, (
+        f"Unexpected graph response shape: {response!r}"
+    )
+    # Must NOT have hybrid-specific keys
+    assert "merged_results" not in response
+    assert "typed_candidates" not in response
+
+
+def test_explicit_graph_with_null_graphiti_returns_initialized_error():
+    """retrieval_mode='graph', graphiti_service=None → deterministic error."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = None
+
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                retrieval_mode="graph",
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+
+    assert response == {"error": "Graphiti service not initialized"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §4  Explicit typed path is unchanged
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_explicit_typed_routes_to_typed_service():
+    """retrieval_mode='typed' still routes to TypedRetrievalService (unchanged)."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_service_cls = server.TypedRetrievalService
+
+    payload = {
+        "message": "Typed memory retrieved successfully",
+        "retrieval_mode": "typed",
+        "result_format": "typed",
+        "query_mode": "current",
+        "state": [],
+        "episodes": [],
+        "procedures": [],
+        "evidence": [],
+        "counts": {"state": 0, "episodes": 0, "procedures": 0, "evidence": 0},
+        "filters_applied": {},
+        "limits_applied": {},
+    }
+
+    class _FakeTyped:
+        async def search(self, **kw):
+            return payload
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.TypedRetrievalService = lambda **_kw: _FakeTyped()
+
+        response = _run(
+            server.search_memory_facts(
+                query="current state",
+                retrieval_mode="typed",
+                group_ids=["s1_sessions_main"],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.TypedRetrievalService = original_service_cls
+
+    assert response == payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §5  Empty-result behaviour
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_both_empty_returns_deterministic_empty_response():
+    """Both graph and typed empty → deterministic empty hybrid response (not error)."""
+    empty_payload = _fake_typed_payload()  # no state, no procedures
+    response, _ = _run_hybrid(
+        fake_typed_payload=empty_payload,
+        fake_merged_override=[],  # merge returns empty
+    )
+
+    assert isinstance(response, dict)
+    assert response.get("retrieval_mode") == "hybrid"
+    assert response.get("merged_results") == []
+    assert response.get("result_count") == 0
+    assert response.get("facts") == []
+    typed_cands = response.get("typed_candidates", {})
+    assert typed_cands.get("state", []) == []
+    assert typed_cands.get("procedures", []) == []
+
+
+def test_hybrid_both_empty_message_indicates_no_results():
+    """Empty hybrid result has a 'No relevant memory found' message."""
+    response, _ = _run_hybrid(
+        fake_typed_payload=_fake_typed_payload(),
+        fake_merged_override=[],
+    )
+    assert "No relevant" in response.get("message", ""), (
+        f"Unexpected message: {response.get('message')!r}"
+    )
+
+
+def test_hybrid_graph_empty_typed_has_results():
+    """Graph empty but typed has state facts → merged_results contains typed items."""
+    state_item = {
+        "object_id": "sf_01",
+        "object_type": "state_fact",
+        "subject": "user",
+        "predicate": "prefers",
+        "value": "dark roast",
+        "is_current": True,
+    }
+    typed_payload = _fake_typed_payload(state=[state_item])
+    response, _ = _run_hybrid(fake_typed_payload=typed_payload)
+
+    # Graph was empty (FakeGraphitiService returns no edges); typed has items.
+    assert response.get("result_count", 0) >= 1, (
+        "Expected at least one result when typed has candidates"
+    )
+    assert any(
+        r.get("_source") in ("typed_state", "typed_procedure")
+        for r in response.get("merged_results", [])
+    ), "merged_results should contain typed items when graph is empty"
+
+
+def test_hybrid_empty_response_has_all_required_keys():
+    """Empty hybrid response must include all required top-level keys."""
+    response, _ = _run_hybrid(
+        fake_typed_payload=_fake_typed_payload(),
+        fake_merged_override=[],
+    )
+    required = {"message", "retrieval_mode", "facts", "typed_candidates", "merged_results", "result_count"}
+    missing = required - set(response.keys())
+    assert not missing, f"Missing keys in empty hybrid response: {missing}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §6  Contract regressions: hybrid with graphiti_service=None still errors
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_with_null_graphiti_returns_initialized_error():
+    """Default hybrid + graphiti_service=None → 'Graphiti service not initialized'."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = None
+
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+
+    assert response == {"error": "Graphiti service not initialized"}
+
+
+def test_explicit_hybrid_with_null_graphiti_returns_initialized_error():
+    """Explicit hybrid + graphiti_service=None → same error (fail-closed)."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = None
+
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                retrieval_mode="hybrid",
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+
+    assert response == {"error": "Graphiti service not initialized"}
+
+
+def test_valid_retrieval_modes_still_contains_hybrid():
+    """VALID_RETRIEVAL_MODES must still contain 'hybrid'."""
+    assert "hybrid" in server.VALID_RETRIEVAL_MODES
+
+
+def test_invalid_retrieval_mode_still_returns_error():
+    """Invalid retrieval_mode still returns a deterministic error (unchanged contract)."""
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                retrieval_mode="totally_invalid",
+                ctx=None,
+            )
+        )
+    finally:
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert "error" in response
+    assert "retrieval_mode must be one of" in response["error"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §7  HybridRetrievalService unit tests (typed_retrieval_service.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rrf_merge_hybrid_empty_inputs():
+    """All empty sources → empty merged list."""
+    result = rrf_merge_hybrid(
+        graph_facts=[],
+        typed_state=[],
+        typed_procedures=[],
+        max_facts=10,
+    )
+    assert result == []
+
+
+def test_rrf_merge_hybrid_graph_only():
+    """Graph facts only → all items present with _source='graph'."""
+    facts = [{"uuid": "f1", "fact": "user likes coffee"}, {"uuid": "f2", "fact": "user is admin"}]
+    result = rrf_merge_hybrid(
+        graph_facts=facts,
+        typed_state=[],
+        typed_procedures=[],
+        max_facts=10,
+    )
+    assert len(result) == 2
+    assert all(r.get("_source") == "graph" for r in result)
+
+
+def test_rrf_merge_hybrid_typed_only():
+    """Typed candidates only → items present with typed_state source."""
+    state = [{"object_id": "sf_01", "subject": "u", "predicate": "p", "value": "v"}]
+    result = rrf_merge_hybrid(
+        graph_facts=[],
+        typed_state=state,
+        typed_procedures=[],
+        max_facts=10,
+    )
+    assert len(result) == 1
+    assert result[0].get("_source") == "typed_state"
+
+
+def test_rrf_merge_hybrid_max_facts_respected():
+    """max_facts caps the merged list length."""
+    facts = [{"uuid": f"f{i}", "fact": f"fact {i}"} for i in range(10)]
+    state = [{"object_id": f"sf{i}"} for i in range(10)]
+    result = rrf_merge_hybrid(
+        graph_facts=facts,
+        typed_state=state,
+        typed_procedures=[],
+        max_facts=5,
+    )
+    assert len(result) == 5
+
+
+def test_rrf_merge_hybrid_scores_are_annotated():
+    """Every item in the merged result has a _hybrid_score float."""
+    facts = [{"uuid": "f1", "fact": "x"}]
+    state = [{"object_id": "sf1"}]
+    result = rrf_merge_hybrid(
+        graph_facts=facts,
+        typed_state=state,
+        typed_procedures=[],
+        max_facts=10,
+    )
+    for item in result:
+        assert "_hybrid_score" in item, f"Missing _hybrid_score on {item!r}"
+        assert isinstance(item["_hybrid_score"], float)
+
+
+def test_rrf_merge_hybrid_graph_ranked_higher_than_typed():
+    """Graph item at rank-1 should outscore typed item at rank-1 (graph weight > typed weight)."""
+    facts = [{"uuid": "gf1", "fact": "top graph fact"}]
+    state = [{"object_id": "sf1", "subject": "a", "predicate": "b", "value": "c"}]
+    result = rrf_merge_hybrid(
+        graph_facts=facts,
+        typed_state=state,
+        typed_procedures=[],
+        max_facts=10,
+    )
+    assert len(result) == 2
+    # Graph item should be first (higher weight).
+    assert result[0].get("_source") == "graph", (
+        f"Expected graph item first, got _source={result[0].get('_source')!r}"
+    )
+
+
+def test_rrf_merge_hybrid_max_facts_zero():
+    """max_facts=0 → empty list (no division by zero)."""
+    result = rrf_merge_hybrid(
+        graph_facts=[{"uuid": "f1"}],
+        typed_state=[{"object_id": "sf1"}],
+        typed_procedures=[],
+        max_facts=0,
+    )
+    assert result == []
+
+
+def test_rrf_merge_hybrid_procedure_source_label():
+    """Procedure items are labeled 'typed_procedure'."""
+    procs = [{"object_id": "pr1", "name": "reset password", "trigger": "user forgets"}]
+    result = rrf_merge_hybrid(
+        graph_facts=[],
+        typed_state=[],
+        typed_procedures=procs,
+        max_facts=10,
+    )
+    assert len(result) == 1
+    assert result[0].get("_source") == "typed_procedure"
+
+
+def test_hybrid_retrieval_service_merge_delegates_to_rrf():
+    """HybridRetrievalService.merge() produces a list from rrf_merge_hybrid."""
+    svc = HybridRetrievalService.__new__(HybridRetrievalService)
+    # Manually set _typed_service to a sentinel (merge doesn't use it).
+    svc.om_projection_service = None
+    svc._typed_service = None
+
+    graph_facts = [{"uuid": "g1", "fact": "graph fact"}]
+    typed_results = {
+        "state": [{"object_id": "sf1", "subject": "u", "predicate": "p", "value": "v"}],
+        "procedures": [],
+    }
+    merged = svc.merge(graph_facts=graph_facts, typed_results=typed_results, max_facts=5)
+
+    assert isinstance(merged, list)
+    assert len(merged) == 2
+    sources = {item.get("_source") for item in merged}
+    assert "graph" in sources
+    assert "typed_state" in sources
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §8  Hybrid query propagation (typed candidates receive correct args)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_typed_candidates_receive_query_and_group_ids():
+    """get_typed_candidates must be called with the correct query and group scope."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    _response, fake_hybrid = _run_hybrid(
+        query="my specific query",
+        group_ids=["s1_sessions_main"],
+        fake_typed_payload=typed_payload,
+    )
+
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call = fake_hybrid.get_typed_calls[0]
+    assert call.get("query") == "my specific query"
+    assert call.get("effective_group_ids") == ["s1_sessions_main"]
+
+
+def test_hybrid_max_facts_forwarded_to_typed_candidates():
+    """max_facts is forwarded to get_typed_candidates as max_candidates."""
+    typed_payload = _fake_typed_payload()
+    _response, fake_hybrid = _run_hybrid(
+        max_facts=7,
+        fake_typed_payload=typed_payload,
+        fake_merged_override=[],
+    )
+
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call = fake_hybrid.get_typed_calls[0]
+    assert call.get("max_candidates") == 7
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §9  Hybrid retrieval_mode key is present on ALL hybrid responses
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_response_always_has_retrieval_mode_key():
+    """Every non-error hybrid response must carry retrieval_mode='hybrid'."""
+    for state_count in (0, 1, 3):
+        state = [{"object_id": f"sf{i}"} for i in range(state_count)]
+        typed_payload = _fake_typed_payload(state=state)
+        merged = [{"_source": "typed_state", **s} for s in state]
+        response, _ = _run_hybrid(
+            fake_typed_payload=typed_payload,
+            fake_merged_override=merged if merged else [],
+        )
+        assert response.get("retrieval_mode") == "hybrid", (
+            f"state_count={state_count}: expected retrieval_mode='hybrid', got {response!r}"
+        )
