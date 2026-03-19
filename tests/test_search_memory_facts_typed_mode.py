@@ -246,7 +246,7 @@ def test_search_memory_facts_typed_mode_rejects_non_hybrid_search_mode():
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
 
     assert response == {
-        'error': "search_mode is not supported for result_format='typed'; use 'hybrid' or omit it"
+        'error': "search_mode is not supported for retrieval_mode='typed'; use 'hybrid' or omit it"
     }
 
 
@@ -268,7 +268,7 @@ def test_search_memory_facts_typed_mode_rejects_center_node_uuid():
         server.config = original_config
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
 
-    assert response == {'error': "center_node_uuid is not supported for result_format='typed'"}
+    assert response == {'error': "center_node_uuid is not supported for retrieval_mode='typed'"}
 
 
 def test_search_memory_facts_typed_mode_caps_requested_limits_before_service_call():

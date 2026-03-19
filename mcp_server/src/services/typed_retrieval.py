@@ -310,7 +310,8 @@ class TypedRetrievalService:
         if total_objects == 0:
             return {
                 'message': 'No relevant typed memory found',
-                'result_format': 'typed',
+                'retrieval_mode': 'typed',
+                'result_format': 'typed',  # deprecated compat alias; use retrieval_mode
                 'query_mode': query_mode,
                 'state': [],
                 'episodes': [],
@@ -323,7 +324,8 @@ class TypedRetrievalService:
 
         return {
             'message': 'Typed memory retrieved successfully',
-            'result_format': 'typed',
+            'retrieval_mode': 'typed',
+            'result_format': 'typed',  # deprecated compat alias; use retrieval_mode
             'query_mode': query_mode,
             'state': bucketed['state'],
             'episodes': bucketed['episodes'],
