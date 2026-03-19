@@ -425,6 +425,11 @@ def configure_uvicorn_logging():
 logger = logging.getLogger(__name__)
 SAFE_GROUP_ID_RE = re.compile(r'^[a-zA-Z0-9_]+$')
 VALID_SEARCH_MODES = {'hybrid', 'semantic', 'keyword'}
+# Top-level retrieval-surface selector (contract v1).
+# 'graph'  – graph-edge path only (legacy facts surface).
+# 'typed'  – typed-ledger retrieval path.
+# 'hybrid' – fuse both surfaces (default; full fusion logic is a planned follow-up).
+VALID_RETRIEVAL_MODES = {'graph', 'typed', 'hybrid'}
 
 _UNSAFE_CHAR_RE = re.compile(r'[<>&\x00-\x1f\x7f-\x9f]')
 _FUSION_TOKEN_RE = re.compile(r'[a-z0-9]+')
@@ -1039,16 +1044,20 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
         ),
         _tool_schema_entry(
             name='search_memory_facts',
-            description='Search memory facts through the legacy graph-edge path or the typed retrieval contract',
+            description=(
+                'Search memory facts. Use retrieval_mode to select the surface: '
+                '"graph" (edge path), "typed" (ledger path), or "hybrid" (default, fused).'
+            ),
             mode_hint='both',
             inputs={
                 'query': 'string',
                 'group_ids': 'list[string] | null',
                 'lane_alias': 'list[string] | null',
-                'search_mode': '"hybrid" | "semantic" | "keyword" (default "hybrid")',
+                'retrieval_mode': '"graph" | "typed" | "hybrid" (default "hybrid")',
+                'search_mode': '"hybrid" | "semantic" | "keyword" (default "hybrid", graph-internal only)',
                 'max_facts': 'integer (default 10)',
-                'center_node_uuid': 'string | null',
-                'result_format': '"facts" | "typed" (default "facts")',
+                'center_node_uuid': 'string | null (graph only)',
+                'result_format': '"facts" | "typed" (deprecated; use retrieval_mode)',
                 'object_types': 'list[string] | null',
                 'metadata_filters': 'object | null',
                 'history_mode': '"auto" | "current" | "history" | "all" (default "auto")',
@@ -1058,17 +1067,22 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
             },
             output='FactSearchResponse | typed retrieval contract dict | ErrorResponse',
             examples=[
-                {'query': 'user preferences', 'result_format': 'typed'},
-                {'query': 'recent events', 'result_format': 'facts'},
+                {'query': 'user preferences', 'retrieval_mode': 'typed'},
+                {'query': 'recent events', 'retrieval_mode': 'graph'},
+                {'query': 'current state', 'retrieval_mode': 'hybrid'},
             ],
             details={
-                'facts': (
+                'graph': (
                     'Search Neo4j/FalkorDB graph edges (legacy). '
                     'Broad recall, lower precision on current state.'
                 ),
                 'typed': (
                     'Ledger-backed retrieval of typed objects and evidence. '
                     "Use for 'what is current/active?' queries."
+                ),
+                'hybrid': (
+                    'Fuses graph and typed results. Default surface. '
+                    'Full fusion logic is a planned follow-up; currently routes to graph path.'
                 ),
                 'om_note': 'OM content is projected from Neo4j in both modes.',
             },
@@ -1792,6 +1806,7 @@ async def search_memory_facts(
     query: str,
     group_ids: list[str] | None = None,
     lane_alias: list[str] | None = None,
+    retrieval_mode: str | None = None,
     search_mode: str = 'hybrid',
     max_facts: int = 10,
     center_node_uuid: str | None = None,
@@ -1806,21 +1821,31 @@ async def search_memory_facts(
 ) -> dict[str, Any] | ErrorResponse:
     """Search memory through the established facts surface.
 
-    Default behavior preserves the legacy facts-only contract. Set
-    ``result_format='typed'`` to opt into the Phase 3 typed retrieval contract
-    (state + episodes + procedures + evidence buckets) without introducing a
-    second MCP search surface.
+    Retrieval surface is selected by ``retrieval_mode`` (contract v1):
+    - ``'graph'``  – graph-edge path (legacy facts surface).
+    - ``'typed'``  – typed-ledger retrieval (state + episodes + procedures + evidence).
+    - ``'hybrid'`` – fused surface (default). Full fusion is a planned follow-up;
+      currently routes to the graph path.
+
+    ``search_mode`` is graph-internal only (``hybrid|semantic|keyword``); it is
+    not a top-level surface selector and must not be supplied when
+    ``retrieval_mode='typed'``.
+
+    Backward compat: ``result_format='typed'`` is a deprecated alias for
+    ``retrieval_mode='typed'``; ``retrieval_mode`` takes precedence when both
+    are supplied.
 
     Args:
         query: The search query
         group_ids: Optional explicit list of group IDs to filter results (highest precedence)
         lane_alias: Optional lane aliases resolved via config.graphiti.lane_aliases
-        search_mode: Retrieval mode for legacy facts path: hybrid|semantic|keyword
+        retrieval_mode: Top-level retrieval surface selector: graph|typed|hybrid (default hybrid)
+        search_mode: Graph-internal retrieval mode: hybrid|semantic|keyword (graph surface only)
         max_facts: Maximum number of facts to return (default: 10). Also used as
-            the default typed result cap when ``result_format='typed'`` and
+            the default typed result cap when ``retrieval_mode='typed'`` and
             ``max_results`` is omitted.
-        center_node_uuid: Optional UUID of a node to center the legacy facts search around
-        result_format: facts|typed
+        center_node_uuid: Optional UUID of a node to center the graph facts search around
+        result_format: Deprecated alias for retrieval_mode. Use retrieval_mode instead.
         object_types: Optional typed bucket filter. Accepted values: state|episodes|procedures
         metadata_filters: Optional typed metadata filter map applied against typed object fields
         history_mode: Typed retrieval mode: auto|current|history|all
@@ -1831,9 +1856,30 @@ async def search_memory_facts(
     global graphiti_service
 
     try:
-        normalized_result_format = (result_format or 'facts').strip().lower()
-        if normalized_result_format not in {'facts', 'typed'}:
-            return ErrorResponse(error="result_format must be one of: 'facts', 'typed'")
+        # --- Retrieval-surface resolution (contract v1) ---
+        # 'retrieval_mode' is the canonical top-level selector (graph|typed|hybrid).
+        # 'result_format' is a deprecated alias retained for backward compatibility.
+        # 'retrieval_mode' takes precedence when both are supplied.
+        if retrieval_mode is not None:
+            resolved_retrieval_mode = retrieval_mode.strip().lower()
+            if resolved_retrieval_mode not in VALID_RETRIEVAL_MODES:
+                return ErrorResponse(
+                    error=f"retrieval_mode must be one of: {sorted(VALID_RETRIEVAL_MODES)}"
+                )
+        else:
+            # Legacy compat: result_format='typed' aliases to retrieval_mode='typed'.
+            normalized_result_format = (result_format or 'facts').strip().lower()
+            if normalized_result_format not in {'facts', 'typed'}:
+                return ErrorResponse(error="result_format must be one of: 'facts', 'typed'")
+            if normalized_result_format == 'typed':
+                logger.warning(
+                    "search_memory_facts: result_format='typed' is deprecated; "
+                    "use retrieval_mode='typed' instead"
+                )
+                resolved_retrieval_mode = 'typed'
+            else:
+                # result_format='facts' (default): surface defaults to 'hybrid'.
+                resolved_retrieval_mode = 'hybrid'
 
         # Validate max_facts parameter and apply defense-in-depth cap.
         if max_facts <= 0:
@@ -1858,7 +1904,7 @@ async def search_memory_facts(
         # typed retrieval path (both pass effective_group_ids to the backend).
         if not effective_group_ids and config.graphiti.authorized_group_ids:
             logger.warning('search_memory_facts: authorized scope intersection yielded empty — failing closed')
-            if normalized_result_format == 'typed':
+            if resolved_retrieval_mode == 'typed':
                 return {
                     'state_facts': [], 'episodes': [], 'procedures': [],
                     'evidence': [], 'result_count': 0,
@@ -1883,7 +1929,9 @@ async def search_memory_facts(
                 )
                 return ErrorResponse(error='rate limit exceeded; retry later')
 
-        if normalized_result_format == 'typed':
+        # 'graph' and 'hybrid' (stub) both route to the graph path.
+        # 'hybrid' full fusion (graph + typed fused) is a planned follow-up.
+        if resolved_retrieval_mode == 'typed':
             normalized_mode = (search_mode or 'hybrid').strip().lower()
             if normalized_mode not in VALID_SEARCH_MODES:
                 return ErrorResponse(
@@ -1894,10 +1942,12 @@ async def search_memory_facts(
                 )
             if normalized_mode != 'hybrid':
                 return ErrorResponse(
+                    # Error string kept for backward compatibility; retrieval_mode is the new name.
                     error="search_mode is not supported for result_format='typed'; use 'hybrid' or omit it"
                 )
             if center_node_uuid is not None:
                 return ErrorResponse(
+                    # Error string kept for backward compatibility; retrieval_mode is the new name.
                     error="center_node_uuid is not supported for result_format='typed'"
                 )
 
