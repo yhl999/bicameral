@@ -484,12 +484,12 @@ def test_retrieval_mode_typed_wins_over_result_format_facts():
 
 def test_valid_retrieval_modes_constant_contains_exactly_three_values():
     """VALID_RETRIEVAL_MODES set has exactly the three documented values."""
-    assert server.VALID_RETRIEVAL_MODES == {'graph', 'typed', 'hybrid'}
+    assert {'graph', 'typed', 'hybrid'} == server.VALID_RETRIEVAL_MODES
 
 
 def test_valid_search_modes_constant_unchanged():
     """VALID_SEARCH_MODES (graph-internal) remains hybrid|semantic|keyword."""
-    assert server.VALID_SEARCH_MODES == {'hybrid', 'semantic', 'keyword'}
+    assert {'hybrid', 'semantic', 'keyword'} == server.VALID_SEARCH_MODES
 
 
 def test_retrieval_mode_and_search_mode_are_orthogonal():
