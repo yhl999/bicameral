@@ -519,3 +519,65 @@ def test_retrieval_mode_and_search_mode_are_orthogonal():
 
     # Reached graph path without parameter conflict errors.
     assert response == {'error': 'Graphiti service not initialized'}
+
+
+# ---------------------------------------------------------------------------
+# P2 fix: error strings now reference canonical retrieval_mode, not result_format
+# ---------------------------------------------------------------------------
+
+def test_search_mode_error_references_retrieval_mode_not_result_format():
+    """Error for typed+search_mode must say retrieval_mode='typed', not result_format='typed'."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test',
+                retrieval_mode='typed',
+                search_mode='semantic',
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert 'error' in response
+    assert "retrieval_mode='typed'" in response['error'], (
+        f"Error should reference retrieval_mode='typed', got: {response['error']!r}"
+    )
+    assert "result_format='typed'" not in response['error'], (
+        f"Error should not reference deprecated result_format, got: {response['error']!r}"
+    )
+
+
+def test_center_node_uuid_error_references_retrieval_mode_not_result_format():
+    """Error for typed+center_node_uuid must say retrieval_mode='typed', not result_format='typed'."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test',
+                retrieval_mode='typed',
+                center_node_uuid='some-node',
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert 'error' in response
+    assert "retrieval_mode='typed'" in response['error'], (
+        f"Error should reference retrieval_mode='typed', got: {response['error']!r}"
+    )
+    assert "result_format='typed'" not in response['error'], (
+        f"Error should not reference deprecated result_format, got: {response['error']!r}"
+    )

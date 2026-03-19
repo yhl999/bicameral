@@ -1942,13 +1942,11 @@ async def search_memory_facts(
                 )
             if normalized_mode != 'hybrid':
                 return ErrorResponse(
-                    # Error string kept for backward compatibility; retrieval_mode is the new name.
-                    error="search_mode is not supported for result_format='typed'; use 'hybrid' or omit it"
+                    error="search_mode is not supported for retrieval_mode='typed'; use 'hybrid' or omit it"
                 )
             if center_node_uuid is not None:
                 return ErrorResponse(
-                    # Error string kept for backward compatibility; retrieval_mode is the new name.
-                    error="center_node_uuid is not supported for result_format='typed'"
+                    error="center_node_uuid is not supported for retrieval_mode='typed'"
                 )
 
             effective_max_results = max_facts if max_results is None else max_results

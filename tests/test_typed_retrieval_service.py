@@ -167,7 +167,8 @@ def test_search_caps_typed_limits_and_reports_applied_limits():
         )
     )
 
-    assert response['result_format'] == 'typed'
+    assert response['retrieval_mode'] == 'typed'
+    assert response['result_format'] == 'typed'  # deprecated compat alias still present
     assert response['counts'] == {'state': 1, 'episodes': 0, 'procedures': 0, 'evidence': 1}
     assert response['limits_applied']['max_results'] == {'requested': 999, 'effective': 200}
     assert response['limits_applied']['max_evidence'] == {'requested': 999, 'effective': 200}
@@ -1259,3 +1260,23 @@ def test_real_om_projection_preserves_same_node_uuid_across_multiple_groups():
         ('group_a', 'om_episode:group_a:shared_node'),
         ('group_b', 'om_episode:group_b:shared_node'),
     }
+
+
+# ---------------------------------------------------------------------------
+# Contract: retrieval_mode field in response payloads (P2 fix)
+# ---------------------------------------------------------------------------
+
+def test_search_response_includes_retrieval_mode_field_on_empty_results():
+    """Zero-results response must include retrieval_mode='typed' (canonical) alongside result_format."""
+    ledger = _memory_ledger()
+    service = TypedRetrievalService(ledger=ledger, evidence_registry=_FakeEvidenceRegistry())
+
+    response = _run(service.search(query='xyzzy_no_match', object_types=['state']))
+
+    assert response['message'] == 'No relevant typed memory found'
+    assert response['retrieval_mode'] == 'typed', (
+        "retrieval_mode must be 'typed' in zero-results payload (canonical contract field)"
+    )
+    assert response['result_format'] == 'typed', (
+        "result_format must still be present for backward-compat callers"
+    )
