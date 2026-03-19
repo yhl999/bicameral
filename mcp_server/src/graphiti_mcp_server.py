@@ -2072,6 +2072,17 @@ async def search_memory_facts(
         # ── Hybrid path (retrieval_mode='hybrid', the default) ───────────────
         # Fetch typed state + procedure candidates and merge with graph recall
         # via Reciprocal Rank Fusion.
+
+        # P0: intersect metadata_filters with lane scope before querying typed
+        # candidates — matching the typed-only path behaviour.
+        try:
+            hybrid_effective_filters = _intersect_source_lane_filter(
+                metadata_filters=metadata_filters,
+                effective_group_ids=effective_group_ids,
+            )
+        except ValueError as filter_err:
+            return ErrorResponse(error=str(filter_err))
+
         hybrid_svc = HybridRetrievalService(
             om_projection_service=OMTypedProjectionService(
                 search_service=search_service,
@@ -2083,7 +2094,9 @@ async def search_memory_facts(
                 query=query,
                 effective_group_ids=effective_group_ids,
                 max_candidates=max_facts,
-                metadata_filters=metadata_filters,
+                metadata_filters=hybrid_effective_filters,
+                history_mode=history_mode,
+                current_only=current_only,
             )
         except Exception as hybrid_err:
             logger.warning(
@@ -2104,8 +2117,11 @@ async def search_memory_facts(
         typed_state: list[dict[str, Any]] = typed_results.get('state', []) or []
         typed_procedures: list[dict[str, Any]] = typed_results.get('procedures', []) or []
 
+        # P1: include candidate_rows from OM facts (parity with graph path).
+        hybrid_candidate_rows = build_om_candidate_rows(om_facts)
+
         if not merged_hybrid:
-            return {
+            empty_response: dict[str, Any] = {
                 'message': 'No relevant memory found',
                 'retrieval_mode': 'hybrid',
                 'facts': [],
@@ -2117,8 +2133,11 @@ async def search_memory_facts(
                 'merged_results': [],
                 'result_count': 0,
             }
+            if hybrid_candidate_rows:
+                empty_response['candidate_rows'] = hybrid_candidate_rows
+            return empty_response
 
-        return {
+        hybrid_response: dict[str, Any] = {
             'message': 'Hybrid memory retrieved successfully',
             'retrieval_mode': 'hybrid',
             'facts': merged_graph_facts,
@@ -2133,6 +2152,9 @@ async def search_memory_facts(
             'merged_results': merged_hybrid,
             'result_count': len(merged_hybrid),
         }
+        if hybrid_candidate_rows:
+            hybrid_response['candidate_rows'] = hybrid_candidate_rows
+        return hybrid_response
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')

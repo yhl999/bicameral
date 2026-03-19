@@ -184,6 +184,8 @@ class HybridRetrievalService:
         effective_group_ids: list[str] | None = None,
         max_candidates: int = 10,
         metadata_filters: dict[str, Any] | None = None,
+        history_mode: str = "auto",
+        current_only: bool | None = None,
     ) -> dict[str, Any]:
         """Run typed retrieval (state + procedures only) for the hybrid candidate pool.
 
@@ -196,6 +198,10 @@ class HybridRetrievalService:
             max_candidates: Cap on typed results (mirrors max_facts).
             metadata_filters: Optional metadata filter map (already intersected
                 with group scope by the caller).
+            history_mode: Typed retrieval mode forwarded from the caller
+                (``'auto'`` | ``'current'`` | ``'history'`` | ``'all'``).
+            current_only: Optional explicit override for current-only typed
+                retrieval, forwarded from the caller.
 
         Returns:
             Typed retrieval result dict (``state``, ``procedures``, ``counts``, …).
@@ -205,8 +211,8 @@ class HybridRetrievalService:
             query=query,
             object_types=["state", "procedure"],
             metadata_filters=metadata_filters or {},
-            history_mode="auto",
-            current_only=None,
+            history_mode=history_mode,
+            current_only=current_only,
             max_results=max_candidates,
             max_evidence=0,
             effective_group_ids=effective_group_ids,

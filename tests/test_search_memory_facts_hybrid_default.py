@@ -784,3 +784,189 @@ def test_hybrid_response_always_has_retrieval_mode_key():
         assert response.get("retrieval_mode") == "hybrid", (
             f"state_count={state_count}: expected retrieval_mode='hybrid', got {response!r}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §10  P0: Lane-scope intersection (metadata_filters must be intersected)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_metadata_filters_intersected_with_group_ids():
+    """P0: metadata_filters passed to get_typed_candidates must already be
+    intersected with the effective_group_ids lane scope, not passed raw."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    _response, fake_hybrid = _run_hybrid(
+        query="test",
+        group_ids=["s1_sessions_main"],
+        fake_typed_payload=typed_payload,
+        metadata_filters=None,
+    )
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call = fake_hybrid.get_typed_calls[0]
+    # After intersection, metadata_filters must carry the lane scope in source_lane.
+    forwarded = call.get("metadata_filters") or {}
+    assert "source_lane" in forwarded, (
+        f"P0: metadata_filters should contain source_lane after intersection; got {forwarded!r}"
+    )
+    source_lane = forwarded["source_lane"]
+    # source_lane must reference the effective group_ids
+    lane_values = source_lane.get("in", []) if isinstance(source_lane, dict) else []
+    assert "s1_sessions_main" in lane_values, (
+        f"P0: effective group_id 's1_sessions_main' missing from intersected source_lane; "
+        f"got {source_lane!r}"
+    )
+
+
+def test_hybrid_invalid_source_lane_filter_returns_error():
+    """P0: invalid metadata_filters.source_lane shape returns an ErrorResponse
+    (not an unhandled exception), matching typed-only path behaviour."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
+
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = _FakeGraphitiService()
+        server.HybridRetrievalService = lambda **_kw: _FakeHybridRetrievalService()
+        server.search_service = _FakeSearchService()
+
+        response = _run(
+            server.search_memory_facts(
+                query="test",
+                group_ids=["s1_sessions_main"],
+                metadata_filters={"source_lane": {"bad_key": "x"}},  # invalid shape
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
+
+    assert "error" in response, f"Expected error for invalid source_lane shape; got {response!r}"
+
+
+def test_hybrid_caller_source_lane_is_intersected_not_replaced():
+    """P0: caller-supplied source_lane is intersected with (not replaced by) group scope."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    original_search_service = server.search_service
+    original_hybrid_cls = server.HybridRetrievalService
+
+    fake_hybrid = _FakeHybridRetrievalService(typed_payload=typed_payload)
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = _FakeGraphitiService()
+        server.search_service = _FakeSearchService()
+        server.HybridRetrievalService = lambda **_kw: fake_hybrid
+
+        _response = _run(
+            server.search_memory_facts(
+                query="test",
+                group_ids=["s1_sessions_main"],
+                # Caller requests a lane that is IN scope → should survive intersection.
+                metadata_filters={"source_lane": "s1_sessions_main"},
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+        server.search_service = original_search_service
+        server.HybridRetrievalService = original_hybrid_cls
+
+    assert fake_hybrid.get_typed_calls, "Expected get_typed_candidates to be called"
+    call = fake_hybrid.get_typed_calls[0]
+    forwarded = call.get("metadata_filters") or {}
+    source_lane = forwarded.get("source_lane")
+    # Intersection of ['s1_sessions_main'] ∩ ['s1_sessions_main'] = ['s1_sessions_main']
+    lane_values = source_lane.get("in", []) if isinstance(source_lane, dict) else []
+    assert "s1_sessions_main" in lane_values, (
+        f"P0: matching lane should survive intersection; got source_lane={source_lane!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §11  P1: history_mode and current_only forwarding
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_history_mode_forwarded_to_typed_candidates():
+    """P1: history_mode is forwarded to get_typed_candidates (not hardcoded 'auto')."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    _response, fake_hybrid = _run_hybrid(
+        fake_typed_payload=typed_payload,
+        history_mode="current",
+    )
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call = fake_hybrid.get_typed_calls[0]
+    assert call.get("history_mode") == "current", (
+        f"P1: expected history_mode='current' forwarded to typed candidates; got {call!r}"
+    )
+
+
+def test_hybrid_current_only_forwarded_to_typed_candidates():
+    """P1: current_only=True is forwarded to get_typed_candidates."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    _response, fake_hybrid = _run_hybrid(
+        fake_typed_payload=typed_payload,
+        current_only=True,
+    )
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call = fake_hybrid.get_typed_calls[0]
+    assert call.get("current_only") is True, (
+        f"P1: expected current_only=True forwarded to typed candidates; got {call!r}"
+    )
+
+
+def test_hybrid_history_mode_all_forwarded():
+    """P1: history_mode='all' (non-default) is forwarded correctly."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    _response, fake_hybrid = _run_hybrid(
+        fake_typed_payload=typed_payload,
+        history_mode="all",
+    )
+    call = fake_hybrid.get_typed_calls[0]
+    assert call.get("history_mode") == "all", (
+        f"P1: expected history_mode='all'; got {call!r}"
+    )
+
+
+def test_hybrid_current_only_false_forwarded():
+    """P1: current_only=False (explicit falsy) is forwarded and not swallowed."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    _response, fake_hybrid = _run_hybrid(
+        fake_typed_payload=typed_payload,
+        current_only=False,
+    )
+    call = fake_hybrid.get_typed_calls[0]
+    assert call.get("current_only") is False, (
+        f"P1: expected current_only=False; got {call!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §12  P1: candidate_rows parity — hybrid response includes candidate_rows
+#          when OM facts produce them (non-regression)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_hybrid_response_no_candidate_rows_when_om_absent():
+    """When OM lane is not in scope, candidate_rows is absent from the hybrid response."""
+    typed_payload = _fake_typed_payload(state=[{"object_id": "sf_01"}])
+    response, _ = _run_hybrid(fake_typed_payload=typed_payload)
+    # _FakeSearchService returns includes_observational_memory=False → no OM facts
+    # → candidate_rows must be absent (no spurious empty list).
+    assert "candidate_rows" not in response, (
+        f"P1: candidate_rows should be absent when OM is not in scope; got {response!r}"
+    )
