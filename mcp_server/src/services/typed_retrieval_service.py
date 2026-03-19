@@ -214,7 +214,7 @@ class HybridRetrievalService:
             history_mode=history_mode,
             current_only=current_only,
             max_results=max_candidates,
-            max_evidence=0,
+            max_evidence=20,
             effective_group_ids=effective_group_ids,
         )
 
