@@ -14,16 +14,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import sys
 from types import SimpleNamespace
 from typing import Any
-
-import pytest
 
 from tests.helpers_mcp_import import load_graphiti_mcp_server
 
 # Also import the service module directly for unit tests.
-import importlib, sys, pathlib
-
 # Make the service importable without a live Neo4j connection.
 _svc_path = str(
     pathlib.Path(__file__).parent.parent / "mcp_server" / "src" / "services"
@@ -31,7 +29,7 @@ _svc_path = str(
 if _svc_path not in sys.path:
     sys.path.insert(0, _svc_path)
 
-from mcp_server.src.services.typed_retrieval_service import (
+from mcp_server.src.services.typed_retrieval_service import (  # noqa: E402
     HybridRetrievalService,
     rrf_merge_hybrid,
 )
@@ -320,7 +318,7 @@ def test_explicit_graph_does_not_call_hybrid_service():
         server.HybridRetrievalService = lambda **_kw: fake_hybrid
         server.search_service = _FakeSearchService()
 
-        response = _run(
+        _run(
             server.search_memory_facts(
                 query="test",
                 retrieval_mode="graph",
@@ -1116,10 +1114,6 @@ def test_hybrid_clean_run_has_no_diagnostics_key():
 
 def test_rrf_k_constant_is_60():
     """_HYBRID_RRF_K must be 60.0 (experiment-calibrated; do not revert to 1.0)."""
-    import importlib
-    import sys
-    import pathlib
-
     svc_path = str(pathlib.Path(__file__).parent.parent / "mcp_server" / "src" / "services")
     if svc_path not in sys.path:
         sys.path.insert(0, svc_path)

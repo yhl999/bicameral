@@ -106,3 +106,8 @@ docstring-code-format = true
 include = ["graphiti_core"]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+]
