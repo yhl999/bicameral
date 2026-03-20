@@ -686,3 +686,138 @@ def test_center_node_uuid_error_references_retrieval_mode_not_result_format():
     assert "result_format='typed'" not in response['error'], (
         f"Error should not reference deprecated result_format, got: {response['error']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P2 fix: fail-closed edge path returns hybrid-shaped response for hybrid mode
+# ---------------------------------------------------------------------------
+
+def _restricted_config(authorized_group_ids):
+    """Config with authorized_group_ids set to a non-empty list (restriction active)."""
+    return SimpleNamespace(
+        database=SimpleNamespace(provider='neo4j'),
+        graphiti=SimpleNamespace(
+            group_id='s1_sessions_main',
+            lane_aliases={
+                'sessions_main': ['s1_sessions_main'],
+            },
+            authorized_group_ids=authorized_group_ids,
+        ),
+    )
+
+
+def test_failclosed_hybrid_returns_hybrid_shaped_empty_response():
+    """P2 regression: when authorized scope intersection yields empty and
+    retrieval_mode resolves to 'hybrid', the fail-closed path must return a
+    hybrid-shaped empty response (not a FactSearchResponse graph shape).
+
+    Discriminating keys: retrieval_mode='hybrid', merged_results, typed_candidates.
+    """
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        # authorized_group_ids is set → restriction is active.
+        # caller requests a lane NOT in authorized_group_ids → empty intersection.
+        server.config = _restricted_config(authorized_group_ids=['s1_authorized_lane'])
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test query',
+                retrieval_mode='hybrid',
+                group_ids=['s1_unauthorized_lane'],  # not in authorized set → empty intersection
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    # Must be a dict (hybrid shape), not a FactSearchResponse object.
+    assert isinstance(response, dict), (
+        f"Fail-closed hybrid must return dict, got {type(response)!r}: {response!r}"
+    )
+    # Must carry the hybrid contract discriminators.
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"Fail-closed hybrid must have retrieval_mode='hybrid', got: {response!r}"
+    )
+    assert 'merged_results' in response, (
+        f"Fail-closed hybrid must have merged_results key; got keys: {list(response.keys())!r}"
+    )
+    assert 'typed_candidates' in response, (
+        f"Fail-closed hybrid must have typed_candidates key; got keys: {list(response.keys())!r}"
+    )
+    # Must be empty (nothing was retrieved).
+    assert response['merged_results'] == []
+    assert response['facts'] == []
+    assert response['result_count'] == 0
+    assert response['typed_candidates']['state'] == []
+    assert response['typed_candidates']['procedures'] == []
+
+
+def test_failclosed_default_mode_returns_hybrid_shaped_empty_response():
+    """P2 regression: fail-closed on the DEFAULT retrieval_mode (which resolves
+    to 'hybrid') must also return a hybrid-shaped empty response.
+    """
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _restricted_config(authorized_group_ids=['s1_authorized_lane'])
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test query',
+                # retrieval_mode omitted → resolves to 'hybrid' default
+                group_ids=['s1_unauthorized_lane'],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert isinstance(response, dict)
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"Fail-closed default (hybrid) must have retrieval_mode='hybrid', got: {response!r}"
+    )
+    assert 'merged_results' in response
+    assert response['merged_results'] == []
+    assert response['result_count'] == 0
+
+
+def test_failclosed_graph_mode_returns_graph_shaped_empty_response():
+    """Sanity check: fail-closed for retrieval_mode='graph' still returns
+    the graph-shaped FactSearchResponse (no regression on graph path).
+    FactSearchResponse is a TypedDict so we check shape by key presence.
+    """
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _restricted_config(authorized_group_ids=['s1_authorized_lane'])
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test query',
+                retrieval_mode='graph',
+                group_ids=['s1_unauthorized_lane'],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    # FactSearchResponse shape: has 'message' and 'facts', but NOT hybrid keys.
+    assert isinstance(response, dict), f"Expected dict, got {type(response)!r}"
+    assert 'message' in response, f"Graph fail-closed must have 'message' key: {response!r}"
+    assert 'facts' in response, f"Graph fail-closed must have 'facts' key: {response!r}"
+    assert response['facts'] == []
+    # Must NOT carry hybrid discriminators.
+    assert 'retrieval_mode' not in response, (
+        f"Graph fail-closed must NOT have retrieval_mode key; got: {response!r}"
+    )
+    assert 'merged_results' not in response, (
+        f"Graph fail-closed must NOT have merged_results key; got: {response!r}"
+    )

@@ -1914,6 +1914,19 @@ async def search_memory_facts(
                     'state_facts': [], 'episodes': [], 'procedures': [],
                     'evidence': [], 'result_count': 0,
                 }
+            if resolved_retrieval_mode == 'hybrid':
+                return {
+                    'message': 'No relevant memory found',
+                    'retrieval_mode': 'hybrid',
+                    'facts': [],
+                    'typed_candidates': {
+                        'state': [],
+                        'procedures': [],
+                        'counts': {'state': 0, 'procedures': 0},
+                    },
+                    'merged_results': [],
+                    'result_count': 0,
+                }
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
         # Extract the trusted caller principal (never from raw request payload).
