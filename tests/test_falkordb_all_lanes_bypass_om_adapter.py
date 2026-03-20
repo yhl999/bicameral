@@ -146,5 +146,9 @@ def test_falkordb_uses_graphiti_search_when_om_observational_scope_for_facts():
         _teardown_falkordb_runtime(state)
 
     assert isinstance(response, dict)
-    assert response['message'] in {'No relevant facts found', 'Facts retrieved successfully'}
+    assert response['message'] in {
+        'No relevant facts found',
+        'Facts retrieved successfully',
+        'No relevant memory found',  # hybrid default surface (retrieval_mode='hybrid')
+    }
     assert isolate_calls['facts'] is False

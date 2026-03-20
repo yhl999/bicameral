@@ -29,7 +29,10 @@ def inspect_extensions(repo_root: Path, extensions_dir: Path) -> ExtensionInspec
         issues.append(f'Extensions directory missing: {extensions_dir}')
         return ExtensionInspection(names=names, command_registry=command_registry, issues=issues)
 
-    for extension_dir in sorted(path for path in extensions_dir.iterdir() if path.is_dir()):
+    for extension_dir in sorted(
+        path for path in extensions_dir.iterdir()
+        if path.is_dir() and not (path.name.startswith('__') and path.name.endswith('__'))
+    ):
         manifest_path = extension_dir / 'manifest.json'
         if not manifest_path.exists():
             issues.append(f'{extension_dir.name}: missing manifest.json')

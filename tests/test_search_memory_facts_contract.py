@@ -3,19 +3,24 @@
 Covers:
 - FR-1: retrieval_mode is the top-level surface selector
 - FR-2: valid values are 'graph', 'typed', 'hybrid'
-- FR-3: default is 'hybrid'
+- FR-3: default is 'hybrid' (not graph-only)
 - FR-4: search_mode is graph-internal only; typed path rejects non-hybrid values
 - FR-5: center_node_uuid is graph-only; typed path rejects it
 - FR-6: result_format='typed' is a deprecated backward-compat alias
 - FR-7: invalid retrieval_mode yields a deterministic ErrorResponse
 
-Routing signal: since graphiti_service is patched to None in tests, the graph
-path reliably returns ErrorResponse('Graphiti service not initialized'), which
-proves routing reached the graph branch rather than the typed branch.
+Routing discrimination strategy:
+- Graph vs hybrid: provide a working fake graphiti_service so the code passes
+  the null-check and diverges at the graph/hybrid split.  Graph responses have
+  FactSearchResponse shape (message + facts, no merged_results).  Hybrid
+  responses carry retrieval_mode='hybrid' + merged_results + typed_candidates.
+- graphiti_service=None tests are reserved for null-guard contract proofs where
+  both paths legitimately produce the same error.
 """
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 from tests.helpers_mcp_import import load_graphiti_mcp_server
 
@@ -63,24 +68,84 @@ class _FakeTypedRetrievalService:
         return self.payload
 
 
+# ── Minimal fakes for hybrid-path discrimination ──────────────────────────────
+# These allow the code to pass the graphiti_service null-check and reach the
+# graph/hybrid routing split, so contract tests can distinguish which path ran.
+
+
+class _FakeSearchResults:
+    def __init__(self, edges=None):
+        self.edges = edges or []
+        self.nodes = []
+
+
+class _FakeGraphitiClient:
+    async def search_(self, **kwargs: Any) -> _FakeSearchResults:
+        return _FakeSearchResults()
+
+
+class _FakeGraphitiService:
+    async def get_client_for_group(self, group_id: str) -> _FakeGraphitiClient:
+        return _FakeGraphitiClient()
+
+
+class _FakeSearchService:
+    def includes_observational_memory(self, group_ids: list[str]) -> bool:
+        return False
+
+
+class _FakeHybridRetrievalService:
+    """Returns empty typed candidates and passes merge through."""
+
+    def __init__(self, **_kwargs: Any):
+        self.get_typed_calls: list[dict] = []
+
+    async def get_typed_candidates(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_typed_calls.append(kwargs)
+        return {
+            'state': [],
+            'procedures': [],
+            'counts': {'state': 0, 'procedures': 0},
+        }
+
+    def merge(
+        self,
+        *,
+        graph_facts: list[dict],
+        typed_results: dict,
+        max_facts: int,
+    ) -> list[dict[str, Any]]:
+        return graph_facts[:max_facts]
+
+
 # ---------------------------------------------------------------------------
 # FR-3: Default surface is 'hybrid'
 # ---------------------------------------------------------------------------
 
 
-def test_default_retrieval_mode_routes_to_graph_path():
-    """retrieval_mode not supplied → default 'hybrid' → graph path (stub)."""
+def test_default_retrieval_mode_routes_to_hybrid_path():
+    """retrieval_mode not supplied → default 'hybrid' → hybrid response shape.
+
+    Discriminating: graph-only would return FactSearchResponse (message + facts,
+    no merged_results/retrieval_mode key).  Hybrid returns retrieval_mode='hybrid'
+    + merged_results + typed_candidates.
+    """
     original_config = server.config
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
     original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.graphiti_service = None
+        server.graphiti_service = _FakeGraphitiService()
+        server.HybridRetrievalService = lambda **_kw: _FakeHybridRetrievalService()
+        server.search_service = _FakeSearchService()
 
         response = _run(
             server.search_memory_facts(
                 query='test query',
+                group_ids=['s1_sessions_main'],
                 ctx=None,
             )
         )
@@ -88,9 +153,17 @@ def test_default_retrieval_mode_routes_to_graph_path():
         server.config = original_config
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
         server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
 
-    # Reaches graph path; graphiti_service = None → deterministic error.
-    assert response == {'error': 'Graphiti service not initialized'}
+    # Must be a hybrid response, not a graph FactSearchResponse.
+    assert isinstance(response, dict)
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"Default should route to hybrid, got: {response!r}"
+    )
+    assert 'merged_results' in response, (
+        f"Hybrid response must have merged_results; got keys: {list(response.keys())!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +196,29 @@ def test_retrieval_mode_graph_routes_to_graph_path():
     assert response == {'error': 'Graphiti service not initialized'}
 
 
-def test_retrieval_mode_hybrid_explicit_routes_to_graph_path_stub():
-    """retrieval_mode='hybrid' explicit → graph path (stub; full fusion TBD)."""
+def test_retrieval_mode_hybrid_explicit_routes_to_hybrid_path():
+    """retrieval_mode='hybrid' explicit → hybrid response shape (not graph-only).
+
+    Discriminating: asserts retrieval_mode='hybrid' + merged_results, which
+    the graph-only FactSearchResponse path does not produce.
+    """
     original_config = server.config
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
     original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.graphiti_service = None
+        server.graphiti_service = _FakeGraphitiService()
+        server.HybridRetrievalService = lambda **_kw: _FakeHybridRetrievalService()
+        server.search_service = _FakeSearchService()
 
         response = _run(
             server.search_memory_facts(
                 query='test',
                 retrieval_mode='hybrid',
+                group_ids=['s1_sessions_main'],
                 ctx=None,
             )
         )
@@ -144,8 +226,14 @@ def test_retrieval_mode_hybrid_explicit_routes_to_graph_path_stub():
         server.config = original_config
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
         server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
 
-    assert response == {'error': 'Graphiti service not initialized'}
+    assert isinstance(response, dict)
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"Explicit hybrid should produce hybrid response, got: {response!r}"
+    )
+    assert 'merged_results' in response
 
 
 def test_retrieval_mode_typed_routes_to_typed_path():
@@ -364,20 +452,30 @@ def test_legacy_result_format_typed_aliases_to_typed_surface():
     assert len(fake_service.calls) == 1
 
 
-def test_legacy_result_format_facts_aliases_to_graph_path():
-    """result_format='facts' (default) without retrieval_mode routes to graph path."""
+def test_legacy_result_format_facts_aliases_to_hybrid_path():
+    """result_format='facts' (default) without retrieval_mode routes to hybrid path.
+
+    Contract: result_format='facts' resolves to retrieval_mode='hybrid' (the
+    default surface).  Discriminating: asserts hybrid response shape, which the
+    graph-only FactSearchResponse path cannot produce.
+    """
     original_config = server.config
     original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
     original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
-        server.graphiti_service = None
+        server.graphiti_service = _FakeGraphitiService()
+        server.HybridRetrievalService = lambda **_kw: _FakeHybridRetrievalService()
+        server.search_service = _FakeSearchService()
 
         response = _run(
             server.search_memory_facts(
                 query='test',
                 result_format='facts',
+                group_ids=['s1_sessions_main'],
                 ctx=None,
             )
         )
@@ -385,8 +483,15 @@ def test_legacy_result_format_facts_aliases_to_graph_path():
         server.config = original_config
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
         server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
 
-    assert response == {'error': 'Graphiti service not initialized'}
+    # result_format='facts' now routes to hybrid (the default surface).
+    assert isinstance(response, dict)
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"result_format='facts' should route to hybrid, got: {response!r}"
+    )
+    assert 'merged_results' in response
 
 
 def test_invalid_legacy_result_format_returns_error():
@@ -580,4 +685,139 @@ def test_center_node_uuid_error_references_retrieval_mode_not_result_format():
     )
     assert "result_format='typed'" not in response['error'], (
         f"Error should not reference deprecated result_format, got: {response['error']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P2 fix: fail-closed edge path returns hybrid-shaped response for hybrid mode
+# ---------------------------------------------------------------------------
+
+def _restricted_config(authorized_group_ids):
+    """Config with authorized_group_ids set to a non-empty list (restriction active)."""
+    return SimpleNamespace(
+        database=SimpleNamespace(provider='neo4j'),
+        graphiti=SimpleNamespace(
+            group_id='s1_sessions_main',
+            lane_aliases={
+                'sessions_main': ['s1_sessions_main'],
+            },
+            authorized_group_ids=authorized_group_ids,
+        ),
+    )
+
+
+def test_failclosed_hybrid_returns_hybrid_shaped_empty_response():
+    """P2 regression: when authorized scope intersection yields empty and
+    retrieval_mode resolves to 'hybrid', the fail-closed path must return a
+    hybrid-shaped empty response (not a FactSearchResponse graph shape).
+
+    Discriminating keys: retrieval_mode='hybrid', merged_results, typed_candidates.
+    """
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        # authorized_group_ids is set → restriction is active.
+        # caller requests a lane NOT in authorized_group_ids → empty intersection.
+        server.config = _restricted_config(authorized_group_ids=['s1_authorized_lane'])
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test query',
+                retrieval_mode='hybrid',
+                group_ids=['s1_unauthorized_lane'],  # not in authorized set → empty intersection
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    # Must be a dict (hybrid shape), not a FactSearchResponse object.
+    assert isinstance(response, dict), (
+        f"Fail-closed hybrid must return dict, got {type(response)!r}: {response!r}"
+    )
+    # Must carry the hybrid contract discriminators.
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"Fail-closed hybrid must have retrieval_mode='hybrid', got: {response!r}"
+    )
+    assert 'merged_results' in response, (
+        f"Fail-closed hybrid must have merged_results key; got keys: {list(response.keys())!r}"
+    )
+    assert 'typed_candidates' in response, (
+        f"Fail-closed hybrid must have typed_candidates key; got keys: {list(response.keys())!r}"
+    )
+    # Must be empty (nothing was retrieved).
+    assert response['merged_results'] == []
+    assert response['facts'] == []
+    assert response['result_count'] == 0
+    assert response['typed_candidates']['state'] == []
+    assert response['typed_candidates']['procedures'] == []
+
+
+def test_failclosed_default_mode_returns_hybrid_shaped_empty_response():
+    """P2 regression: fail-closed on the DEFAULT retrieval_mode (which resolves
+    to 'hybrid') must also return a hybrid-shaped empty response.
+    """
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _restricted_config(authorized_group_ids=['s1_authorized_lane'])
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test query',
+                # retrieval_mode omitted → resolves to 'hybrid' default
+                group_ids=['s1_unauthorized_lane'],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    assert isinstance(response, dict)
+    assert response.get('retrieval_mode') == 'hybrid', (
+        f"Fail-closed default (hybrid) must have retrieval_mode='hybrid', got: {response!r}"
+    )
+    assert 'merged_results' in response
+    assert response['merged_results'] == []
+    assert response['result_count'] == 0
+
+
+def test_failclosed_graph_mode_returns_graph_shaped_empty_response():
+    """Sanity check: fail-closed for retrieval_mode='graph' still returns
+    the graph-shaped FactSearchResponse (no regression on graph path).
+    FactSearchResponse is a TypedDict so we check shape by key presence.
+    """
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    try:
+        server.config = _restricted_config(authorized_group_ids=['s1_authorized_lane'])
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+
+        response = _run(
+            server.search_memory_facts(
+                query='test query',
+                retrieval_mode='graph',
+                group_ids=['s1_unauthorized_lane'],
+                ctx=None,
+            )
+        )
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+
+    # FactSearchResponse shape: has 'message' and 'facts', but NOT hybrid keys.
+    assert isinstance(response, dict), f"Expected dict, got {type(response)!r}"
+    assert 'message' in response, f"Graph fail-closed must have 'message' key: {response!r}"
+    assert 'facts' in response, f"Graph fail-closed must have 'facts' key: {response!r}"
+    assert response['facts'] == []
+    # Must NOT carry hybrid discriminators.
+    assert 'retrieval_mode' not in response, (
+        f"Graph fail-closed must NOT have retrieval_mode key; got: {response!r}"
+    )
+    assert 'merged_results' not in response, (
+        f"Graph fail-closed must NOT have merged_results key; got: {response!r}"
     )

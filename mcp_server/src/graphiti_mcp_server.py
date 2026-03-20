@@ -47,6 +47,7 @@ try:
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
+    from .services.typed_retrieval_service import HybridRetrievalService
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 except ImportError:  # pragma: no cover - script/top-level import fallback
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
+    from services.typed_retrieval_service import HybridRetrievalService
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
@@ -1081,8 +1083,8 @@ def _build_get_tools_response() -> list[dict[str, Any]]:
                     "Use for 'what is current/active?' queries."
                 ),
                 'hybrid': (
-                    'Fuses graph and typed results. Default surface. '
-                    'Full fusion logic is a planned follow-up; currently routes to graph path.'
+                    'Default surface. Merges graph-recall facts with typed state/procedure '
+                    'candidates via Reciprocal Rank Fusion reranking.'
                 ),
                 'om_note': 'OM content is projected from Neo4j in both modes.',
             },
@@ -1824,8 +1826,8 @@ async def search_memory_facts(
     Retrieval surface is selected by ``retrieval_mode`` (contract v1):
     - ``'graph'``  – graph-edge path (legacy facts surface).
     - ``'typed'``  – typed-ledger retrieval (state + episodes + procedures + evidence).
-    - ``'hybrid'`` – fused surface (default). Full fusion is a planned follow-up;
-      currently routes to the graph path.
+    - ``'hybrid'`` – fused surface (default). Merges graph-recall facts with
+      typed state/procedure candidates via Reciprocal Rank Fusion reranking.
 
     ``search_mode`` is graph-internal only (``hybrid|semantic|keyword``); it is
     not a top-level surface selector and must not be supplied when
@@ -1844,14 +1846,20 @@ async def search_memory_facts(
         max_facts: Maximum number of facts to return (default: 10). Also used as
             the default typed result cap when ``retrieval_mode='typed'`` and
             ``max_results`` is omitted.
-        center_node_uuid: Optional UUID of a node to center the graph facts search around
+        center_node_uuid: Optional UUID of a node to center the graph facts search around.
+            In hybrid mode this only affects the graph-recall subpath; the typed-candidate
+            subpath has no concept of a graph-center node and is not influenced by this value.
         result_format: Deprecated alias for retrieval_mode. Use retrieval_mode instead.
-        object_types: Optional typed bucket filter. Accepted values: state|episodes|procedures
+        object_types: Optional typed bucket filter. Accepted values: state|episodes|procedures.
+            NOTE: in hybrid mode this parameter is silently ignored for the typed-candidate
+            subpath. Hybrid always fetches state + procedure objects. Use retrieval_mode='typed'
+            if you need explicit object_types filtering.
         metadata_filters: Optional typed metadata filter map applied against typed object fields
         history_mode: Typed retrieval mode: auto|current|history|all
         current_only: Optional explicit override for current-only typed retrieval
         max_results: Optional typed result cap override
-        max_evidence: Maximum number of typed evidence items to surface
+        max_evidence: Maximum number of typed evidence items to surface per typed object.
+            Forwarded to the typed-candidate subpath in hybrid mode.
     """
     global graphiti_service
 
@@ -1909,6 +1917,19 @@ async def search_memory_facts(
                     'state_facts': [], 'episodes': [], 'procedures': [],
                     'evidence': [], 'result_count': 0,
                 }
+            if resolved_retrieval_mode == 'hybrid':
+                return {
+                    'message': 'No relevant memory found',
+                    'retrieval_mode': 'hybrid',
+                    'facts': [],
+                    'typed_candidates': {
+                        'state': [],
+                        'procedures': [],
+                        'counts': {'state': 0, 'procedures': 0},
+                    },
+                    'merged_results': [],
+                    'result_count': 0,
+                }
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
         # Extract the trusted caller principal (never from raw request payload).
@@ -1929,8 +1950,10 @@ async def search_memory_facts(
                 )
                 return ErrorResponse(error='rate limit exceeded; retry later')
 
-        # 'graph' and 'hybrid' (stub) both route to the graph path.
-        # 'hybrid' full fusion (graph + typed fused) is a planned follow-up.
+        # Route by retrieval surface selector.
+        # 'typed' → typed-ledger path.
+        # 'graph' → graph-edge path only.
+        # 'hybrid' (default) → graph recall + typed state/procedure candidates + RRF merge.
         if resolved_retrieval_mode == 'typed':
             normalized_mode = (search_mode or 'hybrid').strip().lower()
             if normalized_mode not in VALID_SEARCH_MODES:
@@ -2045,24 +2068,148 @@ async def search_memory_facts(
 
         relevant_edges = results.edges[:max_facts] if results.edges else []  # already capped above
 
-        if not relevant_edges and not om_facts:
-            return FactSearchResponse(message='No relevant facts found', facts=[])
-
         facts = [format_fact_result(edge) for edge in relevant_edges]
-        merged_facts = _fuse_node_like_results(
+        merged_graph_facts: list[dict[str, Any]] = _fuse_node_like_results(
             primary=facts,
             supplemental=om_facts,
             max_items=max_facts,
         )
-        if not merged_facts:
-            return FactSearchResponse(message='No relevant facts found', facts=[])
 
-        response = FactSearchResponse(message='Facts retrieved successfully', facts=merged_facts)
-        candidate_rows = build_om_candidate_rows(om_facts)
-        if candidate_rows:
-            response = dict(response)
-            response['candidate_rows'] = candidate_rows
-        return response
+        # ── Graph path (retrieval_mode='graph') ──────────────────────────────
+        if resolved_retrieval_mode == 'graph':
+            if not merged_graph_facts:
+                return FactSearchResponse(message='No relevant facts found', facts=[])
+            response = FactSearchResponse(
+                message='Facts retrieved successfully', facts=merged_graph_facts
+            )
+            candidate_rows = build_om_candidate_rows(om_facts)
+            if candidate_rows:
+                response = dict(response)
+                response['candidate_rows'] = candidate_rows
+            return response
+
+        # ── Hybrid path (retrieval_mode='hybrid', the default) ───────────────
+        # Fetch typed state + procedure candidates and merge with graph recall
+        # via Reciprocal Rank Fusion.
+
+        # P3: object_types is not applied to the typed-candidate subpath.
+        # Hybrid always fetches state + procedure objects; callers who supplied
+        # object_types expecting bucket filtering should use retrieval_mode='typed'.
+        if object_types is not None:
+            logger.warning(
+                "search_memory_facts(retrieval_mode='hybrid'): object_types=%r is "
+                "not applied to the typed candidate subpath. Hybrid always fetches "
+                "state + procedure objects. Use retrieval_mode='typed' to apply "
+                "object_types filtering.",
+                object_types,
+            )
+
+        # P0: intersect metadata_filters with lane scope before querying typed
+        # candidates — matching the typed-only path behaviour.
+        try:
+            hybrid_effective_filters = _intersect_source_lane_filter(
+                metadata_filters=metadata_filters,
+                effective_group_ids=effective_group_ids,
+            )
+        except ValueError as filter_err:
+            return ErrorResponse(error=str(filter_err))
+
+        # HybridRetrievalService is constructed per-request intentionally: it is a
+        # lightweight stateless wrapper (no DB connections, no expensive init) and
+        # graphiti_service / search_service can be reinitialized across test runs.
+        # A module-level singleton would be unsafe here because: (a) graphiti_service
+        # starts as None and is set later during startup, (b) the test framework patches
+        # HybridRetrievalService as a constructor for isolation. Per-request construction
+        # is negligible cost and keeps testability clean.
+        hybrid_svc = HybridRetrievalService(
+            om_projection_service=OMTypedProjectionService(
+                search_service=search_service,
+                graphiti_service=graphiti_service,
+            )
+        )
+        _hybrid_fallback_err: Exception | None = None
+        try:
+            typed_results = await hybrid_svc.get_typed_candidates(
+                query=query,
+                effective_group_ids=effective_group_ids,
+                max_candidates=max_facts,
+                metadata_filters=hybrid_effective_filters,
+                history_mode=history_mode,
+                current_only=current_only,
+                max_evidence=min(max_evidence, _MAX_TYPED_EVIDENCE_CAP),
+            )
+        except Exception as hybrid_err:
+            logger.warning(
+                'Hybrid typed candidate retrieval failed (graph-only fallback): %s',
+                hybrid_err,
+                exc_info=True,
+            )
+            _hybrid_fallback_err = hybrid_err
+            typed_results = {
+                'state': [],
+                'procedures': [],
+                'counts': {'state': 0, 'procedures': 0},
+            }
+
+        merged_hybrid = hybrid_svc.merge(
+            graph_facts=merged_graph_facts,
+            typed_results=typed_results,
+            max_facts=max_facts,
+        )
+
+        typed_state: list[dict[str, Any]] = typed_results.get('state', []) or []
+        typed_procedures: list[dict[str, Any]] = typed_results.get('procedures', []) or []
+
+        # P1: include candidate_rows from OM facts (parity with graph path).
+        hybrid_candidate_rows = build_om_candidate_rows(om_facts)
+
+        if not merged_hybrid:
+            empty_response: dict[str, Any] = {
+                'message': 'No relevant memory found',
+                'retrieval_mode': 'hybrid',
+                'facts': [],
+                'typed_candidates': {
+                    'state': [],
+                    'procedures': [],
+                    'counts': {'state': 0, 'procedures': 0},
+                },
+                'merged_results': [],
+                'result_count': 0,
+            }
+            if hybrid_candidate_rows:
+                empty_response['candidate_rows'] = hybrid_candidate_rows
+            if _hybrid_fallback_err is not None:
+                empty_response['diagnostics'] = {
+                    'typed_retrieval_failed': True,
+                    'fallback': 'graph_only',
+                    'error': str(_hybrid_fallback_err),
+                }
+            return empty_response
+
+        hybrid_response: dict[str, Any] = {
+            'message': 'Hybrid memory retrieved successfully',
+            'retrieval_mode': 'hybrid',
+            'facts': merged_graph_facts,
+            'typed_candidates': {
+                'state': typed_state,
+                'procedures': typed_procedures,
+                'counts': {
+                    'state': len(typed_state),
+                    'procedures': len(typed_procedures),
+                },
+            },
+            'merged_results': merged_hybrid,
+            'result_count': len(merged_hybrid),
+        }
+        if hybrid_candidate_rows:
+            hybrid_response['candidate_rows'] = hybrid_candidate_rows
+        if _hybrid_fallback_err is not None:
+            hybrid_response['diagnostics'] = {
+                'typed_retrieval_failed': True,
+                'fallback': 'graph_only',
+                'error': str(_hybrid_fallback_err),
+            }
+        return hybrid_response
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')

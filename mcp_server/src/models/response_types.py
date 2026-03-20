@@ -36,6 +36,40 @@ class FactSearchResponse(TypedDict):
     facts: list[dict[str, Any]]
 
 
+class HybridTypedCandidates(TypedDict):
+    """Typed state/procedure candidates surfaced by the hybrid retrieval path."""
+    state: list[dict[str, Any]]
+    procedures: list[dict[str, Any]]
+    counts: dict[str, int]
+
+
+class HybridDiagnostics(TypedDict, total=False):
+    """Degradation/diagnostic signals for the hybrid retrieval path.
+
+    Present only when the retrieval path degraded in some way; absent on clean runs.
+    """
+    typed_retrieval_failed: bool
+    fallback: str  # e.g. 'graph_only'
+    error: str     # str(exception) from the failed typed retrieval call
+
+
+class HybridResponse(TypedDict, total=False):
+    """Typed envelope for retrieval_mode='hybrid' responses from search_memory_facts.
+
+    All fields except ``message``, ``retrieval_mode``, ``facts``,
+    ``typed_candidates``, ``merged_results``, and ``result_count`` are
+    conditionally present (``total=False``).
+    """
+    message: str
+    retrieval_mode: str          # always 'hybrid'
+    facts: list[dict[str, Any]]  # raw graph-recall facts (pre-merge input)
+    typed_candidates: HybridTypedCandidates
+    merged_results: list[dict[str, Any]]
+    result_count: int
+    candidate_rows: list[dict[str, Any]]   # only when OM lane in scope
+    diagnostics: HybridDiagnostics         # only when typed retrieval degraded
+
+
 class EpisodeSearchResponse(TypedDict, total=False):
     """Integrated episodes/procedures router search response.
 
