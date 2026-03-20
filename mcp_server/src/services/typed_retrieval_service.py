@@ -20,8 +20,11 @@ except ImportError:  # pragma: no cover — top-level import fallback
     from services.typed_retrieval import TypedRetrievalService
 
 # ── RRF tuning constants ──────────────────────────────────────────────────────
-# k: standard RRF constant (typically 60; smaller values reward higher ranks more).
-_HYBRID_RRF_K: float = 1.0
+# k=60: standard RRF constant matching experiment calibration in lane_fair_merge
+# and reranker blend (reranker uses merge_score * 60 at rrf_blend_weight=0.2).
+# Larger k softens rank differences — less top-heavy than k=1, more forgiving
+# for mid-rank candidates that appear in multiple sources.
+_HYBRID_RRF_K: float = 60.0
 # Graph-edge recall gets full weight; typed candidates get a slight discount so
 # that a weak typed match does not dominate a strong graph hit.
 _HYBRID_WEIGHT_GRAPH: float = 1.0

@@ -32,6 +32,9 @@ try:
         EpisodeSearchResponse,
         ErrorResponse,
         FactSearchResponse,
+        HybridDiagnostics,
+        HybridResponse,
+        HybridTypedCandidates,
         NodeResult,
         NodeSearchResponse,
         StatusResponse,
@@ -2083,12 +2086,20 @@ async def search_memory_facts(
         except ValueError as filter_err:
             return ErrorResponse(error=str(filter_err))
 
+        # HybridRetrievalService is constructed per-request intentionally: it is a
+        # lightweight stateless wrapper (no DB connections, no expensive init) and
+        # graphiti_service / search_service can be reinitialized across test runs.
+        # A module-level singleton would be unsafe here because: (a) graphiti_service
+        # starts as None and is set later during startup, (b) the test framework patches
+        # HybridRetrievalService as a constructor for isolation. Per-request construction
+        # is negligible cost and keeps testability clean.
         hybrid_svc = HybridRetrievalService(
             om_projection_service=OMTypedProjectionService(
                 search_service=search_service,
                 graphiti_service=graphiti_service,
             )
         )
+        _hybrid_fallback_err: Exception | None = None
         try:
             typed_results = await hybrid_svc.get_typed_candidates(
                 query=query,
@@ -2100,8 +2111,11 @@ async def search_memory_facts(
             )
         except Exception as hybrid_err:
             logger.warning(
-                'Hybrid typed candidate retrieval failed (graph-only fallback): %s', hybrid_err
+                'Hybrid typed candidate retrieval failed (graph-only fallback): %s',
+                hybrid_err,
+                exc_info=True,
             )
+            _hybrid_fallback_err = hybrid_err
             typed_results = {
                 'state': [],
                 'procedures': [],
@@ -2135,6 +2149,12 @@ async def search_memory_facts(
             }
             if hybrid_candidate_rows:
                 empty_response['candidate_rows'] = hybrid_candidate_rows
+            if _hybrid_fallback_err is not None:
+                empty_response['diagnostics'] = {
+                    'typed_retrieval_failed': True,
+                    'fallback': 'graph_only',
+                    'error': str(_hybrid_fallback_err),
+                }
             return empty_response
 
         hybrid_response: dict[str, Any] = {
@@ -2154,6 +2174,12 @@ async def search_memory_facts(
         }
         if hybrid_candidate_rows:
             hybrid_response['candidate_rows'] = hybrid_candidate_rows
+        if _hybrid_fallback_err is not None:
+            hybrid_response['diagnostics'] = {
+                'typed_retrieval_failed': True,
+                'fallback': 'graph_only',
+                'error': str(_hybrid_fallback_err),
+            }
         return hybrid_response
     except Exception as e:
         error_msg = str(e)

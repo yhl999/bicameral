@@ -970,3 +970,195 @@ def test_hybrid_response_no_candidate_rows_when_om_absent():
     assert "candidate_rows" not in response, (
         f"P1: candidate_rows should be absent when OM is not in scope; got {response!r}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §13  Hybrid fallback observability — diagnostics when typed retrieval fails
+#
+# Goal: when get_typed_candidates() raises, the response must include a
+# 'diagnostics' key with typed_retrieval_failed=True, fallback='graph_only',
+# and the error string.  The path must degrade gracefully (not crash) and still
+# return a well-formed hybrid response (or empty hybrid response if graph is
+# also empty).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeHybridRetrievalServiceWithFailure(_FakeHybridRetrievalService):
+    """Like _FakeHybridRetrievalService but get_typed_candidates raises."""
+
+    def __init__(self, error_msg: str = "simulated typed retrieval failure", **kwargs):
+        super().__init__(**kwargs)
+        self._error_msg = error_msg
+
+    async def get_typed_candidates(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_typed_calls.append(kwargs)
+        raise RuntimeError(self._error_msg)
+
+
+def _run_hybrid_with_failure(
+    error_msg: str = "simulated typed retrieval failure",
+    fake_graph_edges=None,
+    **kwargs: Any,
+) -> tuple[dict, Any]:
+    """Run search_memory_facts with a typed-retrieval failure injected."""
+    original_config = server.config
+    original_rate_limit = server._SEARCH_RATE_LIMIT_ENABLED
+    original_graphiti = server.graphiti_service
+    original_hybrid_cls = server.HybridRetrievalService
+    original_search_service = server.search_service
+
+    fake_hybrid = _FakeHybridRetrievalServiceWithFailure(error_msg=error_msg)
+    try:
+        server.config = _test_config()
+        server._SEARCH_RATE_LIMIT_ENABLED = False
+        server.graphiti_service = _FakeGraphitiService(edges=fake_graph_edges or [])
+        server.HybridRetrievalService = lambda **_kw: fake_hybrid
+        server.search_service = _FakeSearchService()
+
+        result = _run(
+            server.search_memory_facts(
+                query="test query",
+                group_ids=["s1_sessions_main"],
+                ctx=None,
+                **kwargs,
+            )
+        )
+        return result, fake_hybrid
+    finally:
+        server.config = original_config
+        server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
+        server.graphiti_service = original_graphiti
+        server.HybridRetrievalService = original_hybrid_cls
+        server.search_service = original_search_service
+
+
+def test_hybrid_fallback_diagnostics_present_when_typed_retrieval_fails():
+    """When typed retrieval raises, 'diagnostics' key must appear in the response."""
+    response, _ = _run_hybrid_with_failure()
+    assert "diagnostics" in response, (
+        f"Expected 'diagnostics' key in response when typed retrieval fails; got {response!r}"
+    )
+
+
+def test_hybrid_fallback_diagnostics_typed_retrieval_failed_flag():
+    """diagnostics.typed_retrieval_failed must be True when typed retrieval raises."""
+    response, _ = _run_hybrid_with_failure()
+    diag = response.get("diagnostics", {})
+    assert diag.get("typed_retrieval_failed") is True, (
+        f"Expected diagnostics.typed_retrieval_failed=True; got {diag!r}"
+    )
+
+
+def test_hybrid_fallback_diagnostics_fallback_value():
+    """diagnostics.fallback must be 'graph_only' when typed retrieval degrades."""
+    response, _ = _run_hybrid_with_failure()
+    diag = response.get("diagnostics", {})
+    assert diag.get("fallback") == "graph_only", (
+        f"Expected diagnostics.fallback='graph_only'; got {diag!r}"
+    )
+
+
+def test_hybrid_fallback_diagnostics_error_string_captured():
+    """diagnostics.error must contain the exception message string."""
+    err_msg = "neo4j connection refused"
+    response, _ = _run_hybrid_with_failure(error_msg=err_msg)
+    diag = response.get("diagnostics", {})
+    assert err_msg in diag.get("error", ""), (
+        f"Expected error string '{err_msg}' in diagnostics.error; got {diag!r}"
+    )
+
+
+def test_hybrid_fallback_still_returns_retrieval_mode_hybrid():
+    """Degraded hybrid path must still return retrieval_mode='hybrid' (not 'graph')."""
+    response, _ = _run_hybrid_with_failure()
+    assert response.get("retrieval_mode") == "hybrid", (
+        f"Expected retrieval_mode='hybrid' even on fallback; got {response!r}"
+    )
+
+
+def test_hybrid_fallback_returns_well_formed_response():
+    """Degraded hybrid response must still have all required top-level keys."""
+    response, _ = _run_hybrid_with_failure()
+    required = {"retrieval_mode", "facts", "typed_candidates", "merged_results", "result_count"}
+    missing = required - set(response.keys())
+    assert not missing, (
+        f"Degraded hybrid response missing required keys: {missing}; got {list(response.keys())!r}"
+    )
+
+
+def test_hybrid_fallback_typed_candidates_empty_on_failure():
+    """When typed retrieval fails, typed_candidates must reflect empty state/procedures."""
+    response, _ = _run_hybrid_with_failure()
+    typed_cands = response.get("typed_candidates", {})
+    assert typed_cands.get("state", None) == [], (
+        f"Expected typed_candidates.state=[] on failure; got {typed_cands!r}"
+    )
+    assert typed_cands.get("procedures", None) == [], (
+        f"Expected typed_candidates.procedures=[] on failure; got {typed_cands!r}"
+    )
+
+
+def test_hybrid_clean_run_has_no_diagnostics_key():
+    """On a successful (non-degraded) hybrid run, 'diagnostics' must NOT be present."""
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01", "subject": "user", "predicate": "likes", "value": "tea"}]
+    )
+    response, _ = _run_hybrid(fake_typed_payload=typed_payload)
+    assert "diagnostics" not in response, (
+        f"'diagnostics' should be absent on clean hybrid run; got keys: {list(response.keys())!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §14  RRF k=60 calibration — regression guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rrf_k_constant_is_60():
+    """_HYBRID_RRF_K must be 60.0 (experiment-calibrated; do not revert to 1.0)."""
+    import importlib
+    import sys
+    import pathlib
+
+    svc_path = str(pathlib.Path(__file__).parent.parent / "mcp_server" / "src" / "services")
+    if svc_path not in sys.path:
+        sys.path.insert(0, svc_path)
+
+    import mcp_server.src.services.typed_retrieval_service as trs_mod
+    assert trs_mod._HYBRID_RRF_K == 60.0, (
+        f"_HYBRID_RRF_K must be 60.0 (experiment-calibrated); got {trs_mod._HYBRID_RRF_K}"
+    )
+
+
+def test_rrf_k60_softens_rank_gap_vs_k1():
+    """k=60 produces a smaller rank-score gap than k=1 between rank-1 and rank-2 items.
+
+    This verifies that the calibration change (k=1 → k=60) has the intended
+    behaviour: softer rank differentiation, more forgiving for mid-rank candidates.
+    """
+    facts_k60 = rrf_merge_hybrid(
+        graph_facts=[
+            {"uuid": "f1", "fact": "top"},
+            {"uuid": "f2", "fact": "second"},
+        ],
+        typed_state=[],
+        typed_procedures=[],
+        max_facts=10,
+        rrf_k=60.0,
+    )
+    facts_k1 = rrf_merge_hybrid(
+        graph_facts=[
+            {"uuid": "f1", "fact": "top"},
+            {"uuid": "f2", "fact": "second"},
+        ],
+        typed_state=[],
+        typed_procedures=[],
+        max_facts=10,
+        rrf_k=1.0,
+    )
+    score_gap_k60 = facts_k60[0]["_hybrid_score"] - facts_k60[1]["_hybrid_score"]
+    score_gap_k1 = facts_k1[0]["_hybrid_score"] - facts_k1[1]["_hybrid_score"]
+    assert score_gap_k60 < score_gap_k1, (
+        f"k=60 should produce a smaller rank gap ({score_gap_k60:.6f}) "
+        f"than k=1 ({score_gap_k1:.6f})"
+    )
