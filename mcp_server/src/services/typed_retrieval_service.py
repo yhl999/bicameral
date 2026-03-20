@@ -8,9 +8,25 @@ Design goals:
 - No benchmark-script imports; all fusion logic is self-contained.
 - Deterministic and testable: same inputs → same output.
 - Narrow scope: state + procedure candidates only (not episodes).
+
+Contract notes:
+- object_types filtering is not supported in the hybrid typed-candidate subpath.
+  Hybrid always fetches state + procedure regardless of any caller-supplied
+  object_types. Callers who need object_types filtering should use
+  retrieval_mode='typed' directly.
+- center_node_uuid only affects the graph-recall subpath of hybrid retrieval.
+  It is not forwarded to the typed-candidate subpath (typed retrieval has no
+  concept of a graph-center node). This is intentional.
+- Cross-source deduplication is not performed across graph and typed results.
+  Graph facts and typed objects are distinct entity types (graph edges vs.
+  ledger objects) and are not deduplicated against each other by design. The
+  RRF merge produces a unified ranked list, but does not collapse duplicates
+  across source types.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,9 +59,24 @@ def _graph_fact_id(fact: dict[str, Any]) -> str:
 
 
 def _typed_item_id(item: dict[str, Any], *, bucket: str) -> str:
-    """Stable deduplication key for a typed ledger object."""
+    """Stable deduplication key for a typed ledger object.
+
+    When ``object_id`` is present it is used directly (fast path).
+    When ``object_id`` is absent or empty a SHA-1 content hash is used as
+    a fallback to avoid the collision that would occur if multiple ID-less
+    items were all mapped to the same ``"typed:<bucket>:unknown"`` key.
+    """
     oid = str(item.get("object_id", "") or "").strip()
-    return f"typed:{bucket}:{oid}" if oid else f"typed:{bucket}:unknown"
+    if oid:
+        return f"typed:{bucket}:{oid}"
+    # Fallback: derive a collision-resistant key from item content so that
+    # distinct ID-less items do not overwrite each other in the RRF registry.
+    try:
+        content = json.dumps(item, sort_keys=True, default=str)
+    except Exception:
+        content = str(item)
+    h = hashlib.sha1(content.encode(), usedforsecurity=False).hexdigest()[:16]  # noqa: S324
+    return f"typed:{bucket}:anon:{h}"
 
 
 # ── Typed → hybrid-entry conversion ──────────────────────────────────────────
@@ -189,11 +220,17 @@ class HybridRetrievalService:
         metadata_filters: dict[str, Any] | None = None,
         history_mode: str = "auto",
         current_only: bool | None = None,
+        max_evidence: int = 20,
     ) -> dict[str, Any]:
         """Run typed retrieval (state + procedures only) for the hybrid candidate pool.
 
         Episodes are excluded from the candidate pool; they belong in the
         episodic/graph recall path rather than the fact-surface hybrid merge.
+
+        Note: ``object_types`` is intentionally not exposed here. Hybrid always
+        fetches ``["state", "procedure"]`` regardless of any caller-supplied
+        ``object_types``. Callers who need explicit object-type filtering should
+        use ``retrieval_mode='typed'`` directly.
 
         Args:
             query: The retrieval query.
@@ -205,6 +242,8 @@ class HybridRetrievalService:
                 (``'auto'`` | ``'current'`` | ``'history'`` | ``'all'``).
             current_only: Optional explicit override for current-only typed
                 retrieval, forwarded from the caller.
+            max_evidence: Maximum evidence items per typed object. Forwarded
+                directly from the caller's ``max_evidence`` parameter.
 
         Returns:
             Typed retrieval result dict (``state``, ``procedures``, ``counts``, …).
@@ -217,7 +256,7 @@ class HybridRetrievalService:
             history_mode=history_mode,
             current_only=current_only,
             max_results=max_candidates,
-            max_evidence=20,
+            max_evidence=max_evidence,
             effective_group_ids=effective_group_ids,
         )
 

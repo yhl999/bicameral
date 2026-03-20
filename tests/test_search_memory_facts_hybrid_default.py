@@ -1162,3 +1162,162 @@ def test_rrf_k60_softens_rank_gap_vs_k1():
         f"k=60 should produce a smaller rank gap ({score_gap_k60:.6f}) "
         f"than k=1 ({score_gap_k1:.6f})"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §15  P3 regression guards (surgical follow-up pass)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── P3-2: max_evidence forwarding ────────────────────────────────────────────
+
+
+def test_hybrid_max_evidence_forwarded_to_typed_candidates():
+    """max_evidence supplied by the caller must be forwarded to get_typed_candidates.
+
+    Previously hardcoded to 20 inside get_typed_candidates regardless of the
+    caller-supplied value.
+    """
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01", "subject": "x", "predicate": "y", "value": "z"}]
+    )
+    response, fake_hybrid = _run_hybrid(fake_typed_payload=typed_payload, max_evidence=7)
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call_kwargs = fake_hybrid.get_typed_calls[0]
+    assert "max_evidence" in call_kwargs, (
+        "get_typed_candidates must receive max_evidence keyword argument"
+    )
+    assert call_kwargs["max_evidence"] == 7, (
+        f"Expected max_evidence=7 forwarded to typed candidates, got {call_kwargs.get('max_evidence')!r}"
+    )
+
+
+def test_hybrid_max_evidence_default_20_forwarded():
+    """Default max_evidence=20 must still reach get_typed_candidates unchanged."""
+    typed_payload = _fake_typed_payload()
+    response, fake_hybrid = _run_hybrid(fake_typed_payload=typed_payload)
+    assert len(fake_hybrid.get_typed_calls) == 1
+    call_kwargs = fake_hybrid.get_typed_calls[0]
+    # Default is 20; it must be forwarded (not swallowed).
+    assert "max_evidence" in call_kwargs, (
+        "max_evidence must always be forwarded even at its default value"
+    )
+    assert call_kwargs["max_evidence"] == 20, (
+        f"Default max_evidence should be 20, got {call_kwargs.get('max_evidence')!r}"
+    )
+
+
+def test_get_typed_candidates_accepts_max_evidence_param():
+    """HybridRetrievalService.get_typed_candidates signature includes max_evidence."""
+    import inspect
+    sig = inspect.signature(HybridRetrievalService.get_typed_candidates)
+    assert "max_evidence" in sig.parameters, (
+        "get_typed_candidates must declare a max_evidence parameter"
+    )
+    # Default should be 20 (backward-compatible for direct callers).
+    assert sig.parameters["max_evidence"].default == 20, (
+        "max_evidence default must be 20 for backward compatibility"
+    )
+
+
+# ── P3-3: dedup collision safety on missing object_id ────────────────────────
+
+
+def test_typed_item_id_unique_for_items_without_object_id():
+    """Two distinct ID-less typed objects must produce different dedup keys.
+
+    Previously both mapped to 'typed:<bucket>:unknown', causing the second
+    to silently overwrite the first in the RRF registry.
+    """
+    from mcp_server.src.services.typed_retrieval_service import _typed_item_id
+
+    item_a = {"subject": "user", "predicate": "likes", "value": "coffee"}
+    item_b = {"subject": "user", "predicate": "dislikes", "value": "tea"}
+
+    key_a = _typed_item_id(item_a, bucket="state")
+    key_b = _typed_item_id(item_b, bucket="state")
+
+    assert key_a != key_b, (
+        f"Distinct ID-less items must have distinct dedup keys; "
+        f"both mapped to {key_a!r}"
+    )
+    # Both must still use the expected prefix convention.
+    assert key_a.startswith("typed:state:"), f"Unexpected prefix: {key_a!r}"
+    assert key_b.startswith("typed:state:"), f"Unexpected prefix: {key_b!r}"
+
+
+def test_typed_item_id_identical_items_produce_same_key():
+    """Two identical ID-less objects must produce the same key (deterministic hash)."""
+    from mcp_server.src.services.typed_retrieval_service import _typed_item_id
+
+    item = {"subject": "user", "predicate": "likes", "value": "coffee"}
+    key_1 = _typed_item_id(item, bucket="state")
+    key_2 = _typed_item_id(item, bucket="state")
+    assert key_1 == key_2, "Same item must hash to the same key on repeated calls"
+
+
+def test_typed_item_id_with_object_id_still_uses_id():
+    """When object_id is present the fast-path (no hashing) is used."""
+    from mcp_server.src.services.typed_retrieval_service import _typed_item_id
+
+    item = {"object_id": "obj-123", "subject": "user", "predicate": "likes", "value": "coffee"}
+    key = _typed_item_id(item, bucket="state")
+    assert key == "typed:state:obj-123", f"Unexpected key with object_id: {key!r}"
+
+
+def test_rrf_merge_hybrid_preserves_distinct_id_less_items():
+    """RRF merge must not collapse distinct ID-less typed items into a single entry."""
+    item_a = {"subject": "user", "predicate": "likes", "value": "coffee"}
+    item_b = {"subject": "user", "predicate": "dislikes", "value": "tea"}
+
+    merged = rrf_merge_hybrid(
+        graph_facts=[],
+        typed_state=[item_a, item_b],
+        typed_procedures=[],
+        max_facts=10,
+    )
+    assert len(merged) == 2, (
+        f"Both distinct ID-less items must appear in merged output; got {len(merged)}: {merged!r}"
+    )
+
+
+# ── P3-1: object_types in hybrid mode emits a warning ────────────────────────
+
+
+def test_hybrid_object_types_emits_warning(caplog):
+    """object_types supplied to hybrid mode must trigger a logger.warning."""
+    import logging
+
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01", "subject": "x", "predicate": "y", "value": "z"}]
+    )
+    with caplog.at_level(logging.WARNING):
+        response, _ = _run_hybrid(
+            fake_typed_payload=typed_payload,
+            object_types=["state"],
+        )
+
+    warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("object_types" in txt for txt in warning_texts), (
+        f"Expected a warning mentioning 'object_types' when hybrid mode receives "
+        f"object_types=; got warnings: {warning_texts!r}"
+    )
+
+
+def test_hybrid_no_object_types_no_warning(caplog):
+    """No object_types supplied → no warning about object_types filtering."""
+    import logging
+
+    typed_payload = _fake_typed_payload(
+        state=[{"object_id": "sf_01"}]
+    )
+    with caplog.at_level(logging.WARNING):
+        response, _ = _run_hybrid(fake_typed_payload=typed_payload)
+
+    object_type_warnings = [
+        r.message for r in caplog.records
+        if r.levelno == logging.WARNING and "object_types" in r.message
+    ]
+    assert not object_type_warnings, (
+        f"No object_types warning expected when none supplied; got: {object_type_warnings!r}"
+    )

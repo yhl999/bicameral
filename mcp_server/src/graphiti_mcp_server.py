@@ -1849,14 +1849,20 @@ async def search_memory_facts(
         max_facts: Maximum number of facts to return (default: 10). Also used as
             the default typed result cap when ``retrieval_mode='typed'`` and
             ``max_results`` is omitted.
-        center_node_uuid: Optional UUID of a node to center the graph facts search around
+        center_node_uuid: Optional UUID of a node to center the graph facts search around.
+            In hybrid mode this only affects the graph-recall subpath; the typed-candidate
+            subpath has no concept of a graph-center node and is not influenced by this value.
         result_format: Deprecated alias for retrieval_mode. Use retrieval_mode instead.
-        object_types: Optional typed bucket filter. Accepted values: state|episodes|procedures
+        object_types: Optional typed bucket filter. Accepted values: state|episodes|procedures.
+            NOTE: in hybrid mode this parameter is silently ignored for the typed-candidate
+            subpath. Hybrid always fetches state + procedure objects. Use retrieval_mode='typed'
+            if you need explicit object_types filtering.
         metadata_filters: Optional typed metadata filter map applied against typed object fields
         history_mode: Typed retrieval mode: auto|current|history|all
         current_only: Optional explicit override for current-only typed retrieval
         max_results: Optional typed result cap override
-        max_evidence: Maximum number of typed evidence items to surface
+        max_evidence: Maximum number of typed evidence items to surface per typed object.
+            Forwarded to the typed-candidate subpath in hybrid mode.
     """
     global graphiti_service
 
@@ -2089,6 +2095,18 @@ async def search_memory_facts(
         # Fetch typed state + procedure candidates and merge with graph recall
         # via Reciprocal Rank Fusion.
 
+        # P3: object_types is not applied to the typed-candidate subpath.
+        # Hybrid always fetches state + procedure objects; callers who supplied
+        # object_types expecting bucket filtering should use retrieval_mode='typed'.
+        if object_types is not None:
+            logger.warning(
+                "search_memory_facts(retrieval_mode='hybrid'): object_types=%r is "
+                "not applied to the typed candidate subpath. Hybrid always fetches "
+                "state + procedure objects. Use retrieval_mode='typed' to apply "
+                "object_types filtering.",
+                object_types,
+            )
+
         # P0: intersect metadata_filters with lane scope before querying typed
         # candidates — matching the typed-only path behaviour.
         try:
@@ -2121,6 +2139,7 @@ async def search_memory_facts(
                 metadata_filters=hybrid_effective_filters,
                 history_mode=history_mode,
                 current_only=current_only,
+                max_evidence=min(max_evidence, _MAX_TYPED_EVIDENCE_CAP),
             )
         except Exception as hybrid_err:
             logger.warning(
