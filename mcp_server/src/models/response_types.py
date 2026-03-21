@@ -53,6 +53,42 @@ class HybridDiagnostics(TypedDict, total=False):
     error: str     # str(exception) from the failed typed retrieval call
 
 
+class HybridRerankMetadata(TypedDict, total=False):
+    """Metadata about the LLM reranking pass applied to the hybrid pool.
+
+    Present on all hybrid responses. ``method`` indicates the rerank path:
+    - ``'llm'``: LLM reranking was applied successfully.
+    - ``'passthrough'``: LLM reranking was skipped (disabled or no API key).
+    - ``'fallback'``: LLM reranking failed; RRF order was preserved.
+    """
+    method: str           # 'llm' | 'passthrough' | 'fallback'
+    model: str            # model id used (only when method='llm')
+    total_scored: int     # number of candidates scored
+    diagnostics: dict[str, Any]  # only when degraded
+
+
+class HybridProvenanceRef(TypedDict, total=False):
+    """Per-result provenance reference for hybrid retrieval results.
+
+    Enables callers to trace each result back to its source without
+    spelunking raw internals.
+    """
+    source: str           # 'graph' | 'typed_state' | 'typed_procedure'
+    source_id: str        # uuid (graph) or object_id (typed)
+    object_type: str      # e.g. 'state_fact', 'procedure', 'entity_edge'
+    lane: str             # source lane / group_id
+    evidence_keys: list[str]  # keys into resolved_evidence (typed items only)
+
+
+class HybridProvenance(TypedDict, total=False):
+    """Top-level provenance section for the hybrid retrieval response.
+
+    Contains per-result references and resolved evidence for typed-backed items.
+    """
+    refs: list[HybridProvenanceRef]                 # one per merged_result item
+    resolved_evidence: dict[str, dict[str, Any]]    # key → evidence detail
+
+
 class HybridResponse(TypedDict, total=False):
     """Typed envelope for retrieval_mode='hybrid' responses from search_memory_facts.
 
@@ -68,6 +104,8 @@ class HybridResponse(TypedDict, total=False):
     result_count: int
     candidate_rows: list[dict[str, Any]]   # only when OM lane in scope
     diagnostics: HybridDiagnostics         # only when typed retrieval degraded
+    rerank: HybridRerankMetadata           # LLM reranking metadata (always present)
+    provenance: HybridProvenance           # per-result provenance refs
 
 
 class EpisodeSearchResponse(TypedDict, total=False):
