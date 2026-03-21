@@ -92,15 +92,35 @@ database:
       use_parallel_runtime: ${USE_PARALLEL_RUNTIME:false}
 
 graphiti:
-  group_id: ${GRAPHITI_GROUP_ID:main}
+  # HYBRID DEFAULT SURFACE (2026-03-20):
+  # group_id is intentionally blank so that unscoped search_memory_facts calls
+  # use the all-lanes sentinel ([]) and get scoped to authorized_group_ids.
+  # This implements the agreed hybrid default surface across the 5 active
+  # retrieval lanes without requiring callers to pass lane_alias="all".
+  # To override to a single lane, set GRAPHITI_GROUP_ID env var explicitly,
+  # or pass group_ids/lane_alias at call time.
+  group_id: ${GRAPHITI_GROUP_ID:}
   episode_id_prefix: ${EPISODE_ID_PREFIX:}
   user_id: ${USER_ID:mcp_user}
+  # authorized_group_ids: scope all-lane retrieval to the 5 active global lanes.
+  # This prevents unscoped calls from touching corroboration-only, craft, or
+  # engineering lanes. Per README lane_policy matrix:
+  #   s1_sessions_main, s1_observational_memory, s1_chatgpt_history,
+  #   s1_curated_refs, learning_self_audit → global retrieval.
+  #   s1_memory_day1, craft/content, engineering → excluded from default scope.
+  authorized_group_ids:
+    - "s1_sessions_main"
+    - "s1_observational_memory"
+    - "s1_chatgpt_history"
+    - "s1_curated_refs"
+    - "learning_self_audit"
   lane_aliases:
     sessions_main: ["s1_sessions_main"]
     observational_memory: ["s1_observational_memory"]
     curated: ["s1_curated_refs"]
     chatgpt: ["s1_chatgpt_history"]
-    all: []
+    self_audit: ["learning_self_audit"]
+    all: []  # maps to all-lanes sentinel; scoped by authorized_group_ids
   entity_types:
     - name: "Preference"
       description: "User preferences, choices, opinions, or selections (PRIORITIZE over most other types except User/Assistant)"
