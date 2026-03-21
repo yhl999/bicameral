@@ -306,8 +306,8 @@ def test_typed_item_with_empty_original():
     prov = build_provenance([item])
     ref = prov["refs"][0]
     assert ref["source"] == "typed_state"
-    assert ref["source_id"] == ""  # no object_id, no uuid in original
-    assert ref["evidence_keys"] == []  # no object_id → no evidence lookup
+    assert ref["source_id"] == "x"  # no object_id in original → falls back to item uuid
+    assert ref["evidence_keys"] == []  # no object_id in original → no evidence lookup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
