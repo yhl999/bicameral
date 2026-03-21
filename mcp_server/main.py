@@ -11,16 +11,12 @@ Usage:
 All arguments are passed through to the original server implementation.
 """
 
-import sys
-from pathlib import Path
-
-# Add src directory to Python path for imports
-src_path = Path(__file__).parent / 'src'
-sys.path.insert(0, str(src_path))
-
-# Import and run the original server
+# Import and run the original server via the package path so
+# intra-package relative imports (for example ``from .routers ...`` and
+# ``from ..models ...``) continue to resolve correctly when this wrapper is
+# launched as ``python mcp_server/main.py``.
 if __name__ == '__main__':
-    from graphiti_mcp_server import main
+    from mcp_server.src.graphiti_mcp_server import main
 
     # Pass all command line arguments to the original main function
     main()
