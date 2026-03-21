@@ -33,6 +33,10 @@ from mcp_server.src.services.typed_retrieval_service import (  # noqa: E402
     HybridRetrievalService,
     rrf_merge_hybrid,
 )
+from mcp_server.src.services.llm_reranker import (  # noqa: E402
+    LLMRerankerService,
+    RerankResult,
+)
 
 server = load_graphiti_mcp_server()
 
@@ -155,6 +159,35 @@ class _FakeSearchService:
         return False
 
 
+class _FakeLLMRerankerService:
+    """Fake LLM reranker that passes through candidates in original order.
+
+    This prevents tests from making real API calls while exercising the
+    full hybrid response assembly (including rerank/provenance fields).
+    """
+
+    def __init__(self):
+        self.rerank_calls: list[dict] = []
+
+    @property
+    def is_available(self) -> bool:
+        return False
+
+    async def rerank(self, *, query: str, candidates: list, max_results: int | None = None):
+        cap = max_results if max_results is not None else len(candidates)
+        self.rerank_calls.append({
+            "query": query,
+            "candidates": candidates,
+            "max_results": max_results,
+        })
+        return RerankResult(
+            candidates=candidates[:cap],
+            total_scored=len(candidates),
+            method="passthrough",
+            diagnostics={"reason": "test_mock"},
+        )
+
+
 # ── Helper: run a hybrid search call with standard mocks ─────────────────────
 
 
@@ -173,6 +206,7 @@ def _run_hybrid(
     original_graphiti = server.graphiti_service
     original_hybrid_cls = server.HybridRetrievalService
     original_search_service = server.search_service
+    original_reranker_cls = server.LLMRerankerService
 
     fake_hybrid = _FakeHybridRetrievalService(
         typed_payload=fake_typed_payload,
@@ -183,6 +217,7 @@ def _run_hybrid(
         server._SEARCH_RATE_LIMIT_ENABLED = False
         server.graphiti_service = _FakeGraphitiService()
         server.HybridRetrievalService = lambda **_kw: fake_hybrid
+        server.LLMRerankerService = _FakeLLMRerankerService
         server.search_service = _FakeSearchService()
 
         return _run(
@@ -200,6 +235,7 @@ def _run_hybrid(
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
         server.graphiti_service = original_graphiti
         server.HybridRetrievalService = original_hybrid_cls
+        server.LLMRerankerService = original_reranker_cls
         server.search_service = original_search_service
 
 
@@ -515,7 +551,7 @@ def test_hybrid_empty_response_has_all_required_keys():
         fake_typed_payload=_fake_typed_payload(),
         fake_merged_override=[],
     )
-    required = {"message", "retrieval_mode", "facts", "typed_candidates", "merged_results", "result_count"}
+    required = {"message", "retrieval_mode", "facts", "typed_candidates", "merged_results", "result_count", "rerank", "provenance"}
     missing = required - set(response.keys())
     assert not missing, f"Missing keys in empty hybrid response: {missing}"
 
@@ -823,12 +859,14 @@ def test_hybrid_invalid_source_lane_filter_returns_error():
     original_graphiti = server.graphiti_service
     original_hybrid_cls = server.HybridRetrievalService
     original_search_service = server.search_service
+    original_reranker_cls = server.LLMRerankerService
 
     try:
         server.config = _test_config()
         server._SEARCH_RATE_LIMIT_ENABLED = False
         server.graphiti_service = _FakeGraphitiService()
         server.HybridRetrievalService = lambda **_kw: _FakeHybridRetrievalService()
+        server.LLMRerankerService = _FakeLLMRerankerService
         server.search_service = _FakeSearchService()
 
         response = _run(
@@ -844,6 +882,7 @@ def test_hybrid_invalid_source_lane_filter_returns_error():
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
         server.graphiti_service = original_graphiti
         server.HybridRetrievalService = original_hybrid_cls
+        server.LLMRerankerService = original_reranker_cls
         server.search_service = original_search_service
 
     assert "error" in response, f"Expected error for invalid source_lane shape; got {response!r}"
@@ -858,6 +897,7 @@ def test_hybrid_caller_source_lane_is_intersected_not_replaced():
     original_graphiti = server.graphiti_service
     original_search_service = server.search_service
     original_hybrid_cls = server.HybridRetrievalService
+    original_reranker_cls = server.LLMRerankerService
 
     fake_hybrid = _FakeHybridRetrievalService(typed_payload=typed_payload)
     try:
@@ -866,6 +906,7 @@ def test_hybrid_caller_source_lane_is_intersected_not_replaced():
         server.graphiti_service = _FakeGraphitiService()
         server.search_service = _FakeSearchService()
         server.HybridRetrievalService = lambda **_kw: fake_hybrid
+        server.LLMRerankerService = _FakeLLMRerankerService
 
         _response = _run(
             server.search_memory_facts(
@@ -882,6 +923,7 @@ def test_hybrid_caller_source_lane_is_intersected_not_replaced():
         server.graphiti_service = original_graphiti
         server.search_service = original_search_service
         server.HybridRetrievalService = original_hybrid_cls
+        server.LLMRerankerService = original_reranker_cls
 
     assert fake_hybrid.get_typed_calls, "Expected get_typed_candidates to be called"
     call = fake_hybrid.get_typed_calls[0]
@@ -1004,6 +1046,7 @@ def _run_hybrid_with_failure(
     original_graphiti = server.graphiti_service
     original_hybrid_cls = server.HybridRetrievalService
     original_search_service = server.search_service
+    original_reranker_cls = server.LLMRerankerService
 
     fake_hybrid = _FakeHybridRetrievalServiceWithFailure(error_msg=error_msg)
     try:
@@ -1011,6 +1054,7 @@ def _run_hybrid_with_failure(
         server._SEARCH_RATE_LIMIT_ENABLED = False
         server.graphiti_service = _FakeGraphitiService(edges=fake_graph_edges or [])
         server.HybridRetrievalService = lambda **_kw: fake_hybrid
+        server.LLMRerankerService = _FakeLLMRerankerService
         server.search_service = _FakeSearchService()
 
         result = _run(
@@ -1027,6 +1071,7 @@ def _run_hybrid_with_failure(
         server._SEARCH_RATE_LIMIT_ENABLED = original_rate_limit
         server.graphiti_service = original_graphiti
         server.HybridRetrievalService = original_hybrid_cls
+        server.LLMRerankerService = original_reranker_cls
         server.search_service = original_search_service
 
 
@@ -1077,7 +1122,7 @@ def test_hybrid_fallback_still_returns_retrieval_mode_hybrid():
 def test_hybrid_fallback_returns_well_formed_response():
     """Degraded hybrid response must still have all required top-level keys."""
     response, _ = _run_hybrid_with_failure()
-    required = {"retrieval_mode", "facts", "typed_candidates", "merged_results", "result_count"}
+    required = {"retrieval_mode", "facts", "typed_candidates", "merged_results", "result_count", "rerank", "provenance"}
     missing = required - set(response.keys())
     assert not missing, (
         f"Degraded hybrid response missing required keys: {missing}; got {list(response.keys())!r}"

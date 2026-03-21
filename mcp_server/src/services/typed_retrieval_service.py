@@ -285,3 +285,131 @@ class HybridRetrievalService:
             typed_procedures=procedure_items,
             max_facts=max_facts,
         )
+
+
+# ── Provenance materialization ────────────────────────────────────────────────
+
+
+def build_provenance(
+    merged_results: list[dict[str, Any]],
+    typed_results: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build provenance section for the hybrid response.
+
+    Produces:
+    - ``refs``: One provenance ref per merged result, containing source type,
+      source id, object type, and evidence keys for typed items.
+    - ``resolved_evidence``: A flat dict keyed by stable evidence keys,
+      containing resolved evidence detail for typed-backed items.
+
+    This enables callers to dereference typed-backed results without
+    spelunking raw ``_original`` internals. Graph-backed items get
+    simple refs with no evidence resolution (graph evidence lives
+    in the graph edge itself).
+
+    Args:
+        merged_results: The RRF-merged (or reranked) candidate list.
+        typed_results: Optional typed retrieval result dict (for evidence data).
+
+    Returns:
+        Dict with ``refs`` and ``resolved_evidence`` keys.
+    """
+    refs: list[dict[str, Any]] = []
+    resolved_evidence: dict[str, dict[str, Any]] = {}
+
+    # Build evidence index from typed results
+    evidence_index: dict[str, list[dict[str, Any]]] = {}
+    if typed_results:
+        raw_evidence = typed_results.get("evidence", []) or []
+        for ev in raw_evidence:
+            parent_id = str(ev.get("parent_object_id", "") or "")
+            if parent_id:
+                evidence_index.setdefault(parent_id, []).append(ev)
+
+    for item in merged_results:
+        source = str(item.get("_source", "unknown"))
+        ref: dict[str, Any] = {"source": source}
+
+        if source == "graph":
+            ref["source_id"] = str(item.get("uuid", "") or "")
+            ref["object_type"] = "entity_edge"
+            ref["lane"] = str(item.get("group_id", "") or "")
+            ref["evidence_keys"] = []
+        else:
+            # Typed item — extract from _original if available
+            original = item.get("_original", {}) or {}
+            object_id = str(
+                original.get("object_id", "")
+                or item.get("uuid", "")
+                or ""
+            )
+            ref["source_id"] = object_id
+            ref["object_type"] = str(
+                original.get("object_type", "")
+                or item.get("_object_type", "")
+                or source
+            )
+            ref["lane"] = str(
+                original.get("source_lane", "")
+                or original.get("group_id", "")
+                or ""
+            )
+
+            # Resolve evidence for this typed item
+            evidence_keys: list[str] = []
+            if object_id:
+                # Check for evidence in the typed results evidence index
+                item_evidence = evidence_index.get(object_id, [])
+                # Also check for inline evidence_refs in the original
+                inline_refs = original.get("evidence_refs", []) or []
+
+                for ev_idx, ev in enumerate(item_evidence):
+                    ev_key = f"{object_id}:ev:{ev_idx}"
+                    evidence_keys.append(ev_key)
+                    resolved_evidence[ev_key] = _resolve_evidence_entry(ev)
+
+                for er_idx, er in enumerate(inline_refs):
+                    er_key = f"{object_id}:ref:{er_idx}"
+                    if er_key not in resolved_evidence:
+                        evidence_keys.append(er_key)
+                        resolved_evidence[er_key] = _resolve_evidence_ref(er)
+
+            ref["evidence_keys"] = evidence_keys
+
+        refs.append(ref)
+
+    return {
+        "refs": refs,
+        "resolved_evidence": resolved_evidence,
+    }
+
+
+def _resolve_evidence_entry(ev: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a typed evidence entry into a flat provenance detail dict."""
+    return {
+        "kind": str(ev.get("kind", "") or ev.get("type", "") or "evidence"),
+        "source_system": str(ev.get("source_system", "") or ""),
+        "canonical_uri": str(ev.get("canonical_uri", "") or ""),
+        "snippet": str(ev.get("snippet", "") or ev.get("content", "") or "")[:500],
+        "observed_at": str(ev.get("observed_at", "") or ""),
+        "status": "resolved",
+    }
+
+
+def _resolve_evidence_ref(er: Any) -> dict[str, Any]:
+    """Resolve an inline evidence_ref into a flat provenance detail dict."""
+    if isinstance(er, dict):
+        return {
+            "kind": str(er.get("kind", "") or "ref"),
+            "source_system": str(er.get("source_system", "") or ""),
+            "canonical_uri": str(er.get("canonical_uri", "") or ""),
+            "snippet": str(er.get("snippet", "") or er.get("title", "") or "")[:500],
+            "observed_at": str(er.get("observed_at", "") or ""),
+            "status": "resolved",
+        }
+    # Scalar ref (string URI, etc.)
+    return {
+        "kind": "ref",
+        "canonical_uri": str(er)[:500],
+        "status": "resolved",
+    }

@@ -47,7 +47,8 @@ try:
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
-    from .services.typed_retrieval_service import HybridRetrievalService
+    from .services.typed_retrieval_service import HybridRetrievalService, build_provenance
+    from .services.llm_reranker import LLMRerankerService
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 except ImportError:  # pragma: no cover - script/top-level import fallback
@@ -71,7 +72,8 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
-    from services.typed_retrieval_service import HybridRetrievalService
+    from services.typed_retrieval_service import HybridRetrievalService, build_provenance
+    from services.llm_reranker import LLMRerankerService
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
@@ -2164,6 +2166,11 @@ async def search_memory_facts(
         hybrid_candidate_rows = build_om_candidate_rows(om_facts)
 
         if not merged_hybrid:
+            empty_rerank: dict[str, Any] = {
+                'method': 'passthrough',
+                'total_scored': 0,
+                'diagnostics': {'reason': 'empty_input'},
+            }
             empty_response: dict[str, Any] = {
                 'message': 'No relevant memory found',
                 'retrieval_mode': 'hybrid',
@@ -2175,6 +2182,8 @@ async def search_memory_facts(
                 },
                 'merged_results': [],
                 'result_count': 0,
+                'rerank': empty_rerank,
+                'provenance': {'refs': [], 'resolved_evidence': {}},
             }
             if hybrid_candidate_rows:
                 empty_response['candidate_rows'] = hybrid_candidate_rows
@@ -2185,6 +2194,29 @@ async def search_memory_facts(
                     'error': str(_hybrid_fallback_err),
                 }
             return empty_response
+
+        # ── LLM reranking pass ───────────────────────────────────────────────
+        # Apply LLM reranking over the RRF-merged pool. Fail-soft: if
+        # reranking fails, the RRF-ordered pool is used unchanged.
+        reranker_svc = LLMRerankerService()
+        rerank_result = await reranker_svc.rerank(
+            query=query,
+            candidates=merged_hybrid,
+            max_results=max_facts,
+        )
+        final_merged = rerank_result.candidates
+
+        rerank_meta: dict[str, Any] = {
+            'method': rerank_result.method,
+            'total_scored': rerank_result.total_scored,
+        }
+        if rerank_result.model:
+            rerank_meta['model'] = rerank_result.model
+        if rerank_result.diagnostics:
+            rerank_meta['diagnostics'] = rerank_result.diagnostics
+
+        # ── Provenance materialization ───────────────────────────────────────
+        provenance = build_provenance(final_merged, typed_results)
 
         hybrid_response: dict[str, Any] = {
             'message': 'Hybrid memory retrieved successfully',
@@ -2198,8 +2230,10 @@ async def search_memory_facts(
                     'procedures': len(typed_procedures),
                 },
             },
-            'merged_results': merged_hybrid,
-            'result_count': len(merged_hybrid),
+            'merged_results': final_merged,
+            'result_count': len(final_merged),
+            'rerank': rerank_meta,
+            'provenance': provenance,
         }
         if hybrid_candidate_rows:
             hybrid_response['candidate_rows'] = hybrid_candidate_rows
