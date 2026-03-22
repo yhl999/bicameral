@@ -32,6 +32,16 @@ except ImportError:  # pragma: no cover - top-level import fallback
         coerce_typed_object,
     )
 
+# Entity alias expansion for structured subject identifiers.
+# Kept in sync with _ENTITY_ALIASES in typed_retrieval.py.
+# Used when building search_text for typed_roots so that natural-language
+# query tokens (e.g., "yuan", "archibald") can match facts stored under
+# structured entity IDs like "user:principal" / "agent:archibald".
+_LEDGER_ENTITY_ALIASES: dict[str, str] = {
+    'user:principal': 'yuan yuan-han li',
+    'agent:archibald': 'archibald archie',
+}
+
 CANONICAL_EVENT_TYPES = frozenset(
     {
         'assert',
@@ -743,6 +753,96 @@ def _ensure_typed_root_index(conn: sqlite3.Connection) -> None:
         _refresh_typed_root_row(conn, root_id)
 
 
+def _build_search_text_for_objects(objects: list[TypedMemoryObject]) -> str:
+    """Build structured searchable text from a list of TypedMemoryObjects.
+
+    Extracts semantic fields (subject, predicate, value, title, summary, steps,
+    etc.) rather than serialising raw canonical JSON.  Raw JSON storage caused
+    massive false-positive token matches on structural JSON keys like
+    ``"policy_scope"`` (matched every root) or ``"created_at"`` (matched 75 %
+    of roots) and prevented natural-language query tokens from matching the
+    semantically relevant fields.
+
+    Also appends entity alias expansions for structured subject identifiers so
+    that queries using "Yuan" / "Archibald" can match facts stored under
+    ``"user:principal"`` / ``"agent:archibald"``.
+
+    This function intentionally duplicates the field-extraction logic from
+    ``typed_retrieval._searchable_text()`` to avoid a circular import:
+    ``change_ledger`` ← ``typed_memory`` ← ``change_ledger`` would result if
+    we imported from ``typed_retrieval``.  Both copies must be kept in sync.
+    """
+    lines: list[str] = []
+    for obj in objects:
+        parts: list[str] = [
+            obj.object_type,
+            obj.source_lane or '',
+            obj.source_key or '',
+            obj.policy_scope,
+            obj.visibility_scope,
+        ]
+        if isinstance(obj, StateFact):
+            parts.extend([
+                obj.fact_type,
+                obj.subject,
+                obj.predicate,
+                _stringify_for_search(obj.value),
+                obj.scope,
+                obj.risk_level,
+            ])
+            alias = _LEDGER_ENTITY_ALIASES.get(obj.subject or '')
+            if alias:
+                parts.append(alias)
+        elif isinstance(obj, Episode):
+            parts.extend([
+                obj.title or '',
+                obj.summary or '',
+                ' '.join(obj.annotations),
+            ])
+        elif isinstance(obj, Procedure):
+            parts.extend([
+                obj.name,
+                obj.trigger,
+                ' '.join(obj.preconditions),
+                ' '.join(obj.steps),
+                obj.expected_outcome,
+                obj.risk_level,
+            ])
+        for ref in obj.evidence_refs:
+            parts.append(str(ref.title or ''))
+            parts.append(str(ref.snippet or ''))
+            parts.append(str(ref.canonical_uri or ''))
+        lines.append(' '.join(p for p in parts if p))
+    return '\n'.join(lines).lower()
+
+
+def _stringify_for_search(value: Any) -> str:
+    """Convert a typed-memory value to a flat string suitable for search indexing."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def rebuild_all_search_text(conn: sqlite3.Connection) -> int:
+    """Recompute search_text for every row in typed_roots and commit.
+
+    Call this once after upgrading from the old JSON-blob search_text
+    schema to the structured field-based search_text.  Returns the number
+    of rows updated.
+    """
+    root_ids = [
+        str(row['root_id'])
+        for row in conn.execute('SELECT root_id FROM typed_roots').fetchall()
+        if row['root_id']
+    ]
+    for root_id in root_ids:
+        _refresh_typed_root_row(conn, root_id)
+    conn.commit()
+    return len(root_ids)
+
+
 def _refresh_typed_root_row(conn: sqlite3.Connection, root_id: str) -> None:
     rows = conn.execute(
         """
@@ -767,10 +867,7 @@ def _refresh_typed_root_row(conn: sqlite3.Connection, root_id: str) -> None:
     current = next((obj for obj in reversed(objects) if obj.is_current), objects[-1])
     latest_recorded_at = str(rows[-1]['recorded_at'])
     current_payload_json = _canonical_json(current.model_dump(mode='json'))
-    search_text = '\n'.join(
-        _canonical_json(obj.model_dump(mode='json'))
-        for obj in objects
-    ).lower()
+    search_text = _build_search_text_for_objects(objects)
 
     conn.execute(
         """

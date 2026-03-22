@@ -94,6 +94,41 @@ _STOPWORDS = {
     'when',
     'with',
 }
+# Entity alias expansion: maps structured entity identifiers to natural-language
+# name tokens so that queries using "Yuan" / "Archibald" can match facts that
+# store subjects as "user:principal" / "agent:archibald".
+_ENTITY_ALIASES: dict[str, str] = {
+    'user:principal': 'yuan yuan-han li',
+    'agent:archibald': 'archibald archie',
+}
+# Ordered list of (suffix_to_strip, replacement_to_append, min_stem_length)
+# triples for lightweight English suffix stripping.  Evaluated in order;
+# first matching rule wins.  min_stem_length is the minimum character count
+# of the stem BEFORE appending the replacement.
+_STEM_RULES: tuple[tuple[str, str, int], ...] = (
+    ('nesses', '', 4),
+    ('ness', '', 4),
+    ('ations', '', 4),
+    ('ation', '', 4),
+    ('ments', '', 4),
+    ('ment', '', 4),
+    ('ings', '', 4),
+    ('ing', '', 4),
+    ('ities', 'ity', 4),  # priorities → priority
+    ('ity', '', 4),
+    ('ical', '', 4),
+    ('ied', 'y', 3),      # worried → worry
+    ('ies', 'y', 3),      # priorities → priorit + y (fires after 'ities' so rarely reached)
+    ('eds', '', 3),
+    ('ed', '', 3),
+    ('ers', '', 3),
+    ('er', '', 3),
+    ('est', '', 3),
+    ('ly', '', 3),
+    ('ces', 'ce', 3),     # preferences → preference, differences → difference
+    ('es', '', 3),
+    ('s', '', 3),
+)
 _MAX_TYPED_RESULTS_CAP = 200
 _MAX_TYPED_EVIDENCE_CAP = 200
 _MAX_CANDIDATE_ROOTS = 250
@@ -438,21 +473,53 @@ class TypedRetrievalService:
             if len(token) >= _MIN_QUERY_ROOT_TOKEN_LENGTH
         ][:_MAX_QUERY_ROOT_TOKENS]
         if tokens:
+            # Phase 1: SQL fetch — any token match (broad recall).
+            # We fetch extra candidates (4× cap) and apply a Python-side
+            # minimum-overlap filter to require at least 2 distinct query
+            # tokens to appear in a root's search_text.  This eliminates the
+            # single-token false-positive flood that occurs when a generic
+            # token (e.g., "archibald") appears in every self-audit root.
+            # Fallback: if <2 tokens available OR strict filter returns empty,
+            # we fall back to single-token (any-match) semantics so recall is
+            # not catastrophically lost for short queries.
             token_clause = ' OR '.join('instr(search_text, ?) > 0' for _ in tokens)
             where_clause = ' AND '.join([*base_filters, f'({token_clause})'])
             rows = self.ledger.conn.execute(
                 f"""
-                SELECT root_id
+                SELECT root_id, search_text
                   FROM typed_roots
                  WHERE {where_clause}
                  ORDER BY latest_recorded_at DESC, root_id
                  LIMIT ?
                 """,
-                [*base_params, *tokens, max_roots],
+                [*base_params, *tokens, max_roots * 4],
             ).fetchall()
-            matched_roots = [str(row['root_id']) for row in rows if row['root_id']]
-            if matched_roots:
-                return matched_roots, 'query_tokens'
+
+            if not rows:
+                return [], 'query_tokens_no_match'
+
+            # Phase 2: Python-side overlap filter.
+            min_overlap = 2 if len(tokens) >= 2 else 1
+            strict_roots: list[str] = []
+            any_roots: list[str] = []
+            for row in rows:
+                root_id = str(row['root_id']) if row['root_id'] else None
+                if not root_id:
+                    continue
+                any_roots.append(root_id)
+                if min_overlap <= 1:
+                    strict_roots.append(root_id)
+                else:
+                    st = str(row['search_text'] or '').lower()
+                    overlap = sum(1 for t in tokens if t in st)
+                    if overlap >= min_overlap:
+                        strict_roots.append(root_id)
+
+            if strict_roots:
+                return strict_roots[:max_roots], 'query_tokens_min2_overlap'
+            # Fallback: any single-token match rather than returning empty.
+            if any_roots:
+                return any_roots[:max_roots], 'query_tokens_1overlap_fallback'
             return [], 'query_tokens_no_match'
 
         tokenless_exact_query = _tokenless_exact_query(query)
@@ -865,8 +932,42 @@ def _matches_filter_value(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
+def _stem_token(token: str) -> str | None:
+    """Return a simplified stem of *token*, or ``None`` if no rule applied.
+
+    Applies a lightweight English suffix-stripping pass using the _STEM_RULES
+    table.  Only one rule fires per token (first match wins) and the stripped
+    part must leave at least ``min_stem_length`` characters before the
+    replacement is appended.  The caller emits both the original token and the
+    stem so that downstream matching benefits from both forms.
+    """
+    for suffix, replacement, min_len in _STEM_RULES:
+        if token.endswith(suffix) and (len(token) - len(suffix)) >= min_len:
+            stem = token[: len(token) - len(suffix)] + replacement
+            if stem and stem != token:
+                return stem
+    return None
+
+
 def _tokenize(value: str) -> list[str]:
-    return [token for token in _TOKEN_RE.findall(str(value or '').lower()) if token not in _STOPWORDS]
+    """Tokenize *value* into lowercase tokens for typed retrieval matching.
+
+    Emits both the raw token and a lightweight stemmed form so that
+    morphological variants (e.g., "constraints" → "constraint") match
+    without requiring an external stemming library.
+    """
+    raw_tokens = [t for t in _TOKEN_RE.findall(str(value or '').lower()) if t not in _STOPWORDS]
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        if token not in seen:
+            result.append(token)
+            seen.add(token)
+        stem = _stem_token(token)
+        if stem is not None and stem not in seen:
+            result.append(stem)
+            seen.add(stem)
+    return result
 
 
 def _contains_cjk_character(value: str) -> bool:
@@ -904,6 +1005,12 @@ def _searchable_text(obj: TypedMemoryObject) -> str:
                 obj.risk_level,
             ]
         )
+        # Entity alias expansion: append natural-language names so that
+        # queries using "Yuan" or "Archibald" match facts stored under
+        # structured subject identifiers like "user:principal".
+        alias = _ENTITY_ALIASES.get(obj.subject or '')
+        if alias:
+            parts.append(alias)
     elif isinstance(obj, Episode):
         parts.extend(
             [
