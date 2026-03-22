@@ -772,6 +772,10 @@ def _refresh_typed_root_row(conn: sqlite3.Connection, root_id: str) -> None:
         for obj in objects
     ).lower()
 
+    # Guard: validate source_lane before writing to typed_roots to prevent
+    # scope-as-lane leakage (e.g. 'private' stored as source_lane).
+    effective_source_lane = _validate_source_lane_value(current.source_lane)
+
     conn.execute(
         """
         INSERT INTO typed_roots(
@@ -793,7 +797,7 @@ def _refresh_typed_root_row(conn: sqlite3.Connection, root_id: str) -> None:
             root_id,
             latest_recorded_at,
             current.object_type,
-            current.source_lane,
+            effective_source_lane,
             current.object_id,
             int(current.version),
             current_payload_json,
@@ -879,9 +883,14 @@ def build_object_from_candidate_fact(
 
     # Prefer explicit source_lane from the fact dict (set during candidate creation
     # in remember_fact); fall back to evidence refs for legacy callers.
+    # Guard: validate through lane_registry to prevent scope-as-lane leakage
+    # (e.g. 'private' must never be stored as source_lane).
     source_lane = str(fact.get('source_lane') or '').strip() or None
+    if source_lane is not None:
+        source_lane = _validate_source_lane_value(source_lane)
     if source_lane is None:
-        source_lane = _source_lane_from_legacy_refs(fact.get('evidence_refs') or [])
+        raw_legacy = _source_lane_from_legacy_refs(fact.get('evidence_refs') or [])
+        source_lane = _validate_source_lane_value(raw_legacy)
     source_key = _source_key_from_legacy_refs(fact.get('evidence_refs') or [])
     base = {
         'object_id': _stable_object_id(candidate_id),
@@ -1101,6 +1110,33 @@ def _state_fact_type(assertion_type: str, predicate: str) -> str:
         if normalized.startswith(prefix):
             return fact_type
     return 'world_state'
+
+
+def _validate_source_lane_value(value: str | None) -> str | None:
+    """Validate a source_lane value, rejecting scope values.
+
+    Scope labels (``'private'``, ``'public'``, ``'owner'``, etc.) are
+    visibility/policy scope — not lane identity — and must never be stored
+    as ``source_lane``.  This guard prevents the scope-as-lane leakage bug
+    where typed objects become permanently invisible to lane-scoped reads.
+
+    Uses the lane_registry when available; falls back to an inline check
+    for minimal environments (e.g. isolated test fixtures without server config).
+    """
+    if value is None:
+        return None
+    clean = value.strip()
+    if not clean:
+        return None
+    try:
+        from .lane_registry import get_lane_registry
+        return get_lane_registry().validate_source_lane(clean)
+    except ImportError:
+        # Fallback: inline check for environments without lane_registry module.
+        from .lane_registry import SCOPE_NOT_LANE
+        if clean.lower() in SCOPE_NOT_LANE:
+            return None
+        return clean
 
 
 def _source_lane_from_legacy_refs(refs: list[dict[str, Any]]) -> str | None:
