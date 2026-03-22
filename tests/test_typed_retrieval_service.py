@@ -276,7 +276,11 @@ def test_candidate_root_prefilter_finds_provisional_om_episode_by_plain_group_id
         "om_compressor must write source_lane=<group_id> (not 'om:<group_id>') so scoped "
         "typed retrieval can discover provisional ledger episodes."
     )
-    assert strategy == 'query_tokens'
+    # Strategy reflects 2-token minimum overlap logic (min2 when >=2 tokens match,
+    # fallback to single-token if strict filter is empty).
+    assert strategy in ('query_tokens_min2_overlap', 'query_tokens_1overlap_fallback'), (
+        f"Unexpected strategy: {strategy!r}"
+    )
 
 
 def test_episode_only_query_returns_shadow_episode_not_provisional_for_promoted_om_node():
