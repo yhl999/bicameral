@@ -671,3 +671,73 @@ test('intercameral-readiness: missing required fields in otherwise valid schema 
   const result = validateIntercameralDecision(payload);
   assert.equal(result.trusted, false, 'Schema-valid envelope with missing required semantics must be rejected');
 });
+
+// ── P2 findings: NaN guard + retry behaviour ───────────────────────────────
+
+test('intercameral-readiness: NaN confidence is rejected (NaN guard)', () => {
+  // NaN is typeof 'number' so it passes the type check, but NaN < 0 and NaN > 1
+  // are both false — without Number.isFinite(), NaN would be accepted as valid.
+  const result = validateIntercameralDecision(makeSmoke({ confidence: NaN }));
+  assertRejected(result, 'confidence');
+  if (!result.trusted) {
+    assert.equal(result.fallback.reason_code, 'fallback_contract_invalid');
+  }
+});
+
+test('intercameral-readiness: retries 5xx response up to maxRetries limit then returns fallback_runtime_error', async (t: unknown) => {
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  (t as { after: (fn: () => void) => void }).after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // Always return HTTP 500 — both initial attempt and the one retry.
+  globalThis.fetch = (async () => {
+    callCount += 1;
+    return new Response('Internal Server Error', { status: 500 });
+  }) as typeof fetch;
+
+  const result = await callIntercameralBroker(
+    { request_id: '5xx-exhaust', prompt: 'test' },
+    { maxRetries: 1, retryBackoffMs: 0 }, // 1 retry = 2 total attempts
+  );
+
+  assert.equal(callCount, 2, 'expected exactly 2 fetch calls (initial + 1 retry)');
+  assert.equal(result.trusted, false);
+  if (!result.trusted) {
+    assert.equal(result.fallback.reason_code, 'fallback_runtime_error');
+    assert.equal(result.fallback.route, 'safe_fallback');
+  }
+});
+
+test('intercameral-readiness: retries network error and succeeds on second attempt', async (t: unknown) => {
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  (t as { after: (fn: () => void) => void }).after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const validPayload = makeSmoke();
+
+  // First call throws a network error; second call returns the valid payload.
+  globalThis.fetch = (async () => {
+    callCount += 1;
+    if (callCount === 1) {
+      throw new Error('NetworkError: Failed to fetch');
+    }
+    return new Response(JSON.stringify(validPayload), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  const result = await callIntercameralBroker(
+    { request_id: 'retry-success', prompt: 'test' },
+    { maxRetries: 1, retryBackoffMs: 0 },
+  );
+
+  assert.equal(callCount, 2, 'expected exactly 2 fetch calls (initial error + 1 successful retry)');
+  const d = assertAccepted(result);
+  assert.equal(d.route, 'inject_none');
+  assert.equal(d.confidence, 1.0);
+});

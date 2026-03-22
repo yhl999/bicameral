@@ -324,9 +324,11 @@ export function validateIntercameralDecision(payload: unknown): AdapterResult {
   if (typeof resp['confidence'] !== 'number') {
     return makeReject('missing required field: response.confidence', makeFallback(requestId, 'fallback_contract_invalid'));
   }
-  if (resp['confidence'] < 0 || resp['confidence'] > 1) {
+  // Guard against NaN: NaN < 0 and NaN > 1 are both false, so an explicit
+  // Number.isFinite check is required to close this gap.
+  if (!Number.isFinite(resp['confidence'] as number) || (resp['confidence'] as number) < 0 || (resp['confidence'] as number) > 1) {
     return makeReject(
-      `confidence ${resp['confidence']} is out of range [0, 1]`,
+      `confidence ${resp['confidence']} is out of range [0, 1] or not finite`,
       makeFallback(requestId, 'fallback_contract_invalid'),
     );
   }
