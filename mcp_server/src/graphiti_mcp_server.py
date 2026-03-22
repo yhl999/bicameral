@@ -38,6 +38,8 @@ try:
         SuccessResponse,
     )
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from .services.lane_registry import get_lane_registry, init_lane_registry
+    from .services.llm_reranker import LLMRerankerService
     from .services.om_group_scope import (
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
@@ -48,7 +50,6 @@ try:
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from .services.typed_retrieval import TypedRetrievalService
     from .services.typed_retrieval_service import HybridRetrievalService, build_provenance
-    from .services.llm_reranker import LLMRerankerService
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 except ImportError:  # pragma: no cover - script/top-level import fallback
@@ -63,6 +64,8 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         SuccessResponse,
     )
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from services.lane_registry import get_lane_registry, init_lane_registry
+    from services.llm_reranker import LLMRerankerService
     from services.om_group_scope import (
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
@@ -73,7 +76,6 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
     from services.typed_retrieval import TypedRetrievalService
     from services.typed_retrieval_service import HybridRetrievalService, build_provenance
-    from services.llm_reranker import LLMRerankerService
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 
@@ -1734,6 +1736,20 @@ def _intersect_source_lane_filter(
     metadata_filters: dict[str, Any] | None,
     effective_group_ids: list[str],
 ) -> dict[str, Any]:
+    """Build typed-retrieval metadata filters with canonical source_lane scope.
+
+    Resolves ``effective_group_ids`` (which may include versioned/experimental
+    graph group_ids) through the :class:`LaneRegistry` to obtain canonical
+    ``source_lane`` values that match what is actually stored in
+    ``typed_roots.source_lane``.
+
+    This prevents two classes of bugs:
+
+    1. **Namespace mismatch**: versioned/experimental group_ids that have no
+       corresponding typed_roots rows silently returning zero results.
+    2. **Scope-as-lane leakage**: scope values like ``'private'`` being used
+       as lane filter values (they are policy scope, not lane identity).
+    """
     effective_filters = dict(metadata_filters or {})
     requested_source_lane = effective_filters.get('source_lane')
     source_lane_values: list[str] | None = None
@@ -1745,13 +1761,25 @@ def _intersect_source_lane_filter(
     if effective_group_ids == []:
         return effective_filters
 
-    # Preserve caller scope when supplied, intersect with trusted scope.
-    if source_lane_values is None:
-        effective_filters['source_lane'] = {'in': effective_group_ids}
+    # Resolve effective_group_ids → canonical source_lane values through the
+    # lane registry.  This filters out scope values and preserves order.
+    registry = get_lane_registry()
+    canonical_lanes = registry.resolve_typed_source_lanes(effective_group_ids)
+
+    # If resolution produced no lanes (e.g. all group_ids were scope values),
+    # return filters without a source_lane constraint rather than an empty IN()
+    # which would match nothing.  The authorized_group_ids enforcement in
+    # _resolve_effective_group_ids already handles access control.
+    if not canonical_lanes:
         return effective_filters
 
-    allowed_group_set = set(effective_group_ids)
-    filtered_values = [value for value in source_lane_values if value in allowed_group_set]
+    # Preserve caller scope when supplied, intersect with trusted scope.
+    if source_lane_values is None:
+        effective_filters['source_lane'] = {'in': canonical_lanes}
+        return effective_filters
+
+    allowed_lane_set = set(canonical_lanes)
+    filtered_values = [value for value in source_lane_values if value in allowed_lane_set]
     effective_filters['source_lane'] = {'in': _unique_preserve_order(filtered_values)}
 
     return effective_filters
@@ -2708,6 +2736,10 @@ async def initialize_server() -> ServerConfig:
     # Also apply legacy CLI args for backward compatibility
     if hasattr(args, 'destroy_graph'):
         config.destroy_graph = args.destroy_graph
+
+    # Initialize the lane registry from config so typed retrieval can resolve
+    # effective_group_ids → canonical source_lane values.
+    init_lane_registry(config.graphiti.lane_aliases or {})
 
     # Log configuration details
     logger.info('Using configuration:')

@@ -418,7 +418,9 @@ def _extract_server_principal(ctx: Any) -> str:
     """
     # 1. OAuth bearer-token contextvar (AuthContextMiddleware, verified server-side).
     try:
-        from mcp.server.auth.middleware.auth_context import get_access_token  # type: ignore[import-not-found]
+        from mcp.server.auth.middleware.auth_context import (
+            get_access_token,  # type: ignore[import-not-found]
+        )
         access_token = get_access_token()
         if access_token is not None and access_token.client_id:
             return str(access_token.client_id)
@@ -466,13 +468,11 @@ def _resolve_write_context(hint: dict[str, Any], server_principal: str | None = 
     trust = hint.get('trust') if isinstance(hint, dict) else None
 
     # Extract caller-supplied hint fields — informational only, NOT security gates.
-    hint_actor_id = ''
     hint_source = ''
     hint_scope = None
     hint_is_owner = False
     hint_allow_supersede = False
     if isinstance(trust, dict):
-        hint_actor_id = str(trust.get('actor_id') or '').strip()
         hint_source = str(trust.get('source') or '').strip().lower()
         hint_scope = str(trust.get('scope') or '').strip() or None
         hint_is_owner = bool(trust.get('is_owner') is True)
@@ -802,12 +802,26 @@ def _derive_source_lane() -> str | None:
     This ensures facts created via remember_fact are associated with a lane
     and remain visible to correctly scoped reads.  Returns None only when
     no default group_id is configured (backward-compatible).
+
+    Guards against scope-as-lane leakage: if the configured group_id is a
+    scope value (e.g. ``'private'``), it is rejected and ``None`` is returned
+    instead of silently storing a scope label as lane identity.
     """
     try:
         from ..graphiti_mcp_server import config as _server_config
         gid = _server_config.graphiti.group_id
         if gid and isinstance(gid, str) and gid.strip():
-            return gid.strip()
+            # Validate through the lane registry to prevent scope-as-lane leakage.
+            try:
+                from ..services.lane_registry import get_lane_registry
+                return get_lane_registry().validate_source_lane(gid.strip())
+            except ImportError:
+                # Fallback: inline scope check for minimal environments.
+                from ..services.lane_registry import SCOPE_NOT_LANE
+                clean = gid.strip()
+                if clean.lower() in SCOPE_NOT_LANE:
+                    return None
+                return clean
     except (ImportError, AttributeError, Exception):
         pass
     return None
