@@ -38,6 +38,8 @@ try:
         SuccessResponse,
     )
     from .services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from .services.lane_registry import get_lane_registry, init_lane_registry
+    from .services.llm_reranker import LLMRerankerService
     from .services.om_group_scope import (
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
@@ -46,10 +48,8 @@ try:
     from .services.ontology_registry import OntologyRegistry
     from .services.queue_service import QueueService, build_om_candidate_rows
     from .services.search_service import DEFAULT_OM_GROUP_ID, SearchService
-    from .services.lane_registry import get_lane_registry, init_lane_registry
     from .services.typed_retrieval import TypedRetrievalService
     from .services.typed_retrieval_service import HybridRetrievalService, build_provenance
-    from .services.llm_reranker import LLMRerankerService
     from .utils.formatting import format_fact_result
     from .utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 except ImportError:  # pragma: no cover - script/top-level import fallback
@@ -64,6 +64,8 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
         SuccessResponse,
     )
     from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
+    from services.lane_registry import get_lane_registry, init_lane_registry
+    from services.llm_reranker import LLMRerankerService
     from services.om_group_scope import (
         is_om_native_only_scope,
         requires_strict_om_native_only_scope,
@@ -72,10 +74,8 @@ except ImportError:  # pragma: no cover - script/top-level import fallback
     from services.ontology_registry import OntologyRegistry
     from services.queue_service import QueueService, build_om_candidate_rows
     from services.search_service import DEFAULT_OM_GROUP_ID, SearchService
-    from services.lane_registry import get_lane_registry, init_lane_registry
     from services.typed_retrieval import TypedRetrievalService
     from services.typed_retrieval_service import HybridRetrievalService, build_provenance
-    from services.llm_reranker import LLMRerankerService
     from utils.formatting import format_fact_result
     from utils.rate_limiter import SlidingWindowRateLimiter as _SlidingWindowRateLimiter
 

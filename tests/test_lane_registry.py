@@ -16,7 +16,6 @@ from mcp_server.src.services.lane_registry import (
     set_lane_registry,
 )
 
-
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 _SAMPLE_ALIASES = {

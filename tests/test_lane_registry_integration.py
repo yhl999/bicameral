@@ -7,21 +7,18 @@ Verifies that:
    reject scope-as-lane
 """
 
-import sqlite3
 from types import SimpleNamespace
 from unittest import mock
 
+from mcp_server.src.services.change_ledger import (
+    _validate_source_lane_value,
+    build_object_from_candidate_fact,
+)
 from mcp_server.src.services.lane_registry import (
     LaneRegistry,
-    set_lane_registry,
     get_lane_registry,
+    set_lane_registry,
 )
-from mcp_server.src.services.change_ledger import (
-    ChangeLedger,
-    build_object_from_candidate_fact,
-    _validate_source_lane_value,
-)
-
 from tests.helpers_mcp_import import load_graphiti_mcp_server
 
 server = load_graphiti_mcp_server()
@@ -232,10 +229,11 @@ def test_derive_source_lane_rejects_scope_value():
     fake_config = SimpleNamespace(
         graphiti=SimpleNamespace(group_id='private'),
     )
-    with mock.patch('mcp_server.src.routers.memory._derive_source_lane.__module__', 'mcp_server.src.routers.memory'):
-        # Patch the config import inside _derive_source_lane
-        with mock.patch('mcp_server.src.graphiti_mcp_server.config', fake_config):
-            result = _derive_source_lane()
+    with (
+        mock.patch('mcp_server.src.routers.memory._derive_source_lane.__module__', 'mcp_server.src.routers.memory'),
+        mock.patch('mcp_server.src.graphiti_mcp_server.config', fake_config),
+    ):
+        result = _derive_source_lane()
     assert result is None, f'_derive_source_lane should reject scope value "private"; got {result!r}'
 
 

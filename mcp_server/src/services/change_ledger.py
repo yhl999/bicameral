@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import secrets
@@ -477,10 +478,8 @@ class ChangeLedger:
             with ChangeLedger(path) as ledger:
                 facts = ledger.current_state_facts()
         """
-        try:
+        with contextlib.suppress(Exception):
             self.conn.close()
-        except Exception:
-            pass
 
     def __enter__(self) -> ChangeLedger:
         return self

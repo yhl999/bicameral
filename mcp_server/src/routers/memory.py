@@ -418,7 +418,9 @@ def _extract_server_principal(ctx: Any) -> str:
     """
     # 1. OAuth bearer-token contextvar (AuthContextMiddleware, verified server-side).
     try:
-        from mcp.server.auth.middleware.auth_context import get_access_token  # type: ignore[import-not-found]
+        from mcp.server.auth.middleware.auth_context import (
+            get_access_token,  # type: ignore[import-not-found]
+        )
         access_token = get_access_token()
         if access_token is not None and access_token.client_id:
             return str(access_token.client_id)
@@ -466,13 +468,11 @@ def _resolve_write_context(hint: dict[str, Any], server_principal: str | None = 
     trust = hint.get('trust') if isinstance(hint, dict) else None
 
     # Extract caller-supplied hint fields — informational only, NOT security gates.
-    hint_actor_id = ''
     hint_source = ''
     hint_scope = None
     hint_is_owner = False
     hint_allow_supersede = False
     if isinstance(trust, dict):
-        hint_actor_id = str(trust.get('actor_id') or '').strip()
         hint_source = str(trust.get('source') or '').strip().lower()
         hint_scope = str(trust.get('scope') or '').strip() or None
         hint_is_owner = bool(trust.get('is_owner') is True)
