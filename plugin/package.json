@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/correctness.test.ts",
+    "test": "node --experimental-strip-types --test tests/correctness.test.ts tests/intercameral-readiness.test.ts",
+    "test:intercameral": "node --experimental-strip-types --test tests/intercameral-readiness.test.ts",
     "check": "node --experimental-strip-types --check index.ts",
     "typecheck": "tsc --noEmit"
   },
