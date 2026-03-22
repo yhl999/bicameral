@@ -343,9 +343,9 @@ def test_resolve_model_openrouter_adds_prefix():
     svc = LLMRerankerService(
         api_key="sk-or-test",
         api_base="https://openrouter.ai/api/v1",
-        model="gpt-4.1-nano",
+        model="gpt-5.4-nano",
     )
-    assert svc._resolve_model() == "openai/gpt-4.1-nano"
+    assert svc._resolve_model() == "openai/gpt-5.4-nano"
 
 
 def test_resolve_model_openrouter_preserves_existing_prefix():
@@ -363,9 +363,9 @@ def test_resolve_model_openai_strips_prefix():
     svc = LLMRerankerService(
         api_key="sk-test",
         api_base="https://api.openai.com/v1",
-        model="openai/gpt-4.1-nano",
+        model="openai/gpt-5.4-nano",
     )
-    assert svc._resolve_model() == "gpt-4.1-nano"
+    assert svc._resolve_model() == "gpt-5.4-nano"
 
 
 def test_detect_api_base_from_openrouter_key():
