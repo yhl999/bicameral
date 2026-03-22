@@ -13,7 +13,7 @@ Design goals:
 - Clean abstraction: no benchmark-script imports, no experiment harness deps.
 
 Configuration is via environment variables:
-- BICAMERAL_RERANK_MODEL: model id (default: gpt-4.1-nano)
+- BICAMERAL_RERANK_MODEL: model id (default: gpt-5.4-nano)
 - BICAMERAL_RERANK_API_KEY: API key (falls back to OPENAI_API_KEY)
 - BICAMERAL_RERANK_API_BASE: API base URL (auto-detected from key prefix)
 - BICAMERAL_RERANK_ENABLED: '1' to enable, '0' to disable (default: '1')
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration defaults ────────────────────────────────────────────────────
 
-_DEFAULT_MODEL = "gpt-4.1-nano"
+_DEFAULT_MODEL = "gpt-5.4-nano"
 _DEFAULT_TIMEOUT = 30
 _DEFAULT_BATCH_SIZE = 20
 _MAX_RETRIES = 2
