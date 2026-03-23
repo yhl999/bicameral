@@ -249,12 +249,10 @@ class TestDedupCandidates:
         assert len(result) == 1
         assert result[0]["_hybrid_score"] == 0.88
 
-    def test_threshold_zero_keeps_all(self):
-        """threshold=0 → no dedup (nothing reaches threshold)."""
+    def test_threshold_above_one_keeps_all(self):
+        """threshold > 1.0 → nothing reaches it, all candidates kept."""
         c1 = _make_candidate("fact A", score=0.9, uuid="f1")
         c2 = _make_candidate("fact A", score=0.8, uuid="f2")
-        # Jaccard of identical text = 1.0 > 0.0, so they will be deduped
-        # ... actually threshold=0 means everything ≥ 0 is a dup. Let's use 1.01.
         result = _dedup_candidates([c1, c2], threshold=1.01)
         assert len(result) == 2  # nothing reaches threshold of 1.01
 

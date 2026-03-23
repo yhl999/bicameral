@@ -268,8 +268,15 @@ def _lane_label(candidate: dict[str, Any]) -> str:
 # ── Phase 2B: Candidate Diversity Helpers ─────────────────────────────────────
 
 # Env-var overrides for tuning knobs
-_DEDUP_THRESHOLD: float = float(os.environ.get("BICAMERAL_DEDUP_THRESHOLD", "0.85"))
-_MMR_WEIGHT_DIVERSITY: float = float(os.environ.get("BICAMERAL_MMR_WEIGHT_DIVERSITY", "0.3"))
+def _parse_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        logger.warning("Invalid value for %s; using default %.2f", name, default)
+        return default
+
+_DEDUP_THRESHOLD: float = _parse_float_env("BICAMERAL_DEDUP_THRESHOLD", 0.85)
+_MMR_WEIGHT_DIVERSITY: float = _parse_float_env("BICAMERAL_MMR_WEIGHT_DIVERSITY", 0.3)
 
 
 def _candidate_fact_text(candidate: dict[str, Any]) -> str:
