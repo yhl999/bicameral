@@ -27,6 +27,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +38,8 @@ try:
     from .typed_retrieval import TypedRetrievalService
 except ImportError:  # pragma: no cover — top-level import fallback
     from services.typed_retrieval import TypedRetrievalService
+
+logger = logging.getLogger(__name__)
 
 # ── RRF tuning constants ──────────────────────────────────────────────────────
 # k=60: standard RRF constant matching experiment calibration in lane_fair_merge
@@ -45,6 +51,362 @@ _HYBRID_RRF_K: float = 60.0
 # that a weak typed match does not dominate a strong graph hit.
 _HYBRID_WEIGHT_GRAPH: float = 1.0
 _HYBRID_WEIGHT_TYPED: float = 0.85
+
+
+# ── Phase 2A: Query-Intent Lane Filter ────────────────────────────────────────
+
+# Suppression matrix: intent → list of lane labels to suppress (zero-score).
+SUPPRESSION_MATRIX: dict[str, list[str]] = {
+    "persona": ["engineering", "technical"],
+    "preference": ["engineering", "incident", "operational"],
+    "operational": [],
+    "technical": ["persona", "preference"],
+    "decision": ["persona", "preference"],
+    "engineering": [],
+    "incident": [],
+    "generic": [],
+}
+
+# Intent classification patterns: list of (compiled_regex, intent_label).
+# Order matters — first match wins.
+_INTENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # decision — check early; "alternative … considered" can have words between
+    (re.compile(
+        r"\b(?:why\s+did\s+(?:we|you|i)|trade[\s-]?off|"
+        r"alternative(?:s)?(?:\s+\w+)*\s+considered|"
+        r"decision|decided|chose|rationale|reasoning\s+behind|"
+        r"pros?\s+(?:and|&)\s+cons?|compare|comparison|"
+        r"evaluation|evaluated|assessed|picked|selected\s+(?:over|instead))",
+        re.IGNORECASE,
+    ), "decision"),
+    # operational — before persona to avoid "schedule" false positives;
+    #   "pipeline" is qualified to avoid stealing technical queries.
+    (re.compile(
+        r"\b(?:interrupt\s+vs|batch\s+update|operational\s+(?:rule|procedure|mode)|"
+        r"communication\s+guard|guard\s+server|cron\s+(?:job|schedule|audit)|"
+        r"heartbeat|workflow|(?:deploy(?:ment)?|ci|cd|build)\s+pipeline|"
+        r"deploy(?:ment)?|rollback|runbook|"
+        r"procedure|playbook|escalat(?:e|ion)|on[\s-]?call|"
+        r"incident\s+(?:response|management|review)|post[\s-]?mortem)",
+        re.IGNORECASE,
+    ), "operational"),
+    # technical / engineering — before persona/preference to catch specific terms
+    (re.compile(
+        r"\b(?:how\s+does\s+(?:it|the|this)\s+work|architecture|spec(?:s|ification)?|"
+        r"implement(?:ation|ed)?|code|function|class|method|module|"
+        r"api|endpoint|schema|database|query|index|"
+        r"bug|fix(?:ed)?|error|exception|stack\s+trace|debug|"
+        r"performance|latency|throughput|benchmark|pipeline|"
+        r"config(?:uration)?|infrastructure|service|server|"
+        r"graph(?:iti)?|neo4j|falkordb|rrf|rerank|retrieval|"
+        r"vector|embedding|semantic|hybrid|fusion|"
+        r"typed\s+retrieval|change\s+ledger|om\s+projection|"
+        r"feature\s+flag|migration|refactor)",
+        re.IGNORECASE,
+    ), "technical"),
+    # persona — "schedule" qualified to avoid stealing operational/technical
+    (re.compile(
+        r"\b(?:favorite|favourite|prefer(?:s|red|ence)?|personality|character|"
+        r"style|habit|routine|who\s+(?:is|am)|about\s+(?:yuan|me|him|her|them)|"
+        r"schedul(?:e|ing)\s+(?:preference|default|block|habit)|"
+        r"scheduling|calendar|availability|morning|workout|"
+        r"background|family|hometown|grew\s+up|boarding\s+school|"
+        r"communication\s+(?:style|rules|preference)|"
+        r"decision\s+style|working\s+hours|meeting\s+default|buffer\s+time)",
+        re.IGNORECASE,
+    ), "persona"),
+    # preference
+    (re.compile(
+        r"\b(?:opinion\s+on|think\s+about|taste\s+in|like(?:s)?\s+(?:to|about)?|"
+        r"dislike|enjoy|love(?:s)?|hate(?:s)?|"
+        r"recommend(?:ation)?|suggestion|what\s+(?:do\s+(?:you|i)\s+think|should\s+i)|"
+        r"cuisine|restaurant|wine|food|favorite\s+(?:food|movie|book|song|color|music)|"
+        r"best\s+(?:restaurant|bar|place)|ranking|rated)",
+        re.IGNORECASE,
+    ), "preference"),
+]
+
+
+class QueryIntentClassifier:
+    """Rule-based query-intent classifier with TTL cache.
+
+    Classifies a query string into one of the intent labels used by the
+    suppression matrix.  Results are cached for 1 hour keyed on SHA-256
+    of the query to avoid redundant regex passes on repeated queries.
+    """
+
+    _CACHE_TTL_SECONDS: int = 3600  # 1 hour
+
+    def __init__(self) -> None:
+        self._cache: dict[str, tuple[str, float]] = {}
+
+    def classify(self, query: str) -> str:
+        """Classify *query* into an intent label.
+
+        Returns one of: persona, preference, decision, operational,
+        technical, engineering, incident, generic.
+        """
+        key = hashlib.sha256(query.encode()).hexdigest()
+        now = time.monotonic()
+
+        # Check cache
+        if key in self._cache:
+            intent, ts = self._cache[key]
+            if now - ts < self._CACHE_TTL_SECONDS:
+                return intent
+            # Expired — fall through to re-classify.
+
+        intent = self._classify_uncached(query)
+        self._cache[key] = (intent, now)
+        return intent
+
+    @staticmethod
+    def _classify_uncached(query: str) -> str:
+        """Run pattern matching against *query*; return intent label."""
+        for pattern, label in _INTENT_PATTERNS:
+            if pattern.search(query):
+                return label
+        return "generic"
+
+    def clear_cache(self) -> None:
+        """Clear the classification cache (useful for testing)."""
+        self._cache.clear()
+
+
+# Module-level singleton for lightweight reuse across calls.
+_query_intent_classifier = QueryIntentClassifier()
+
+
+def _lane_label(candidate: dict[str, Any]) -> str:
+    """Derive a lane label from candidate metadata.
+
+    Inspects ``_source``, entity type, tags, bucket, and object type to
+    return one of: persona, preference, operational, technical, decision,
+    engineering, incident, generic.
+    """
+    source = str(candidate.get("_source", "") or "").lower()
+
+    # ── Typed candidates (from ChangeLedger) ──────────────────────────────
+    if source in ("typed_state", "typed_procedure"):
+        original = candidate.get("_original", {}) or {}
+        obj_type = str(original.get("object_type", "") or "").lower()
+        bucket = str(original.get("bucket", "") or "").lower()
+        subject = str(original.get("subject", "") or "").lower()
+        tags = [str(t).lower() for t in (original.get("tags", []) or [])]
+
+        # Explicit bucket match
+        if bucket in ("persona",):
+            return "persona"
+        if bucket in ("preference", "preferences"):
+            return "preference"
+        if bucket in ("operational",):
+            return "operational"
+        if bucket in ("decision", "decisions"):
+            return "decision"
+
+        # Object-type / tag heuristics
+        if obj_type in ("persona", "identity"):
+            return "persona"
+        if obj_type in ("preference",):
+            return "preference"
+        if obj_type in ("decision", "decision_framework"):
+            return "decision"
+        if obj_type in ("procedure",) or "decision_framework" in tags:
+            return "decision"
+        if any(t in tags for t in ("engineering", "ops", "architecture", "technical")):
+            return "engineering"
+
+        # Subject-based heuristics
+        if any(kw in subject for kw in ("favorite", "preference", "taste", "opinion")):
+            return "preference"
+        if any(kw in subject for kw in ("schedule", "calendar", "routine", "habit")):
+            return "persona"
+
+        return "generic"
+
+    # ── Graph candidates ──────────────────────────────────────────────────
+    if source == "graph":
+        entity_type = str(candidate.get("entity_type", "") or "").lower()
+        name = str(candidate.get("name", "") or "").lower()
+        fact = str(candidate.get("fact", "") or "").lower()
+        tags = [str(t).lower() for t in (candidate.get("tags", []) or [])]
+        group_id = str(candidate.get("group_id", "") or "").lower()
+
+        # Incident detection
+        if entity_type == "incident" or "incident" in tags:
+            return "incident"
+
+        # Engineering / technical signals
+        engineering_keywords = (
+            "feature flag", "migration", "refactor", "bug", "fix",
+            "scanner", "runtime", "version", "config", "deploy",
+            "pipeline", "ci/cd", "test", "spec",
+        )
+        if any(kw in name or kw in fact for kw in engineering_keywords):
+            return "engineering"
+        if any(t in ("engineering", "ops", "architecture", "technical") for t in tags):
+            return "engineering"
+
+        # Persona / preference signals from graph
+        persona_keywords = (
+            "favorite", "preference", "schedule", "routine",
+            "personality", "background", "family",
+        )
+        if any(kw in name or kw in fact for kw in persona_keywords):
+            return "persona"
+
+        # Decision signals
+        if "decision" in entity_type or "decision" in name or "trade-off" in fact:
+            return "decision"
+
+        return "generic"
+
+    # Fallback
+    return "generic"
+
+
+# ── Phase 2B: Candidate Diversity Helpers ─────────────────────────────────────
+
+# Env-var overrides for tuning knobs
+def _parse_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        logger.warning("Invalid value for %s; using default %.2f", name, default)
+        return default
+
+_DEDUP_THRESHOLD: float = _parse_float_env("BICAMERAL_DEDUP_THRESHOLD", 0.85)
+_MMR_WEIGHT_DIVERSITY: float = _parse_float_env("BICAMERAL_MMR_WEIGHT_DIVERSITY", 0.3)
+
+
+def _candidate_fact_text(candidate: dict[str, Any]) -> str:
+    """Extract canonical text from a candidate for similarity comparison."""
+    parts: list[str] = []
+
+    # Primary: fact text
+    fact = str(candidate.get("fact", "") or "")
+    if fact:
+        parts.append(fact)
+
+    # Secondary: name
+    name = str(candidate.get("name", "") or "")
+    if name and name != fact:
+        parts.append(name)
+
+    # For typed items, pull subject/predicate/value from _original
+    original = candidate.get("_original", {}) or {}
+    for key in ("subject", "predicate", "value"):
+        v = str(original.get(key, "") or "")
+        if v and v not in parts:
+            parts.append(v)
+
+    return " ".join(parts).strip() or str(candidate.get("uuid", ""))
+
+
+def _tokenize(text: str) -> set[str]:
+    """Simple whitespace + lowercased tokenizer for Jaccard similarity."""
+    return set(re.findall(r"\w+", text.lower()))
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Jaccard token overlap similarity (0.0–1.0)."""
+    tokens_a = _tokenize(a)
+    tokens_b = _tokenize(b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+def _dedup_candidates(
+    candidates: list[dict[str, Any]],
+    threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    """Remove near-duplicate candidates.
+
+    Keeps the highest-scoring variant (assumes *candidates* is sorted by
+    descending ``_hybrid_score`` already).
+
+    Args:
+        candidates: Score-sorted candidate list.
+        threshold: Jaccard similarity threshold (0.0–1.0).  Defaults to
+            ``_DEDUP_THRESHOLD`` (env-overridable).
+
+    Returns:
+        De-duplicated list preserving original order.
+    """
+    if threshold is None:
+        threshold = _DEDUP_THRESHOLD
+
+    kept: list[dict[str, Any]] = []
+    for candidate in candidates:
+        fact_text = _candidate_fact_text(candidate)
+        is_dup = False
+        for kept_cand in kept:
+            kept_text = _candidate_fact_text(kept_cand)
+            if _text_similarity(fact_text, kept_text) >= threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(candidate)
+    return kept
+
+
+def _apply_mmr_diversity(
+    candidates: list[dict[str, Any]],
+    mmr_weight: float | None = None,
+    max_items: int = 10,
+) -> list[dict[str, Any]]:
+    """Re-rank candidates using Maximal Marginal Relevance.
+
+    Balances relevance (``_hybrid_score``) with diversity (Jaccard distance
+    from already-selected candidates).
+
+    Args:
+        candidates: Input candidate list (post-dedup).
+        mmr_weight: Diversity weight λ (0 = pure relevance, 1 = pure
+            diversity).  Defaults to ``_MMR_WEIGHT_DIVERSITY``.
+        max_items: Maximum items to select.
+
+    Returns:
+        MMR-reranked list, length ≤ min(len(candidates), max_items).
+    """
+    if mmr_weight is None:
+        mmr_weight = _MMR_WEIGHT_DIVERSITY
+
+    if not candidates:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    remaining = list(candidates)
+
+    while remaining and len(selected) < max_items:
+        best_idx = 0
+        best_mmr = float("-inf")
+
+        for i, cand in enumerate(remaining):
+            relevance = cand.get("_hybrid_score", 0.0)
+
+            # Diversity penalty: max similarity to any already-selected
+            if selected:
+                cand_text = _candidate_fact_text(cand)
+                max_sim = max(
+                    _text_similarity(cand_text, _candidate_fact_text(s))
+                    for s in selected
+                )
+            else:
+                max_sim = 0.0
+
+            mmr_score = (1.0 - mmr_weight) * relevance - mmr_weight * max_sim
+
+            if mmr_score > best_mmr:
+                best_mmr = mmr_score
+                best_idx = i
+
+        selected.append(remaining.pop(best_idx))
+
+    return selected
 
 
 # ── Key helpers for deduplication ────────────────────────────────────────────
@@ -130,12 +492,22 @@ def rrf_merge_hybrid(
     rrf_k: float = _HYBRID_RRF_K,
     weight_graph: float = _HYBRID_WEIGHT_GRAPH,
     weight_typed: float = _HYBRID_WEIGHT_TYPED,
+    query_intent: str | None = None,
+    apply_diversity: bool = True,
 ) -> list[dict[str, Any]]:
     """Reciprocal Rank Fusion over graph facts + typed state/procedure candidates.
 
     Each source is ranked independently and weighted. Items that appear in
     multiple sources accumulate their RRF scores. The merged list is returned
     in score-descending order, capped at ``max_facts``.
+
+    Phase 2A: When *query_intent* is provided, candidates whose lane label
+    is in the suppression matrix for that intent are zero-scored before
+    final ranking.
+
+    Phase 2B: After scoring and suppression, near-duplicate candidates are
+    removed and MMR diversity re-ranking is applied (when *apply_diversity*
+    is True).
 
     Args:
         graph_facts: Ranked list of graph-edge facts (index 0 = best).
@@ -145,6 +517,11 @@ def rrf_merge_hybrid(
         rrf_k: RRF smoothing constant.
         weight_graph: Multiplicative weight for graph-edge source.
         weight_typed: Multiplicative weight for typed-ledger source.
+        query_intent: Optional intent label from QueryIntentClassifier.
+            When provided, candidates in suppressed lanes are zero-scored.
+        apply_diversity: When True (default), apply dedup + MMR diversity
+            after RRF merge.  Set to False when an LLM reranker will run
+            downstream.
 
     Returns:
         Merged list of hybrid-entry dicts, annotated with ``_source`` and
@@ -177,13 +554,37 @@ def rrf_merge_hybrid(
         if key not in registry:
             registry[key] = _typed_to_hybrid_entry(item, source_label="typed_procedure")
 
+    # ── Phase 2A: Lane suppression ────────────────────────────────────────
+    if query_intent:
+        suppressed_lanes = SUPPRESSION_MATRIX.get(query_intent, [])
+        if suppressed_lanes:
+            for key in list(scores.keys()):
+                candidate = registry.get(key)
+                if candidate is not None:
+                    lane = _lane_label(candidate)
+                    if lane in suppressed_lanes:
+                        scores[key] = 0.0
+
     # Annotate with final RRF scores.
     for key, score in scores.items():
         if key in registry:
             registry[key]["_hybrid_score"] = round(score, 6)
 
     ordered_keys = sorted(scores, key=lambda k: (-scores[k], k))
-    return [registry[k] for k in ordered_keys[:max_facts]]
+    merged = [registry[k] for k in ordered_keys]
+
+    # ── Phase 2B: Dedup + MMR diversity ───────────────────────────────────
+    if apply_diversity and merged:
+        try:
+            merged = _dedup_candidates(merged)
+        except Exception:
+            logger.warning("Candidate dedup failed; returning undeduped pool", exc_info=True)
+        try:
+            merged = _apply_mmr_diversity(merged, max_items=max_facts)
+        except Exception:
+            logger.warning("MMR diversity failed; returning pool without MMR", exc_info=True)
+
+    return merged[:max_facts]
 
 
 # ── Service class ─────────────────────────────────────────────────────────────
@@ -266,6 +667,8 @@ class HybridRetrievalService:
         graph_facts: list[dict[str, Any]],
         typed_results: dict[str, Any],
         max_facts: int,
+        query: str | None = None,
+        apply_diversity: bool = True,
     ) -> list[dict[str, Any]]:
         """Merge graph-recall facts with typed state/procedure candidates via RRF.
 
@@ -273,17 +676,30 @@ class HybridRetrievalService:
             graph_facts: Ranked graph-edge facts from the graph recall path.
             typed_results: Result dict from :meth:`get_typed_candidates`.
             max_facts: Maximum items in the returned merged list.
+            query: Original query string.  When provided, the query-intent
+                classifier runs and passes the intent to the RRF merge for
+                lane suppression.
+            apply_diversity: When True (default), dedup + MMR diversity is
+                applied.  Set to False when an LLM reranker runs downstream.
 
         Returns:
             RRF-merged list of hybrid entries, score-descending.
         """
         state_items: list[dict[str, Any]] = typed_results.get("state", []) or []
         procedure_items: list[dict[str, Any]] = typed_results.get("procedures", []) or []
+
+        # Phase 2A: classify query intent for lane suppression
+        intent: str | None = None
+        if query:
+            intent = _query_intent_classifier.classify(query)
+
         return rrf_merge_hybrid(
             graph_facts=graph_facts,
             typed_state=state_items,
             typed_procedures=procedure_items,
             max_facts=max_facts,
+            query_intent=intent,
+            apply_diversity=apply_diversity,
         )
 
 
