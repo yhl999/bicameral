@@ -29,7 +29,6 @@ import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,21 +42,42 @@ _DEFAULT_BATCH_SIZE = 20
 _MAX_RETRIES = 2
 _RETRY_BASE_DELAY = 1.0
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt (unified — no classifier needed) ────────────────────────────
 
 _RERANK_SYSTEM_PROMPT = (
-    "You are a relevance judge for a memory retrieval system. "
+    "You are a relevance judge for a personal AI memory retrieval system. "
     "Given a query and a numbered list of memory candidates, "
     "score EACH candidate's relevance to the query.\n\n"
     "Respond with ONLY a JSON array. Each element must have:\n"
-    '  {"index": <int>, "score": <float 0.0-1.0>, "rationale": "<brief reason>"}\n\n'
-    "Scoring rules:\n"
+    ' {"index": <int>, "score": <float 0.0-1.0>, "rationale": "<brief reason>"}\n\n'
+    "## Scoring Scale\n"
     "- 0.8-1.0: candidate directly and substantially answers the query\n"
     "- 0.5-0.7: candidate contains partially relevant information\n"
     "- 0.2-0.4: candidate is tangentially related\n"
     "- 0.0-0.1: candidate is irrelevant to the query\n"
-    "- Return one object per candidate, in order of index\n"
-    "- Be strict: high scores only for candidates that genuinely help answer the query"
+    "- Return one object per candidate, in order of index\n\n"
+    "## Core Principle\n"
+    "Read the query carefully. Determine what the user actually wants to know — "
+    "then score each candidate by how much it helps answer THAT specific question. "
+    "Be strict: high scores only for candidates that genuinely serve the query's intent.\n\n"
+    "## What to Reward\n"
+    "- Facts that directly answer the core question over general background\n"
+    "- The KIND of information the query is actually seeking:\n"
+    "  - Asking about a person? Reward their background, role, interactions, opinions, personal details\n"
+    "  - Asking about a project? Reward status, timeline, stakeholders, milestones, decisions\n"
+    "  - Asking about an event? Reward specific dates, attendees, outcomes, what happened\n"
+    "  - Asking about a decision? Reward rationale, tradeoffs, alternatives, who decided\n"
+    "  - Asking how something works? Reward architecture, specs, explanations, debugging details\n"
+    "  - Asking about numbers or finances? Reward specific figures, metrics, valuations, pricing\n"
+    "  - Asking about preferences or opinions? Reward stated tastes, aversions, personal stances\n"
+    "- Specificity and concrete details over vague generalities\n"
+    "- Recency when the query implies current state\n\n"
+    "## What to Penalize\n"
+    "- Keyword matches that don't serve the query's actual intent "
+    "(e.g., a project description when the query asks about a person who happens to be mentioned in it)\n"
+    "- Generic organizational facts or public knowledge (unless specifically asked)\n"
+    "- Vague or abstract facts without specific details\n"
+    "- Metadata-only facts (e.g., 'directory of' without content)"
 )
 
 
@@ -282,12 +302,13 @@ class LLMRerankerService:
         to the batch, not the full candidate list).
         """
         user_prompt = self._build_user_prompt(query, candidates)
+        system_prompt = _RERANK_SYSTEM_PROMPT
         max_tokens = max(100, min(4000, len(candidates) * 80 + 100))
 
         payload = {
             "model": self._resolve_model(),
             "messages": [
-                {"role": "system", "content": _RERANK_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.0,
