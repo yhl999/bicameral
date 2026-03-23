@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from services.llm_reranker import (
     QUERY_TYPES,
+    _QUERY_TYPES_SORTED,
     LLMRerankerService,
     RerankedCandidate,
     RerankResult,
@@ -115,6 +116,13 @@ class TestQueryTypeConstants:
         for qt in QUERY_TYPES:
             assert qt in _TYPE_SCORING_RULES, f"Missing scoring rule for type: {qt}"
             assert len(_TYPE_SCORING_RULES[qt]) > 10, f"Scoring rule too short for type: {qt}"
+
+    def test_sorted_query_types_is_deterministic(self):
+        """_QUERY_TYPES_SORTED must be a plain sorted list for deterministic iteration."""
+        assert isinstance(_QUERY_TYPES_SORTED, list)
+        assert _QUERY_TYPES_SORTED == sorted(QUERY_TYPES)
+        # Verify it's actually sorted (alphabetical)
+        assert _QUERY_TYPES_SORTED == sorted(_QUERY_TYPES_SORTED)
 
 
 class TestTypeAwareSystemPrompt:
@@ -305,6 +313,77 @@ class TestClassifyQueryType:
         with patch.object(svc, "_http_post", return_value=resp):
             result = await svc.classify_query_type("Budget for Q1?")
         assert result == "financial"
+
+    # ── Substring false-positive regression tests ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_classify_no_false_positive_event_in_prevent(self):
+        """'event' must NOT match in 'prevent' — substring false positive."""
+        svc = _service()
+        resp = _mock_classify_response("prevent")
+        with patch.object(svc, "_http_post", return_value=resp):
+            result = await svc.classify_query_type("How to prevent issues?")
+        assert result == "generic"  # not "event"
+
+    @pytest.mark.asyncio
+    async def test_classify_no_false_positive_person_in_personal(self):
+        """'person' must NOT match in 'personal' — substring false positive."""
+        svc = _service()
+        resp = _mock_classify_response("personal")
+        with patch.object(svc, "_http_post", return_value=resp):
+            result = await svc.classify_query_type("What are my personal notes?")
+        assert result == "generic"  # not "person"
+
+    @pytest.mark.asyncio
+    async def test_classify_no_false_positive_event_in_eventually(self):
+        """'event' must NOT match in 'eventually'."""
+        svc = _service()
+        resp = _mock_classify_response("eventually generic")
+        with patch.object(svc, "_http_post", return_value=resp):
+            result = await svc.classify_query_type("What will eventually happen?")
+        assert result == "generic"  # not "event"
+
+    @pytest.mark.asyncio
+    async def test_classify_no_false_positive_decision_in_indecision(self):
+        """'decision' must NOT match in 'indecision'."""
+        svc = _service()
+        resp = _mock_classify_response("indecision")
+        with patch.object(svc, "_http_post", return_value=resp):
+            result = await svc.classify_query_type("test query")
+        assert result == "generic"  # not "decision"
+
+    @pytest.mark.asyncio
+    async def test_classify_word_boundary_matches_in_verbose_response(self):
+        """Word-boundary regex should still match 'event' as a standalone word."""
+        svc = _service()
+        resp = _mock_classify_response("I believe the type is event.")
+        with patch.object(svc, "_http_post", return_value=resp):
+            result = await svc.classify_query_type("What happened at the conference?")
+        assert result == "event"
+
+    @pytest.mark.asyncio
+    async def test_classify_exact_match_preferred_over_regex(self):
+        """Clean single-word response should use exact match, not regex."""
+        svc = _service()
+        resp = _mock_classify_response("person")
+        with patch.object(svc, "_http_post", return_value=resp):
+            result = await svc.classify_query_type("Who is Alice?")
+        assert result == "person"
+
+    @pytest.mark.asyncio
+    async def test_classify_deterministic_across_runs(self):
+        """The same ambiguous response must always produce the same type
+        regardless of frozenset iteration order (hash seed)."""
+        svc = _service()
+        # Response containing both "decision" and "event" as whole words
+        resp = _mock_classify_response("this is about a decision at the event")
+        results = set()
+        for _ in range(50):  # run many times to detect non-determinism
+            _CLASSIFY_CACHE.clear()
+            with patch.object(svc, "_http_post", return_value=resp):
+                result = await svc.classify_query_type("some query")
+            results.add(result)
+        assert len(results) == 1, f"Non-deterministic results: {results}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

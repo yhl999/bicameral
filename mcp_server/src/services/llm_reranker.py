@@ -43,6 +43,11 @@ QUERY_TYPES = frozenset({
     "technical", "financial", "preference", "generic",
 })
 
+# Sorted list for deterministic iteration (frozenset order varies by Python
+# version / hash seed).  Used only when exact-match fails and we fall back
+# to word-boundary search in a verbose LLM response.
+_QUERY_TYPES_SORTED = sorted(QUERY_TYPES)
+
 _CLASSIFY_SYSTEM_PROMPT = (
     "Classify the user's query into exactly one of these types: "
     "person, project, event, decision, technical, financial, preference, generic.\n\n"
@@ -408,11 +413,20 @@ class LLMRerankerService:
                 payload,
             )
             raw = result["choices"][0]["message"]["content"].strip().lower()
-            # Extract just the type word (handle edge cases like "type: person")
-            for qt in QUERY_TYPES:
-                if qt in raw:
+
+            # Fast path: exact match (the prompt asks for a single word)
+            if raw in QUERY_TYPES:
+                _cache_set(query_text, raw)
+                logger.debug("Query type classified: %s -> %s", query_text[:60], raw)
+                return raw
+
+            # Fallback: word-boundary regex for verbose responses like
+            # "The query type is: person".  Uses sorted iteration for
+            # determinism across Python versions (frozenset order varies).
+            for qt in _QUERY_TYPES_SORTED:
+                if re.search(rf"\b{qt}\b", raw):
                     _cache_set(query_text, qt)
-                    logger.debug("Query type classified: %s -> %s", query_text[:60], qt)
+                    logger.debug("Query type classified (regex fallback): %s -> %s", query_text[:60], qt)
                     return qt
 
             # LLM returned something unexpected — default to generic
