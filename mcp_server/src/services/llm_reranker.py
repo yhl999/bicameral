@@ -25,110 +25,14 @@ the RRF-ordered pool unchanged (passthrough mode), not an error.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-# ── Query-type classification ─────────────────────────────────────────────────
-
-QUERY_TYPES = frozenset({
-    "person", "project", "event", "decision",
-    "technical", "financial", "preference", "generic",
-})
-
-# Sorted list for deterministic iteration (frozenset order varies by Python
-# version / hash seed).  Used only when exact-match fails and we fall back
-# to word-boundary search in a verbose LLM response.
-_QUERY_TYPES_SORTED = sorted(QUERY_TYPES)
-
-_CLASSIFY_SYSTEM_PROMPT = (
-    "Classify the user's query into exactly one of these types: "
-    "person, project, event, decision, technical, financial, preference, generic.\n\n"
-    "Definitions:\n"
-    "- person: about a specific person (who is X, what do I know about X, has X contacted me)\n"
-    "- project: about a project's status, timeline, stakeholders, or deliverables\n"
-    "- event: about a specific event — when, who attended, what happened\n"
-    "- decision: about why a decision was made, tradeoffs, alternatives considered\n"
-    "- technical: how something works, architecture, specs, debugging\n"
-    "- financial: prices, budgets, valuations, P&L, financial figures\n"
-    "- preference: personal opinions, tastes, likes/dislikes\n"
-    "- generic: mixed, unclear, or doesn't fit other types\n\n"
-    "Respond with ONLY the single type word, nothing else."
-)
-
-# ── TTL cache for query-type classification ───────────────────────────────────
-
-_CLASSIFY_CACHE: dict[str, tuple[str, float]] = {}
-_CLASSIFY_CACHE_TTL = 3600.0  # 1 hour
-
-
-def _cache_get(query_text: str) -> str | None:
-    """Return cached query type if still valid, else None."""
-    key = hashlib.sha256(query_text.encode()).hexdigest()
-    entry = _CLASSIFY_CACHE.get(key)
-    if entry is None:
-        return None
-    value, ts = entry
-    if time.monotonic() - ts > _CLASSIFY_CACHE_TTL:
-        _CLASSIFY_CACHE.pop(key, None)
-        return None
-    return value
-
-
-def _cache_set(query_text: str, query_type: str) -> None:
-    """Store a classification result with monotonic timestamp."""
-    key = hashlib.sha256(query_text.encode()).hexdigest()
-    _CLASSIFY_CACHE[key] = (query_type, time.monotonic())
-
-
-# ── Type-specific scoring rules ───────────────────────────────────────────────
-
-_TYPE_SCORING_RULES: dict[str, str] = {
-    "person": (
-        "Reward facts about the person's background, role, interactions, opinions, "
-        "or personal details. Penalize generic org overviews or project descriptions "
-        "that merely mention the person's name."
-    ),
-    "project": (
-        "Reward facts about project status, timeline, stakeholders, milestones, "
-        "and decisions. Penalize general company descriptions or unrelated "
-        "personal context."
-    ),
-    "event": (
-        "Reward facts with specific dates, attendees, outcomes, agendas, "
-        "and what happened. Penalize organizational history or generic context "
-        "that doesn't reference the event."
-    ),
-    "decision": (
-        "Reward facts containing rationale, tradeoffs, alternatives considered, "
-        "and who decided. Penalize implementation details or procedural steps "
-        "unrelated to the decision context."
-    ),
-    "technical": (
-        "Reward explanations, architecture details, specs, debugging info, "
-        "and how things work. Penalize unrelated organizational or personal facts."
-    ),
-    "financial": (
-        "Reward specific numbers, budgets, valuations, pricing, revenue, "
-        "and financial metrics. Penalize narrative context without quantitative data."
-    ),
-    "preference": (
-        "Reward stated opinions, tastes, aversions, and personal preferences. "
-        "Penalize purely factual or procedural information that doesn't reflect "
-        "a personal stance."
-    ),
-    "generic": (
-        "No type-specific penalty. Reward specificity, recency, and direct "
-        "relevance to the query intent."
-    ),
-}
 
 # ── Configuration defaults ────────────────────────────────────────────────────
 
@@ -138,51 +42,43 @@ _DEFAULT_BATCH_SIZE = 20
 _MAX_RETRIES = 2
 _RETRY_BASE_DELAY = 1.0
 
-# ── System prompt (v2 — type-aware) ───────────────────────────────────────────
+# ── System prompt (unified — no classifier needed) ────────────────────────────
 
-_RERANK_SYSTEM_PROMPT_BASE = (
+_RERANK_SYSTEM_PROMPT = (
     "You are a relevance judge for a personal AI memory retrieval system. "
     "Given a query and a numbered list of memory candidates, "
     "score EACH candidate's relevance to the query.\n\n"
     "Respond with ONLY a JSON array. Each element must have:\n"
-    '  {"index": <int>, "score": <float 0.0-1.0>, "rationale": "<brief reason>"}\n\n'
-    "Scoring rules:\n"
+    ' {"index": <int>, "score": <float 0.0-1.0>, "rationale": "<brief reason>"}\n\n'
+    "## Scoring Scale\n"
     "- 0.8-1.0: candidate directly and substantially answers the query\n"
     "- 0.5-0.7: candidate contains partially relevant information\n"
     "- 0.2-0.4: candidate is tangentially related\n"
     "- 0.0-0.1: candidate is irrelevant to the query\n"
-    "- Return one object per candidate, in order of index\n"
-    "- Be strict: high scores only for candidates that genuinely help answer the query\n\n"
-    "General penalties (apply always):\n"
-    "- Penalize generic/organizational facts (e.g., company overview, public knowledge) "
-    "unless the query specifically asks for that\n"
-    "- Penalize facts that are lexically similar but off-type "
-    "(e.g., project description when query is about a person)\n"
-    "- Penalize vague/abstract facts without specific details\n"
-    "- Penalize metadata-only facts (e.g., 'directory of' without content)\n\n"
-    "General rewards (apply always):\n"
-    "- Reward facts that directly answer the query\n"
-    "- Reward specific, recent, and actionable context\n"
-    "- Reward facts that match the query type"
+    "- Return one object per candidate, in order of index\n\n"
+    "## Core Principle\n"
+    "Read the query carefully. Determine what the user actually wants to know — "
+    "then score each candidate by how much it helps answer THAT specific question. "
+    "Be strict: high scores only for candidates that genuinely serve the query's intent.\n\n"
+    "## What to Reward\n"
+    "- Facts that directly answer the core question over general background\n"
+    "- The KIND of information the query is actually seeking:\n"
+    "  - Asking about a person? Reward their background, role, interactions, opinions, personal details\n"
+    "  - Asking about a project? Reward status, timeline, stakeholders, milestones, decisions\n"
+    "  - Asking about an event? Reward specific dates, attendees, outcomes, what happened\n"
+    "  - Asking about a decision? Reward rationale, tradeoffs, alternatives, who decided\n"
+    "  - Asking how something works? Reward architecture, specs, explanations, debugging details\n"
+    "  - Asking about numbers or finances? Reward specific figures, metrics, valuations, pricing\n"
+    "  - Asking about preferences or opinions? Reward stated tastes, aversions, personal stances\n"
+    "- Specificity and concrete details over vague generalities\n"
+    "- Recency when the query implies current state\n\n"
+    "## What to Penalize\n"
+    "- Keyword matches that don't serve the query's actual intent "
+    "(e.g., a project description when the query asks about a person who happens to be mentioned in it)\n"
+    "- Generic organizational facts or public knowledge (unless specifically asked)\n"
+    "- Vague or abstract facts without specific details\n"
+    "- Metadata-only facts (e.g., 'directory of' without content)"
 )
-
-
-def _build_type_aware_system_prompt(query_type: str) -> str:
-    """Build the full system prompt with type-specific scoring rules injected.
-
-    Args:
-        query_type: One of the 8 recognized query types.
-
-    Returns:
-        Complete system prompt string with type-specific guidance.
-    """
-    type_rule = _TYPE_SCORING_RULES.get(query_type, _TYPE_SCORING_RULES["generic"])
-    return (
-        f"{_RERANK_SYSTEM_PROMPT_BASE}\n\n"
-        f"Query type: {query_type}\n"
-        f"Type-specific scoring guidance:\n"
-        f"- {type_rule}"
-    )
 
 
 # ── Data types ────────────────────────────────────────────────────────────────
@@ -334,10 +230,7 @@ class LLMRerankerService:
             )
 
         try:
-            # ── Phase 1A: classify query type for type-aware reranking ────────
-            query_type = await self.classify_query_type(query)
-
-            scored = await self._score_candidates(query, candidates, query_type=query_type)
+            scored = await self._score_candidates(query, candidates)
             if not scored:
                 # LLM returned empty/unparseable — fall back to RRF order
                 logger.warning("LLM reranker returned empty scores — falling back to RRF order")
@@ -346,7 +239,7 @@ class LLMRerankerService:
                     total_scored=len(candidates),
                     method="fallback",
                     model=self._model,
-                    diagnostics={"reason": "empty_llm_response", "query_type": query_type},
+                    diagnostics={"reason": "empty_llm_response"},
                 )
 
             # Blend LLM scores with RRF scores
@@ -358,7 +251,6 @@ class LLMRerankerService:
                 total_scored=len(reranked),
                 method="llm",
                 model=self._model,
-                diagnostics={"query_type": query_type},
             )
 
         except Exception as e:
@@ -378,77 +270,10 @@ class LLMRerankerService:
                 },
             )
 
-    async def classify_query_type(self, query_text: str) -> str:
-        """Classify a query into one of 8 types using a lightweight LLM call.
-
-        Uses a 1-hour in-memory cache keyed by SHA-256 of query_text.
-        Falls back to 'generic' on any error.
-
-        Args:
-            query_text: The user's search query.
-
-        Returns:
-            One of: person, project, event, decision, technical, financial,
-            preference, generic.
-        """
-        # Check cache first
-        cached = _cache_get(query_text)
-        if cached is not None:
-            logger.debug("Query type cache hit: %s -> %s", query_text[:60], cached)
-            return cached
-
-        try:
-            payload = {
-                "model": self._resolve_model(),
-                "messages": [
-                    {"role": "system", "content": _CLASSIFY_SYSTEM_PROMPT},
-                    {"role": "user", "content": query_text},
-                ],
-                "temperature": 0.0,
-                "max_tokens": 10,
-            }
-            result = await asyncio.to_thread(
-                self._http_post,
-                f"{self._api_base}/chat/completions",
-                payload,
-            )
-            raw = result["choices"][0]["message"]["content"].strip().lower()
-
-            # Fast path: exact match (the prompt asks for a single word)
-            if raw in QUERY_TYPES:
-                _cache_set(query_text, raw)
-                logger.debug("Query type classified: %s -> %s", query_text[:60], raw)
-                return raw
-
-            # Fallback: word-boundary regex for verbose responses like
-            # "The query type is: person".  Uses sorted iteration for
-            # determinism across Python versions (frozenset order varies).
-            for qt in _QUERY_TYPES_SORTED:
-                if re.search(rf"\b{qt}\b", raw):
-                    _cache_set(query_text, qt)
-                    logger.debug("Query type classified (regex fallback): %s -> %s", query_text[:60], qt)
-                    return qt
-
-            # LLM returned something unexpected — default to generic
-            logger.warning(
-                "Query type classifier returned unrecognized type '%s' for query '%s' — defaulting to generic",
-                raw[:50], query_text[:60],
-            )
-            _cache_set(query_text, "generic")
-            return "generic"
-
-        except Exception as e:
-            logger.warning(
-                "Query type classification failed (defaulting to generic): %s", e
-            )
-            return "generic"
-
     async def _score_candidates(
         self,
         query: str,
         candidates: list[dict[str, Any]],
-        *,
-        query_type: str = "generic",
     ) -> list[dict[str, Any]]:
         """Call the LLM to score candidates in batches.
 
@@ -458,7 +283,7 @@ class LLMRerankerService:
 
         for batch_start in range(0, len(candidates), self._batch_size):
             batch = candidates[batch_start: batch_start + self._batch_size]
-            batch_scores = await self._call_llm_batch(query, batch, query_type=query_type)
+            batch_scores = await self._call_llm_batch(query, batch)
 
             for item in batch_scores:
                 item["index"] = batch_start + item["index"]
@@ -470,16 +295,14 @@ class LLMRerankerService:
         self,
         query: str,
         candidates: list[dict[str, Any]],
-        *,
-        query_type: str = "generic",
     ) -> list[dict[str, Any]]:
         """Make a single batched LLM call for a set of candidates.
 
         Returns list of {index, score, rationale} dicts (indices relative
         to the batch, not the full candidate list).
         """
-        user_prompt = self._build_user_prompt(query, candidates, query_type=query_type)
-        system_prompt = _build_type_aware_system_prompt(query_type)
+        user_prompt = self._build_user_prompt(query, candidates)
+        system_prompt = _RERANK_SYSTEM_PROMPT
         max_tokens = max(100, min(4000, len(candidates) * 80 + 100))
 
         payload = {
@@ -567,15 +390,10 @@ class LLMRerankerService:
         self,
         query: str,
         candidates: list[dict[str, Any]],
-        *,
-        query_type: str = "generic",
     ) -> str:
-        """Build the user prompt for the batched rerank call.
-
-        Includes query type label so the model can apply type-specific scoring.
-        """
+        """Build the user prompt for the batched rerank call."""
         parts = [
-            f"Query (type: {query_type}): {query}",
+            f"Query: {query}",
             "",
             f"Score each of these {len(candidates)} memory candidates:",
             "",

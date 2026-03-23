@@ -1,9 +1,8 @@
 """
-Tests for LLMRerankerService — covers query-type classifier, type-aware
-prompt generation, caching, blending, passthrough/fallback paths, and
-response parsing.
+Tests for LLMRerankerService — covers unified system prompt, blending,
+passthrough/fallback paths, and response parsing.
 
-Phase 1A: query-type classifier + type-aware reranker prompting.
+Phase 1A simplified: single unified prompt, no query-type classifier.
 """
 from __future__ import annotations
 
@@ -24,18 +23,10 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from services.llm_reranker import (
-    QUERY_TYPES,
-    _QUERY_TYPES_SORTED,
     LLMRerankerService,
     RerankedCandidate,
     RerankResult,
-    _CLASSIFY_CACHE,
-    _CLASSIFY_CACHE_TTL,
-    _RERANK_SYSTEM_PROMPT_BASE,
-    _TYPE_SCORING_RULES,
-    _build_type_aware_system_prompt,
-    _cache_get,
-    _cache_set,
+    _RERANK_SYSTEM_PROMPT,
 )
 
 
@@ -67,19 +58,6 @@ def _mock_llm_response(scores: list[dict]) -> dict:
     }
 
 
-def _mock_classify_response(query_type: str) -> dict:
-    """Build a mock chat completion for classification."""
-    return {
-        "choices": [
-            {
-                "message": {
-                    "content": query_type,
-                }
-            }
-        ]
-    }
-
-
 def _service(**kwargs) -> LLMRerankerService:
     """Create a test service with a fake API key so it's 'available'."""
     defaults = {"api_key": "sk-or-test-key-1234", "enabled": True}
@@ -87,335 +65,99 @@ def _service(**kwargs) -> LLMRerankerService:
     return LLMRerankerService(**defaults)
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 1: Unified System Prompt
+# ══════════════════════════════════════════════════════════════════════════════
 
-@pytest.fixture(autouse=True)
-def _clear_classify_cache():
-    """Clear the classification cache before each test."""
-    _CLASSIFY_CACHE.clear()
-    yield
-    _CLASSIFY_CACHE.clear()
+class TestUnifiedSystemPrompt:
+    """Verify the unified system prompt contains all required heuristics."""
+
+    def test_prompt_is_string(self):
+        assert isinstance(_RERANK_SYSTEM_PROMPT, str)
+
+    def test_prompt_includes_scoring_scale(self):
+        assert "0.8-1.0" in _RERANK_SYSTEM_PROMPT
+        assert "0.0-0.1" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_json_format(self):
+        assert "JSON array" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_core_principle(self):
+        assert "Core Principle" in _RERANK_SYSTEM_PROMPT
+        assert "query's intent" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_person_heuristic(self):
+        assert "Asking about a person" in _RERANK_SYSTEM_PROMPT
+        assert "background" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_project_heuristic(self):
+        assert "Asking about a project" in _RERANK_SYSTEM_PROMPT
+        assert "milestones" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_event_heuristic(self):
+        assert "Asking about an event" in _RERANK_SYSTEM_PROMPT
+        assert "attendees" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_decision_heuristic(self):
+        assert "Asking about a decision" in _RERANK_SYSTEM_PROMPT
+        assert "tradeoffs" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_technical_heuristic(self):
+        assert "Asking how something works" in _RERANK_SYSTEM_PROMPT
+        assert "architecture" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_financial_heuristic(self):
+        assert "Asking about numbers or finances" in _RERANK_SYSTEM_PROMPT
+        assert "valuations" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_preference_heuristic(self):
+        assert "Asking about preferences or opinions" in _RERANK_SYSTEM_PROMPT
+        assert "tastes" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_penalty_section(self):
+        assert "What to Penalize" in _RERANK_SYSTEM_PROMPT
+        assert "Keyword matches" in _RERANK_SYSTEM_PROMPT
+        assert "Metadata-only facts" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_includes_reward_section(self):
+        assert "What to Reward" in _RERANK_SYSTEM_PROMPT
+        assert "Specificity and concrete details" in _RERANK_SYSTEM_PROMPT
+        assert "Recency" in _RERANK_SYSTEM_PROMPT
+
+    def test_prompt_nontrivial_length(self):
+        assert len(_RERANK_SYSTEM_PROMPT) > 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 1: Query-Type Constants & Prompt Generation
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestQueryTypeConstants:
-    """Verify the 8 query types are properly defined."""
-
-    def test_query_types_count(self):
-        assert len(QUERY_TYPES) == 8
-
-    def test_query_types_values(self):
-        expected = {"person", "project", "event", "decision",
-                    "technical", "financial", "preference", "generic"}
-        assert QUERY_TYPES == expected
-
-    def test_all_types_have_scoring_rules(self):
-        for qt in QUERY_TYPES:
-            assert qt in _TYPE_SCORING_RULES, f"Missing scoring rule for type: {qt}"
-            assert len(_TYPE_SCORING_RULES[qt]) > 10, f"Scoring rule too short for type: {qt}"
-
-    def test_sorted_query_types_is_deterministic(self):
-        """_QUERY_TYPES_SORTED must be a plain sorted list for deterministic iteration."""
-        assert isinstance(_QUERY_TYPES_SORTED, list)
-        assert _QUERY_TYPES_SORTED == sorted(QUERY_TYPES)
-        # Verify it's actually sorted (alphabetical)
-        assert _QUERY_TYPES_SORTED == sorted(_QUERY_TYPES_SORTED)
-
-
-class TestTypeAwareSystemPrompt:
-    """Test _build_type_aware_system_prompt generates correct prompts."""
-
-    def test_includes_base_prompt(self):
-        prompt = _build_type_aware_system_prompt("person")
-        assert "relevance judge" in prompt
-        assert "JSON array" in prompt
-
-    def test_includes_query_type_label(self):
-        for qt in QUERY_TYPES:
-            prompt = _build_type_aware_system_prompt(qt)
-            assert f"Query type: {qt}" in prompt
-
-    def test_includes_type_specific_rule(self):
-        prompt = _build_type_aware_system_prompt("person")
-        assert "background" in prompt and "role" in prompt
-
-        prompt = _build_type_aware_system_prompt("financial")
-        assert "numbers" in prompt or "budgets" in prompt
-
-        prompt = _build_type_aware_system_prompt("event")
-        assert "dates" in prompt or "attendees" in prompt
-
-    def test_generic_type_no_penalty(self):
-        prompt = _build_type_aware_system_prompt("generic")
-        assert "No type-specific penalty" in prompt
-
-    def test_unknown_type_falls_back_to_generic(self):
-        prompt = _build_type_aware_system_prompt("nonexistent_type")
-        assert "No type-specific penalty" in prompt
-
-    def test_includes_general_penalties(self):
-        prompt = _build_type_aware_system_prompt("person")
-        assert "Penalize generic/organizational facts" in prompt
-        assert "Penalize facts that are lexically similar but off-type" in prompt
-
-    def test_includes_general_rewards(self):
-        prompt = _build_type_aware_system_prompt("project")
-        assert "Reward facts that directly answer the query" in prompt
-        assert "Reward specific, recent, and actionable context" in prompt
-
-    @pytest.mark.parametrize("query_type", list(QUERY_TYPES))
-    def test_all_types_generate_valid_prompt(self, query_type: str):
-        prompt = _build_type_aware_system_prompt(query_type)
-        assert isinstance(prompt, str)
-        assert len(prompt) > 200  # Non-trivial prompt
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Section 2: Classification Cache
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestClassificationCache:
-    """Test the TTL-based classification cache."""
-
-    def test_cache_set_and_get(self):
-        _cache_set("who is alice?", "person")
-        assert _cache_get("who is alice?") == "person"
-
-    def test_cache_miss(self):
-        assert _cache_get("never seen this query") is None
-
-    def test_cache_expiry(self):
-        _cache_set("test query", "project")
-        # Manually expire the entry
-        import hashlib
-        key = hashlib.sha256("test query".encode()).hexdigest()
-        # Set timestamp far in the past
-        _CLASSIFY_CACHE[key] = ("project", time.monotonic() - _CLASSIFY_CACHE_TTL - 1)
-        assert _cache_get("test query") is None
-
-    def test_cache_different_queries(self):
-        _cache_set("who is alice?", "person")
-        _cache_set("project status?", "project")
-        assert _cache_get("who is alice?") == "person"
-        assert _cache_get("project status?") == "project"
-
-    def test_cache_overwrite(self):
-        _cache_set("ambiguous query", "generic")
-        _cache_set("ambiguous query", "person")
-        assert _cache_get("ambiguous query") == "person"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Section 3: classify_query_type
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestClassifyQueryType:
-    """Test the classify_query_type method."""
-
-    @pytest.mark.asyncio
-    async def test_classify_person_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("person")):
-            result = await svc.classify_query_type("Who is Alice Chen?")
-        assert result == "person"
-
-    @pytest.mark.asyncio
-    async def test_classify_project_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("project")):
-            result = await svc.classify_query_type("What's the status of Project Alpha?")
-        assert result == "project"
-
-    @pytest.mark.asyncio
-    async def test_classify_event_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("event")):
-            result = await svc.classify_query_type("What happened at the offsite last week?")
-        assert result == "event"
-
-    @pytest.mark.asyncio
-    async def test_classify_decision_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("decision")):
-            result = await svc.classify_query_type("Why did we decide to use Rust?")
-        assert result == "decision"
-
-    @pytest.mark.asyncio
-    async def test_classify_technical_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("technical")):
-            result = await svc.classify_query_type("How does the RRF merge algorithm work?")
-        assert result == "technical"
-
-    @pytest.mark.asyncio
-    async def test_classify_financial_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("financial")):
-            result = await svc.classify_query_type("What's the valuation of Acme Corp?")
-        assert result == "financial"
-
-    @pytest.mark.asyncio
-    async def test_classify_preference_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("preference")):
-            result = await svc.classify_query_type("Do I like sushi?")
-        assert result == "preference"
-
-    @pytest.mark.asyncio
-    async def test_classify_generic_query(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("generic")):
-            result = await svc.classify_query_type("Tell me something interesting")
-        assert result == "generic"
-
-    @pytest.mark.asyncio
-    async def test_classify_uses_cache(self):
-        svc = _service()
-        mock_post = MagicMock(return_value=_mock_classify_response("person"))
-        with patch.object(svc, "_http_post", mock_post):
-            result1 = await svc.classify_query_type("Who is Bob?")
-            result2 = await svc.classify_query_type("Who is Bob?")
-        assert result1 == "person"
-        assert result2 == "person"
-        # Should only call LLM once — second hit served from cache
-        assert mock_post.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_classify_error_falls_back_to_generic(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", side_effect=RuntimeError("API error")):
-            result = await svc.classify_query_type("Who is Alice?")
-        assert result == "generic"
-
-    @pytest.mark.asyncio
-    async def test_classify_unrecognized_response_falls_back(self):
-        svc = _service()
-        with patch.object(svc, "_http_post", return_value=_mock_classify_response("banana")):
-            result = await svc.classify_query_type("Something weird")
-        assert result == "generic"
-
-    @pytest.mark.asyncio
-    async def test_classify_extracts_type_from_verbose_response(self):
-        """LLM might return 'The query type is: person' instead of just 'person'."""
-        svc = _service()
-        resp = _mock_classify_response("The query type is: person")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("Who is Alice?")
-        assert result == "person"
-
-    @pytest.mark.asyncio
-    async def test_classify_handles_uppercase_response(self):
-        svc = _service()
-        resp = _mock_classify_response("FINANCIAL")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("Budget for Q1?")
-        assert result == "financial"
-
-    # ── Substring false-positive regression tests ─────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_classify_no_false_positive_event_in_prevent(self):
-        """'event' must NOT match in 'prevent' — substring false positive."""
-        svc = _service()
-        resp = _mock_classify_response("prevent")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("How to prevent issues?")
-        assert result == "generic"  # not "event"
-
-    @pytest.mark.asyncio
-    async def test_classify_no_false_positive_person_in_personal(self):
-        """'person' must NOT match in 'personal' — substring false positive."""
-        svc = _service()
-        resp = _mock_classify_response("personal")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("What are my personal notes?")
-        assert result == "generic"  # not "person"
-
-    @pytest.mark.asyncio
-    async def test_classify_no_false_positive_event_in_eventually(self):
-        """'event' must NOT match in 'eventually'."""
-        svc = _service()
-        resp = _mock_classify_response("eventually generic")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("What will eventually happen?")
-        assert result == "generic"  # not "event"
-
-    @pytest.mark.asyncio
-    async def test_classify_no_false_positive_decision_in_indecision(self):
-        """'decision' must NOT match in 'indecision'."""
-        svc = _service()
-        resp = _mock_classify_response("indecision")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("test query")
-        assert result == "generic"  # not "decision"
-
-    @pytest.mark.asyncio
-    async def test_classify_word_boundary_matches_in_verbose_response(self):
-        """Word-boundary regex should still match 'event' as a standalone word."""
-        svc = _service()
-        resp = _mock_classify_response("I believe the type is event.")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("What happened at the conference?")
-        assert result == "event"
-
-    @pytest.mark.asyncio
-    async def test_classify_exact_match_preferred_over_regex(self):
-        """Clean single-word response should use exact match, not regex."""
-        svc = _service()
-        resp = _mock_classify_response("person")
-        with patch.object(svc, "_http_post", return_value=resp):
-            result = await svc.classify_query_type("Who is Alice?")
-        assert result == "person"
-
-    @pytest.mark.asyncio
-    async def test_classify_deterministic_across_runs(self):
-        """The same ambiguous response must always produce the same type
-        regardless of frozenset iteration order (hash seed)."""
-        svc = _service()
-        # Response containing both "decision" and "event" as whole words
-        resp = _mock_classify_response("this is about a decision at the event")
-        results = set()
-        for _ in range(50):  # run many times to detect non-determinism
-            _CLASSIFY_CACHE.clear()
-            with patch.object(svc, "_http_post", return_value=resp):
-                result = await svc.classify_query_type("some query")
-            results.add(result)
-        assert len(results) == 1, f"Non-deterministic results: {results}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Section 4: Type-Aware User Prompt
+# Section 2: User Prompt
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBuildUserPrompt:
-    """Test that _build_user_prompt includes query type."""
+    """Test that _build_user_prompt formats correctly."""
 
-    def test_user_prompt_includes_query_type(self):
+    def test_user_prompt_includes_query(self):
         svc = _service()
         candidates = _make_candidates(3)
-        prompt = svc._build_user_prompt("Who is Alice?", candidates, query_type="person")
-        assert "Query (type: person):" in prompt
-        assert "Who is Alice?" in prompt
+        prompt = svc._build_user_prompt("Who is Alice?", candidates)
+        assert "Query: Who is Alice?" in prompt
 
-    def test_user_prompt_default_type_is_generic(self):
+    def test_user_prompt_no_type_label(self):
+        """Unified prompt should NOT include a query type label."""
         svc = _service()
         candidates = _make_candidates(2)
         prompt = svc._build_user_prompt("test query", candidates)
-        assert "Query (type: generic):" in prompt
+        assert "(type:" not in prompt
 
     def test_user_prompt_includes_all_candidates(self):
         svc = _service()
         candidates = _make_candidates(5)
-        prompt = svc._build_user_prompt("test", candidates, query_type="technical")
+        prompt = svc._build_user_prompt("test", candidates)
         for i in range(5):
             assert f"[{i}]" in prompt
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 5: Full Rerank Flow (integration with mocks)
+# Section 3: Full Rerank Flow (integration with mocks)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestRerankIntegration:
@@ -445,55 +187,46 @@ class TestRerankIntegration:
         assert result.diagnostics["reason"] == "no_api_key"
 
     @pytest.mark.asyncio
-    async def test_rerank_llm_success_includes_query_type(self):
-        """Full flow: classify → score → blend. Verify query_type in diagnostics."""
+    async def test_rerank_llm_success(self):
+        """Full flow: single LLM call for scoring, no classifier."""
         svc = _service()
         candidates = _make_candidates(3)
+        scores = [
+            {"index": 0, "score": 0.9, "rationale": "directly about the person"},
+            {"index": 1, "score": 0.3, "rationale": "tangential"},
+            {"index": 2, "score": 0.7, "rationale": "partially relevant"},
+        ]
 
-        call_count = 0
-
-        def mock_post(url, payload):
-            nonlocal call_count
-            call_count += 1
-            messages = payload["messages"]
-            user_msg = messages[-1]["content"]
-
-            if call_count == 1:
-                # First call is classification
-                return _mock_classify_response("person")
-            else:
-                # Second call is reranking
-                scores = [
-                    {"index": 0, "score": 0.9, "rationale": "directly about the person"},
-                    {"index": 1, "score": 0.3, "rationale": "tangential"},
-                    {"index": 2, "score": 0.7, "rationale": "partially relevant"},
-                ]
-                return _mock_llm_response(scores)
-
-        with patch.object(svc, "_http_post", side_effect=mock_post):
+        with patch.object(svc, "_http_post", return_value=_mock_llm_response(scores)):
             result = await svc.rerank(query="Who is Alice?", candidates=candidates)
 
         assert result.method == "llm"
-        assert result.diagnostics.get("query_type") == "person"
+        assert "query_type" not in result.diagnostics
         assert len(result.candidates) == 3
         # First result should be the highest scored (index 0, score 0.9)
         assert result.candidates[0].get("_rerank_score") == 0.9
+
+    @pytest.mark.asyncio
+    async def test_rerank_only_one_llm_call(self):
+        """Unified prompt means only one LLM call (scoring), not two (classify + score)."""
+        svc = _service()
+        candidates = _make_candidates(3)
+        scores = [{"index": i, "score": 0.5, "rationale": "ok"} for i in range(3)]
+        mock_post = MagicMock(return_value=_mock_llm_response(scores))
+
+        with patch.object(svc, "_http_post", mock_post):
+            result = await svc.rerank(query="test", candidates=candidates)
+
+        assert result.method == "llm"
+        # Exactly 1 call (scoring batch), not 2 (no classifier)
+        assert mock_post.call_count == 1
 
     @pytest.mark.asyncio
     async def test_rerank_llm_failure_falls_back(self):
         svc = _service()
         candidates = _make_candidates(3)
 
-        call_count = 0
-
-        def mock_post(url, payload):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return _mock_classify_response("generic")
-            raise RuntimeError("API failure")
-
-        with patch.object(svc, "_http_post", side_effect=mock_post):
+        with patch.object(svc, "_http_post", side_effect=RuntimeError("API failure")):
             result = await svc.rerank(query="test", candidates=candidates)
 
         assert result.method == "fallback"
@@ -503,49 +236,29 @@ class TestRerankIntegration:
     async def test_rerank_max_results_caps_output(self):
         svc = _service()
         candidates = _make_candidates(5)
+        scores = [{"index": i, "score": 0.5, "rationale": "ok"} for i in range(5)]
 
-        call_count = 0
-
-        def mock_post(url, payload):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return _mock_classify_response("generic")
-            scores = [{"index": i, "score": 0.5, "rationale": "ok"} for i in range(5)]
-            return _mock_llm_response(scores)
-
-        with patch.object(svc, "_http_post", side_effect=mock_post):
+        with patch.object(svc, "_http_post", return_value=_mock_llm_response(scores)):
             result = await svc.rerank(query="test", candidates=candidates, max_results=2)
 
         assert len(result.candidates) <= 2
 
     @pytest.mark.asyncio
-    async def test_rerank_classification_failure_still_reranks(self):
-        """If classifier fails, reranking should still proceed with 'generic' type."""
+    async def test_rerank_empty_llm_response_falls_back(self):
+        """If the LLM returns unparseable output, fall back to RRF order."""
         svc = _service()
         candidates = _make_candidates(3)
+        empty_resp = {"choices": [{"message": {"content": "I can't do that"}}]}
 
-        call_count = 0
-
-        def mock_post(url, payload):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # Classification fails
-                raise RuntimeError("classify failed")
-            # Reranking succeeds
-            scores = [{"index": i, "score": 0.5 + i * 0.1, "rationale": "ok"} for i in range(3)]
-            return _mock_llm_response(scores)
-
-        with patch.object(svc, "_http_post", side_effect=mock_post):
+        with patch.object(svc, "_http_post", return_value=empty_resp):
             result = await svc.rerank(query="test", candidates=candidates)
 
-        assert result.method == "llm"
-        assert result.diagnostics.get("query_type") == "generic"
+        assert result.method == "fallback"
+        assert result.diagnostics.get("reason") == "empty_llm_response"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 6: Response Parsing
+# Section 4: Response Parsing
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestParseResponse:
@@ -599,7 +312,7 @@ class TestParseResponse:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 7: Blend and Sort
+# Section 5: Blend and Sort
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBlendAndSort:
@@ -632,7 +345,7 @@ class TestBlendAndSort:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 8: RerankedCandidate & RerankResult data classes
+# Section 6: RerankedCandidate & RerankResult data classes
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestDataClasses:
@@ -671,7 +384,7 @@ class TestDataClasses:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 9: Service Configuration
+# Section 7: Service Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestServiceConfiguration:
@@ -679,8 +392,6 @@ class TestServiceConfiguration:
 
     def test_default_model_is_nano(self):
         svc = _service()
-        # Model should remain gpt-5.4-nano for cost efficiency.
-        # Semantic work comes from type-aware prompt + query-type classifier.
         assert "nano" in svc._model
 
     def test_openrouter_api_base_detection(self):
@@ -702,7 +413,7 @@ class TestServiceConfiguration:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 10: Extract Candidate Text
+# Section 8: Extract Candidate Text
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestExtractCandidateText:
@@ -734,7 +445,7 @@ class TestExtractCandidateText:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 11: Model Resolution
+# Section 9: Model Resolution
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestModelResolution:
@@ -751,3 +462,35 @@ class TestModelResolution:
     def test_model_with_slash_kept_for_openrouter(self):
         svc = _service(api_base="https://openrouter.ai/api/v1", model="openai/gpt-5.4-nano")
         assert svc._resolve_model() == "openai/gpt-5.4-nano"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 10: Classifier Removal Regression
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestClassifierRemoved:
+    """Verify the query-type classifier is fully removed."""
+
+    def test_no_classify_method(self):
+        svc = _service()
+        assert not hasattr(svc, "classify_query_type")
+
+    def test_no_query_types_constant(self):
+        import services.llm_reranker as mod
+        assert not hasattr(mod, "QUERY_TYPES")
+
+    def test_no_classify_cache(self):
+        import services.llm_reranker as mod
+        assert not hasattr(mod, "_CLASSIFY_CACHE")
+
+    def test_no_type_scoring_rules(self):
+        import services.llm_reranker as mod
+        assert not hasattr(mod, "_TYPE_SCORING_RULES")
+
+    def test_no_build_type_aware_prompt(self):
+        import services.llm_reranker as mod
+        assert not hasattr(mod, "_build_type_aware_system_prompt")
+
+    def test_unified_prompt_exists(self):
+        import services.llm_reranker as mod
+        assert hasattr(mod, "_RERANK_SYSTEM_PROMPT")
