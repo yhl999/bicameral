@@ -109,6 +109,8 @@ class _FakeHybridRetrievalService:
         graph_facts: list[dict],
         typed_results: dict,
         max_facts: int,
+        query: str | None = None,
+        apply_diversity: bool = True,
     ) -> list[dict[str, Any]]:
         self.merge_calls.append(
             {"graph_facts": graph_facts, "typed_results": typed_results, "max_facts": max_facts}

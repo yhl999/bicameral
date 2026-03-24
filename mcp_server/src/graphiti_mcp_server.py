@@ -2181,10 +2181,17 @@ async def search_memory_facts(
                 'counts': {'state': 0, 'procedures': 0},
             }
 
+        # Construct the reranker before merge so we can tell merge whether
+        # Phase 2B diversity (dedup+MMR) should run.  When the LLM reranker
+        # is available it will handle diversity; when it will pass through
+        # we apply dedup+MMR in the merge step instead.
+        reranker_svc = LLMRerankerService()
         merged_hybrid = hybrid_svc.merge(
             graph_facts=merged_graph_facts,
             typed_results=typed_results,
             max_facts=max_facts,
+            query=query,
+            apply_diversity=not reranker_svc.is_available,
         )
 
         typed_state: list[dict[str, Any]] = typed_results.get('state', []) or []
@@ -2226,7 +2233,8 @@ async def search_memory_facts(
         # ── LLM reranking pass ───────────────────────────────────────────────
         # Apply LLM reranking over the RRF-merged pool. Fail-soft: if
         # reranking fails, the RRF-ordered pool is used unchanged.
-        reranker_svc = LLMRerankerService()
+        # reranker_svc is constructed above (before merge) so we can pass
+        # apply_diversity=not reranker_svc.is_available to merge().
         rerank_result = await reranker_svc.rerank(
             query=query,
             candidates=merged_hybrid,

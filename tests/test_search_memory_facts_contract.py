@@ -114,6 +114,8 @@ class _FakeHybridRetrievalService:
         graph_facts: list[dict],
         typed_results: dict,
         max_facts: int,
+        query: str | None = None,
+        apply_diversity: bool = True,
     ) -> list[dict[str, Any]]:
         return graph_facts[:max_facts]
 
