@@ -1,8 +1,8 @@
-# Bicameral - Dual-Brain Memory Runtime for Agents
+# Bicameral - Dual-Brain Typed Memory Runtime for Agents
 
-This repository is a **production delta layer** on top of [upstream Graphiti](https://github.com/getzep/graphiti). It turns Graphiti from a graph-memory library into a **dual-brain, policy-governed memory runtime** for OpenClaw agents.
+This repository is a **production delta layer** on top of [upstream Graphiti](https://github.com/getzep/graphiti). It turns Graphiti from a graph-memory library into a **dual-brain, policy-governed typed memory runtime** for OpenClaw agents.
 
-The key insight: **A single LLM-powered brain can't be trusted with your memories.** We added a second brain-a strict, append-only Fact Ledger-that acts as a thermostat to keep the semantic engine honest.
+The key insight: **A single LLM-powered brain can't be trusted with your memories.** We added a second brain — now modeled as an append-only **ChangeLedger** — that acts as a thermostat to keep the semantic engine honest.
 
 If you're looking for the core Graphiti framework docs:
 - Upstream repo: <https://github.com/getzep/graphiti>
@@ -16,7 +16,7 @@ Plain vector search (RAG) is good at recall ("find documents about X") but terri
 
 **Brain 1 alone is unreliable for high-stakes decisions.** When your AI manages your calendar, drafts your deals, and handles your relationships, you can't trust an LLM to silently invalidate facts or decide what supersedes what. There's no audit trail. There's no rollback. If the LLM hallucinates over your metadata, you'll never know.
 
-**We built Brain 2: A Fact Ledger.**
+**We built Brain 2: a canonical ledger layer (now represented as ChangeLedger).**
 
 Brain 1 (Neo4j) holds all the semantic richness-messy, probabilistic, non-deterministic. Brain 2 (SQLite) holds deterministic truth-append-only, auditable, hash-chained. At retrieval time, a trust multiplier combines them: `final_score = semantic_relevance + (trust_score × trust_weight)`.
 
@@ -29,6 +29,34 @@ This architecture solves three problems vanilla Graphiti can't:
 - **Agents that learn.** After every coding run, learnings are extracted and promoted to Brain 2 with `trust_score = 1.0`. The next run gets them injected as context. Knowledge compounds instead of evaporating.
 
 For the full architecture deep-dive, see [The Dual-Brain Architecture](docs/DUAL-BRAIN-ARCHITECTURE.md).
+
+### Post-Rescope Framing (2026)
+
+- The dual-brain thesis still stands: semantic retrieval and deterministic truth governance are separate concerns.
+- The second brain is now framed as **ChangeLedger** (event-governed object lifecycle), while preserving compatibility with existing Fact Ledger flows.
+- Typed memory objects are first-class: **StateFact** (semantic), **Episode** (episodic), **Procedure** (procedural).
+- Target retrieval contract is explicit typed buckets (`state`, `episodes`, `procedures`, `evidence`) while preserving legacy compatibility during migration.
+
+### Storage & Truth Model (Current, Explicit)
+
+The three storage surfaces are intentionally different and **not redundant**:
+
+| Store | Primary role | Not this |
+|---|---|---|
+| **Neo4j** | Raw/projected memory surface for extraction, graph traversal, and retrieval ranking | Canonical truth history |
+| **`state/candidates.db`** | Staging + governance queue (verification, policy decisions, approvals/rejections) | Replacement for ChangeLedger |
+| **ChangeLedger** (`state/fact_ledger*.db`, typed ledger paths) | Canonical typed memory + event history | Complete log of every Graphiti/Neo4j mutation |
+
+Important nuance: ChangeLedger tracks canonical typed memory/history and selected provisional typed writes in specific flows. It does **not** mirror all graph-level mutations. Neo4j remains the raw/projection/search layer, and `candidates.db` remains the promotion/governance queue.
+
+#### Lane-specific mapping (what goes where)
+
+| Lane / domain | Neo4j | `candidates.db` | ChangeLedger |
+|---|---|---|---|
+| `s1_sessions_main` / `s1_chatgpt_history` | Primary extraction + retrieval surface | Candidate verification + promotion queue | Promoted typed memory/history written as events/objects |
+| `s1_observational_memory` (OM) | OMNode lifecycle + retrieval surface | OM verification + dead-letter/governance queue | Includes specific provisional typed writes and promoted typed outcomes |
+| `learning_self_audit` | Lane is retrievable today | Not in the v3 candidate-generating set | Target path is typed graduation; currently partial/in-progress |
+| `procedures` | Optional derived projection for retrieval/ranking | Procedure candidates can still be staged/governed when applicable | Canonical `Procedure` objects + success/failure lineage/history |
 
 ---
 
@@ -458,14 +486,22 @@ For the full sync and patch application procedure, see the [Upstream Sync Runboo
 
 ## Current Status
 
+### Stable Operational Baseline
+
 - Publicization execution lanes completed: adapter wiring, backup wiring, cron cutover.
 - Integration gate: **GO** (`reports/publicization/integration-report.md`).
 - Boundary policy: **ALLOW=370 / BLOCK=0 / AMBIGUOUS=0**.
-- **Truth pipeline: operational, with deterministic migration closeout policy.** Fact ledger + trust-aware retrieval are live, and curated-facts migration now uses deterministic disposition-aware validation (rather than ad-hoc/manual overrides) for unresolved legacy mappings. Canonical curated migration closeout is complete.
-- **Promotion policy v3 unified:** Policy v3 is now the default for all code paths — both OM-derived candidates and graph-lane candidates. The prior v2/v3 split-brain is resolved (`truth/candidates.py` `POLICY_VERSION_DEFAULT = "promotion-v3"`).
-- **Lane matrix locked (v3):** Retrieval eligibility, corroboration-only classification, and candidate-generating status are codified in `truth/candidates.py` constants and `config/runtime_pack_registry.json` `lane_policy`. See Candidate Generation Policy table above.
-- **Ingest sanitization live:** Session ingest strips `<graphiti-context>` blocks, untrusted metadata wrappers, and tool-call noise before LLM extraction (`scripts/mcp_ingest_sessions.py`). Token savings: ~20–60% per episode on typical sessions.
-- **Flip readiness caveat:** do not treat this status as automatic "Graphiti-primary GO." First confirm extraction freshness / queue-drain reliability, pass a fresh shadow-compare window, and complete a pilot run with per-lane quality report; otherwise keep Graphiti in governed shadow mode with QMD failover semantics. See private repo `docs/runbooks/operator-rollout-runbook.md` for the merge/rebuild/smoke/pilot/backfill decision flow.
+- **Truth pipeline: operational, with deterministic migration closeout policy.** Fact ledger + trust-aware retrieval are live, and curated-facts migration now uses deterministic disposition-aware validation for unresolved legacy mappings.
+- **Promotion policy v3 unified:** Policy v3 is the default for OM-derived and graph-lane candidates (`truth/candidates.py` `POLICY_VERSION_DEFAULT = "promotion-v3"`).
+- **Lane matrix locked (v3):** Retrieval eligibility, corroboration-only classification, and candidate-generating status are codified in code and config.
+- **Ingest sanitization live:** Session ingest strips `<graphiti-context>` blocks, untrusted metadata wrappers, and tool-call noise before LLM extraction (~20–60% token savings).
+
+### Typed Memory Rescope Status (Target Architecture)
+
+- **Target framing:** dual brain + ChangeLedger-governed typed objects (StateFact / Episode / Procedure) + pluggable evidence plane.
+- **Typed retrieval surface:** available via `result_format='typed'` (non-default while legacy caller migration remains open).
+- **Operator gating remains explicit:** do not treat status as automatic Graphiti-primary GO; require freshness/queue-drain checks, shadow compare, and pilot quality reporting before any flip.
+- **Source of truth for phase-level status:** `bicameral-private/prd/EPIC-BICAMERAL-TYPED-MEMORY-RESCOPE.md`.
 
 ## CI Policy
 
